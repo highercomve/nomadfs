@@ -75,6 +75,7 @@ pub const Session = struct {
     mutex: std.Thread.Mutex = .{},
     accept_cond: std.Thread.Condition = .{},
     is_server: bool,
+    closed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, transport: network.Stream, is_server: bool) !*Session {
         const self = try allocator.create(Session);
@@ -85,6 +86,7 @@ pub const Session = struct {
             .streams = .{},
             .accept_queue = .{},
             .is_server = is_server,
+            .closed = false,
         };
         return self;
     }
@@ -103,6 +105,8 @@ pub const Session = struct {
     pub fn newStream(self: *Session) !*YamuxStream {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        if (self.closed) return error.SessionClosed;
 
         const id = self.next_stream_id;
         self.next_stream_id += 2;
@@ -131,7 +135,7 @@ pub const Session = struct {
         defer self.mutex.unlock();
 
         while (self.accept_queue.items.len == 0) {
-            // TODO: check for session closed
+            if (self.closed) return error.SessionClosed;
             self.accept_cond.wait(&self.mutex);
         }
         return self.accept_queue.orderedRemove(0);
@@ -139,6 +143,21 @@ pub const Session = struct {
 
     /// Read loop - must be called from a dedicated thread.
     pub fn run(self: *Session) !void {
+        defer {
+            self.mutex.lock();
+            self.closed = true;
+            var it = self.streams.iterator();
+            while (it.next()) |entry| {
+                const stream = entry.value_ptr.*;
+                stream.mutex.lock();
+                stream.closed = true;
+                stream.cond.signal();
+                stream.mutex.unlock();
+            }
+            self.accept_cond.broadcast();
+            self.mutex.unlock();
+        }
+
         var header_buf: [12]u8 = undefined;
         while (true) {
             const n = self.transport.read(&header_buf) catch |err| {

@@ -1,0 +1,9 @@
+.git
+.zig-cache
+zig-out
+0.15.2
+tests
+learning
+.config
+*.key
+nomad_data

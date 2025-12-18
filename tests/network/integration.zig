@@ -19,7 +19,7 @@ test "network: tcp loopback" {
     std.Thread.sleep(100 * std.time.ns_per_ms);
 
     // 3. Peer2 connects to Peer1
-    const conn = try peer2.manager.connectToPeer(peer1.listen_addr);
+    const conn = try peer2.manager.connectToPeer(peer1.listen_addr, peer2.config.node.swarm_key);
     const stream = try conn.openStream();
     defer stream.close();
 

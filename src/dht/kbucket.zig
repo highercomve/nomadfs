@@ -7,6 +7,7 @@ pub const PeerInfo = struct {
     id: NodeID,
     address: std.net.Address,
     last_seen: i64,
+    online: bool = true,
 };
 
 const Bucket = struct {
@@ -33,9 +34,9 @@ const Bucket = struct {
                 // For simplicity in MVP, just update last_seen and keep order
                 p.last_seen = peer.last_seen;
                 p.address = peer.address;
-                
+
                 // Rotate to end
-                const removed = self.peers.orderedRemove(self.allocator, i);
+                const removed = self.peers.orderedRemove(i);
                 try self.peers.append(self.allocator, removed);
                 return true;
             }
@@ -46,7 +47,7 @@ const Bucket = struct {
             return true;
         }
 
-        // Bucket full. In real Kademlia, we ping the LRU (head). 
+        // Bucket full. In real Kademlia, we ping the LRU (head).
         // MVP: Just discard new peer.
         return false;
     }
@@ -76,22 +77,42 @@ pub const RoutingTable = struct {
     }
 
     pub fn addPeer(self: *RoutingTable, peer: PeerInfo) !void {
-        if (peer.id.eql(self.local_id)) return;
+        std.debug.assert(!peer.id.eql(self.local_id));
         const cpl = self.local_id.commonPrefixLen(peer.id);
-        _ = try self.buckets[cpl].add(peer);
+
+        // cpl is 0..256. If cpl is 256, ids are identical (handled by assert above).
+        // Index must be < 256.
+        const index = @min(cpl, 255);
+        _ = try self.buckets[index].add(peer);
     }
 
+    pub fn markDisconnected(self: *RoutingTable, peer_id: NodeID) void {
+        const cpl = self.local_id.commonPrefixLen(peer_id);
+
+        const index = @min(cpl, 255);
+
+        const bucket = &self.buckets[index];
+
+        for (bucket.peers.items) |*p| {
+            if (p.id.eql(peer_id)) {
+                p.online = false;
+                p.last_seen = std.time.timestamp();
+                return;
+            }
+        }
+    }
     pub fn getClosestPeers(self: *RoutingTable, target: NodeID, count: usize) ![]PeerInfo {
+        std.debug.assert(count > 0);
         var result = std.ArrayListUnmanaged(PeerInfo){};
         defer result.deinit(self.allocator); // We will return a slice, so we shouldn't deinit the backing if we were just returning list, but here we copy.
 
         // Search starting from the specific bucket, spreading out
         // 1. Check bucket[cpl]
         // 2. Check bucket[cpl-1], bucket[cpl+1] etc.
-        
+
         // Simplified approach: Iterate all buckets, collect, sort.
         // For MVP this is acceptable (K*256 is small).
-        
+
         var all_peers = std.ArrayListUnmanaged(PeerInfo){};
         defer all_peers.deinit(self.allocator);
 
@@ -118,5 +139,23 @@ pub const RoutingTable = struct {
 
         const result_len = @min(count, all_peers.items.len);
         return self.allocator.dupe(PeerInfo, all_peers.items[0..result_len]);
+    }
+
+    pub fn dump(self: *RoutingTable) void {
+        std.debug.print("--- Routing Table Dump ---\n", .{});
+        std.debug.print("Local ID: {x}\n", .{self.local_id.bytes});
+        var total_peers: usize = 0;
+        for (&self.buckets, 0..) |*b, i| {
+            if (b.peers.items.len > 0) {
+                std.debug.print("Bucket {d}: {d} peers\n", .{ i, b.peers.items.len });
+                for (b.peers.items) |p| {
+                    const status = if (p.online) "ONLINE" else "OFFLINE";
+                    std.debug.print("  - Peer: {x} at {f} [{s}]\n", .{ p.id.bytes, p.address, status });
+                }
+                total_peers += b.peers.items.len;
+            }
+        }
+        std.debug.print("Total Peers: {d}\n", .{total_peers});
+        std.debug.print("--------------------------\n", .{});
     }
 };

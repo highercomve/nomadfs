@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Config = struct {
     node: NodeConfig,
@@ -41,7 +42,23 @@ pub const Config = struct {
 /// Note: In a real-world scenario, we might use a full TOML parser.
 /// For this MVP, we implement a basic line-by-line parser.
 pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
-    const file = try std.fs.cwd().openFile(path, .{});
+    var expanded_path: []const u8 = path;
+    var owned_path: ?[]const u8 = null;
+    defer if (owned_path) |p| allocator.free(p);
+
+    if (std.mem.startsWith(u8, path, "~")) {
+        const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+        if (std.process.getEnvVarOwned(allocator, home_env)) |home| {
+            defer allocator.free(home);
+            owned_path = try std.fs.path.join(allocator, &.{ home, path[1..] });
+            expanded_path = owned_path.?;
+        } else |_| {}
+    }
+
+    const file = if (std.fs.path.isAbsolute(expanded_path))
+        try std.fs.openFileAbsolute(expanded_path, .{})
+    else
+        try std.fs.cwd().openFile(expanded_path, .{});
     defer file.close();
 
     var file_buffer: [4096]u8 = undefined;
@@ -78,7 +95,13 @@ pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
         if (std.mem.eql(u8, key, "nickname")) {
             config.node.nickname = try allocator.dupe(u8, val);
         } else if (std.mem.eql(u8, key, "swarm_key")) {
-            config.node.swarm_key = try allocator.dupe(u8, val);
+            if (val.len == 64) {
+                const decoded = try allocator.alloc(u8, 32);
+                _ = try std.fmt.hexToBytes(decoded, val);
+                config.node.swarm_key = decoded;
+            } else {
+                config.node.swarm_key = try allocator.dupe(u8, val);
+            }
         } else if (std.mem.eql(u8, key, "enabled")) {
             config.storage.enabled = std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, key, "storage_path")) {
@@ -109,4 +132,36 @@ pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
 
     config.network.bootstrap_peers = try bootstrap_list.toOwnedSlice(allocator);
     return config;
+}
+
+pub fn findAndParseConfig(allocator: std.mem.Allocator) !Config {
+    // 1. Current working directory
+    if (parseConfig(allocator, "nomadfs.conf")) |cfg| {
+        return cfg;
+    } else |_| {}
+
+    // 2. Home directory: ~/.nomadfs/nomadfs.conf
+    const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+    if (std.process.getEnvVarOwned(allocator, home_env)) |home| {
+        defer allocator.free(home);
+        const path = try std.fs.path.join(allocator, &.{ home, ".nomadfs", "nomadfs.conf" });
+        defer allocator.free(path);
+        if (parseConfig(allocator, path)) |cfg| {
+            return cfg;
+        } else |_| {}
+    } else |_| {}
+
+    // 3. System-wide standard: /etc/nomadfs/nomadfs.conf
+    if (parseConfig(allocator, "/etc/nomadfs/nomadfs.conf")) |cfg| {
+        return cfg;
+    } else |_| {}
+
+    // 4. System-wide: /usr/share/nomadfs/nomadfs.conf
+    // On Windows, this path might not make sense, but we keep it for Linux/macOS as requested.
+    if (parseConfig(allocator, "/usr/share/nomadfs/nomadfs.conf")) |cfg| {
+        return cfg;
+    } else |err| {
+        // If all fail, return the last error (likely FileNotFoundError)
+        return err;
+    }
 }

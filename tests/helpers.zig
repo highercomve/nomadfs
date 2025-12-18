@@ -13,22 +13,22 @@ pub const TestPeer = struct {
 
     pub fn init(allocator: std.mem.Allocator, port: u16) !*TestPeer {
         const peer = try allocator.create(TestPeer);
-        
+
         // Setup minimal config
         var cfg = nomadfs.config.Config{
-            .node = .{ .nickname = "TestNode", .swarm_key = "test_key" },
+            .node = .{ .nickname = "TestNode", .swarm_key = "test_key_32_bytes_long_!!!!!!!!!" },
             .storage = .{ .enabled = true, .storage_path = "./test_data" }, // TODO: Use tmp dir
             .network = .{ .port = port, .bootstrap_peers = undefined, .transport = .tcp },
         };
         // Dummy lists to avoid leaks or complex init for now
         cfg.network.bootstrap_peers = &.{};
-        
+
         const addr = try std.net.Address.parseIp("127.0.0.1", port);
 
-        peer.* = .{ 
+        peer.* = .{
             .allocator = allocator,
             .config = cfg,
-            .manager = nomadfs.network.manager.ConnectionManager.init(allocator, .tcp),
+            .manager = nomadfs.network.manager.ConnectionManager.initExplicit(allocator, .tcp, nomadfs.network.noise.KeyPair.generate()),
             .listen_addr = addr,
         };
         return peer;
@@ -50,7 +50,7 @@ pub const TestPeer = struct {
     pub fn stop(self: *TestPeer) void {
         if (!self.running.load(.acquire)) return;
         self.running.store(false, .release);
-        
+
         // Connect to self to unblock accept()
         if (std.net.tcpConnectToAddress(self.listen_addr)) |s| {
             s.close();
@@ -63,8 +63,7 @@ pub const TestPeer = struct {
     }
 
     fn serverLoop(self: *TestPeer) void {
-        // We call the actual listener from tcp.zig
-        nomadfs.network.tcp.listen(self.allocator, self.config.network.port, &self.running, &self.manager) catch |err| {
+        self.manager.listen(self.config.network.port, self.config.node.swarm_key, &self.running) catch |err| {
             if (self.running.load(.acquire)) {
                 std.debug.print("TestPeer server error: {}\n", .{err});
             }
@@ -72,7 +71,7 @@ pub const TestPeer = struct {
     }
 
     pub fn connect(self: *TestPeer, other: *TestPeer) !nomadfs.network.Stream {
-        const conn = try self.manager.connectToPeer(other.listen_addr);
+        const conn = try self.manager.connectToPeer(other.listen_addr, self.config.node.swarm_key);
         // We have a connection, now open a stream
         return conn.openStream();
     }

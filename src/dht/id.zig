@@ -3,7 +3,16 @@ const std = @import("std");
 pub const NodeID = struct {
     bytes: [32]u8,
 
-    pub fn random() NodeID {
+    pub fn fromPublicKey(public_key: [32]u8) NodeID {
+        var id: NodeID = undefined;
+        // In a real-world scenario, we might use a hash of the public key (e.g., Blake2b-256)
+        // For simplicity in the MVP, we use the public key directly if it's already 32 bytes
+        // or hash it if we want to ensure uniform distribution.
+        std.crypto.hash.blake2.Blake2s256.hash(&public_key, &id.bytes, .{});
+        return id;
+    }
+
+    pub fn generate() NodeID {
         var id: NodeID = undefined;
         std.crypto.random.bytes(&id.bytes);
         return id;
@@ -37,21 +46,44 @@ pub const NodeID = struct {
             if (byte == 0) {
                 zeros += 8;
             } else {
-                zeros += @as(u8, @intCast(@clz(byte))) - 24; // @clz returns u32/u64 count
+                zeros += @intCast(@clz(byte));
                 break;
             }
         }
+        std.debug.assert(zeros <= 256);
         return zeros;
     }
 
     pub fn format(
         self: NodeID,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
         writer: anytype,
     ) !void {
-        _ = fmt;
-        _ = options;
-        try writer.print("{s}", .{std.fmt.fmtSliceHexLower(&self.bytes)});
+        try writer.print("{x}", .{self.bytes});
     }
 };
+
+test "id: commonPrefixLen" {
+    var id1 = NodeID{ .bytes = [_]u8{0} ** 32 };
+    var id2 = NodeID{ .bytes = [_]u8{0} ** 32 };
+
+    // Identical
+    try std.testing.expectEqual(@as(u8, 256), id1.commonPrefixLen(id2));
+
+    // Differ in last bit
+    id2.bytes[31] = 1;
+    try std.testing.expectEqual(@as(u8, 255), id1.commonPrefixLen(id2));
+
+    // Differ in first bit
+    id2.bytes[31] = 0;
+    id2.bytes[0] = 0x80;
+    try std.testing.expectEqual(@as(u8, 0), id1.commonPrefixLen(id2));
+
+    // Differ in second bit
+    id2.bytes[0] = 0x40;
+    try std.testing.expectEqual(@as(u8, 1), id1.commonPrefixLen(id2));
+
+    // One byte identical, then differ
+    id2.bytes[0] = 0;
+    id2.bytes[1] = 0x80;
+    try std.testing.expectEqual(@as(u8, 8), id1.commonPrefixLen(id2));
+}

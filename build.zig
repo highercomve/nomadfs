@@ -41,6 +41,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // Define the test_helpers module
+    const test_helpers_mod = b.createModule(.{
+        .root_source_file = b.path("tests/helpers.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "nomadfs", .module = mod },
+        },
+    });
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -141,16 +150,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
-
-    // Define the test_helpers module
-    const test_helpers_mod = b.createModule(.{
-        .root_source_file = b.path("tests/helpers.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "nomadfs", .module = mod },
-        },
-    });
 
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
