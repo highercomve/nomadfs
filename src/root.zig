@@ -151,9 +151,23 @@ pub const Node = struct {
             }
         }
 
-        std.debug.print("Bootstrap connections complete. Starting peer discovery...\n", .{});
-        try self.dht_node.lookup(self.net.node_id);
-        std.debug.print("Peer discovery complete.\n", .{});
-        self.dht_node.routing_table.dump();
+        std.debug.print("Bootstrap connections complete. Starting periodic peer discovery...\n", .{});
+        const dht_node_ptr = self.dht_node;
+        const net_node_id = self.net.node_id;
+
+        const discovery_thread = try std.Thread.spawn(.{}, struct {
+            fn run(node: *dht.Node, target_id: dht.id.NodeID) void {
+                while (true) {
+                    std.debug.print("Starting peer discovery...\n", .{});
+                    node.lookup(target_id) catch |err| {
+                        std.debug.print("Error during DHT lookup: {any}\n", .{err});
+                    };
+                    std.debug.print("Peer discovery complete. Routing table dump:\n", .{});
+                    node.routing_table.dump();
+                    std.Thread.sleep(10 * std.time.ns_per_s); // Run every 10 seconds
+                }
+            }
+        }.run, .{ dht_node_ptr, net_node_id });
+        discovery_thread.detach();
     }
 };
