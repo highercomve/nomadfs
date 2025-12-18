@@ -26,8 +26,8 @@ pub const Node = struct {
 
         var store: ?*storage.engine.StorageEngine = null;
         if (cfg.storage.enabled) {
-            store = try allocator.create(storage.engine.StorageEngine);
-            store.?.* = try storage.engine.StorageEngine.init(cfg.storage.storage_path);
+            var s = try storage.engine.StorageEngine.init(allocator, cfg.storage.storage_path);
+            store = &s;
             // TODO: call store.?.open() or similar if needed
         }
         errdefer if (store) |s| {

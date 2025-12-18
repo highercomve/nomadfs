@@ -32,7 +32,7 @@ gen-swarm-key:
 $(TARGETS): 
 	@echo "Building for $@..."
 	@mkdir -p $(BUILD_DIR)/$@
-	zig build -Dtarget=$@ -Doptimize=ReleaseSafe --prefix $(BUILD_DIR)/$@
+	zig build -Dtarget=$@ --release=safe -Doptimize=ReleaseSafe --prefix $(BUILD_DIR)/$@
 
 package: $(TARGETS)
 	@mkdir -p $(DIST_DIR)
