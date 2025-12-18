@@ -26,8 +26,8 @@ pub const Node = struct {
 
         var store: ?*storage.engine.StorageEngine = null;
         if (cfg.storage.enabled) {
-            var s = try storage.engine.StorageEngine.init(allocator, cfg.storage.storage_path);
-            store = &s;
+            store = try allocator.create(storage.engine.StorageEngine);
+            store.?.* = try storage.engine.StorageEngine.init(allocator, cfg.storage.storage_path);
             // TODO: call store.?.open() or similar if needed
         }
         errdefer if (store) |s| {
@@ -37,7 +37,10 @@ pub const Node = struct {
 
         const dht_node = try allocator.create(dht.Node);
         dht_node.* = dht.Node.init(allocator, net, cfg.node.swarm_key);
-        errdefer allocator.destroy(dht_node);
+        errdefer {
+            dht_node.deinit();
+            allocator.destroy(dht_node);
+        }
 
         // Register DHT serve loop for new connections
         net.on_connection_ctx = dht_node;
@@ -147,5 +150,10 @@ pub const Node = struct {
                 }
             }
         }
+
+        std.debug.print("Bootstrap connections complete. Starting peer discovery...\n", .{});
+        try self.dht_node.lookup(self.net.node_id);
+        std.debug.print("Peer discovery complete.\n", .{});
+        self.dht_node.routing_table.dump();
     }
 };
