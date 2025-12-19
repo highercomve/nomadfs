@@ -56,29 +56,36 @@ In a decentralized network, nodes have vastly different capabilities. A high-spe
 
 This mechanism ensures that NomadFS remains stable even when transferring large files between nodes with asymmetric bandwidth.
 
-## 4. Graceful Closure: The FIN Flag
-
-When an application is finished with a stream, it calls `close()`.
-1.  The local `YamuxStream` is marked as `closed`.
-2.  A 0-length `DATA` frame with the `FIN` flag is sent to the peer.
-3.  The peer receives the `FIN` flag and marks its own side as `closed`.
-4.  Subsequent `read()` calls on a closed stream will return the remaining buffered data and then return `0` (EOF).
-
-This allow us to distinguish between a clean "End of File" and an abrupt connection failure.
-
 ## 4. The Session Loop: `run()`
 
 Each connection runs a background thread executing the `Session.run()` function. This is the "heart" of the multiplexer.
 
 ### The Routing Logic
 1.  **Read Header**: The loop reads exactly 12 bytes from the underlying encrypted Noise channel.
-2.  **Lookup**: It looks up the `stream_id` in a hash map (`streams`).
-3.  **Handle Data**:
-    *   If the frame is `DATA` and the stream exists, it appends the payload to that stream's `incoming_data` buffer.
-    *   If it's a new `SYN` frame, it creates a new stream and signals the `accept_cond` variable.
-4.  **Signal**: It signals a **Condition Variable** (`cond`) associated with the stream. Any thread waiting in a `stream.read()` call will wake up and process the new data.
+2.  **Handle Frame Type**:
+    *   **`DATA`**: It looks up the `stream_id` and appends the payload to that stream's `incoming_data` buffer. If it's a new `SYN`, it accepts the new stream.
+    *   **`WINDOW_UPDATE`**: It updates the `remote_window` for the stream and wakes up any blocked writers.
+    *   **`PING`**: It immediately replies with a PONG (see below).
+    *   **`GO_AWAY`**: It marks the session as closed.
+3.  **Signal**: It signals a **Condition Variable** (`cond`) associated with the stream to wake up app threads.
 
-## 5. Thread Safety & Concurrency
+## 5. Control Messages
+
+Beyond simple data transfer, Yamux uses control frames to maintain the health of the connection.
+
+### PING / PONG
+A `PING` frame (Type 2) is used to measure latency (RTT) or verify the peer is still alive.
+*   **Request:** Sender sends `PING` with `flags = 0`.
+*   **Response:** Receiver must immediately send back a `PING` with `flags = ACK` and the exact same payload/length (usually empty or an opaque session ID).
+*   **NomadFS Handling:** The session loop detects the Ping request and immediately writes the Ping ACK back to the transport layer, ensuring the connection remains active without application intervention.
+
+### GO_AWAY
+A `GO_AWAY` frame (Type 3) signals a graceful shutdown.
+*   **Trigger:** A peer wants to close the connection but let existing streams finish (e.g., shutting down the app).
+*   **Action:** The receiver marks the session as `closed`.
+*   **Effect:** No *new* streams can be opened (attempts will fail), but existing streams continue processing until they naturally complete.
+
+## 6. Thread Safety & Concurrency
 
 NomadFS's Yamux implementation is designed for high concurrency:
 *   **Session Mutex**: Protects the hash map of streams and the outbound transport.
@@ -87,3 +94,12 @@ NomadFS's Yamux implementation is designed for high concurrency:
 
 By separating the **Network I/O** (the background loop) from the **Application Logic** (the reader/writer threads), NomadFS ensures that a slow file transfer doesn't block critical DHT discovery queries.
 
+## 7. Implementation Note: Evolution from MVP
+
+Implementing a multiplexer is complex. Our initial MVP focused solely on data movement.
+
+*   **MVP Behavior**: The `Session.run()` loop only processed `DATA` and `WINDOW_UPDATE` frames. `PING` and `GO_AWAY` frames were ignored (discarded).
+*   **The Flaw**:
+    *   **Timeouts**: Without responding to Pings, remote peers would assume we crashed and sever the connection, even if we were just idle.
+    *   **Errors**: Without `GO_AWAY`, a peer shutting down would sever the TCP connection, causing "Connection Reset" errors for active streams instead of a clean "End of Stream".
+*   **The Fix**: Adding handlers for these control frames allows NomadFS to "play nice" with the network. We now prove our liveness (via Pongs) and respect peer shutdowns, creating a robust, long-running mesh.

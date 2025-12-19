@@ -246,8 +246,28 @@ pub const Session = struct {
                         stream.mutex.unlock();
                     }
                 },
-                else => {
-                    if (header.length > 0) try self.discardBytes(header.length);
+                .PING => {
+                    // If it's a request (no ACK flag), send it back
+                    if (header.flags & Flags.ACK == 0) {
+                        var resp = header;
+                        resp.flags |= Flags.ACK;
+                        
+                        var h_buf: [12]u8 = undefined;
+                        resp.encode(&h_buf);
+                        
+                        self.mutex.lock();
+                        _ = try self.transport.write(&h_buf);
+                        self.mutex.unlock();
+                    }
+                    // If it is an ACK, we just ignore it for now (no PING tracker)
+                },
+                .GO_AWAY => {
+                    // Stop accepting new streams
+                    self.mutex.lock();
+                    self.closed = true;
+                    // Wake up anyone waiting for accept
+                    self.accept_cond.broadcast();
+                    self.mutex.unlock();
                 },
             }
         }

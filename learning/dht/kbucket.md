@@ -32,16 +32,19 @@ pub fn addPeer(self: *RoutingTable, peer: PeerInfo) !void {
 }
 ```
 
-## 4. Reliability and Eviction
+## 4. Reliability: Churn and the Replacement Cache
 
-Kademlia prefers **older nodes**. Studies of P2P networks show that the longer a node has been online, the more likely it is to stay online.
+Nodes in a P2P network are constantly joining and leaving ("churn"). If we just discarded new nodes when a bucket is full, we might miss out on a stable peer just because our bucket is full of stale ones.
 
-When a bucket is full and a new node is seen:
-1.  We **Ping** the oldest node in the bucket.
-2.  If the oldest node responds, it is moved to the "tail" (most recently seen), and the new node is discarded.
-3.  If the oldest node fails to respond, it is evicted, and the new node is added.
+To handle this, NomadFS implements a **Replacement Cache** for each bucket.
 
-This strategy makes the DHT incredibly resilient to "churn" (nodes constantly joining and leaving).
+### The Algorithm
+1.  **Bucket Full?** If we find a new node and the main bucket ($K=20$) is full, we don't discard it yet.
+2.  **Cache It:** We check the **Replacement Cache**. If it has space, we add the new node there.
+3.  **Eviction & Promotion:** When a node in the main bucket fails (e.g., fails to respond to a query or disconnects), we remove it.
+4.  **Instant Refill:** Immediately after removal, we look at the Replacement Cache. If it has peers, we **promote** the most recently seen one into the main bucket.
+
+This ensures that our routing table remains "saturated" with live peers, even if many nodes suddenly go offline. This strategy makes the DHT incredibly resilient to network instability.
 
 ## 5. Inspecting the Table
 
@@ -53,3 +56,11 @@ pub fn dump(self: *RoutingTable) void {
     // ... iterates and prints active buckets and peers ...
 }
 ```
+
+## 6. Implementation Note: MVP vs. Production
+
+When building a DHT, one often starts with a "Minimum Viable Product" (MVP). In NomadFS, our MVP implementation used a simple **Static Bucket Array** without a replacement cache.
+
+*   **MVP Behavior**: If a bucket was full ($K=20$) and a new peer arrived, the new peer was simply **discarded**.
+*   **The Flaw**: This assumes the 20 peers currently in the bucket are "good." In reality, peers often go offline without warning. If we keep stale peers and discard new (live) ones, our routing table slowly "rots," leading to lookup failures.
+*   **The Fix**: The **Replacement Cache** acts as a waiting room. It allows us to hold onto new, live peers and swap them in the moment an old peer dies. This transforms the system from "static and decaying" to "dynamic and self-healing."
