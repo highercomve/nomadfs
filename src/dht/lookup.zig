@@ -16,6 +16,8 @@ pub const LookupState = struct {
     queried: std.AutoHashMapUnmanaged(id.NodeID, void),
     /// Set of Peer IDs currently being queried.
     in_flight: std.AutoHashMapUnmanaged(id.NodeID, void),
+    /// Set of Peer IDs that failed to respond.
+    failed: std.AutoHashMapUnmanaged(id.NodeID, void),
 
     pub const LookupPeer = struct {
         info: kbucket.PeerInfo,
@@ -30,6 +32,7 @@ pub const LookupState = struct {
             .best_peers = try std.ArrayListUnmanaged(LookupPeer).initCapacity(allocator, initial_peers.len),
             .queried = .{},
             .in_flight = .{},
+            .failed = .{},
         };
 
         for (initial_peers) |info| {
@@ -43,9 +46,12 @@ pub const LookupState = struct {
         self.best_peers.deinit(self.allocator);
         self.queried.deinit(self.allocator);
         self.in_flight.deinit(self.allocator);
+        self.failed.deinit(self.allocator);
     }
 
     pub fn addPeer(self: *LookupState, info: kbucket.PeerInfo) !void {
+        if (self.queried.contains(info.id) or self.failed.contains(info.id)) return;
+
         // Don't add if already in best_peers
         for (self.best_peers.items) |p| {
             if (p.info.id.eql(info.id)) return;
@@ -113,6 +119,8 @@ pub const LookupState = struct {
 
     pub fn reportFailure(self: *LookupState, sender_id: id.NodeID) void {
         _ = self.in_flight.remove(sender_id);
+        self.failed.put(self.allocator, sender_id, {}) catch {};
+
         // Remove from best_peers
         for (self.best_peers.items, 0..) |p, i| {
             if (p.info.id.eql(sender_id)) {
@@ -124,23 +132,24 @@ pub const LookupState = struct {
 
     pub fn isFinished(self: *LookupState) bool {
         // Finished if:
-        // 1. Alpha closest peers have all replied.
-        // 2. Or we have no more peers to query and nothing in flight.
+        // 1. We have nothing in flight.
+        // AND
+        // 2. Either we have no more unqueried peers.
+        // 3. Or the K closest peers have all replied.
 
         if (self.in_flight.count() > 0) return false;
 
         var queried_count: usize = 0;
+        var unqueried_found = false;
         for (self.best_peers.items) |p| {
-            if (p.queried) {
+            if (p.replied) {
                 queried_count += 1;
-            } else {
-                // If we find an unqueried peer, and it's within the top K, we aren't done
-                // unless we've already queried some closer ones and they are the best we can get.
-                return false;
+            } else if (!p.queried) {
+                unqueried_found = true;
             }
             if (queried_count >= kbucket.K) return true;
         }
 
-        return true;
+        return !unqueried_found;
     }
 };

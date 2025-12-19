@@ -40,14 +40,24 @@ pub fn isFinished(self: *LookupState) bool {
 }
 ```
 
-## 4. Handling Failures
+## 4. Handling Failures and Churn
 
-In a P2P network, nodes go offline all the time. If a node fails to respond to a `FIND_NODE` request:
-1.  We remove it from our `best_peers` list.
-2.  We mark it as "dead" in our routing table (or initiate an eviction check).
-3.  The lookup continues with the next best known peer.
+In a P2P network, nodes go offline all the time. NomadFS handles this at multiple levels:
 
-This makes the search extremely resilient. Even if many nodes in our path are offline, we only need *one* path to survive to find the target.
+1.  **Detection**: If an RPC call (e.g., `FIND_NODE`) fails due to a connection error or timeout, the peer is considered dead for the duration of that lookup.
+2.  **Lookup State Isolation**: The `LookupState` maintains a `failed` set. Once a node fails to respond, it is moved to this set and will **never** be re-added to the current search, even if another peer suggests it.
+3.  **Routing Table Cleanup**: Failed peers are immediately removed from the routing table via `markDisconnected`. This ensures that subsequent lookups don't waste time on known-dead nodes.
+4.  **Automatic Continuity**: Because lookups query $\alpha$ nodes in parallel and maintain a list of $K$ candidates, the search automatically "routes around" the failure by selecting the next best available peer.
+
+This multi-layered approach makes the discovery process resilient to high levels of churn.
+
+## 5. Integration Testing
+
+The robustness of the lookup algorithm is verified by `tests/dht/churn_test.zig`, which:
+1.  Spawns a 10-node network.
+2.  Populates routing tables so Node A knows about Node B (the closest to a target).
+3.  Abruptly stops Node B.
+4.  Verifies that Node A can still find the *second* closest node to the target by correctly identifying Node B's failure and continuing the search.
 
 ## 5. Value Lookup
 

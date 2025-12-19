@@ -5,13 +5,14 @@ const rpc = nomadfs.dht.rpc;
 const kbucket = nomadfs.dht.kbucket;
 
 test "dht: rpc serialization and deserialization" {
+    std.debug.print("\n=== Running Test: dht: rpc serialization and deserialization ===\n", .{});
     const allocator = std.testing.allocator;
 
     const sender_id = id.NodeID{ .bytes = [_]u8{0x01} ** 32 };
-    
+
     const peers = try allocator.alloc(kbucket.PeerInfo, 2);
     defer allocator.free(peers);
-    
+
     peers[0] = .{
         .id = id.NodeID{ .bytes = [_]u8{0x03} ** 32 },
         .address = try std.net.Address.parseIp("1.2.3.4", 1234),
@@ -40,7 +41,7 @@ test "dht: rpc serialization and deserialization" {
     defer decoded_msg.deinit(allocator);
 
     try std.testing.expect(decoded_msg.sender_id.eql(sender_id));
-    
+
     switch (decoded_msg.payload) {
         .FIND_NODE_RESPONSE => |p| {
             try std.testing.expectEqual(@as(usize, 2), p.closer_peers.len);

@@ -126,11 +126,11 @@ pub const Message = struct {
                     const len = try reader.readInt(u32, .big);
                     // Sanity check for max value size (e.g., 10MB)
                     if (len > 10 * 1024 * 1024) return error.ValueTooLarge;
-                    
+
                     const val = try allocator.alloc(u8, len);
                     errdefer allocator.free(val);
                     try reader.readNoEof(val);
-                    
+
                     break :blk MessagePayload{ .FIND_VALUE_RESPONSE = .{ .value = val } };
                 } else {
                     const count = try reader.readByte();
@@ -158,11 +158,11 @@ pub const Message = struct {
                 const len = try reader.readInt(u32, .big);
                 // Sanity check for max value size
                 if (len > 10 * 1024 * 1024) return error.ValueTooLarge;
-                
+
                 const val = try allocator.alloc(u8, len);
                 errdefer allocator.free(val);
                 try reader.readNoEof(val);
-                
+
                 break :blk MessagePayload{ .STORE = .{ .key = key, .value = val } };
             },
         };

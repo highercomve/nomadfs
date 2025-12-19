@@ -19,14 +19,11 @@ pub const MemoryStream = struct {
     }
 
     pub fn stream(self: *MemoryStream) network.Stream {
-        return .{
-            .ptr = self,
-            .vtable = &network.Stream.StreamVTable{
-                .read = read,
-                .write = write,
-                .close = close,
-            },
-        };
+        return network.Stream.init(self, &network.Stream.StreamVTable{
+            .read = read,
+            .write = write,
+            .close = close,
+        });
     }
 
     fn read(ptr: *anyopaque, buffer: []u8) anyerror!usize {
@@ -35,11 +32,11 @@ pub const MemoryStream = struct {
         defer self.mutex.unlock();
 
         if (self.read_pos >= self.buffer.items.len) return 0;
-        
+
         const available = self.buffer.items.len - self.read_pos;
         const to_read = @min(available, buffer.len);
-        
-        @memcpy(buffer[0..to_read], self.buffer.items[self.read_pos..self.read_pos+to_read]);
+
+        @memcpy(buffer[0..to_read], self.buffer.items[self.read_pos .. self.read_pos + to_read]);
         self.read_pos += to_read;
         return to_read;
     }
@@ -80,40 +77,34 @@ pub const Pipe = struct {
     }
 
     pub fn client(self: *Pipe) network.Stream {
-        return .{
-            .ptr = self,
-            .vtable = &network.Stream.StreamVTable{
-                .read = readClient,
-                .write = writeClient,
-                .close = close,
-            },
-        };
+        return network.Stream.init(self, &network.Stream.StreamVTable{
+            .read = readClient,
+            .write = writeClient,
+            .close = close,
+        });
     }
 
     pub fn server(self: *Pipe) network.Stream {
-        return .{
-            .ptr = self,
-            .vtable = &network.Stream.StreamVTable{
-                .read = readServer,
-                .write = writeServer,
-                .close = close,
-            },
-        };
+        return network.Stream.init(self, &network.Stream.StreamVTable{
+            .read = readServer,
+            .write = writeServer,
+            .close = close,
+        });
     }
 
     fn readClient(ptr: *anyopaque, buffer: []u8) anyerror!usize {
         const self: *Pipe = @ptrCast(@alignCast(ptr));
         self.mutex.lock();
         defer self.mutex.unlock();
-        
+
         while (self.cursor_b_to_a >= self.buffer_b_to_a.items.len) {
             if (self.closed) return 0;
             self.cond.wait(&self.mutex);
         }
-        
+
         const available = self.buffer_b_to_a.items.len - self.cursor_b_to_a;
         const to_read = @min(available, buffer.len);
-        @memcpy(buffer[0..to_read], self.buffer_b_to_a.items[self.cursor_b_to_a..self.cursor_b_to_a+to_read]);
+        @memcpy(buffer[0..to_read], self.buffer_b_to_a.items[self.cursor_b_to_a .. self.cursor_b_to_a + to_read]);
         self.cursor_b_to_a += to_read;
         return to_read;
     }
@@ -132,15 +123,15 @@ pub const Pipe = struct {
         const self: *Pipe = @ptrCast(@alignCast(ptr));
         self.mutex.lock();
         defer self.mutex.unlock();
-        
+
         while (self.cursor_a_to_b >= self.buffer_a_to_b.items.len) {
             if (self.closed) return 0;
             self.cond.wait(&self.mutex);
         }
-        
+
         const available = self.buffer_a_to_b.items.len - self.cursor_a_to_b;
         const to_read = @min(available, buffer.len);
-        @memcpy(buffer[0..to_read], self.buffer_a_to_b.items[self.cursor_a_to_b..self.cursor_a_to_b+to_read]);
+        @memcpy(buffer[0..to_read], self.buffer_a_to_b.items[self.cursor_a_to_b .. self.cursor_a_to_b + to_read]);
         self.cursor_a_to_b += to_read;
         return to_read;
     }
@@ -155,11 +146,55 @@ pub const Pipe = struct {
         return buffer.len;
     }
 
-    fn close(ptr: *anyopaque) void {
-        const self: *Pipe = @ptrCast(@alignCast(ptr));
+    pub fn connection(self: *Pipe) network.Connection {
+        return network.Connection.init(self, &network.Connection.ConnectionVTable{
+            .openStream = openStream,
+            .acceptStream = acceptStream,
+            .getPeerAddress = getPeerAddress,
+            .getRemoteNodeID = getRemoteNodeID,
+            .close = close,
+            .isClosed = isClosed,
+        });
+    }
+
+    fn openStream(ctx: *anyopaque) anyerror!network.Stream {
+        const self: *Pipe = @ptrCast(@alignCast(ctx));
+        return self.client();
+    }
+
+    fn acceptStream(ctx: *anyopaque) anyerror!network.Stream {
+        const self: *Pipe = @ptrCast(@alignCast(ctx));
+        return self.server();
+    }
+
+    fn getPeerAddress(ctx: *anyopaque) std.net.Address {
+        _ = ctx;
+        return std.net.Address.parseIp("127.0.0.1", 0) catch unreachable;
+    }
+
+    fn getRemoteNodeID(ctx: *anyopaque) @import("nomadfs").dht.id.NodeID {
+        _ = ctx;
+        var bytes: [32]u8 = undefined;
+        @memset(&bytes, 0);
+        return .{ .bytes = bytes };
+    }
+
+    fn isClosed(ctx: *anyopaque) bool {
+        const self: *Pipe = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.closed;
+    }
+
+    pub fn stop(self: *Pipe) void {
         self.mutex.lock();
         self.closed = true;
         self.cond.broadcast();
         self.mutex.unlock();
+    }
+
+    fn close(ptr: *anyopaque) void {
+        const self: *Pipe = @ptrCast(@alignCast(ptr));
+        self.stop();
     }
 };

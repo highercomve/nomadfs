@@ -4,6 +4,7 @@ const kbucket = @import("nomadfs").dht.kbucket;
 const lookup = @import("nomadfs").dht.lookup;
 
 test "dht: iterative lookup state management" {
+    std.debug.print("\n=== Running Test: dht: iterative lookup state management ===\n", .{});
     const allocator = std.testing.allocator;
 
     const target = id.NodeID{ .bytes = [_]u8{0xff} ** 32 };

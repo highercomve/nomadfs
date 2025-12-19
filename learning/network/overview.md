@@ -24,22 +24,18 @@ graph TD
 
 To decouple the application from the underlying network implementation, we use two primary interfaces:
 
-### `Connection`
-Represents a session with a specific peer. It is authenticated and secure.
-*   **Purpose**: A factory for streams.
-*   **Methods**: `openStream()`, `acceptStream()`, `close()`.
+### `ConnectionManager`
+The central registry for all active connections.
+*   **Purpose**: Pooling connections to avoid redundant handshakes and cleaning up idle resources.
+*   **Methods**: `connectToPeer()`, `listen()`, `stop()`.
 
-### `Stream`
-A bidirectional binary channel.
-*   **Purpose**: The actual object used to send/receive data (e.g., for a DHT query or block transfer).
-*   **Methods**: `read()`, `write()`, `close()`.
+## 3. The Implementation Glue (`tcp.zig` & `manager.zig`)
 
-## 3. The Implementation Glue (`tcp.zig`)
-
-The `tcp.zig` file manages the lifecycle of these connections:
+The network layer coordinates several components to provide a seamless experience:
 *   **Listening**: Accepts raw TCP connections and immediately triggers the [Noise Handshake](./noise.md).
 *   **Connecting**: Dials a remote peer and initiates the handshake.
 *   **Session Management**: Once the handshake is complete, it starts the [Yamux Session](./yamux.md) in a dedicated background thread.
+*   **Lifecycle Control**: The [ConnectionManager](./management.md) runs a "Reaper" thread to prune dead or idle connections, ensuring system stability.
 
 ---
 

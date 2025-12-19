@@ -365,14 +365,11 @@ pub const NoiseStream = struct {
     }
 
     pub fn stream(self: *NoiseStream) network.Stream {
-        return .{
-            .ptr = self,
-            .vtable = &network.Stream.StreamVTable{
-                .read = read,
-                .write = write,
-                .close = close,
-            },
-        };
+        return network.Stream.init(self, &network.Stream.StreamVTable{
+            .read = read,
+            .write = write,
+            .close = close,
+        });
     }
 
     fn read(ptr: *anyopaque, buffer: []u8) anyerror!usize {

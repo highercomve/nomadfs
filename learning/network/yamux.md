@@ -47,14 +47,24 @@ To prevent conflicts where both sides try to use the same ID:
 
 ## 3. Flow Control: The Window System
 
-Yamux prevents a fast sender from overwhelming a slow receiver using **Flow Control Windows**.
+In a decentralized network, nodes have vastly different capabilities. A high-speed server could easily overwhelm a mobile device's memory if it sends data faster than the app can process it. Yamux prevents this using **Flow Control Windows**.
 
-1.  Each stream starts with a default **Receive Window** (e.g., 256 KB).
-2.  The sender tracks how much data it has sent and subtracts it from the peer's window.
-3.  If the window reaches **0**, the sender **must stop** and wait.
-4.  When the receiver's application reads data from the buffer, the receiver sends a `WINDOW_UPDATE` frame to the sender, "refilling" the window.
+1.  **Initial Window**: Each stream starts with a **256 KB** window on both sides.
+2.  **Sender Constraint**: The sender tracks the `remote_window`. Every byte sent decreases this count. If it hits **0**, the sender's `write()` call blocks.
+3.  **Receiver Feedback**: When the receiver's application consumes data via `read()`, it frees up space in its local buffer. It then sends a `WINDOW_UPDATE` frame back to the sender.
+4.  **Wake up**: Upon receiving the update, the sender increases its `remote_window` and signals the blocked writer thread to continue.
 
-*Note: The current NomadFS MVP implementation uses a simplified window model, but the protocol supports complex per-stream flow control.*
+This mechanism ensures that NomadFS remains stable even when transferring large files between nodes with asymmetric bandwidth.
+
+## 4. Graceful Closure: The FIN Flag
+
+When an application is finished with a stream, it calls `close()`.
+1.  The local `YamuxStream` is marked as `closed`.
+2.  A 0-length `DATA` frame with the `FIN` flag is sent to the peer.
+3.  The peer receives the `FIN` flag and marks its own side as `closed`.
+4.  Subsequent `read()` calls on a closed stream will return the remaining buffered data and then return `0` (EOF).
+
+This allow us to distinguish between a clean "End of File" and an abrupt connection failure.
 
 ## 4. The Session Loop: `run()`
 

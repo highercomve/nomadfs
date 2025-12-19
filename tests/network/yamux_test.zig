@@ -4,6 +4,7 @@ const yamux = network.yamux;
 const Pipe = @import("memory_stream.zig").Pipe;
 
 test "yamux: multiple streams over single connection" {
+    std.debug.print("\n=== Running Test: yamux: multiple streams over single connection ===\n", .{});
     const allocator = std.testing.allocator;
 
     // 1. Setup Pipe

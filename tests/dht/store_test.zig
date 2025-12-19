@@ -4,6 +4,7 @@ const TestPeer = @import("test_helpers").TestPeer;
 const id = nomadfs.dht.id;
 
 test "dht: store and find_value" {
+    std.debug.print("\n=== Running Test: dht: store and find_value ===\n", .{});
     const allocator = std.testing.allocator;
 
     // 1. Create two peers
@@ -37,7 +38,7 @@ test "dht: store and find_value" {
     // 5. Store data from Peer2 to Peer1
     const key = id.NodeID.fromData("my_secret_data");
     const value = "hello world";
-    
+
     // Peer2 stores
     try dht2.store(key, value);
     std.Thread.sleep(50 * std.time.ns_per_ms);

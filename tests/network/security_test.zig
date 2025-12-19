@@ -6,6 +6,7 @@ const MemoryStream = @import("memory_stream.zig").MemoryStream;
 const Pipe = @import("memory_stream.zig").Pipe;
 
 test "security: noise handshake and data transfer" {
+    std.debug.print("\n=== Running Test: security: noise handshake and data transfer ===\n", .{});
     const allocator = std.testing.allocator;
 
     // 1. Create two peers with SAME swarm key
@@ -30,13 +31,13 @@ test "security: noise handshake and data transfer" {
 
     // 4. Server side verification
     var retries: usize = 0;
-    while (peer1.manager.connections.items.len == 0) {
+    while (peer1.manager.getConnectionsCount() == 0) {
         if (retries > 10) return error.TestTimeout;
         std.Thread.sleep(50 * std.time.ns_per_ms);
         retries += 1;
     }
 
-    const server_conn = peer1.manager.connections.items[0];
+    const server_conn = peer1.manager.getConnection(0).?;
     const server_stream = try server_conn.acceptStream();
     defer server_stream.close();
 
@@ -47,6 +48,7 @@ test "security: noise handshake and data transfer" {
 }
 
 test "security: noise handshake fails with wrong swarm key" {
+    std.debug.print("\n=== Running Test: security: noise handshake fails with wrong swarm key ===\n", .{});
     const allocator = std.testing.allocator;
 
     // 1. Create two peers with DIFFERENT swarm keys
@@ -97,6 +99,7 @@ test "security: noise handshake fails with wrong swarm key" {
 }
 
 test "security: connection drop during handshake" {
+    std.debug.print("\n=== Running Test: security: connection drop during handshake ===\n", .{});
     const allocator = std.testing.allocator;
     const swarm_key = "correct_swarm_key_32_bytes_long_";
 
@@ -119,6 +122,7 @@ test "security: connection drop during handshake" {
 }
 
 test "security: data on wire is encrypted" {
+    std.debug.print("\n=== Running Test: security: data on wire is encrypted ===\n", .{});
     const allocator = std.testing.allocator;
     const swarm_key = "correct_swarm_key_32_bytes_long_";
 

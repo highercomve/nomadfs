@@ -16,16 +16,14 @@ const TcpConnectionImpl = struct {
     closed: bool = false,
 
     pub fn connection(self: *TcpConnectionImpl) network.Connection {
-        return .{
-            .ptr = self,
-            .vtable = &network.Connection.ConnectionVTable{
-                .openStream = openStream,
-                .acceptStream = acceptStream,
-                .getPeerAddress = getPeerAddress,
-                .getRemoteNodeID = getRemoteNodeID,
-                .close = close,
-            },
-        };
+        return network.Connection.init(self, &network.Connection.ConnectionVTable{
+            .openStream = openStream,
+            .acceptStream = acceptStream,
+            .getPeerAddress = getPeerAddress,
+            .getRemoteNodeID = getRemoteNodeID,
+            .close = close,
+            .isClosed = isClosed,
+        });
     }
 
     /// Implements network.Connection.openStream
@@ -36,28 +34,22 @@ const TcpConnectionImpl = struct {
         const yamux_stream = try self.yamux.newStream();
 
         // Return the abstract interface pointing to our concrete Yamux stream
-        return network.Stream{
-            .ptr = yamux_stream,
-            .vtable = &network.Stream.StreamVTable{
-                .read = YamuxSession.streamRead,
-                .write = YamuxSession.streamWrite,
-                .close = YamuxSession.streamClose,
-            },
-        };
+        return network.Stream.init(yamux_stream, &network.Stream.StreamVTable{
+            .read = YamuxSession.streamRead,
+            .write = YamuxSession.streamWrite,
+            .close = YamuxSession.streamClose,
+        });
     }
 
     pub fn acceptStream(ctx: *anyopaque) anyerror!network.Stream {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
         const yamux_stream = try self.yamux.acceptStream();
 
-        return network.Stream{
-            .ptr = yamux_stream,
-            .vtable = &network.Stream.StreamVTable{
-                .read = YamuxSession.streamRead,
-                .write = YamuxSession.streamWrite,
-                .close = YamuxSession.streamClose,
-            },
-        };
+        return network.Stream.init(yamux_stream, &network.Stream.StreamVTable{
+            .read = YamuxSession.streamRead,
+            .write = YamuxSession.streamWrite,
+            .close = YamuxSession.streamClose,
+        });
     }
 
     pub fn getPeerAddress(ctx: *anyopaque) std.net.Address {
@@ -68,6 +60,11 @@ const TcpConnectionImpl = struct {
     pub fn getRemoteNodeID(ctx: *anyopaque) id.NodeID {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
         return id.NodeID.fromPublicKey(self.noise_stream.remote_static);
+    }
+
+    pub fn isClosed(ctx: *anyopaque) bool {
+        const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
+        return self.closed or self.yamux.closed;
     }
 
     pub fn close(ctx: *anyopaque) void {
@@ -92,14 +89,11 @@ pub const TcpStream = struct {
     closed: bool = false,
 
     pub fn stream(self: *TcpStream) network.Stream {
-        return .{
-            .ptr = self,
-            .vtable = &network.Stream.StreamVTable{
-                .read = read,
-                .write = write,
-                .close = close,
-            },
-        };
+        return network.Stream.init(self, &network.Stream.StreamVTable{
+            .read = read,
+            .write = write,
+            .close = close,
+        });
     }
 
     fn read(ptr: *anyopaque, buffer: []u8) anyerror!usize {

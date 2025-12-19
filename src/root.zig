@@ -19,6 +19,7 @@ pub const Node = struct {
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !*Node {
         const net = try allocator.create(network.manager.ConnectionManager);
         net.* = try network.manager.ConnectionManager.init(allocator, cfg.network.transport);
+        try net.start();
         errdefer {
             net.deinit();
             allocator.destroy(net);

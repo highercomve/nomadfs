@@ -30,6 +30,11 @@ const wire_data = pipe.buffer_a_to_b.items;
 try std.testing.expect(std.mem.indexOf(u8, wire_data, "Secret Data") == null);
 ```
 
-## 3. Integration Tests
+## 4. Multi-Node Simulations
 
-While unit tests use `Pipe`, our integration tests (`tests/network/integration.zig`) use the actual `std.net` stack on the `loopback` (127.0.0.1) interface. This ensures that our abstractions correctly map to real operating system sockets.
+Complex systems like the DHT require testing interactions across more than just two peers. We use `TestPeer` (`tests/helpers.zig`) to spawn multiple local nodes, each listening on a unique port.
+
+*   **Discovery Test**: Spawns 10 nodes and verifies that they can discover the entire network starting from a single bootstrap node.
+*   **Churn Simulation**: Abruptly stops nodes mid-lookup to ensure the network can route around failures.
+
+These tests run on the real TCP stack to ensure that the combination of Noise encryption, Yamux multiplexing, and DHT logic works correctly in a realistic (though local) environment.

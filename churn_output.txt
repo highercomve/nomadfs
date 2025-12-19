@@ -1,0 +1,949 @@
+test
++- run test 12/13 passed, 1 failed
+error: 'dht.churn_test.test.dht: churn resilience' failed: === Running Test: network: tcp loopback ===
+Listening for TCP connections on 0.0.0.0:9001...
+Accepted connection from 127.0.0.1:42286
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+Successfully opened stream between peers
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+
+=== Running Test: security: noise handshake and data transfer ===
+Listening for TCP connections on 0.0.0.0:9005...
+Accepted connection from 127.0.0.1:57112
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+Accepted connection from 127.0.0.1:57126
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+
+=== Running Test: security: noise handshake fails with wrong swarm key ===
+Listening for TCP connections on 0.0.0.0:9007...
+Accepted connection from 127.0.0.1:51330
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Error at step 'Message 3 Decrypt (payload/psk verify)': error.AuthenticationFailed
+* Noise Handshake FAILED (Responder): error.AuthenticationFailed
+Handshake failed: error.AuthenticationFailed
+Caught expected EOF during read
+Accepted connection from 127.0.0.1:51332
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+
+=== Running Test: security: connection drop during handshake ===
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+
+=== Running Test: security: data on wire is encrypted ===
+* Noise_XXpsk3 handshake start (Responder)
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise Handshake complete
+
+=== Running Test: yamux: multiple streams over single connection ===
+
+=== Running Test: dht: iterative lookup state management ===
+LookupState.init: target=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff, initial_peers=2
+LookupState: adding peer 1010101010101010101010101010101010101010101010101010101010101010
+LookupState: adding peer 8080808080808080808080808080808080808080808080808080808080808080
+LookupState.nextPeersToQuery: checking 2 best_peers
+LookupState.nextPeersToQuery: selecting peer 8080808080808080808080808080808080808080808080808080808080808080, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer 1010101010101010101010101010101010101010101010101010101010101010, queried=false, in_flight=false
+LookupState: reportReply from 8080808080808080808080808080808080808080808080808080808080808080, got 1 closer peers
+LookupState: adding peer f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0
+LookupState.nextPeersToQuery: checking 3 best_peers
+LookupState.nextPeersToQuery: selecting peer f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0, queried=false, in_flight=false
+LookupState: reportReply from f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0, got 0 closer peers
+LookupState: reportReply from 1010101010101010101010101010101010101010101010101010101010101010, got 0 closer peers
+
+=== Running Test: dht: rpc serialization and deserialization ===
+
+=== Running Test: dht: ping/pong integration ===
+Listening for TCP connections on 0.0.0.0:10001...
+Accepted connection from 127.0.0.1:47740
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: d3c95adf0bd1ed659b0020238b6afa93de58763bd4fbfea617651040eb5484ec
+Bucket 2: 1 peers
+  - Peer: f6b0e5a11f0f98c3a0817a5f43ecffc63fbca6899ef0900d25383eec18ffa7c1 at 127.0.0.1:47740
+Total Peers: 1
+--------------------------
+Received PONG from d3c95adf0bd1ed659b0020238b6afa93de58763bd4fbfea617651040eb5484ec
+Ping test passed!
+Peer disconnected: d3c95adf0bd1ed659b0020238b6afa93de58763bd4fbfea617651040eb5484ec
+Peer disconnected: f6b0e5a11f0f98c3a0817a5f43ecffc63fbca6899ef0900d25383eec18ffa7c1
+Accepted connection from 127.0.0.1:47750
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+
+=== Running Test: dht: store and find_value ===
+Listening for TCP connections on 0.0.0.0:11001...
+Listening for TCP connections on 0.0.0.0:11002...
+Accepted connection from 127.0.0.1:38862
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: 82de80b2e4cf41f8beff56b048e68332c252301447bc7e575e6ba3bedfd435db
+Bucket 0: 1 peers
+  - Peer: 4c556fc20280c10dc0ebe345cd2d98bf3ef76224d3916f01b4a96ccdf9d8379e at 127.0.0.1:38862
+Total Peers: 1
+--------------------------
+Received PONG from 82de80b2e4cf41f8beff56b048e68332c252301447bc7e575e6ba3bedfd435db
+Node.lookup: target=767b9bfacbfc2659b3ab39784f4d58dbd665c31d0781aea51abf577416b1514d
+LookupState.init: target=767b9bfacbfc2659b3ab39784f4d58dbd665c31d0781aea51abf577416b1514d, initial_peers=1
+LookupState: adding peer 82de80b2e4cf41f8beff56b048e68332c252301447bc7e575e6ba3bedfd435db
+LookupState.nextPeersToQuery: checking 1 best_peers
+LookupState.nextPeersToQuery: selecting peer 82de80b2e4cf41f8beff56b048e68332c252301447bc7e575e6ba3bedfd435db, queried=false, in_flight=false
+Node.lookup: next_peers=1
+Node.lookup: querying peer 82de80b2e4cf41f8beff56b048e68332c252301447bc7e575e6ba3bedfd435db at .{ .any = .{ .family = 2, .data = { 42, 249, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 63786, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 63786, .flowinfo = 16777343, .addr = { ... }, .scope_id = 0 } }, .un = .{ .family = 2, .path = { 42, 249, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 48, 41, 163, 132, 253, 127, 0, 0, 192, 200, 55, 1, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } }
+--- Routing Table Dump ---
+Local ID: 82de80b2e4cf41f8beff56b048e68332c252301447bc7e575e6ba3bedfd435db
+Bucket 0: 1 peers
+  - Peer: 4c556fc20280c10dc0ebe345cd2d98bf3ef76224d3916f01b4a96ccdf9d8379e at 127.0.0.1:38862
+Total Peers: 1
+--------------------------
+LookupState: reportReply from 82de80b2e4cf41f8beff56b048e68332c252301447bc7e575e6ba3bedfd435db, got 1 closer peers
+LookupState: adding peer 4c556fc20280c10dc0ebe345cd2d98bf3ef76224d3916f01b4a96ccdf9d8379e
+LookupState.nextPeersToQuery: checking 2 best_peers
+LookupState.nextPeersToQuery: selecting peer 4c556fc20280c10dc0ebe345cd2d98bf3ef76224d3916f01b4a96ccdf9d8379e, queried=false, in_flight=false
+Node.lookup: next_peers=1
+LookupState.nextPeersToQuery: checking 2 best_peers
+Node.lookup: next_peers=0
+Node.lookup: finished
+--- Routing Table Dump ---
+Local ID: 82de80b2e4cf41f8beff56b048e68332c252301447bc7e575e6ba3bedfd435db
+Bucket 0: 1 peers
+  - Peer: 4c556fc20280c10dc0ebe345cd2d98bf3ef76224d3916f01b4a96ccdf9d8379e at 127.0.0.1:38862
+Total Peers: 1
+--------------------------
+LookupState.init: target=767b9bfacbfc2659b3ab39784f4d58dbd665c31d0781aea51abf577416b1514d, initial_peers=1
+LookupState: adding peer 82de80b2e4cf41f8beff56b048e68332c252301447bc7e575e6ba3bedfd435db
+LookupState.nextPeersToQuery: checking 1 best_peers
+LookupState.nextPeersToQuery: selecting peer 82de80b2e4cf41f8beff56b048e68332c252301447bc7e575e6ba3bedfd435db, queried=false, in_flight=false
+--- Routing Table Dump ---
+Local ID: 82de80b2e4cf41f8beff56b048e68332c252301447bc7e575e6ba3bedfd435db
+Bucket 0: 1 peers
+  - Peer: 4c556fc20280c10dc0ebe345cd2d98bf3ef76224d3916f01b4a96ccdf9d8379e at 127.0.0.1:38862
+Total Peers: 1
+--------------------------
+Peer disconnected: 4c556fc20280c10dc0ebe345cd2d98bf3ef76224d3916f01b4a96ccdf9d8379e
+Peer disconnected: 82de80b2e4cf41f8beff56b048e68332c252301447bc7e575e6ba3bedfd435db
+Accepted connection from 127.0.0.1:59124
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Accepted connection from 127.0.0.1:57930
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+
+=== Running Test: dht: 10-node discovery ===
+Node 0 ID: 73aa336078467cc2951d616bef2043f28b9b940c99f8ed74f7777d4788344ab9
+Listening for TCP connections on 0.0.0.0:11000...
+Node 1 ID: 6dc3802bcc9e5b91ebd0ba631adc3257f6e04b4b711dea069a748f76dbe76070
+Listening for TCP connections on 0.0.0.0:11001...
+Node 2 ID: 8ac82d7c89f2b2b0e01227b531f96791d704bbb55a93300cd88973b316ced162
+Listening for TCP connections on 0.0.0.0:11002...
+Node 3 ID: e1868c39c842c320a0be4c1f5e07c456781f3ca0b14b123f2f1bedde77d55077
+Listening for TCP connections on 0.0.0.0:11003...
+Node 4 ID: 5403ac85427e163c6c207586db205521b26ca96f2e289e289f859f57180fdbda
+Listening for TCP connections on 0.0.0.0:11004...
+Node 5 ID: 07eb640ab99bdd1c2e8a500c0f221c326828e87dbd0d9bc91bf3e99ec4432988
+Listening for TCP connections on 0.0.0.0:11005...
+Node 6 ID: 53a066648cb8a89d979096076175b8948cfd3d484fb8ab4773aa29ba40a9a9c7
+Listening for TCP connections on 0.0.0.0:11006...
+Node 7 ID: d97a3115ece7fc519ecca39041e657ed91ef3501bd428ae94d5e24fbf2270008
+Listening for TCP connections on 0.0.0.0:11007...
+Node 8 ID: a5f3ce4507cf75b82bdd190421778965417f66ff0d9378807dfbfda76524ec3e
+Listening for TCP connections on 0.0.0.0:11008...
+Node 9 ID: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d
+Listening for TCP connections on 0.0.0.0:11009...
+Bootstrapping complete. Node 0 knows all nodes with correct listen ports.
+Node 9 searching for Node 5 (ID: 07eb640ab99bdd1c2e8a500c0f221c326828e87dbd0d9bc91bf3e99ec4432988)
+Node 0 thinks closest to target is: 07eb640ab99bdd1c2e8a500c0f221c326828e87dbd0d9bc91bf3e99ec4432988 at .{ .any = .{ .family = 2, .data = { 42, 253, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 64810, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 64810, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2863311530 } }, .un = .{ .family = 2, .path = { 42, 253, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170, 170 } } }
+Node.lookup: target=07eb640ab99bdd1c2e8a500c0f221c326828e87dbd0d9bc91bf3e99ec4432988
+LookupState.init: target=07eb640ab99bdd1c2e8a500c0f221c326828e87dbd0d9bc91bf3e99ec4432988, initial_peers=1
+LookupState: adding peer 73aa336078467cc2951d616bef2043f28b9b940c99f8ed74f7777d4788344ab9
+LookupState.nextPeersToQuery: checking 1 best_peers
+LookupState.nextPeersToQuery: selecting peer 73aa336078467cc2951d616bef2043f28b9b940c99f8ed74f7777d4788344ab9, queried=false, in_flight=false
+Node.lookup: next_peers=1
+Node.lookup: querying peer 73aa336078467cc2951d616bef2043f28b9b940c99f8ed74f7777d4788344ab9 at .{ .any = .{ .family = 2, .data = { 42, 248, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 63530, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 63530, .flowinfo = 16777343, .addr = { ... }, .scope_id = 0 } }, .un = .{ .family = 2, .path = { 42, 248, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 112, 142, 163, 132, 253, 127, 0, 0, 192, 200, 55, 1, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:40790
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: 73aa336078467cc2951d616bef2043f28b9b940c99f8ed74f7777d4788344ab9
+Bucket 0: 5 peers
+  - Peer: 8ac82d7c89f2b2b0e01227b531f96791d704bbb55a93300cd88973b316ced162 at 127.0.0.1:11002
+  - Peer: e1868c39c842c320a0be4c1f5e07c456781f3ca0b14b123f2f1bedde77d55077 at 127.0.0.1:11003
+  - Peer: d97a3115ece7fc519ecca39041e657ed91ef3501bd428ae94d5e24fbf2270008 at 127.0.0.1:11007
+  - Peer: a5f3ce4507cf75b82bdd190421778965417f66ff0d9378807dfbfda76524ec3e at 127.0.0.1:11008
+  - Peer: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d at 127.0.0.1:40790
+Bucket 1: 1 peers
+  - Peer: 07eb640ab99bdd1c2e8a500c0f221c326828e87dbd0d9bc91bf3e99ec4432988 at 127.0.0.1:11005
+Bucket 2: 2 peers
+  - Peer: 5403ac85427e163c6c207586db205521b26ca96f2e289e289f859f57180fdbda at 127.0.0.1:11004
+  - Peer: 53a066648cb8a89d979096076175b8948cfd3d484fb8ab4773aa29ba40a9a9c7 at 127.0.0.1:11006
+Bucket 3: 1 peers
+  - Peer: 6dc3802bcc9e5b91ebd0ba631adc3257f6e04b4b711dea069a748f76dbe76070 at 127.0.0.1:11001
+Total Peers: 9
+--------------------------
+LookupState: reportReply from 73aa336078467cc2951d616bef2043f28b9b940c99f8ed74f7777d4788344ab9, got 9 closer peers
+LookupState: adding peer 07eb640ab99bdd1c2e8a500c0f221c326828e87dbd0d9bc91bf3e99ec4432988
+LookupState: adding peer 5403ac85427e163c6c207586db205521b26ca96f2e289e289f859f57180fdbda
+LookupState: adding peer 53a066648cb8a89d979096076175b8948cfd3d484fb8ab4773aa29ba40a9a9c7
+LookupState: adding peer 6dc3802bcc9e5b91ebd0ba631adc3257f6e04b4b711dea069a748f76dbe76070
+LookupState: adding peer 8ac82d7c89f2b2b0e01227b531f96791d704bbb55a93300cd88973b316ced162
+LookupState: adding peer a5f3ce4507cf75b82bdd190421778965417f66ff0d9378807dfbfda76524ec3e
+LookupState: adding peer bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d
+LookupState: adding peer d97a3115ece7fc519ecca39041e657ed91ef3501bd428ae94d5e24fbf2270008
+LookupState: adding peer e1868c39c842c320a0be4c1f5e07c456781f3ca0b14b123f2f1bedde77d55077
+LookupState.nextPeersToQuery: checking 10 best_peers
+LookupState.nextPeersToQuery: selecting peer 07eb640ab99bdd1c2e8a500c0f221c326828e87dbd0d9bc91bf3e99ec4432988, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer 5403ac85427e163c6c207586db205521b26ca96f2e289e289f859f57180fdbda, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer 53a066648cb8a89d979096076175b8948cfd3d484fb8ab4773aa29ba40a9a9c7, queried=false, in_flight=false
+Node.lookup: next_peers=3
+Node.lookup: querying peer 07eb640ab99bdd1c2e8a500c0f221c326828e87dbd0d9bc91bf3e99ec4432988 at .{ .any = .{ .family = 2, .data = { 42, 253, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 64810, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 64810, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2214461448 } }, .un = .{ .family = 2, .path = { 42, 253, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 152, 79, 163, 132, 253, 127, 0, 0, 8, 0, 254, 131, 223, 127, 0, 0, 180, 123, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 48, 80, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 242, 131, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:49322
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: 07eb640ab99bdd1c2e8a500c0f221c326828e87dbd0d9bc91bf3e99ec4432988
+Bucket 0: 1 peers
+  - Peer: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d at 127.0.0.1:49322
+Total Peers: 1
+--------------------------
+LookupState: reportReply from 07eb640ab99bdd1c2e8a500c0f221c326828e87dbd0d9bc91bf3e99ec4432988, got 1 closer peers
+Node.lookup: querying peer 5403ac85427e163c6c207586db205521b26ca96f2e289e289f859f57180fdbda at .{ .any = .{ .family = 2, .data = { 42, 252, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 64554, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 64554, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2214461448 } }, .un = .{ .family = 2, .path = { 42, 252, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 152, 79, 163, 132, 253, 127, 0, 0, 8, 0, 254, 131, 223, 127, 0, 0, 180, 123, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 48, 80, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 242, 131, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:40550
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: 5403ac85427e163c6c207586db205521b26ca96f2e289e289f859f57180fdbda
+Bucket 0: 1 peers
+  - Peer: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d at 127.0.0.1:40550
+Total Peers: 1
+--------------------------
+LookupState: reportReply from 5403ac85427e163c6c207586db205521b26ca96f2e289e289f859f57180fdbda, got 1 closer peers
+Node.lookup: querying peer 53a066648cb8a89d979096076175b8948cfd3d484fb8ab4773aa29ba40a9a9c7 at .{ .any = .{ .family = 2, .data = { 42, 254, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 65066, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 65066, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2214461448 } }, .un = .{ .family = 2, .path = { 42, 254, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 152, 79, 163, 132, 253, 127, 0, 0, 8, 0, 254, 131, 223, 127, 0, 0, 180, 123, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 48, 80, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 242, 131, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:34278
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: 53a066648cb8a89d979096076175b8948cfd3d484fb8ab4773aa29ba40a9a9c7
+Bucket 0: 1 peers
+  - Peer: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d at 127.0.0.1:34278
+Total Peers: 1
+--------------------------
+LookupState: reportReply from 53a066648cb8a89d979096076175b8948cfd3d484fb8ab4773aa29ba40a9a9c7, got 1 closer peers
+LookupState.nextPeersToQuery: checking 10 best_peers
+LookupState.nextPeersToQuery: selecting peer 6dc3802bcc9e5b91ebd0ba631adc3257f6e04b4b711dea069a748f76dbe76070, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer 8ac82d7c89f2b2b0e01227b531f96791d704bbb55a93300cd88973b316ced162, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer a5f3ce4507cf75b82bdd190421778965417f66ff0d9378807dfbfda76524ec3e, queried=false, in_flight=false
+Node.lookup: next_peers=3
+Node.lookup: querying peer 6dc3802bcc9e5b91ebd0ba631adc3257f6e04b4b711dea069a748f76dbe76070 at .{ .any = .{ .family = 2, .data = { 42, 249, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 63786, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 63786, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2214461448 } }, .un = .{ .family = 2, .path = { 42, 249, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 152, 79, 163, 132, 253, 127, 0, 0, 8, 0, 254, 131, 223, 127, 0, 0, 180, 123, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 48, 80, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 242, 131, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:57944
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: 6dc3802bcc9e5b91ebd0ba631adc3257f6e04b4b711dea069a748f76dbe76070
+Bucket 0: 1 peers
+  - Peer: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d at 127.0.0.1:57944
+Total Peers: 1
+--------------------------
+LookupState: reportReply from 6dc3802bcc9e5b91ebd0ba631adc3257f6e04b4b711dea069a748f76dbe76070, got 1 closer peers
+Node.lookup: querying peer 8ac82d7c89f2b2b0e01227b531f96791d704bbb55a93300cd88973b316ced162 at .{ .any = .{ .family = 2, .data = { 42, 250, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 64042, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 64042, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2214461448 } }, .un = .{ .family = 2, .path = { 42, 250, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 152, 79, 163, 132, 253, 127, 0, 0, 8, 0, 254, 131, 223, 127, 0, 0, 180, 123, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 48, 80, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 242, 131, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:59128
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: 8ac82d7c89f2b2b0e01227b531f96791d704bbb55a93300cd88973b316ced162
+Bucket 2: 1 peers
+  - Peer: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d at 127.0.0.1:59128
+Total Peers: 1
+--------------------------
+LookupState: reportReply from 8ac82d7c89f2b2b0e01227b531f96791d704bbb55a93300cd88973b316ced162, got 1 closer peers
+Node.lookup: querying peer a5f3ce4507cf75b82bdd190421778965417f66ff0d9378807dfbfda76524ec3e at .{ .any = .{ .family = 2, .data = { 43, 0, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 43, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 43, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2214461448 } }, .un = .{ .family = 2, .path = { 43, 0, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 152, 79, 163, 132, 253, 127, 0, 0, 8, 0, 254, 131, 223, 127, 0, 0, 180, 123, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 48, 80, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 242, 131, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:37894
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: a5f3ce4507cf75b82bdd190421778965417f66ff0d9378807dfbfda76524ec3e
+Bucket 3: 1 peers
+  - Peer: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d at 127.0.0.1:37894
+Total Peers: 1
+--------------------------
+LookupState: reportReply from a5f3ce4507cf75b82bdd190421778965417f66ff0d9378807dfbfda76524ec3e, got 1 closer peers
+LookupState.nextPeersToQuery: checking 10 best_peers
+LookupState.nextPeersToQuery: selecting peer bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer d97a3115ece7fc519ecca39041e657ed91ef3501bd428ae94d5e24fbf2270008, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer e1868c39c842c320a0be4c1f5e07c456781f3ca0b14b123f2f1bedde77d55077, queried=false, in_flight=false
+Node.lookup: next_peers=3
+Node.lookup: querying peer d97a3115ece7fc519ecca39041e657ed91ef3501bd428ae94d5e24fbf2270008 at .{ .any = .{ .family = 2, .data = { 42, 255, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 65322, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 65322, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2214461448 } }, .un = .{ .family = 2, .path = { 42, 255, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 152, 79, 163, 132, 253, 127, 0, 0, 8, 0, 254, 131, 223, 127, 0, 0, 180, 123, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 48, 80, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 242, 131, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:53124
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: d97a3115ece7fc519ecca39041e657ed91ef3501bd428ae94d5e24fbf2270008
+Bucket 1: 1 peers
+  - Peer: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d at 127.0.0.1:53124
+Total Peers: 1
+--------------------------
+LookupState: reportReply from d97a3115ece7fc519ecca39041e657ed91ef3501bd428ae94d5e24fbf2270008, got 1 closer peers
+Node.lookup: querying peer e1868c39c842c320a0be4c1f5e07c456781f3ca0b14b123f2f1bedde77d55077 at .{ .any = .{ .family = 2, .data = { 42, 251, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 64298, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 64298, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2214461448 } }, .un = .{ .family = 2, .path = { 42, 251, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 152, 79, 163, 132, 253, 127, 0, 0, 8, 0, 254, 131, 223, 127, 0, 0, 180, 123, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 48, 80, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 242, 131, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:42268
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: e1868c39c842c320a0be4c1f5e07c456781f3ca0b14b123f2f1bedde77d55077
+Bucket 1: 1 peers
+  - Peer: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d at 127.0.0.1:42268
+Total Peers: 1
+--------------------------
+LookupState: reportReply from e1868c39c842c320a0be4c1f5e07c456781f3ca0b14b123f2f1bedde77d55077, got 1 closer peers
+LookupState.nextPeersToQuery: checking 10 best_peers
+Node.lookup: next_peers=0
+Node.lookup: finished
+Discovery successful! Node 9 found Node 5.
+Accepted connection from 127.0.0.1:40798
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Accepted connection from 127.0.0.1:57948
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Accepted connection from 127.0.0.1:59132
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Accepted connection from 127.0.0.1:42270
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Accepted connection from 127.0.0.1:40564
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Accepted connection from 127.0.0.1:49324
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Accepted connection from 127.0.0.1:34290
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Accepted connection from 127.0.0.1:53130
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Accepted connection from 127.0.0.1:37896
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Accepted connection from 127.0.0.1:36758
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Peer disconnected: 73aa336078467cc2951d616bef2043f28b9b940c99f8ed74f7777d4788344ab9
+Peer disconnected: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d
+Peer disconnected: 6dc3802bcc9e5b91ebd0ba631adc3257f6e04b4b711dea069a748f76dbe76070
+Peer disconnected: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d
+Peer disconnected: 8ac82d7c89f2b2b0e01227b531f96791d704bbb55a93300cd88973b316ced162
+Peer disconnected: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d
+Peer disconnected: e1868c39c842c320a0be4c1f5e07c456781f3ca0b14b123f2f1bedde77d55077
+Peer disconnected: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d
+Peer disconnected: 5403ac85427e163c6c207586db205521b26ca96f2e289e289f859f57180fdbda
+Peer disconnected: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d
+Peer disconnected: 07eb640ab99bdd1c2e8a500c0f221c326828e87dbd0d9bc91bf3e99ec4432988
+Peer disconnected: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d
+Peer disconnected: 53a066648cb8a89d979096076175b8948cfd3d484fb8ab4773aa29ba40a9a9c7
+Peer disconnected: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d
+Peer disconnected: d97a3115ece7fc519ecca39041e657ed91ef3501bd428ae94d5e24fbf2270008
+Peer disconnected: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d
+Peer disconnected: a5f3ce4507cf75b82bdd190421778965417f66ff0d9378807dfbfda76524ec3e
+Peer disconnected: bd8d27625bd143ab4cda6b89ecad27c2b74341678da2680192dcb2cb08617d0d
+
+=== Running Test: dht: churn resilience ===
+Listening for TCP connections on 0.0.0.0:12000...
+Listening for TCP connections on 0.0.0.0:12001...
+Listening for TCP connections on 0.0.0.0:12002...
+Listening for TCP connections on 0.0.0.0:12003...
+Listening for TCP connections on 0.0.0.0:12004...
+Listening for TCP connections on 0.0.0.0:12005...
+Listening for TCP connections on 0.0.0.0:12006...
+Listening for TCP connections on 0.0.0.0:12007...
+Listening for TCP connections on 0.0.0.0:12008...
+Listening for TCP connections on 0.0.0.0:12009...
+Node.lookup: target=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+LookupState.init: target=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, initial_peers=1
+LookupState: adding peer 0e23c75d37ab2695b20bd9174231c0ba46451b5f9d7f36116c2dcd165765312c
+LookupState.nextPeersToQuery: checking 1 best_peers
+LookupState.nextPeersToQuery: selecting peer 0e23c75d37ab2695b20bd9174231c0ba46451b5f9d7f36116c2dcd165765312c, queried=false, in_flight=false
+Node.lookup: next_peers=1
+Node.lookup: querying peer 0e23c75d37ab2695b20bd9174231c0ba46451b5f9d7f36116c2dcd165765312c at .{ .any = .{ .family = 2, .data = { 46, 224, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 57390, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 57390, .flowinfo = 16777343, .addr = { ... }, .scope_id = 0 } }, .un = .{ .family = 2, .path = { 46, 224, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 208, 134, 163, 132, 253, 127, 0, 0, 192, 200, 55, 1, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:45524
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: 0e23c75d37ab2695b20bd9174231c0ba46451b5f9d7f36116c2dcd165765312c
+Bucket 0: 7 peers
+  - Peer: 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2 at 127.0.0.1:12001
+  - Peer: d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816 at 127.0.0.1:12002
+  - Peer: c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f at 127.0.0.1:12005
+  - Peer: acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a at 127.0.0.1:12006
+  - Peer: bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033 at 127.0.0.1:12007
+  - Peer: b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c at 127.0.0.1:12008
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:45524
+Bucket 2: 1 peers
+  - Peer: 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4 at 127.0.0.1:12003
+Bucket 4: 1 peers
+  - Peer: 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc at 127.0.0.1:12004
+Total Peers: 9
+--------------------------
+LookupState: reportReply from 0e23c75d37ab2695b20bd9174231c0ba46451b5f9d7f36116c2dcd165765312c, got 9 closer peers
+LookupState: adding peer ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07
+LookupState: adding peer acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a
+LookupState: adding peer bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033
+LookupState: adding peer b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c
+LookupState: adding peer 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2
+LookupState: adding peer c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f
+LookupState: adding peer d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816
+LookupState: adding peer 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4
+LookupState: adding peer 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc
+LookupState.nextPeersToQuery: checking 10 best_peers
+LookupState.nextPeersToQuery: selecting peer ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033, queried=false, in_flight=false
+Node.lookup: next_peers=3
+Node.lookup: querying peer acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a at .{ .any = .{ .family = 2, .data = { 46, 230, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 58926, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 58926, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 230, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:45608
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a
+Bucket 9: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:45608
+Total Peers: 1
+--------------------------
+LookupState: reportReply from acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a, got 1 closer peers
+Node.lookup: querying peer bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033 at .{ .any = .{ .family = 2, .data = { 46, 231, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 59182, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 59182, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 231, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:51874
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033
+Bucket 3: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:51874
+Total Peers: 1
+--------------------------
+LookupState: reportReply from bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033, got 1 closer peers
+LookupState.nextPeersToQuery: checking 10 best_peers
+LookupState.nextPeersToQuery: selecting peer b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f, queried=false, in_flight=false
+Node.lookup: next_peers=3
+Node.lookup: querying peer b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c at .{ .any = .{ .family = 2, .data = { 46, 232, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 59438, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 59438, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 232, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:43218
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c
+Bucket 3: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:43218
+Total Peers: 1
+--------------------------
+LookupState: reportReply from b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c, got 1 closer peers
+Node.lookup: querying peer 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2 at .{ .any = .{ .family = 2, .data = { 46, 225, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 57646, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 57646, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 225, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:44126
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2
+Bucket 2: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:44126
+Total Peers: 1
+--------------------------
+LookupState: reportReply from 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2, got 1 closer peers
+Node.lookup: querying peer c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f at .{ .any = .{ .family = 2, .data = { 46, 229, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 58670, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 58670, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 229, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:44026
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f
+Bucket 1: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:44026
+Total Peers: 1
+--------------------------
+LookupState: reportReply from c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f, got 1 closer peers
+LookupState.nextPeersToQuery: checking 10 best_peers
+LookupState.nextPeersToQuery: selecting peer d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc, queried=false, in_flight=false
+Node.lookup: next_peers=3
+Node.lookup: querying peer d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816 at .{ .any = .{ .family = 2, .data = { 46, 226, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 57902, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 57902, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 226, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:50892
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816
+Bucket 1: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:50892
+Total Peers: 1
+--------------------------
+LookupState: reportReply from d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816, got 1 closer peers
+Node.lookup: querying peer 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4 at .{ .any = .{ .family = 2, .data = { 46, 227, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 58158, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 58158, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 227, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:46030
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4
+Bucket 0: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:46030
+Total Peers: 1
+--------------------------
+LookupState: reportReply from 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4, got 1 closer peers
+Node.lookup: querying peer 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc at .{ .any = .{ .family = 2, .data = { 46, 228, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 58414, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 58414, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 228, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+Accepted connection from 127.0.0.1:38718
+* Noise_XXpsk3 handshake start (Initiator)
+* Noise (OUT): Message 1 -> sending ephemeral public key (e)
+* Noise_XXpsk3 handshake start (Responder)
+* Noise (IN):  Message 1 <- received ephemeral public key (e)
+* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)
+* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)
+* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication
+* Noise Handshake complete
+* Noise (IN):  Message 3 <- received static key (s) and PSK authentication
+* Noise Handshake complete
+--- Routing Table Dump ---
+Local ID: 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc
+Bucket 0: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:38718
+Total Peers: 1
+--------------------------
+LookupState: reportReply from 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc, got 1 closer peers
+LookupState.nextPeersToQuery: checking 10 best_peers
+Node.lookup: next_peers=0
+Node.lookup: finished
+Closest node to target is Node 4 (ID: 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc)
+Stopping Node 4 to simulate churn...
+Accepted connection from 127.0.0.1:38724
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+--- Routing Table Dump ---
+Local ID: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07
+Bucket 0: 3 peers
+  - Peer: 0e23c75d37ab2695b20bd9174231c0ba46451b5f9d7f36116c2dcd165765312c at 127.0.0.1:12000
+  - Peer: 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4 at 127.0.0.1:12003
+  - Peer: 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc at 127.0.0.1:12004
+Bucket 1: 2 peers
+  - Peer: c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f at 127.0.0.1:12005
+  - Peer: d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816 at 127.0.0.1:12002
+Bucket 2: 1 peers
+  - Peer: 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2 at 127.0.0.1:12001
+Bucket 3: 2 peers
+  - Peer: bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033 at 127.0.0.1:12007
+  - Peer: b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c at 127.0.0.1:12008
+Bucket 9: 1 peers
+  - Peer: acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a at 127.0.0.1:12006
+Total Peers: 9
+--------------------------
+Node 9 starting lookup for target...
+Node.lookup: target=5555555555555555555555555555555555555555555555555555555555555555
+LookupState.init: target=5555555555555555555555555555555555555555555555555555555555555555, initial_peers=9
+LookupState: adding peer 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc
+LookupState: adding peer 0e23c75d37ab2695b20bd9174231c0ba46451b5f9d7f36116c2dcd165765312c
+LookupState: adding peer 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4
+LookupState: adding peer d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816
+LookupState: adding peer c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f
+LookupState: adding peer 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2
+LookupState: adding peer b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c
+LookupState: adding peer bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033
+LookupState: adding peer acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a
+LookupState.nextPeersToQuery: checking 9 best_peers
+LookupState.nextPeersToQuery: selecting peer 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer 0e23c75d37ab2695b20bd9174231c0ba46451b5f9d7f36116c2dcd165765312c, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4, queried=false, in_flight=false
+Node.lookup: next_peers=3
+Node.lookup: querying peer 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc at .{ .any = .{ .family = 2, .data = { 46, 228, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 58414, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 58414, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 228, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+--- Routing Table Dump ---
+Local ID: 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc
+Bucket 0: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:38718
+Total Peers: 1
+--------------------------
+LookupState: reportReply from 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc, got 1 closer peers
+LookupState: adding peer ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07
+Node.lookup: querying peer 0e23c75d37ab2695b20bd9174231c0ba46451b5f9d7f36116c2dcd165765312c at .{ .any = .{ .family = 2, .data = { 46, 224, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 57390, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 57390, .flowinfo = 16777343, .addr = { ... }, .scope_id = 0 } }, .un = .{ .family = 2, .path = { 46, 224, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 208, 134, 163, 132, 253, 127, 0, 0, 192, 200, 55, 1, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } }
+--- Routing Table Dump ---
+Local ID: 0e23c75d37ab2695b20bd9174231c0ba46451b5f9d7f36116c2dcd165765312c
+Bucket 0: 7 peers
+  - Peer: 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2 at 127.0.0.1:12001
+  - Peer: d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816 at 127.0.0.1:12002
+  - Peer: c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f at 127.0.0.1:12005
+  - Peer: acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a at 127.0.0.1:12006
+  - Peer: bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033 at 127.0.0.1:12007
+  - Peer: b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c at 127.0.0.1:12008
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:45524
+Bucket 2: 1 peers
+  - Peer: 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4 at 127.0.0.1:12003
+Bucket 4: 1 peers
+  - Peer: 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc at 127.0.0.1:12004
+Total Peers: 9
+--------------------------
+LookupState: reportReply from 0e23c75d37ab2695b20bd9174231c0ba46451b5f9d7f36116c2dcd165765312c, got 9 closer peers
+Node.lookup: querying peer 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4 at .{ .any = .{ .family = 2, .data = { 46, 227, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 58158, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 58158, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 227, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+--- Routing Table Dump ---
+Local ID: 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4
+Bucket 0: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:46030
+Total Peers: 1
+--------------------------
+LookupState: reportReply from 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4, got 1 closer peers
+LookupState.nextPeersToQuery: checking 10 best_peers
+LookupState.nextPeersToQuery: selecting peer d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2, queried=false, in_flight=false
+Node.lookup: next_peers=3
+Node.lookup: querying peer d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816 at .{ .any = .{ .family = 2, .data = { 46, 226, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 57902, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 57902, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 226, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+--- Routing Table Dump ---
+Local ID: d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816
+Bucket 1: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:50892
+Total Peers: 1
+--------------------------
+LookupState: reportReply from d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816, got 1 closer peers
+Node.lookup: querying peer c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f at .{ .any = .{ .family = 2, .data = { 46, 229, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 58670, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 58670, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 229, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+--- Routing Table Dump ---
+Local ID: c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f
+Bucket 1: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:44026
+Total Peers: 1
+--------------------------
+LookupState: reportReply from c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f, got 1 closer peers
+Node.lookup: querying peer 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2 at .{ .any = .{ .family = 2, .data = { 46, 225, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 57646, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 57646, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 225, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+--- Routing Table Dump ---
+Local ID: 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2
+Bucket 2: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:44126
+Total Peers: 1
+--------------------------
+LookupState: reportReply from 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2, got 1 closer peers
+LookupState.nextPeersToQuery: checking 10 best_peers
+LookupState.nextPeersToQuery: selecting peer b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033, queried=false, in_flight=false
+LookupState.nextPeersToQuery: selecting peer acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a, queried=false, in_flight=false
+Node.lookup: next_peers=3
+Node.lookup: querying peer b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c at .{ .any = .{ .family = 2, .data = { 46, 232, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 59438, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 59438, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 232, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+--- Routing Table Dump ---
+Local ID: b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c
+Bucket 3: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:43218
+Total Peers: 1
+--------------------------
+LookupState: reportReply from b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c, got 1 closer peers
+Node.lookup: querying peer bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033 at .{ .any = .{ .family = 2, .data = { 46, 231, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 59182, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 59182, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 231, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+--- Routing Table Dump ---
+Local ID: bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033
+Bucket 3: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:51874
+Total Peers: 1
+--------------------------
+LookupState: reportReply from bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033, got 1 closer peers
+Node.lookup: querying peer acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a at .{ .any = .{ .family = 2, .data = { 46, 230, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 } }, .in = .{ .sa = .{ .family = 2, .port = 58926, .addr = 16777343, .zero = { ... } } }, .in6 = .{ .sa = .{ .family = 2, .port = 58926, .flowinfo = 16777343, .addr = { ... }, .scope_id = 2256797704 } }, .un = .{ .family = 2, .path = { 46, 230, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 248, 71, 163, 132, 253, 127, 0, 0, 8, 0, 132, 134, 223, 127, 0, 0, 20, 116, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 144, 72, 163, 132, 253, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 168, 232, 163, 132, 253, 127, 0, 0, 128, 4, 142, 134, 223, 127, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0 } } }
+--- Routing Table Dump ---
+Local ID: acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a
+Bucket 9: 1 peers
+  - Peer: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07 at 127.0.0.1:45608
+Total Peers: 1
+--------------------------
+LookupState: reportReply from acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a, got 1 closer peers
+LookupState.nextPeersToQuery: checking 10 best_peers
+LookupState.nextPeersToQuery: selecting peer ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07, queried=false, in_flight=false
+Node.lookup: next_peers=1
+LookupState.nextPeersToQuery: checking 10 best_peers
+Node.lookup: next_peers=0
+Node.lookup: finished
+Accepted connection from 127.0.0.1:45540
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Peer disconnected: 0e23c75d37ab2695b20bd9174231c0ba46451b5f9d7f36116c2dcd165765312c
+Peer disconnected: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07
+Accepted connection from 127.0.0.1:44136
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Peer disconnected: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07
+Peer disconnected: 9f8ec9059131ad6ba8d75e50c3f4717a264b76dfea52c8cff119df706ede61e2
+Accepted connection from 127.0.0.1:50894
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Peer disconnected: d5cb715d161d7f8e0d3544663786aa66f1e9805ee5ad7dd6c208227d96d61816
+Peer disconnected: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07
+Accepted connection from 127.0.0.1:46046
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Peer disconnected: 2e40a95e7c01a883c3e9ab35da94e9938363ec9e29acb060a6d718efd05855a4
+Peer disconnected: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07
+Peer disconnected: 01401839e0a8ef877c84c762e4f4f3b38d82f1bac43dfd80e8296ebfd1d46edc
+Peer disconnected: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07
+Accepted connection from 127.0.0.1:44036
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Peer disconnected: c762e435a7410ecbe40a274a790603b0216e201dba6a2497b8245fd12fbfe94f
+Peer disconnected: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07
+Accepted connection from 127.0.0.1:45616
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Peer disconnected: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07
+Peer disconnected: acc15bedbbc317302ba7a5411f36d550f1754136e7ceafee4cba03122f0dde0a
+Accepted connection from 127.0.0.1:51886
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Peer disconnected: bcb7005b54b16a47f7b47746157723ff48463a18fcc3f067a03e041e2b8b7033
+Peer disconnected: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07
+Accepted connection from 127.0.0.1:43224
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+Peer disconnected: b2dbf407a302d2ecc2a8d531f8af892c260642162a26e7d007238d30c567ff6c
+Peer disconnected: ac815d795212f8e7da5839eae4f19c3dcfbff064b5600612b2d7a354b1b5db07
+Accepted connection from 127.0.0.1:34514
+* Noise_XXpsk3 handshake start (Responder)
+* Noise Error at step 'Message 1 read': error.EndOfStream
+* Noise Handshake FAILED (Responder): error.EndOfStream
+Handshake failed: error.EndOfStream
+/home/sergiom/.zvm/0.15.2/lib/std/testing.zig:607:14: 0x1266d99 in expect (std.zig)
+    if (!ok) return error.TestUnexpectedResult;
+             ^
+/home/projects/personal/nomadfs/tests/dht/churn_test.zig:109:5: 0x132e0ad in test.dht: churn resilience (runner.zig)
+    try std.testing.expect(!results[0].id.eql(peers[closest_idx].manager.node_id));
+    ^
+error: while executing test 'dht.churn_test.test.dht: churn resilience', the following test command failed:
+./.zig-cache/o/54e9395cb075ad7252808dd7633eed50/test --cache-dir=./.zig-cache --seed=0xa161f009 --listen=-
+
+Build Summary: 5/7 steps succeeded; 1 failed; 12/13 tests passed; 1 failed
+test transitive failure
++- run test 12/13 passed, 1 failed
+
+error: the following build command failed with exit code 1:
+.zig-cache/o/fdf2eaf106d71f84e91789559caa5dbb/build /home/sergiom/.zvm/0.15.2/zig /home/sergiom/.zvm/0.15.2/lib /home/projects/personal/nomadfs .zig-cache /home/sergiom/.cache/zig --seed 0xa161f009 -Z2de63d57bede6aaf test -- --filter churn

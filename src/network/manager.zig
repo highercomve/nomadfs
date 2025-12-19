@@ -7,14 +7,23 @@ const noise = @import("noise.zig");
 const id = @import("../dht/id.zig");
 
 pub const ConnectionManager = struct {
+    const ManagedConnection = struct {
+        conn: network.Connection,
+        last_active: i64,
+    };
+
     allocator: std.mem.Allocator,
-    connections: std.ArrayListUnmanaged(network.Connection),
+    connections: std.ArrayListUnmanaged(ManagedConnection),
     transport_type: config.Config.TransportType,
     identity_key: noise.KeyPair,
     node_id: id.NodeID,
     mutex: std.Thread.Mutex = .{},
     on_connection_ctx: ?*anyopaque = null,
     on_connection_fn: ?*const fn (ctx: *anyopaque, conn: network.Connection) anyerror!void = null,
+    reaper_thread: ?std.Thread = null,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    idle_timeout: i64 = 60 * 5,
+    reap_interval_ms: u64 = 10000,
 
     pub fn init(allocator: std.mem.Allocator, transport_type: config.Config.TransportType) !ConnectionManager {
         const keypair = try loadOrGenerateKey(allocator);
@@ -24,13 +33,21 @@ pub const ConnectionManager = struct {
     pub fn initExplicit(allocator: std.mem.Allocator, transport_type: config.Config.TransportType, keypair: noise.KeyPair) ConnectionManager {
         return .{
             .allocator = allocator,
-            .connections = std.ArrayListUnmanaged(network.Connection){},
+            .connections = std.ArrayListUnmanaged(ManagedConnection){},
             .transport_type = transport_type,
             .identity_key = keypair,
             .node_id = id.NodeID.fromPublicKey(keypair.public_key),
             .on_connection_ctx = null,
             .on_connection_fn = null,
+            .reaper_thread = null,
+            .running = std.atomic.Value(bool).init(true),
         };
+    }
+
+    pub fn start(self: *ConnectionManager) !void {
+        if (self.reaper_thread != null) return;
+        self.running.store(true, .release);
+        self.reaper_thread = try std.Thread.spawn(.{}, runReaper, .{self});
     }
 
     fn loadOrGenerateKey(allocator: std.mem.Allocator) !noise.KeyPair {
@@ -38,7 +55,6 @@ pub const ConnectionManager = struct {
 
         // 1. Try CWD
         if (noise.KeyPair.loadFromFile(key_filename)) |kp| {
-            std.debug.print("Loaded identity key from ./{s}\n", .{key_filename});
             return kp;
         } else |_| {}
 
@@ -56,13 +72,10 @@ pub const ConnectionManager = struct {
             defer allocator.free(key_path);
 
             if (noise.KeyPair.loadFromFile(key_path)) |kp| {
-                std.debug.print("Loaded identity key from {s}\n", .{key_path});
                 return kp;
             } else |_| {
-                // If it doesn't exist in home, but home is accessible, we'll create it here
                 const kp = noise.KeyPair.generate();
                 try kp.saveToFile(key_path);
-                std.debug.print("Generated new identity key at {s}\n", .{key_path});
                 return kp;
             }
         } else |_| {}
@@ -70,17 +83,69 @@ pub const ConnectionManager = struct {
         // 3. Fallback: Generate and save in CWD
         const kp = noise.KeyPair.generate();
         try kp.saveToFile(key_filename);
-        std.debug.print("Generated new identity key at ./{s}\n", .{key_filename});
         return kp;
     }
 
-    pub fn deinit(self: *ConnectionManager) void {
+    pub fn stop(self: *ConnectionManager) void {
+        self.running.store(false, .release);
+        if (self.reaper_thread) |t| {
+            t.join();
+            self.reaper_thread = null;
+        }
+
         self.mutex.lock();
         defer self.mutex.unlock();
-        for (self.connections.items) |conn| {
-            conn.close();
+        for (self.connections.items) |mc| {
+            mc.conn.close();
         }
+        self.connections.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *ConnectionManager) void {
+        self.stop();
         self.connections.deinit(self.allocator);
+    }
+
+    fn runReaper(self: *ConnectionManager) void {
+        while (self.running.load(.acquire)) {
+            // Sleep in small increments
+            const sleep_interval = 100; // ms
+            var total_slept: u64 = 0;
+            while (total_slept < self.reap_interval_ms and self.running.load(.acquire)) : (total_slept += sleep_interval) {
+                std.Thread.sleep(sleep_interval * std.time.ns_per_ms);
+            }
+            if (!self.running.load(.acquire)) break;
+
+            self.mutex.lock();
+            var i: usize = 0;
+            const now = std.time.timestamp();
+            while (i < self.connections.items.len) {
+                const mc = self.connections.items[i];
+                const is_idle = (now - mc.last_active) > self.idle_timeout;
+                const is_closed = mc.conn.isClosed();
+
+                if (is_closed or is_idle) {
+                    _ = self.connections.orderedRemove(i);
+                    mc.conn.close();
+                } else {
+                    i += 1;
+                }
+            }
+            self.mutex.unlock();
+        }
+    }
+
+    pub fn getConnectionsCount(self: *ConnectionManager) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.connections.items.len;
+    }
+
+    pub fn getConnection(self: *ConnectionManager, index: usize) ?network.Connection {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (index >= self.connections.items.len) return null;
+        return self.connections.items[index].conn;
     }
 
     fn threadWrapper(cb: *const fn (*anyopaque, network.Connection) anyerror!void, ctx: *anyopaque, conn: network.Connection) void {
@@ -96,7 +161,10 @@ pub const ConnectionManager = struct {
         {
             self.mutex.lock();
             defer self.mutex.unlock();
-            try self.connections.append(self.allocator, conn);
+            try self.connections.append(self.allocator, .{
+                .conn = conn,
+                .last_active = std.time.timestamp(),
+            });
             cb_opt = self.on_connection_fn;
             ctx_opt = self.on_connection_ctx;
         }
@@ -111,9 +179,6 @@ pub const ConnectionManager = struct {
         const ContextType = @TypeOf(ctx);
         const Wrapper = struct {
             fn wrap(c: *anyopaque, conn: network.Connection) anyerror!void {
-                // Determine if ctx is a pointer or not.
-                // Typically ctx is a pointer to a struct (e.g. *Node).
-                // If ContextType is a pointer, @ptrCast works.
                 const typed_ctx: ContextType = @ptrCast(@alignCast(c));
                 return handler(typed_ctx, conn);
             }
@@ -125,7 +190,6 @@ pub const ConnectionManager = struct {
     pub fn listen(self: *ConnectionManager, port: u16, swarm_key: []const u8, running: ?*std.atomic.Value(bool)) !void {
         switch (self.transport_type) {
             .tcp => {
-                // For MVP, we assume tcp.connect returns a fully negotiated Connection
                 try tcp.listen(self.allocator, port, swarm_key, self.identity_key, running, self);
             },
             .quic => {
@@ -135,9 +199,19 @@ pub const ConnectionManager = struct {
     }
 
     pub fn connectToPeer(self: *ConnectionManager, address: std.net.Address, swarm_key: []const u8) !network.Connection {
+        self.mutex.lock();
+        for (self.connections.items) |*mc| {
+            if (addressesMatch(mc.conn.getPeerAddress(), address)) {
+                mc.last_active = std.time.timestamp();
+                const c = mc.conn;
+                self.mutex.unlock();
+                return c;
+            }
+        }
+        self.mutex.unlock();
+
         switch (self.transport_type) {
             .tcp => {
-                // For MVP, we assume tcp.connect returns a fully negotiated Connection
                 const conn = try tcp.connect(self.allocator, address, swarm_key, self.identity_key);
                 try self.addConnection(conn);
                 return conn;
@@ -148,3 +222,16 @@ pub const ConnectionManager = struct {
         }
     }
 };
+
+fn addressesMatch(a: std.net.Address, b: std.net.Address) bool {
+    if (a.any.family != b.any.family) return false;
+    switch (a.any.family) {
+        std.posix.AF.INET => {
+            return a.in.sa.port == b.in.sa.port and a.in.sa.addr == b.in.sa.addr;
+        },
+        std.posix.AF.INET6 => {
+            return a.in6.sa.port == b.in6.sa.port and std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr);
+        },
+        else => return false,
+    }
+}

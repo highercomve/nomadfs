@@ -7,7 +7,6 @@ pub const PeerInfo = struct {
     id: NodeID,
     address: std.net.Address,
     last_seen: i64,
-    online: bool = true,
 };
 
 const Bucket = struct {
@@ -88,31 +87,18 @@ pub const RoutingTable = struct {
 
     pub fn markDisconnected(self: *RoutingTable, peer_id: NodeID) void {
         const cpl = self.local_id.commonPrefixLen(peer_id);
-
         const index = @min(cpl, 255);
-
         const bucket = &self.buckets[index];
 
-        for (bucket.peers.items) |*p| {
+        for (bucket.peers.items, 0..) |*p, i| {
             if (p.id.eql(peer_id)) {
-                p.online = false;
-                p.last_seen = std.time.timestamp();
+                _ = bucket.peers.orderedRemove(i);
                 return;
             }
         }
     }
     pub fn getClosestPeers(self: *RoutingTable, target: NodeID, count: usize) ![]PeerInfo {
         std.debug.assert(count > 0);
-        var result = std.ArrayListUnmanaged(PeerInfo){};
-        defer result.deinit(self.allocator); // We will return a slice, so we shouldn't deinit the backing if we were just returning list, but here we copy.
-
-        // Search starting from the specific bucket, spreading out
-        // 1. Check bucket[cpl]
-        // 2. Check bucket[cpl-1], bucket[cpl+1] etc.
-
-        // Simplified approach: Iterate all buckets, collect, sort.
-        // For MVP this is acceptable (K*256 is small).
-
         var all_peers = std.ArrayListUnmanaged(PeerInfo){};
         defer all_peers.deinit(self.allocator);
 
@@ -149,8 +135,7 @@ pub const RoutingTable = struct {
             if (b.peers.items.len > 0) {
                 std.debug.print("Bucket {d}: {d} peers\n", .{ i, b.peers.items.len });
                 for (b.peers.items) |p| {
-                    const status = if (p.online) "ONLINE" else "OFFLINE";
-                    std.debug.print("  - Peer: {x} at {f} [{s}]\n", .{ p.id.bytes, p.address, status });
+                    std.debug.print("  - Peer: {x} at {f}\n", .{ p.id.bytes, p.address });
                 }
                 total_peers += b.peers.items.len;
             }

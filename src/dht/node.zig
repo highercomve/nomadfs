@@ -47,7 +47,6 @@ pub const Node = struct {
         defer response.deinit(self.allocator);
 
         if (response.payload == .PONG) {
-            std.debug.print("Received PONG from {f}\n", .{response.sender_id});
             try self.routing_table.addPeer(.{
                 .id = response.sender_id,
                 .address = conn.getPeerAddress(),
@@ -124,6 +123,7 @@ pub const Node = struct {
                             try state.reportReply(peer.id, closer);
                             for (closer) |p| {
                                 if (p.id.eql(self.manager.node_id)) continue;
+                                if (state.failed.contains(p.id)) continue;
                                 try self.routing_table.addPeer(p);
                             }
                         },
@@ -137,22 +137,7 @@ pub const Node = struct {
     }
 
     pub fn sendStore(self: *Node, address: std.net.Address, key: id.NodeID, value: []const u8) !void {
-        var conn: network.Connection = undefined;
-        var found = false;
-
-        self.manager.mutex.lock();
-        for (self.manager.connections.items) |c| {
-            if (addressesMatch(c.getPeerAddress(), address)) {
-                conn = c;
-                found = true;
-                break;
-            }
-        }
-        self.manager.mutex.unlock();
-
-        if (!found) {
-            conn = try self.manager.connectToPeer(address, self.swarm_key);
-        }
+        const conn = try self.manager.connectToPeer(address, self.swarm_key);
 
         const stream = try conn.openStream();
         defer stream.close();
@@ -171,22 +156,7 @@ pub const Node = struct {
     };
 
     pub fn sendFindValue(self: *Node, address: std.net.Address, key: id.NodeID) !FindValueResult {
-        var conn: network.Connection = undefined;
-        var found = false;
-
-        self.manager.mutex.lock();
-        for (self.manager.connections.items) |c| {
-            if (addressesMatch(c.getPeerAddress(), address)) {
-                conn = c;
-                found = true;
-                break;
-            }
-        }
-        self.manager.mutex.unlock();
-
-        if (!found) {
-            conn = try self.manager.connectToPeer(address, self.swarm_key);
-        }
+        const conn = try self.manager.connectToPeer(address, self.swarm_key);
 
         const stream = try conn.openStream();
         defer stream.close();
@@ -240,34 +210,19 @@ pub const Node = struct {
                     // Add discovered peers to routing table
                     for (closer_peers) |p| {
                         if (p.id.eql(self.manager.node_id)) continue;
+                        if (state.failed.contains(p.id)) continue;
                         try self.routing_table.addPeer(p);
                     }
                 } else |_| {
-                    // std.debug.print("Lookup query failed for {}: {any}\n", .{peer.address, err});
                     state.reportFailure(peer.id);
+                    self.routing_table.markDisconnected(peer.id);
                 }
             }
         }
     }
 
     pub fn sendFindNode(self: *Node, address: std.net.Address, target: id.NodeID) ![]kbucket.PeerInfo {
-        var conn: network.Connection = undefined;
-        var found = false;
-
-        // Try to find existing connection
-        self.manager.mutex.lock();
-        for (self.manager.connections.items) |c| {
-            if (addressesMatch(c.getPeerAddress(), address)) {
-                conn = c;
-                found = true;
-                break;
-            }
-        }
-        self.manager.mutex.unlock();
-
-        if (!found) {
-            conn = try self.manager.connectToPeer(address, self.swarm_key);
-        }
+        const conn = try self.manager.connectToPeer(address, self.swarm_key);
 
         const stream = try conn.openStream();
         defer stream.close();
@@ -292,12 +247,7 @@ pub const Node = struct {
     }
 
     pub fn serve(self: *Node, conn: network.Connection) !void {
-        const remote_id = conn.getRemoteNodeID();
-        defer {
-            std.debug.print("Peer disconnected: {f}\n", .{remote_id});
-            self.routing_table.markDisconnected(remote_id);
-            self.routing_table.dump();
-        }
+        _ = conn.getRemoteNodeID();
 
         while (true) {
             const stream = conn.acceptStream() catch |err| {
@@ -333,7 +283,6 @@ pub const Node = struct {
         }) catch |err| {
             std.debug.print("Failed to update routing table: {any}\n", .{err});
         };
-        self.routing_table.dump();
 
         switch (msg.payload) {
             .PING => {

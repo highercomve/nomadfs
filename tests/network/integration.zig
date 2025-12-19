@@ -3,6 +3,7 @@ const nomadfs = @import("nomadfs");
 const TestPeer = @import("test_helpers").TestPeer;
 
 test "network: tcp loopback" {
+    std.debug.print("\n=== Running Test: network: tcp loopback ===\n", .{});
     const allocator = std.testing.allocator;
 
     // 1. Create two peers

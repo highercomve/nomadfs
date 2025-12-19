@@ -3,6 +3,7 @@ const nomadfs = @import("nomadfs");
 const TestPeer = @import("test_helpers").TestPeer;
 
 test "dht: ping/pong integration" {
+    std.debug.print("\n=== Running Test: dht: ping/pong integration ===\n", .{});
     const allocator = std.testing.allocator;
 
     // 1. Create two peers
@@ -29,7 +30,7 @@ test "dht: ping/pong integration" {
 
     // 5. Peer2 connects to Peer1
     const conn = try peer2.manager.connectToPeer(peer1.listen_addr, peer2.config.node.swarm_key);
-    
+
     // 6. Peer2 pings Peer1
     // We expect this to not time out and succeed
     try dht2.ping(conn);

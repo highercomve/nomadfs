@@ -31,6 +31,7 @@ pub const TestPeer = struct {
             .manager = nomadfs.network.manager.ConnectionManager.initExplicit(allocator, .tcp, nomadfs.network.noise.KeyPair.generate()),
             .listen_addr = addr,
         };
+        try peer.manager.start();
         return peer;
     }
 
@@ -50,6 +51,9 @@ pub const TestPeer = struct {
     pub fn stop(self: *TestPeer) void {
         if (!self.running.load(.acquire)) return;
         self.running.store(false, .release);
+
+        // Close all existing connections
+        self.manager.stop();
 
         // Connect to self to unblock accept()
         if (std.net.tcpConnectToAddress(self.listen_addr)) |s| {

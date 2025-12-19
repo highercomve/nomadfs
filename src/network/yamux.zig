@@ -43,13 +43,27 @@ pub const Header = struct {
     }
 };
 
+fn readExactly(stream: network.Stream, buffer: []u8) !void {
+    var total_read: usize = 0;
+    while (total_read < buffer.len) {
+        const n = try stream.read(buffer[total_read..]);
+        if (n == 0) return error.EndOfStream;
+        total_read += n;
+    }
+}
+
+pub const InitialWindowSize: u32 = 256 * 1024;
+
 /// A single logical stream within a Yamux session.
 pub const YamuxStream = struct {
     id: u32,
     session: *Session,
     incoming_data: std.ArrayListUnmanaged(u8),
+    remote_window: u32, // How much we can send to peer
+    local_window: u32, // How much peer can send to us
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
+    write_cond: std.Thread.Condition = .{},
     closed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, id: u32, session: *Session) YamuxStream {
@@ -58,6 +72,8 @@ pub const YamuxStream = struct {
             .id = id,
             .session = session,
             .incoming_data = .{},
+            .remote_window = InitialWindowSize,
+            .local_window = InitialWindowSize,
         };
     }
 
@@ -113,7 +129,7 @@ pub const Session = struct {
 
         const stream_ptr = try self.allocator.create(YamuxStream);
         stream_ptr.* = YamuxStream.init(self.allocator, id, self);
-        
+
         try self.streams.put(self.allocator, id, stream_ptr);
 
         // Send SYN frame
@@ -152,6 +168,7 @@ pub const Session = struct {
                 stream.mutex.lock();
                 stream.closed = true;
                 stream.cond.signal();
+                stream.write_cond.signal();
                 stream.mutex.unlock();
             }
             self.accept_cond.broadcast();
@@ -160,30 +177,20 @@ pub const Session = struct {
 
         var header_buf: [12]u8 = undefined;
         while (true) {
-            const n = self.transport.read(&header_buf) catch |err| {
-                // If the connection is closed or reset, stop the loop gracefully
-                switch (err) {
-                    error.NotOpenForReading, error.ConnectionResetByPeer, error.BrokenPipe, error.EndOfStream => break,
-                    else => return err,
-                }
+            readExactly(self.transport, &header_buf) catch |err| {
+                if (err == error.EndOfStream or err == error.NotOpenForReading or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
+                return err;
             };
-            if (n == 0) break; // Connection closed
-            if (n < 12) return error.IncompleteHeader;
 
             const header = Header.decode(header_buf);
-            
+
             switch (header.type) {
                 .DATA => {
                     self.mutex.lock();
                     var stream_ptr = self.streams.get(header.stream_id);
-                    
+
                     if (stream_ptr == null) {
-                        // New stream?
-                        // Server accepts odd IDs, Client accepts even IDs?
-                        // If we are server (next_id=2), we accept 1, 3...
-                        // If we are client (next_id=1), we accept 2, 4...
                         const is_incoming = if (self.is_server) (header.stream_id % 2 != 0) else (header.stream_id % 2 == 0);
-                        
                         if (is_incoming) {
                             const new_s = try self.allocator.create(YamuxStream);
                             new_s.* = YamuxStream.init(self.allocator, header.stream_id, self);
@@ -196,25 +203,47 @@ pub const Session = struct {
                     self.mutex.unlock();
 
                     if (header.length > 0) {
-                        // Read payload
                         const payload_buf = try self.allocator.alloc(u8, header.length);
                         errdefer self.allocator.free(payload_buf);
-                        
-                        const read_n = try self.transport.read(payload_buf);
-                        if (read_n != header.length) {
-                            self.allocator.free(payload_buf);
-                            return error.IncompletePayload;
-                        }
+
+                        try readExactly(self.transport, payload_buf);
 
                         if (stream_ptr) |stream| {
                             stream.mutex.lock();
                             try stream.incoming_data.appendSlice(self.allocator, payload_buf);
+                            if (stream.local_window >= header.length) {
+                                stream.local_window -= header.length;
+                            } else {
+                                stream.local_window = 0;
+                            }
+                            if (header.flags & Flags.FIN != 0) {
+                                stream.closed = true;
+                            }
                             stream.cond.signal();
                             stream.mutex.unlock();
                             self.allocator.free(payload_buf);
                         } else {
                             self.allocator.free(payload_buf);
                         }
+                    } else if (header.flags & Flags.FIN != 0) {
+                        if (stream_ptr) |stream| {
+                            stream.mutex.lock();
+                            stream.closed = true;
+                            stream.cond.signal();
+                            stream.mutex.unlock();
+                        }
+                    }
+                },
+                .WINDOW_UPDATE => {
+                    self.mutex.lock();
+                    const stream_ptr = self.streams.get(header.stream_id);
+                    self.mutex.unlock();
+
+                    if (stream_ptr) |stream| {
+                        stream.mutex.lock();
+                        stream.remote_window += header.length;
+                        stream.write_cond.signal();
+                        stream.mutex.unlock();
                     }
                 },
                 else => {
@@ -228,14 +257,15 @@ pub const Session = struct {
         var buf: [1024]u8 = undefined;
         var remaining = len;
         while (remaining > 0) {
-            const to_read = @min(remaining, buf.len);
-            _ = try self.transport.read(buf[0..to_read]);
+            const to_read = @min(remaining, @as(u32, @intCast(buf.len)));
+            try readExactly(self.transport, buf[0..to_read]);
             remaining -= to_read;
         }
     }
 
     pub fn streamRead(ctx: *anyopaque, buffer: []u8) anyerror!usize {
         const stream: *YamuxStream = @ptrCast(@alignCast(ctx));
+        const session = stream.session;
         stream.mutex.lock();
         defer stream.mutex.unlock();
 
@@ -243,12 +273,32 @@ pub const Session = struct {
             stream.cond.wait(&stream.mutex);
         }
 
+        if (stream.incoming_data.items.len == 0 and stream.closed) return 0;
+
         const to_read = @min(buffer.len, stream.incoming_data.items.len);
         @memcpy(buffer[0..to_read], stream.incoming_data.items[0..to_read]);
-        
+
         // Remove read bytes from the front (inefficient but OK for MVP)
         for (0..to_read) |_| {
             _ = stream.incoming_data.orderedRemove(0);
+        }
+
+        // Increment local window and send update
+        stream.local_window += @intCast(to_read);
+
+        if (to_read > 0) {
+            var header = Header{
+                .type = .WINDOW_UPDATE,
+                .flags = 0,
+                .stream_id = stream.id,
+                .length = @intCast(to_read),
+            };
+            var h_buf: [12]u8 = undefined;
+            header.encode(&h_buf);
+
+            session.mutex.lock();
+            _ = try session.transport.write(&h_buf);
+            session.mutex.unlock();
         }
 
         return to_read;
@@ -258,31 +308,69 @@ pub const Session = struct {
         const stream: *YamuxStream = @ptrCast(@alignCast(ctx));
         const session = stream.session;
 
-        // Wrap in a DATA frame
-        var header = Header{
-            .type = .DATA,
-            .flags = 0,
-            .stream_id = stream.id,
-            .length = @intCast(buffer.len),
-        };
-        
-        session.mutex.lock();
-        defer session.mutex.unlock();
+        var total_sent: usize = 0;
+        while (total_sent < buffer.len) {
+            stream.mutex.lock();
+            while (stream.remote_window == 0 and !stream.closed) {
+                stream.write_cond.wait(&stream.mutex);
+            }
+            if (stream.closed) {
+                stream.mutex.unlock();
+                return error.StreamClosed;
+            }
 
-        var h_buf: [12]u8 = undefined;
-        header.encode(&h_buf);
-        _ = try session.transport.write(&h_buf);
-        _ = try session.transport.write(buffer);
+            const can_send = @min(buffer.len - total_sent, @as(usize, @intCast(stream.remote_window)));
+            const to_send = buffer[total_sent .. total_sent + can_send];
+            stream.remote_window -= @intCast(can_send);
+            stream.mutex.unlock();
 
-        return buffer.len;
+            // Wrap in a DATA frame
+            var header = Header{
+                .type = .DATA,
+                .flags = 0,
+                .stream_id = stream.id,
+                .length = @intCast(can_send),
+            };
+
+            session.mutex.lock();
+            var h_buf: [12]u8 = undefined;
+            header.encode(&h_buf);
+            _ = try session.transport.write(&h_buf);
+            _ = try session.transport.write(to_send);
+            session.mutex.unlock();
+
+            total_sent += can_send;
+        }
+
+        return total_sent;
     }
 
     pub fn streamClose(ctx: *anyopaque) void {
         const stream: *YamuxStream = @ptrCast(@alignCast(ctx));
+        const session = stream.session;
         stream.mutex.lock();
+        if (stream.closed) {
+            stream.mutex.unlock();
+            return;
+        }
         stream.closed = true;
         stream.cond.signal();
+        stream.write_cond.signal();
+        const id = stream.id;
         stream.mutex.unlock();
-        // TODO: Send FIN frame
+
+        // Send FIN frame
+        var header = Header{
+            .type = .DATA,
+            .flags = Flags.FIN,
+            .stream_id = id,
+            .length = 0,
+        };
+        var h_buf: [12]u8 = undefined;
+        header.encode(&h_buf);
+
+        session.mutex.lock();
+        _ = session.transport.write(&h_buf) catch {};
+        session.mutex.unlock();
     }
 };
