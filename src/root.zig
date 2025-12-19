@@ -29,7 +29,6 @@ pub const Node = struct {
         if (cfg.storage.enabled) {
             store = try allocator.create(storage.engine.StorageEngine);
             store.?.* = try storage.engine.StorageEngine.init(allocator, cfg.storage.storage_path);
-            // TODO: call store.?.open() or similar if needed
         }
         errdefer if (store) |s| {
             s.deinit();
@@ -145,7 +144,7 @@ pub const Node = struct {
             }
         }
 
-        std.debug.print("Bootstrap connections complete. Starting periodic peer discovery...\n", .{});
+        std.debug.print("Bootstrap connections complete. Starting periodic peer discovery and maintenance...\n", .{});
         const dht_node_ptr = self.dht_node;
         const net_node_id = self.net.node_id;
 
@@ -163,5 +162,18 @@ pub const Node = struct {
             }
         }.run, .{ dht_node_ptr, net_node_id });
         discovery_thread.detach();
+
+        const maintenance_thread = try std.Thread.spawn(.{}, struct {
+            fn run(node: *dht.Node) void {
+                while (true) {
+                    std.Thread.sleep(60 * std.time.ns_per_s);
+                    std.debug.print("Starting maintenance (ping all peers)...\n", .{});
+                    node.maintain() catch |err| {
+                        std.debug.print("Maintenance error: {any}\n", .{err});
+                    };
+                }
+            }
+        }.run, .{ dht_node_ptr });
+        maintenance_thread.detach();
     }
 };

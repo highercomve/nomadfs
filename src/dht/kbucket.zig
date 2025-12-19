@@ -166,6 +166,16 @@ pub const RoutingTable = struct {
         return self.allocator.dupe(PeerInfo, all_peers.items[0..result_len]);
     }
 
+    pub fn getAllPeers(self: *RoutingTable) ![]PeerInfo {
+        var all_peers = std.ArrayListUnmanaged(PeerInfo){};
+        defer all_peers.deinit(self.allocator);
+
+        for (&self.buckets) |*b| {
+            try all_peers.appendSlice(self.allocator, b.peers.items);
+        }
+        return self.allocator.dupe(PeerInfo, all_peers.items);
+    }
+
     pub fn dump(self: *RoutingTable) void {
         std.debug.print("--- Routing Table Dump ---\n", .{});
         std.debug.print("Local ID: {x}\n", .{self.local_id.bytes});

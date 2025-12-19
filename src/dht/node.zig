@@ -70,7 +70,7 @@ pub const Node = struct {
                 continue;
             }
             self.sendStore(peer.address, key, value) catch |err| {
-                std.debug.print("Failed to store at {f}: {any}\n", .{ peer.address, err });
+                std.debug.print("Failed to store at {any}: {any}\n", .{ peer.address, err });
                 continue;
             };
             stored_count += 1;
@@ -112,10 +112,6 @@ pub const Node = struct {
                     switch (result) {
                         .value => |v| {
                             // Found it!
-                            // value is owned by the message inside sendFindValue, but we duped it there?
-                            // No, sendFindValue returns FindValueResult which points to message memory?
-                            // We need to handle memory carefully.
-                            // Let's assume sendFindValue returns allocated copies.
                             return v;
                         },
                         .closer_peers => |closer| {
@@ -243,6 +239,25 @@ pub const Node = struct {
                 return peers;
             },
             else => return error.InvalidResponse,
+        }
+    }
+
+    pub fn maintain(self: *Node) !void {
+        const peers = try self.routing_table.getAllPeers();
+        defer self.allocator.free(peers);
+
+        for (peers) |peer| {
+            if (peer.id.eql(self.manager.node_id)) continue;
+
+            if (self.manager.connectToPeer(peer.address, self.swarm_key)) |conn| {
+                self.ping(conn) catch |err| {
+                    std.debug.print("Maintenance: Peer {x} failed ping ({any}). Evicting.\n", .{peer.id.bytes[0..4], err});
+                    self.routing_table.markDisconnected(peer.id);
+                };
+            } else |err| {
+                std.debug.print("Maintenance: Could not connect to {x} ({any}). Evicting.\n", .{peer.id.bytes[0..4], err});
+                self.routing_table.markDisconnected(peer.id);
+            }
         }
     }
 
