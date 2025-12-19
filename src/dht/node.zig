@@ -10,6 +10,7 @@ pub const Node = struct {
     manager: *network.manager.ConnectionManager,
     routing_table: kbucket.RoutingTable,
     swarm_key: []const u8,
+    storage: std.AutoHashMapUnmanaged(id.NodeID, []u8),
 
     pub fn init(allocator: std.mem.Allocator, manager: *network.manager.ConnectionManager, swarm_key: []const u8) Node {
         return .{
@@ -17,11 +18,17 @@ pub const Node = struct {
             .manager = manager,
             .routing_table = kbucket.RoutingTable.init(allocator, manager.node_id),
             .swarm_key = swarm_key,
+            .storage = .{},
         };
     }
 
     pub fn deinit(self: *Node) void {
         self.routing_table.deinit();
+        var it = self.storage.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.storage.deinit(self.allocator);
     }
 
     pub fn ping(self: *Node, conn: network.Connection) !void {
@@ -46,6 +53,167 @@ pub const Node = struct {
                 .address = conn.getPeerAddress(),
                 .last_seen = std.time.timestamp(),
             });
+        }
+    }
+
+    pub fn store(self: *Node, key: id.NodeID, value: []const u8) !void {
+        // Ensure we know about the closest nodes
+        try self.lookup(key);
+
+        const closest = try self.routing_table.getClosestPeers(key, kbucket.K);
+        defer self.allocator.free(closest);
+
+        var stored_count: usize = 0;
+        for (closest) |peer| {
+            if (peer.id.eql(self.manager.node_id)) {
+                try self.localStore(key, value);
+                stored_count += 1;
+                continue;
+            }
+            self.sendStore(peer.address, key, value) catch |err| {
+                std.debug.print("Failed to store at {f}: {any}\n", .{ peer.address, err });
+                continue;
+            };
+            stored_count += 1;
+        }
+    }
+
+    pub fn localStore(self: *Node, key: id.NodeID, value: []const u8) !void {
+        const v_copy = try self.allocator.dupe(u8, value);
+        const res = try self.storage.getOrPut(self.allocator, key);
+        if (res.found_existing) {
+            self.allocator.free(res.value_ptr.*);
+        }
+        res.value_ptr.* = v_copy;
+    }
+
+    pub fn lookupValue(self: *Node, target: id.NodeID) !?[]u8 {
+        // Check local storage first
+        if (self.storage.get(target)) |val| {
+            return try self.allocator.dupe(u8, val);
+        }
+
+        const initial_peers = try self.routing_table.getClosestPeers(target, kbucket.K);
+        defer self.allocator.free(initial_peers);
+
+        var state = try lookup_mod.LookupState.init(self.allocator, target, initial_peers);
+        defer state.deinit();
+
+        while (!state.isFinished()) {
+            const next_peers = try state.nextPeersToQuery();
+            defer self.allocator.free(next_peers);
+
+            if (next_peers.len == 0) break;
+
+            for (next_peers) |peer| {
+                if (peer.id.eql(self.manager.node_id)) continue;
+
+                const result_or_err = self.sendFindValue(peer.address, target);
+                if (result_or_err) |result| {
+                    switch (result) {
+                        .value => |v| {
+                            // Found it!
+                            // value is owned by the message inside sendFindValue, but we duped it there?
+                            // No, sendFindValue returns FindValueResult which points to message memory?
+                            // We need to handle memory carefully.
+                            // Let's assume sendFindValue returns allocated copies.
+                            return v;
+                        },
+                        .closer_peers => |closer| {
+                            defer self.allocator.free(closer);
+                            try state.reportReply(peer.id, closer);
+                            for (closer) |p| {
+                                if (p.id.eql(self.manager.node_id)) continue;
+                                try self.routing_table.addPeer(p);
+                            }
+                        },
+                    }
+                } else |_| {
+                    state.reportFailure(peer.id);
+                }
+            }
+        }
+        return null;
+    }
+
+    pub fn sendStore(self: *Node, address: std.net.Address, key: id.NodeID, value: []const u8) !void {
+        var conn: network.Connection = undefined;
+        var found = false;
+
+        self.manager.mutex.lock();
+        for (self.manager.connections.items) |c| {
+            if (addressesMatch(c.getPeerAddress(), address)) {
+                conn = c;
+                found = true;
+                break;
+            }
+        }
+        self.manager.mutex.unlock();
+
+        if (!found) {
+            conn = try self.manager.connectToPeer(address, self.swarm_key);
+        }
+
+        const stream = try conn.openStream();
+        defer stream.close();
+
+        const msg = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .STORE = .{ .key = key, .value = value } },
+        };
+        try msg.serialize(stream.writer());
+    }
+
+    // Returns either the value (allocated) or closer peers (allocated)
+    pub const FindValueResult = union(enum) {
+        value: []u8,
+        closer_peers: []kbucket.PeerInfo,
+    };
+
+    pub fn sendFindValue(self: *Node, address: std.net.Address, key: id.NodeID) !FindValueResult {
+        var conn: network.Connection = undefined;
+        var found = false;
+
+        self.manager.mutex.lock();
+        for (self.manager.connections.items) |c| {
+            if (addressesMatch(c.getPeerAddress(), address)) {
+                conn = c;
+                found = true;
+                break;
+            }
+        }
+        self.manager.mutex.unlock();
+
+        if (!found) {
+            conn = try self.manager.connectToPeer(address, self.swarm_key);
+        }
+
+        const stream = try conn.openStream();
+        defer stream.close();
+
+        const msg = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .FIND_VALUE = .{ .key = key } },
+        };
+        try msg.serialize(stream.writer());
+
+        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
+        defer response.deinit(self.allocator);
+
+        switch (response.payload) {
+            .FIND_VALUE_RESPONSE => |p| {
+                switch (p) {
+                    .value => |v| {
+                        return FindValueResult{ .value = try self.allocator.dupe(u8, v) };
+                    },
+                    .closer_peers => |peers| {
+                        const peers_copy = try self.allocator.alloc(kbucket.PeerInfo, peers.len);
+                        @memcpy(peers_copy, peers);
+                        return FindValueResult{ .closer_peers = peers_copy };
+                    },
+                }
+            },
+            else => return error.InvalidResponse,
         }
     }
 
@@ -184,6 +352,29 @@ pub const Node = struct {
                     .payload = .{ .FIND_NODE_RESPONSE = .{ .closer_peers = closer } },
                 };
                 try response.serialize(stream.writer());
+            },
+            .FIND_VALUE => |p| {
+                if (self.storage.get(p.key)) |val| {
+                    // Return value
+                    const response = rpc.Message{
+                        .sender_id = self.manager.node_id,
+                        .payload = .{ .FIND_VALUE_RESPONSE = .{ .value = val } },
+                    };
+                    try response.serialize(stream.writer());
+                } else {
+                    // Return closest peers
+                    const closer = try self.routing_table.getClosestPeers(p.key, kbucket.K);
+                    defer self.allocator.free(closer);
+
+                    const response = rpc.Message{
+                        .sender_id = self.manager.node_id,
+                        .payload = .{ .FIND_VALUE_RESPONSE = .{ .closer_peers = closer } },
+                    };
+                    try response.serialize(stream.writer());
+                }
+            },
+            .STORE => |p| {
+                try self.localStore(p.key, p.value);
             },
             else => {
                 std.debug.print("Received unhandled DHT message type: {any}\n", .{msg.payload});

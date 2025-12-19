@@ -43,14 +43,7 @@ pub const Node = struct {
         }
 
         // Register DHT serve loop for new connections
-        net.on_connection_ctx = dht_node;
-        net.on_connection_fn = struct {
-            fn handle(ctx: *anyopaque, conn: network.Connection) anyerror!void {
-                const node: *dht.Node = @ptrCast(@alignCast(ctx));
-                const thread = try std.Thread.spawn(.{}, dht.Node.serve, .{ node, conn });
-                thread.detach();
-            }
-        }.handle;
+        net.setConnectionHandler(dht_node, dht.Node.serve);
 
         const block_manager = try dist.BlockManager.init(allocator, .{
             .network = net,

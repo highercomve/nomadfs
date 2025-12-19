@@ -49,6 +49,15 @@ In a P2P network, nodes go offline all the time. If a node fails to respond to a
 
 This makes the search extremely resilient. Even if many nodes in our path are offline, we only need *one* path to survive to find the target.
 
+## 5. Value Lookup
+
+Looking up a value (`lookupValue`) follows the same iterative process as finding a node, but uses `FIND_VALUE` RPCs instead of `FIND_NODE`.
+
+*   If a peer returns **Closer Peers**, the search continues as normal, adding those peers to the list.
+*   If a peer returns the **Value**, the search terminates immediately, and the value is returned to the caller.
+
+This optimization allows data to be found often before the search converges on the absolutely closest nodes.
+
 ---
 
 **Next Chapters:**

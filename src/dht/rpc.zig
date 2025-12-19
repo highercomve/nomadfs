@@ -7,6 +7,14 @@ pub const MessageType = enum(u8) {
     PONG = 1,
     FIND_NODE = 2,
     FIND_NODE_RESPONSE = 3,
+    FIND_VALUE = 4,
+    FIND_VALUE_RESPONSE = 5,
+    STORE = 6,
+};
+
+pub const FindValueResult = union(enum) {
+    value: []const u8,
+    closer_peers: []kbucket.PeerInfo,
 };
 
 pub const MessagePayload = union(MessageType) {
@@ -14,6 +22,9 @@ pub const MessagePayload = union(MessageType) {
     PONG: void,
     FIND_NODE: struct { target: id.NodeID },
     FIND_NODE_RESPONSE: struct { closer_peers: []kbucket.PeerInfo },
+    FIND_VALUE: struct { key: id.NodeID },
+    FIND_VALUE_RESPONSE: FindValueResult,
+    STORE: struct { key: id.NodeID, value: []const u8 },
 };
 
 pub const Message = struct {
@@ -40,6 +51,32 @@ pub const Message = struct {
                     try writer.writeAll(&peer.id.bytes);
                     try serializeAddress(peer.address, writer);
                 }
+            },
+            .FIND_VALUE => |p| {
+                try writer.writeAll(&p.key.bytes);
+            },
+            .FIND_VALUE_RESPONSE => |p| {
+                switch (p) {
+                    .value => |val| {
+                        try writer.writeByte(1); // 1 indicates found value
+                        try writer.writeInt(u32, @intCast(val.len), .big);
+                        try writer.writeAll(val);
+                    },
+                    .closer_peers => |peers| {
+                        try writer.writeByte(0); // 0 indicates closer peers
+                        if (peers.len > 255) return error.TooManyPeers;
+                        try writer.writeByte(@intCast(peers.len));
+                        for (peers) |peer| {
+                            try writer.writeAll(&peer.id.bytes);
+                            try serializeAddress(peer.address, writer);
+                        }
+                    },
+                }
+            },
+            .STORE => |p| {
+                try writer.writeAll(&p.key.bytes);
+                try writer.writeInt(u32, @intCast(p.value.len), .big);
+                try writer.writeAll(p.value);
             },
         }
     }
@@ -78,6 +115,56 @@ pub const Message = struct {
                 }
                 break :blk MessagePayload{ .FIND_NODE_RESPONSE = .{ .closer_peers = peers } };
             },
+            .FIND_VALUE => blk: {
+                var key: id.NodeID = undefined;
+                try reader.readNoEof(&key.bytes);
+                break :blk MessagePayload{ .FIND_VALUE = .{ .key = key } };
+            },
+            .FIND_VALUE_RESPONSE => blk: {
+                const found_byte = try reader.readByte();
+                if (found_byte == 1) {
+                    const len = try reader.readInt(u32, .big);
+                    // Sanity check for max value size (e.g., 10MB)
+                    if (len > 10 * 1024 * 1024) return error.ValueTooLarge;
+                    
+                    const val = try allocator.alloc(u8, len);
+                    errdefer allocator.free(val);
+                    try reader.readNoEof(val);
+                    
+                    break :blk MessagePayload{ .FIND_VALUE_RESPONSE = .{ .value = val } };
+                } else {
+                    const count = try reader.readByte();
+                    if (count > kbucket.K) return error.TooManyPeers;
+
+                    const peers = try allocator.alloc(kbucket.PeerInfo, count);
+                    errdefer allocator.free(peers);
+
+                    for (0..count) |i| {
+                        var peer_id: id.NodeID = undefined;
+                        try reader.readNoEof(&peer_id.bytes);
+                        const address = try deserializeAddress(reader);
+                        peers[i] = .{
+                            .id = peer_id,
+                            .address = address,
+                            .last_seen = std.time.timestamp(),
+                        };
+                    }
+                    break :blk MessagePayload{ .FIND_VALUE_RESPONSE = .{ .closer_peers = peers } };
+                }
+            },
+            .STORE => blk: {
+                var key: id.NodeID = undefined;
+                try reader.readNoEof(&key.bytes);
+                const len = try reader.readInt(u32, .big);
+                // Sanity check for max value size
+                if (len > 10 * 1024 * 1024) return error.ValueTooLarge;
+                
+                const val = try allocator.alloc(u8, len);
+                errdefer allocator.free(val);
+                try reader.readNoEof(val);
+                
+                break :blk MessagePayload{ .STORE = .{ .key = key, .value = val } };
+            },
         };
 
         return Message{
@@ -89,6 +176,13 @@ pub const Message = struct {
     pub fn deinit(self: Message, allocator: std.mem.Allocator) void {
         switch (self.payload) {
             .FIND_NODE_RESPONSE => |p| allocator.free(p.closer_peers),
+            .FIND_VALUE_RESPONSE => |p| {
+                switch (p) {
+                    .value => |v| allocator.free(v),
+                    .closer_peers => |peers| allocator.free(peers),
+                }
+            },
+            .STORE => |p| allocator.free(p.value),
             else => {},
         }
     }

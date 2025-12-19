@@ -20,7 +20,7 @@ pub const NodeID = struct {
 
     pub fn fromData(data: []const u8) NodeID {
         var id: NodeID = undefined;
-        std.crypto.hash.sha2.Sha256.hash(data, &id.bytes);
+        std.crypto.hash.sha2.Sha256.hash(data, &id.bytes, .{});
         return id;
     }
 

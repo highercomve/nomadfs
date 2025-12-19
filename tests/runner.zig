@@ -5,4 +5,5 @@ test {
     _ = @import("dht/lookup_test.zig");
     _ = @import("dht/rpc_test.zig");
     _ = @import("dht/ping_test.zig");
+    _ = @import("dht/store_test.zig");
 }

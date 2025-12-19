@@ -20,23 +20,8 @@ test "dht: ping/pong integration" {
     defer dht2.deinit();
 
     // 3. Register DHT serve loop for both
-    peer1.manager.on_connection_ctx = &dht1;
-    peer1.manager.on_connection_fn = struct {
-        fn handle(ctx: *anyopaque, conn: nomadfs.network.Connection) anyerror!void {
-            const node: *nomadfs.dht.Node = @ptrCast(@alignCast(ctx));
-            const thread = try std.Thread.spawn(.{}, nomadfs.dht.Node.serve, .{ node, conn });
-            thread.detach();
-        }
-    }.handle;
-
-    peer2.manager.on_connection_ctx = &dht2;
-    peer2.manager.on_connection_fn = struct {
-        fn handle(ctx: *anyopaque, conn: nomadfs.network.Connection) anyerror!void {
-            const node: *nomadfs.dht.Node = @ptrCast(@alignCast(ctx));
-            const thread = try std.Thread.spawn(.{}, nomadfs.dht.Node.serve, .{ node, conn });
-            thread.detach();
-        }
-    }.handle;
+    peer1.manager.setConnectionHandler(&dht1, nomadfs.dht.Node.serve);
+    peer2.manager.setConnectionHandler(&dht2, nomadfs.dht.Node.serve);
 
     // 4. Start peer1 (the "server")
     try peer1.start();

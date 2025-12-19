@@ -83,13 +83,43 @@ pub const ConnectionManager = struct {
         self.connections.deinit(self.allocator);
     }
 
+    fn threadWrapper(cb: *const fn (*anyopaque, network.Connection) anyerror!void, ctx: *anyopaque, conn: network.Connection) void {
+        cb(ctx, conn) catch |err| {
+            std.debug.print("Connection handler error: {any}\n", .{err});
+        };
+    }
+
     pub fn addConnection(self: *ConnectionManager, conn: network.Connection) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        try self.connections.append(self.allocator, conn);
-        if (self.on_connection_fn) |cb| {
-            try cb(self.on_connection_ctx.?, conn);
+        var cb_opt: ?*const fn (*anyopaque, network.Connection) anyerror!void = null;
+        var ctx_opt: ?*anyopaque = null;
+
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            try self.connections.append(self.allocator, conn);
+            cb_opt = self.on_connection_fn;
+            ctx_opt = self.on_connection_ctx;
         }
+
+        if (cb_opt) |cb| {
+            const thread = try std.Thread.spawn(.{}, threadWrapper, .{ cb, ctx_opt.?, conn });
+            thread.detach();
+        }
+    }
+
+    pub fn setConnectionHandler(self: *ConnectionManager, ctx: anytype, comptime handler: fn (@TypeOf(ctx), network.Connection) anyerror!void) void {
+        const ContextType = @TypeOf(ctx);
+        const Wrapper = struct {
+            fn wrap(c: *anyopaque, conn: network.Connection) anyerror!void {
+                // Determine if ctx is a pointer or not.
+                // Typically ctx is a pointer to a struct (e.g. *Node).
+                // If ContextType is a pointer, @ptrCast works.
+                const typed_ctx: ContextType = @ptrCast(@alignCast(c));
+                return handler(typed_ctx, conn);
+            }
+        };
+        self.on_connection_ctx = ctx;
+        self.on_connection_fn = Wrapper.wrap;
     }
 
     pub fn listen(self: *ConnectionManager, port: u16, swarm_key: []const u8, running: ?*std.atomic.Value(bool)) !void {

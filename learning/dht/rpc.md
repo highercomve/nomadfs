@@ -29,6 +29,25 @@ Every message consists of:
         *   **IP Address (4 or 16 bytes)**.
         *   **Port (2 bytes)**: Big-endian.
 
+### FIND_VALUE (4)
+*   **Payload**: Key `NodeID` (32 bytes).
+
+### FIND_VALUE_RESPONSE (5)
+*   **Payload**:
+    *   **Found (1 byte)**: 1 if value is found, 0 if returning closer peers.
+    *   **If Found**:
+        *   **Length (4 bytes)**: Big-endian length of the value.
+        *   **Value**: The raw bytes of the value.
+    *   **If Not Found** (Closer Peers):
+        *   **Count (1 byte)**: Number of peers.
+        *   **Peers**: Array of Peer records (same format as `FIND_NODE_RESPONSE`).
+
+### STORE (6)
+*   **Payload**:
+    *   **Key**: `NodeID` (32 bytes).
+    *   **Length (4 bytes)**: Big-endian length of the value.
+    *   **Value**: The raw bytes to store.
+
 ## 3. Implementation in Zig
 
 The implementation in `src/dht/rpc.zig` uses a `Message` struct with `serialize` and `deserialize` methods.
@@ -56,6 +75,31 @@ pub fn serialize(self: Message, writer: anytype) !void {
                 try writer.writeAll(&peer.id.bytes);
                 try serializeAddress(peer.address, writer);
             }
+        },
+        .FIND_VALUE => |p| {
+            try writer.writeAll(&p.key.bytes);
+        },
+        .FIND_VALUE_RESPONSE => |p| {
+            switch (p) {
+                .value => |val| {
+                    try writer.writeByte(1); // Found
+                    try writer.writeInt(u32, @intCast(val.len), .big);
+                    try writer.writeAll(val);
+                },
+                .closer_peers => |peers| {
+                    try writer.writeByte(0); // Not Found, here are peers
+                    try writer.writeByte(@intCast(peers.len));
+                    for (peers) |peer| {
+                        try writer.writeAll(&peer.id.bytes);
+                        try serializeAddress(peer.address, writer);
+                    }
+                },
+            }
+        },
+        .STORE => |p| {
+            try writer.writeAll(&p.key.bytes);
+            try writer.writeInt(u32, @intCast(p.value.len), .big);
+            try writer.writeAll(p.value);
         },
     }
 }
