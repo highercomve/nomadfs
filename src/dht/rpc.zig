@@ -18,7 +18,7 @@ pub const FindValueResult = union(enum) {
 };
 
 pub const MessagePayload = union(MessageType) {
-    PING: void,
+    PING: struct { port: u16 },
     PONG: void,
     FIND_NODE: struct { target: id.NodeID },
     FIND_NODE_RESPONSE: struct { closer_peers: []kbucket.PeerInfo },
@@ -40,7 +40,10 @@ pub const Message = struct {
 
         // 3. Write Payload
         switch (self.payload) {
-            .PING, .PONG => {},
+            .PING => |p| {
+                try writer.writeInt(u16, p.port, .big);
+            },
+            .PONG => {},
             .FIND_NODE => |p| {
                 try writer.writeAll(&p.target.bytes);
             },
@@ -89,7 +92,10 @@ pub const Message = struct {
         try reader.readNoEof(&sender_id.bytes);
 
         const payload = switch (msg_type) {
-            .PING => MessagePayload{ .PING = {} },
+            .PING => blk: {
+                const port = try reader.readInt(u16, .big);
+                break :blk MessagePayload{ .PING = .{ .port = port } };
+            },
             .PONG => MessagePayload{ .PONG = {} },
             .FIND_NODE => blk: {
                 var target: id.NodeID = undefined;

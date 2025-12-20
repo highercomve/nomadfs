@@ -37,7 +37,7 @@ pub const Node = struct {
 
         const msg = rpc.Message{
             .sender_id = self.manager.node_id,
-            .payload = .{ .PING = {} },
+            .payload = .{ .PING = .{ .port = self.manager.bound_port } },
         };
 
         try msg.serialize(stream.writer());
@@ -290,17 +290,27 @@ pub const Node = struct {
         const msg = try rpc.Message.deserialize(self.allocator, stream.reader());
         defer msg.deinit(self.allocator);
 
-        // Add sender to routing table
-        self.routing_table.addPeer(.{
-            .id = msg.sender_id,
-            .address = conn.getPeerAddress(),
-            .last_seen = std.time.timestamp(),
-        }) catch |err| {
-            std.debug.print("Failed to update routing table: {any}\n", .{err});
-        };
+        // NOTE: We do NOT add the peer here anymore. We wait for PING to get the correct port.
 
         switch (msg.payload) {
-            .PING => {
+            .PING => |p| {
+                // Construct correct address from socket IP + Payload Port
+                var address = conn.getPeerAddress();
+                if (address.any.family == std.posix.AF.INET) {
+                    address.in.sa.port = std.mem.nativeToBig(u16, p.port);
+                } else if (address.any.family == std.posix.AF.INET6) {
+                    address.in6.sa.port = std.mem.nativeToBig(u16, p.port);
+                }
+
+                // Add to routing table with CORRECT port
+                self.routing_table.addPeer(.{
+                    .id = msg.sender_id,
+                    .address = address,
+                    .last_seen = std.time.timestamp(),
+                }) catch |err| {
+                    std.debug.print("Failed to update routing table: {any}\n", .{err});
+                };
+
                 const response = rpc.Message{
                     .sender_id = self.manager.node_id,
                     .payload = .{ .PONG = {} },

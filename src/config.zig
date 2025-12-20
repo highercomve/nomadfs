@@ -9,6 +9,7 @@ pub const Config = struct {
     pub const NodeConfig = struct {
         nickname: []const u8,
         swarm_key: []const u8,
+        key_path: ?[]const u8 = null,
     };
 
     pub const StorageConfig = struct {
@@ -30,6 +31,7 @@ pub const Config = struct {
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.node.nickname);
         allocator.free(self.node.swarm_key);
+        if (self.node.key_path) |p| allocator.free(p);
         allocator.free(self.storage.storage_path);
         for (self.network.bootstrap_peers) |peer| {
             allocator.free(peer);
@@ -65,7 +67,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
     var in_stream = file.reader(&file_buffer);
 
     var config = Config{
-        .node = .{ .nickname = "", .swarm_key = "" },
+        .node = .{ .nickname = "", .swarm_key = "", .key_path = null },
         .storage = .{ .enabled = true, .storage_path = "" },
         .network = .{ .port = 9000, .bootstrap_peers = undefined, .transport = .tcp },
     };
@@ -102,6 +104,8 @@ pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
             } else {
                 config.node.swarm_key = try allocator.dupe(u8, val);
             }
+        } else if (std.mem.eql(u8, key, "key_path")) {
+            config.node.key_path = try allocator.dupe(u8, val);
         } else if (std.mem.eql(u8, key, "enabled")) {
             config.storage.enabled = std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, key, "storage_path")) {

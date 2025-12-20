@@ -17,6 +17,7 @@ pub const ConnectionManager = struct {
     transport_type: config.Config.TransportType,
     identity_key: noise.KeyPair,
     node_id: id.NodeID,
+    bound_port: u16 = 0,
     mutex: std.Thread.Mutex = .{},
     on_connection_ctx: ?*anyopaque = null,
     on_connection_fn: ?*const fn (ctx: *anyopaque, conn: network.Connection) anyerror!void = null,
@@ -25,8 +26,8 @@ pub const ConnectionManager = struct {
     idle_timeout: i64 = 60 * 5,
     reap_interval_ms: u64 = 10000,
 
-    pub fn init(allocator: std.mem.Allocator, transport_type: config.Config.TransportType) !ConnectionManager {
-        const keypair = try loadOrGenerateKey(allocator);
+    pub fn init(allocator: std.mem.Allocator, transport_type: config.Config.TransportType, key_path: ?[]const u8) !ConnectionManager {
+        const keypair = try loadOrGenerateKey(allocator, key_path);
         return initExplicit(allocator, transport_type, keypair);
     }
 
@@ -37,6 +38,7 @@ pub const ConnectionManager = struct {
             .transport_type = transport_type,
             .identity_key = keypair,
             .node_id = id.NodeID.fromPublicKey(keypair.public_key),
+            .bound_port = 0,
             .on_connection_ctx = null,
             .on_connection_fn = null,
             .reaper_thread = null,
@@ -50,7 +52,17 @@ pub const ConnectionManager = struct {
         self.reaper_thread = try std.Thread.spawn(.{}, runReaper, .{self});
     }
 
-    fn loadOrGenerateKey(allocator: std.mem.Allocator) !noise.KeyPair {
+    fn loadOrGenerateKey(allocator: std.mem.Allocator, explicit_path: ?[]const u8) !noise.KeyPair {
+        if (explicit_path) |path| {
+            if (noise.KeyPair.loadFromFile(path)) |kp| {
+                return kp;
+            } else |_| {
+                const kp = noise.KeyPair.generate();
+                try kp.saveToFile(path);
+                return kp;
+            }
+        }
+
         const key_filename = "node.key";
 
         // 1. Try CWD
@@ -188,6 +200,7 @@ pub const ConnectionManager = struct {
     }
 
     pub fn listen(self: *ConnectionManager, port: u16, swarm_key: []const u8, running: ?*std.atomic.Value(bool)) !void {
+        self.bound_port = port;
         switch (self.transport_type) {
             .tcp => {
                 try tcp.listen(self.allocator, port, swarm_key, self.identity_key, running, self);
