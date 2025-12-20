@@ -75,7 +75,7 @@ pub const TestPeer = struct {
     }
 
     pub fn connect(self: *TestPeer, other: *TestPeer) !nomadfs.network.Stream {
-        const conn = try self.manager.connectToPeer(other.listen_addr, self.config.node.swarm_key);
+        const conn = try self.manager.connectToPeer(other.listen_addr, self.config.node.swarm_key, other.manager.node_id);
         // We have a connection, now open a stream
         return conn.openStream();
     }

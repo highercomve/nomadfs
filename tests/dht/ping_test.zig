@@ -29,13 +29,26 @@ test "dht: ping/pong integration" {
     std.Thread.sleep(100 * std.time.ns_per_ms);
 
     // 5. Peer2 connects to Peer1
-    const conn = try peer2.manager.connectToPeer(peer1.listen_addr, peer2.config.node.swarm_key);
+    const conn = try peer2.manager.connectToPeer(peer1.listen_addr, peer2.config.node.swarm_key, peer1.manager.node_id);
 
     // 6. Peer2 pings Peer1
     // We expect this to not time out and succeed
     try dht2.ping(conn);
 
     std.debug.print("Ping test passed!\n", .{});
+
+    // Check if dht1 added peer2
+    std.Thread.sleep(500 * std.time.ns_per_ms); // Give some time for the thread to process PING
+    
+    dht1.mutex.lock();
+    const peers = try dht1.routing_table.getAllPeers();
+    dht1.mutex.unlock();
+    defer allocator.free(peers);
+    
+    if (peers.len != 1) {
+        std.debug.print("Expected 1 peer, got {d}\n", .{peers.len});
+        return error.TestFailed;
+    }
 
     // 7. Close connection and wait for disconnection logic to run
     conn.close();

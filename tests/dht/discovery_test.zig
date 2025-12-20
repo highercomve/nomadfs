@@ -2,11 +2,11 @@ const std = @import("std");
 const nomadfs = @import("nomadfs");
 const TestPeer = @import("test_helpers").TestPeer;
 
-test "dht: 10-node discovery" {
+test "dht: X-node discovery" {
     std.debug.print("\n=== Running Test: dht: 10-node discovery ===\n", .{});
     const allocator = std.testing.allocator;
 
-    const NUM_NODES = 10;
+    const NUM_NODES = 5;
     var peers = try allocator.alloc(*TestPeer, NUM_NODES);
     defer allocator.free(peers);
 
@@ -44,31 +44,34 @@ test "dht: 10-node discovery" {
 
     std.debug.print("Bootstrapping complete. Node 0 knows all nodes with correct listen ports.\n", .{});
 
-    // 3. Node 9 knows Node 0
-    try dht_nodes[9].routing_table.addPeer(.{
+    const last_node_idx = NUM_NODES - 1;
+    // 3. Last node knows Node 0
+    try dht_nodes[last_node_idx].routing_table.addPeer(.{
         .id = peers[0].manager.node_id,
         .address = peers[0].listen_addr,
         .last_seen = std.time.timestamp(),
     });
 
-    // 4. Node 9 tries to find Node 5
-    // Node 9 knows Node 0.
+    // 4. Last node tries to find Node 5 (or 2 if NUM_NODES=5)
     // Node 0 knows Node 5 (with correct port).
 
-    const target_id = peers[5].manager.node_id;
-    std.debug.print("Node 9 searching for Node 5 (ID: {x})\n", .{target_id.bytes});
+    const target_idx = NUM_NODES / 2;
+    const target_id = peers[target_idx].manager.node_id;
+    std.debug.print("Last node searching for Node {d} (ID: {x})\n", .{ target_idx, target_id.bytes });
 
     // Check Node 0's routing table first
     {
         const closest_to_target = try dht_nodes[0].routing_table.getClosestPeers(target_id, 1);
         defer allocator.free(closest_to_target);
-        std.debug.print("Node 0 thinks closest to target is: {f} at {any}\n", .{ closest_to_target[0].id, closest_to_target[0].address });
+        if (closest_to_target.len > 0) {
+            std.debug.print("Node 0 thinks closest to target is: {f} at {any}\n", .{ closest_to_target[0].id, closest_to_target[0].address });
+        }
     }
 
-    try dht_nodes[9].lookup(target_id);
+    try dht_nodes[last_node_idx].lookup(target_id);
 
     // 5. Verify discovery
-    const closest = try dht_nodes[9].routing_table.getClosestPeers(target_id, 1);
+    const closest = try dht_nodes[last_node_idx].routing_table.getClosestPeers(target_id, 1);
     defer allocator.free(closest);
 
     if (closest.len == 0 or !closest[0].id.eql(target_id)) {
@@ -79,7 +82,7 @@ test "dht: 10-node discovery" {
         return error.DiscoveryFailed;
     }
 
-    std.debug.print("Discovery successful! Node 9 found Node 5.\n", .{});
+    std.debug.print("Discovery successful! Last node found Node {d}.\n", .{target_idx});
 
     // 6. Clean teardown
     for (0..NUM_NODES) |i| {

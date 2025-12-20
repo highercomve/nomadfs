@@ -127,6 +127,7 @@ pub const RoutingTable = struct {
         const cpl = self.local_id.commonPrefixLen(peer.id);
 
         const index = @min(cpl, 255);
+        std.debug.print("RoutingTable: Adding peer {x} to bucket {d} (CPL: {d})\n", .{peer.id.bytes[0..4], index, cpl});
         _ = try self.buckets[index].add(peer);
     }
 

@@ -148,8 +148,10 @@ pub fn build(b: *std.Build) void {
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
+
+    // Force sequential execution to avoid potential resource conflicts or timeouts
+    // mod -> exe -> integration
+    run_exe_tests.step.dependOn(&run_mod_tests.step);
 
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -163,5 +165,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_integration_tests = b.addRunArtifact(integration_tests);
+
+    run_integration_tests.step.dependOn(&run_exe_tests.step);
+
     test_step.dependOn(&run_integration_tests.step);
+
+    const test_mod_step = b.step("test-mod", "Run module tests");
+    test_mod_step.dependOn(&run_mod_tests.step);
+
+    const test_exe_step = b.step("test-exe", "Run executable tests");
+    test_exe_step.dependOn(&run_exe_tests.step);
+
+    const test_int_step = b.step("test-int", "Run integration tests");
+    test_int_step.dependOn(&run_integration_tests.step);
 }

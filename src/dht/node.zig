@@ -11,6 +11,7 @@ pub const Node = struct {
     routing_table: kbucket.RoutingTable,
     swarm_key: []const u8,
     storage: std.AutoHashMapUnmanaged(id.NodeID, []u8),
+    mutex: std.Thread.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, manager: *network.manager.ConnectionManager, swarm_key: []const u8) Node {
         return .{
@@ -19,10 +20,13 @@ pub const Node = struct {
             .routing_table = kbucket.RoutingTable.init(allocator, manager.node_id),
             .swarm_key = swarm_key,
             .storage = .{},
+            .mutex = .{},
         };
     }
 
     pub fn deinit(self: *Node) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.routing_table.deinit();
         var it = self.storage.iterator();
         while (it.next()) |entry| {
@@ -47,6 +51,8 @@ pub const Node = struct {
         defer response.deinit(self.allocator);
 
         if (response.payload == .PONG) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
             try self.routing_table.addPeer(.{
                 .id = response.sender_id,
                 .address = conn.getPeerAddress(),
@@ -59,7 +65,9 @@ pub const Node = struct {
         // Ensure we know about the closest nodes
         try self.lookup(key);
 
+        self.mutex.lock();
         const closest = try self.routing_table.getClosestPeers(key, kbucket.K);
+        self.mutex.unlock();
         defer self.allocator.free(closest);
 
         var stored_count: usize = 0;
@@ -69,8 +77,8 @@ pub const Node = struct {
                 stored_count += 1;
                 continue;
             }
-            self.sendStore(peer.address, key, value) catch |err| {
-                std.debug.print("Failed to store at {any}: {any}\n", .{ peer.address, err });
+            self.sendStore(peer.address, key, value, peer.id) catch |err| {
+                std.debug.print("Failed to store at {f}: {any}\n", .{ peer.address, err });
                 continue;
             };
             stored_count += 1;
@@ -78,6 +86,8 @@ pub const Node = struct {
     }
 
     pub fn localStore(self: *Node, key: id.NodeID, value: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const v_copy = try self.allocator.dupe(u8, value);
         const res = try self.storage.getOrPut(self.allocator, key);
         if (res.found_existing) {
@@ -88,11 +98,14 @@ pub const Node = struct {
 
     pub fn lookupValue(self: *Node, target: id.NodeID) !?[]u8 {
         // Check local storage first
+        self.mutex.lock();
         if (self.storage.get(target)) |val| {
-            return try self.allocator.dupe(u8, val);
+            const v = try self.allocator.dupe(u8, val);
+            self.mutex.unlock();
+            return v;
         }
-
         const initial_peers = try self.routing_table.getClosestPeers(target, kbucket.K);
+        self.mutex.unlock();
         defer self.allocator.free(initial_peers);
 
         var state = try lookup_mod.LookupState.init(self.allocator, target, initial_peers);
@@ -107,7 +120,7 @@ pub const Node = struct {
             for (next_peers) |peer| {
                 if (peer.id.eql(self.manager.node_id)) continue;
 
-                const result_or_err = self.sendFindValue(peer.address, target);
+                const result_or_err = self.sendFindValue(peer.address, target, peer.id);
                 if (result_or_err) |result| {
                     switch (result) {
                         .value => |v| {
@@ -117,11 +130,13 @@ pub const Node = struct {
                         .closer_peers => |closer| {
                             defer self.allocator.free(closer);
                             try state.reportReply(peer.id, closer);
+                            self.mutex.lock();
                             for (closer) |p| {
                                 if (p.id.eql(self.manager.node_id)) continue;
                                 if (state.failed.contains(p.id)) continue;
                                 try self.routing_table.addPeer(p);
                             }
+                            self.mutex.unlock();
                         },
                     }
                 } else |_| {
@@ -132,8 +147,8 @@ pub const Node = struct {
         return null;
     }
 
-    pub fn sendStore(self: *Node, address: std.net.Address, key: id.NodeID, value: []const u8) !void {
-        const conn = try self.manager.connectToPeer(address, self.swarm_key);
+    pub fn sendStore(self: *Node, address: std.net.Address, key: id.NodeID, value: []const u8, peer_id: ?id.NodeID) !void {
+        const conn = try self.manager.connectToPeer(address, self.swarm_key, peer_id);
 
         const stream = try conn.openStream();
         defer stream.close();
@@ -151,8 +166,8 @@ pub const Node = struct {
         closer_peers: []kbucket.PeerInfo,
     };
 
-    pub fn sendFindValue(self: *Node, address: std.net.Address, key: id.NodeID) !FindValueResult {
-        const conn = try self.manager.connectToPeer(address, self.swarm_key);
+    pub fn sendFindValue(self: *Node, address: std.net.Address, key: id.NodeID, peer_id: ?id.NodeID) !FindValueResult {
+        const conn = try self.manager.connectToPeer(address, self.swarm_key, peer_id);
 
         const stream = try conn.openStream();
         defer stream.close();
@@ -184,7 +199,9 @@ pub const Node = struct {
     }
 
     pub fn lookup(self: *Node, target: id.NodeID) !void {
+        self.mutex.lock();
         const initial_peers = try self.routing_table.getClosestPeers(target, kbucket.K);
+        self.mutex.unlock();
         defer self.allocator.free(initial_peers);
 
         var state = try lookup_mod.LookupState.init(self.allocator, target, initial_peers);
@@ -199,26 +216,31 @@ pub const Node = struct {
             for (next_peers) |peer| {
                 if (peer.id.eql(self.manager.node_id)) continue;
 
-                if (self.sendFindNode(peer.address, target)) |closer_peers| {
+                if (self.sendFindNode(peer.address, target, peer.id)) |closer_peers| {
                     defer self.allocator.free(closer_peers);
                     try state.reportReply(peer.id, closer_peers);
 
                     // Add discovered peers to routing table
+                    self.mutex.lock();
                     for (closer_peers) |p| {
                         if (p.id.eql(self.manager.node_id)) continue;
                         if (state.failed.contains(p.id)) continue;
                         try self.routing_table.addPeer(p);
                     }
-                } else |_| {
+                    self.mutex.unlock();
+                } else |err| {
+                    std.debug.print("Lookup: Failed to contact {f}: {any}. Removing from table.\n", .{ peer.address, err });
                     state.reportFailure(peer.id);
+                    self.mutex.lock();
                     self.routing_table.markDisconnected(peer.id);
+                    self.mutex.unlock();
                 }
             }
         }
     }
 
-    pub fn sendFindNode(self: *Node, address: std.net.Address, target: id.NodeID) ![]kbucket.PeerInfo {
-        const conn = try self.manager.connectToPeer(address, self.swarm_key);
+    pub fn sendFindNode(self: *Node, address: std.net.Address, target: id.NodeID, peer_id: ?id.NodeID) ![]kbucket.PeerInfo {
+        const conn = try self.manager.connectToPeer(address, self.swarm_key, peer_id);
 
         const stream = try conn.openStream();
         defer stream.close();
@@ -243,20 +265,26 @@ pub const Node = struct {
     }
 
     pub fn maintain(self: *Node) !void {
+        self.mutex.lock();
         const peers = try self.routing_table.getAllPeers();
+        self.mutex.unlock();
         defer self.allocator.free(peers);
 
         for (peers) |peer| {
             if (peer.id.eql(self.manager.node_id)) continue;
 
-            if (self.manager.connectToPeer(peer.address, self.swarm_key)) |conn| {
+            if (self.manager.connectToPeer(peer.address, self.swarm_key, peer.id)) |conn| {
                 self.ping(conn) catch |err| {
                     std.debug.print("Maintenance: Peer {x} failed ping ({any}). Evicting.\n", .{peer.id.bytes[0..4], err});
+                    self.mutex.lock();
                     self.routing_table.markDisconnected(peer.id);
+                    self.mutex.unlock();
                 };
             } else |err| {
                 std.debug.print("Maintenance: Could not connect to {x} ({any}). Evicting.\n", .{peer.id.bytes[0..4], err});
+                self.mutex.lock();
                 self.routing_table.markDisconnected(peer.id);
+                self.mutex.unlock();
             }
         }
     }
@@ -296,13 +324,18 @@ pub const Node = struct {
             .PING => |p| {
                 // Construct correct address from socket IP + Payload Port
                 var address = conn.getPeerAddress();
+                std.debug.print("Received PING from {x}. Address from sock: {f}, Port from payload: {d}\n", .{msg.sender_id.bytes[0..4], address, p.port});
+
                 if (address.any.family == std.posix.AF.INET) {
                     address.in.sa.port = std.mem.nativeToBig(u16, p.port);
                 } else if (address.any.family == std.posix.AF.INET6) {
                     address.in6.sa.port = std.mem.nativeToBig(u16, p.port);
                 }
+                std.debug.print("Address adjusted to: {f}\n", .{address});
 
                 // Add to routing table with CORRECT port
+                self.mutex.lock();
+                defer self.mutex.unlock();
                 self.routing_table.addPeer(.{
                     .id = msg.sender_id,
                     .address = address,
@@ -310,6 +343,7 @@ pub const Node = struct {
                 }) catch |err| {
                     std.debug.print("Failed to update routing table: {any}\n", .{err});
                 };
+                std.debug.print("Added peer to routing table.\n", .{});
 
                 const response = rpc.Message{
                     .sender_id = self.manager.node_id,
@@ -318,7 +352,9 @@ pub const Node = struct {
                 try response.serialize(stream.writer());
             },
             .FIND_NODE => |p| {
+                self.mutex.lock();
                 const closer = try self.routing_table.getClosestPeers(p.target, kbucket.K);
+                self.mutex.unlock();
                 defer self.allocator.free(closer);
 
                 const response = rpc.Message{
@@ -328,7 +364,15 @@ pub const Node = struct {
                 try response.serialize(stream.writer());
             },
             .FIND_VALUE => |p| {
+                var val_opt: ?[]u8 = null;
+                self.mutex.lock();
                 if (self.storage.get(p.key)) |val| {
+                    val_opt = try self.allocator.dupe(u8, val);
+                }
+                self.mutex.unlock();
+
+                if (val_opt) |val| {
+                    defer self.allocator.free(val);
                     // Return value
                     const response = rpc.Message{
                         .sender_id = self.manager.node_id,
@@ -337,7 +381,9 @@ pub const Node = struct {
                     try response.serialize(stream.writer());
                 } else {
                     // Return closest peers
+                    self.mutex.lock();
                     const closer = try self.routing_table.getClosestPeers(p.key, kbucket.K);
+                    self.mutex.unlock();
                     defer self.allocator.free(closer);
 
                     const response = rpc.Message{

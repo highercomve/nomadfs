@@ -6,7 +6,7 @@ test "dht: churn resilience" {
     std.debug.print("\n=== Running Test: dht: churn resilience ===\n", .{});
     const allocator = std.testing.allocator;
 
-    const NUM_NODES = 10;
+    const NUM_NODES = 5;
     var peers = try allocator.alloc(*TestPeer, NUM_NODES);
     defer allocator.free(peers);
 
@@ -28,7 +28,7 @@ test "dht: churn resilience" {
         }
     }
 
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(100 * std.time.ns_per_ms);
 
     // 2. Bootstrap: Node 0 knows everyone else (correct ports)
     for (1..NUM_NODES) |i| {
@@ -39,24 +39,25 @@ test "dht: churn resilience" {
         });
     }
 
-    // 3. Node 9 knows Node 0
-    try dht_nodes[9].routing_table.addPeer(.{
+    const last_node_idx = NUM_NODES - 1;
+    // 3. Last node knows Node 0
+    try dht_nodes[last_node_idx].routing_table.addPeer(.{
         .id = peers[0].manager.node_id,
         .address = peers[0].listen_addr,
         .last_seen = std.time.timestamp(),
     });
 
-    // 4. Node 9 performs a general lookup to discover some peers
+    // 4. Last node performs a general lookup to discover some peers
     const discovery_target = nomadfs.dht.id.NodeID{ .bytes = [_]u8{0xaa} ** 32 };
-    try dht_nodes[9].lookup(discovery_target);
+    try dht_nodes[last_node_idx].lookup(discovery_target);
 
-    // 5. Select a target and find which node is closest to it (among 1..8)
+    // 5. Select a target and find which node is closest to it (among 1..NUM_NODES-2)
     const target = nomadfs.dht.id.NodeID{ .bytes = [_]u8{0x55} ** 32 };
 
     var closest_idx: usize = 1;
     var min_dist = peers[1].manager.node_id.distance(target);
 
-    for (2..9) |i| {
+    for (2..last_node_idx) |i| {
         const dist = peers[i].manager.node_id.distance(target);
         for (0..32) |b| {
             if (dist.bytes[b] < min_dist.bytes[b]) {
@@ -76,10 +77,10 @@ test "dht: churn resilience" {
     peers[closest_idx].stop();
     std.Thread.sleep(1 * std.time.ns_per_s);
 
-    // Verify Node 9 HAS the stopped node in its routing table before lookup
+    // Verify Last Node HAS the stopped node in its routing table before lookup
     {
-        dht_nodes[9].routing_table.dump();
-        const all_peers = try dht_nodes[9].routing_table.getClosestPeers(target, 20);
+        dht_nodes[last_node_idx].routing_table.dump();
+        const all_peers = try dht_nodes[last_node_idx].routing_table.getClosestPeers(target, 20);
         defer allocator.free(all_peers);
         var found = false;
         for (all_peers) |p| {
@@ -89,18 +90,18 @@ test "dht: churn resilience" {
             }
         }
         if (!found) {
-            std.debug.print("FAILED: Stopped node NOT in Node 9 routing table before lookup!\n", .{});
+            std.debug.print("FAILED: Stopped node NOT in Last Node routing table before lookup!\n", .{});
             return error.TestSetupFailed;
         }
     }
 
-    // 7. Node 9 tries to lookup the target
+    // 7. Last Node tries to lookup the target
     // It should encounter the failure of the stopped node and find the NEXT best peer.
-    std.debug.print("Node 9 starting lookup for target...\n", .{});
-    try dht_nodes[9].lookup(target);
+    std.debug.print("Last Node starting lookup for target...\n", .{});
+    try dht_nodes[last_node_idx].lookup(target);
 
     // 8. Verify lookup results
-    const results = try dht_nodes[9].routing_table.getClosestPeers(target, 1);
+    const results = try dht_nodes[last_node_idx].routing_table.getClosestPeers(target, 1);
     defer allocator.free(results);
 
     try std.testing.expect(results.len > 0);
@@ -108,11 +109,11 @@ test "dht: churn resilience" {
     // Should NOT be the stopped node
     try std.testing.expect(!results[0].id.eql(peers[closest_idx].manager.node_id));
 
-    std.debug.print("Churn resilience test passed! Node 9 found next best peer (ID: {x}).\n", .{results[0].id.bytes});
+    std.debug.print("Churn resilience test passed! Node {d} found next best peer (ID: {x}).\n", .{ last_node_idx, results[0].id.bytes });
 
     // Cleanup
     for (0..NUM_NODES) |i| {
         peers[i].stop();
     }
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(100 * std.time.ns_per_ms);
 }

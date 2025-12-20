@@ -30,7 +30,7 @@ test "dht: store and find_value" {
     std.Thread.sleep(100 * std.time.ns_per_ms);
 
     // 4. Connect Peer2 to Peer1
-    const conn = try peer2.manager.connectToPeer(peer1.listen_addr, peer2.config.node.swarm_key);
+    const conn = try peer2.manager.connectToPeer(peer1.listen_addr, peer2.config.node.swarm_key, peer1.manager.node_id);
     // Ping to ensure they know each other and update routing tables
     try dht2.ping(conn);
     std.Thread.sleep(50 * std.time.ns_per_ms);

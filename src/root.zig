@@ -129,7 +129,7 @@ pub const Node = struct {
             var attempts: usize = 0;
             const max_attempts = 5;
             while (attempts < max_attempts) : (attempts += 1) {
-                if (self.net.connectToPeer(address, swarm_key)) |conn| {
+                if (self.net.connectToPeer(address, swarm_key, null)) |conn| {
                     std.debug.print("Successfully connected to bootstrap peer: {s}\n", .{peer_url});
                     try self.dht_node.ping(conn);
                     break;

@@ -211,10 +211,23 @@ pub const ConnectionManager = struct {
         }
     }
 
-    pub fn connectToPeer(self: *ConnectionManager, address: std.net.Address, swarm_key: []const u8) !network.Connection {
+    pub fn connectToPeer(self: *ConnectionManager, address: std.net.Address, swarm_key: []const u8, remote_node_id: ?id.NodeID) !network.Connection {
         self.mutex.lock();
         for (self.connections.items) |*mc| {
+            // Check for NodeID match (preferred)
+            if (remote_node_id) |target_id| {
+                if (mc.conn.getRemoteNodeID().eql(target_id)) {
+                    // std.debug.print("ConnectionManager: Reusing connection for {x}\n", .{target_id.bytes[0..4]});
+                    mc.last_active = std.time.timestamp();
+                    const c = mc.conn;
+                    self.mutex.unlock();
+                    return c;
+                }
+            }
+
+            // Check for Address match (fallback)
             if (addressesMatch(mc.conn.getPeerAddress(), address)) {
+                // std.debug.print("ConnectionManager: Reusing connection for address {any}\n", .{address});
                 mc.last_active = std.time.timestamp();
                 const c = mc.conn;
                 self.mutex.unlock();
@@ -223,6 +236,7 @@ pub const ConnectionManager = struct {
         }
         self.mutex.unlock();
 
+        std.debug.print("ConnectionManager: Connecting to {f} (New)\n", .{address});
         switch (self.transport_type) {
             .tcp => {
                 const conn = try tcp.connect(self.allocator, address, swarm_key, self.identity_key);
