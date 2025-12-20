@@ -217,7 +217,6 @@ pub const ConnectionManager = struct {
             // Check for NodeID match (preferred)
             if (remote_node_id) |target_id| {
                 if (mc.conn.getRemoteNodeID().eql(target_id)) {
-                    // std.debug.print("ConnectionManager: Reusing connection for {x}\n", .{target_id.bytes[0..4]});
                     mc.last_active = std.time.timestamp();
                     const c = mc.conn;
                     self.mutex.unlock();
@@ -227,7 +226,6 @@ pub const ConnectionManager = struct {
 
             // Check for Address match (fallback)
             if (addressesMatch(mc.conn.getPeerAddress(), address)) {
-                // std.debug.print("ConnectionManager: Reusing connection for address {any}\n", .{address});
                 mc.last_active = std.time.timestamp();
                 const c = mc.conn;
                 self.mutex.unlock();

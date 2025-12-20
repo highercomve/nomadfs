@@ -60,6 +60,37 @@ pub const NodeID = struct {
     ) !void {
         try writer.print("{x}", .{self.bytes});
     }
+
+    pub fn randomIdInBucket(self: NodeID, bucket_index: usize) NodeID {
+        var new_id = self;
+        // Bucket index i corresponds to CPL = i.
+        // We need to flip the bit at index i (0-based from MSB)
+        // and randomize all bits after it.
+        
+        const byte_idx = bucket_index / 8;
+        const bit_offset = bucket_index % 8;
+        const bit_mask = @as(u8, 1) << @intCast(7 - bit_offset);
+
+        // Flip the determining bit
+        new_id.bytes[byte_idx] ^= bit_mask;
+
+        // Randomize remaining bits in this byte
+        // Mask of bits to randomize (those to the right of bit_offset)
+        const rand_mask = bit_mask - 1;
+        if (rand_mask > 0) {
+            var rand_byte: u8 = undefined;
+            std.crypto.random.bytes(std.mem.asBytes(&rand_byte));
+            new_id.bytes[byte_idx] &= ~rand_mask; // Clear random bits
+            new_id.bytes[byte_idx] |= (rand_byte & rand_mask); // Set new random bits
+        }
+
+        // Randomize all subsequent bytes
+        if (byte_idx + 1 < 32) {
+            std.crypto.random.bytes(new_id.bytes[byte_idx + 1 ..]);
+        }
+
+        return new_id;
+    }
 };
 
 test "id: commonPrefixLen" {

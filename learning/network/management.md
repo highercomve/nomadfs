@@ -9,8 +9,10 @@ The **`ConnectionManager`** (`src/network/manager.zig`) is responsible for the h
 Opening an authenticated Noise connection involves a cryptographic handshake, which is CPU-intensive. To avoid redundant work:
 
 1.  **Lookup before Dial**: When the DHT or another component calls `connectToPeer(address)`, the manager first checks its internal list of active connections.
-2.  **Re-use**: If a connection to that IP/Port already exists, it is returned immediately.
+2.  **Yamux Re-use**: If a connection to that PeerID or Address already exists, the manager returns the existing **Yamux Session**. Components then open a new logical "Stream" over this session instead of dialing a new TCP connection.
 3.  **Thread Safety**: A global mutex ensures that two components don't accidentally try to dial the same peer simultaneously.
+
+By using Yamux, NomadFS avoids the high cost of repeated TCP handshakes and Noise cryptographic setups. Multiple concurrent requests (e.g., a DHT lookup and a file transfer) all flow through the same established "Pipe."
 
 ## 2. Resource Reaping (The Garbage Collector)
 

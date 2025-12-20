@@ -148,32 +148,25 @@ pub const Node = struct {
         const dht_node_ptr = self.dht_node;
         const net_node_id = self.net.node_id;
 
-        const discovery_thread = try std.Thread.spawn(.{}, struct {
-            fn run(node: *dht.Node, target_id: dht.id.NodeID) void {
+        const maintenance_thread = try std.Thread.spawn(.{}, struct {
+            fn run(node: *dht.Node, self_id: dht.id.NodeID) void {
+                // 1. Initial Self-Lookup (Once)
+                std.debug.print("Starting initial self-lookup...\n", .{});
+                node.lookup(self_id) catch |err| {
+                    std.debug.print("Error during self-lookup: {any}\n", .{err});
+                };
+                std.debug.print("Initial self-lookup complete. Routing table dump:\n", .{});
+                node.routing_table.dump();
+
+                // 2. Periodic Bucket Refresh (Standard Kademlia Maintenance)
                 while (true) {
-                    std.debug.print("Starting peer discovery...\n", .{});
-                    node.lookup(target_id) catch |err| {
-                        std.debug.print("Error during DHT lookup: {any}\n", .{err});
+                    std.Thread.sleep(60 * std.time.ns_per_s); // Check for stale buckets every minute
+                    node.refreshBuckets() catch |err| {
+                        std.debug.print("Bucket refresh error: {any}\n", .{err});
                     };
-                    std.debug.print("Peer discovery complete. Routing table dump:\n", .{});
-                    node.routing_table.dump();
-                    std.Thread.sleep(10 * std.time.ns_per_s); // Run every 10 seconds
                 }
             }
         }.run, .{ dht_node_ptr, net_node_id });
-        discovery_thread.detach();
-
-        const maintenance_thread = try std.Thread.spawn(.{}, struct {
-            fn run(node: *dht.Node) void {
-                while (true) {
-                    std.Thread.sleep(60 * std.time.ns_per_s);
-                    std.debug.print("Starting maintenance (ping all peers)...\n", .{});
-                    node.maintain() catch |err| {
-                        std.debug.print("Maintenance error: {any}\n", .{err});
-                    };
-                }
-            }
-        }.run, .{ dht_node_ptr });
         maintenance_thread.detach();
     }
 };

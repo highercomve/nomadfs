@@ -36,6 +36,18 @@ The most important part of Kademlia is the iterative lookup process. When a node
 3.  As it receives replies with even closer nodes, it queries those new nodes.
 4.  The process continues until no closer nodes can be found or the target is reached.
 
+## 6. Maintenance Strategy
+
+NomadFS has evolved its maintenance strategy from an aggressive "MVP" approach to a more standard, scalable Kademlia implementation.
+
+| Feature | Legacy NomadFS (Aggressive) | Standard Kademlia/NomadFS (Current) |
+| :--- | :--- | :--- |
+| **Self-Lookup** | Every **10 seconds** (Infinite Loop). | **Once** at startup (to find closest neighbors). |
+| **Table Maintenance** | **Ping All** peers every 60s. | **Bucket Refresh**: Lookup a random ID in a bucket only if that bucket has been idle for **1 hour**. |
+| **Liveness** | Active Pinging. | **Lazy**: Remove peers only when they fail to respond to a user query. |
+
+This shift ensures the network remains quiet when idle and scales efficiently to thousands of nodes without overwhelming low-power devices.
+
 ---
 
 **Next Chapters:**

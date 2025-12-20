@@ -10,4 +10,5 @@ test {
     _ = @import("dht/store_test.zig");
     _ = @import("dht/discovery_test.zig");
     _ = @import("dht/churn_test.zig");
+    _ = @import("dht/kbucket_standard_test.zig");
 }

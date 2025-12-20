@@ -14,7 +14,11 @@ Every message consists of:
 
 ## 2. Payload Formats
 
-### PING (0) / PONG (1)
+### PING (0)
+*   **Payload**: 
+    *   **Port (2 bytes)**: Big-endian. The listening port of the sender (to allow callbacks through NAT/Firewalls).
+
+### PONG (1)
 *   **Payload**: Empty (0 bytes).
 
 ### FIND_NODE (2)

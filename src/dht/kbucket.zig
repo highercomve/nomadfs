@@ -13,12 +13,14 @@ const Bucket = struct {
     peers: std.ArrayListUnmanaged(PeerInfo),
     replacements: std.ArrayListUnmanaged(PeerInfo),
     allocator: std.mem.Allocator,
+    last_updated: i64,
 
     pub fn init(allocator: std.mem.Allocator) Bucket {
         return Bucket{
             .peers = std.ArrayListUnmanaged(PeerInfo){},
             .replacements = std.ArrayListUnmanaged(PeerInfo){},
             .allocator = allocator,
+            .last_updated = std.time.timestamp(),
         };
     }
 
@@ -29,6 +31,7 @@ const Bucket = struct {
 
     // Returns true if added/updated, false if bucket full and peer added to replacement cache
     pub fn add(self: *Bucket, peer: PeerInfo) !bool {
+        self.last_updated = std.time.timestamp();
         // Check if exists in peers (Main Bucket), update
         for (self.peers.items, 0..) |*p, i| {
             if (p.id.eql(peer.id)) {

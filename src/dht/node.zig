@@ -264,27 +264,26 @@ pub const Node = struct {
         }
     }
 
-    pub fn maintain(self: *Node) !void {
-        self.mutex.lock();
-        const peers = try self.routing_table.getAllPeers();
-        self.mutex.unlock();
-        defer self.allocator.free(peers);
-
-        for (peers) |peer| {
-            if (peer.id.eql(self.manager.node_id)) continue;
-
-            if (self.manager.connectToPeer(peer.address, self.swarm_key, peer.id)) |conn| {
-                self.ping(conn) catch |err| {
-                    std.debug.print("Maintenance: Peer {x} failed ping ({any}). Evicting.\n", .{peer.id.bytes[0..4], err});
-                    self.mutex.lock();
-                    self.routing_table.markDisconnected(peer.id);
-                    self.mutex.unlock();
-                };
-            } else |err| {
-                std.debug.print("Maintenance: Could not connect to {x} ({any}). Evicting.\n", .{peer.id.bytes[0..4], err});
+    pub fn refreshBuckets(self: *Node) !void {
+        const now = std.time.timestamp();
+        var i: usize = 0;
+        while (i < 256) : (i += 1) {
+            var needs_refresh = false;
+            {
                 self.mutex.lock();
-                self.routing_table.markDisconnected(peer.id);
+                const bucket = &self.routing_table.buckets[i];
+                if (now - bucket.last_updated > 3600) {
+                    needs_refresh = true;
+                }
                 self.mutex.unlock();
+            }
+
+            if (needs_refresh) {
+                // std.debug.print("Refreshing bucket {d}...\n", .{i});
+                const target = self.manager.node_id.randomIdInBucket(i);
+                self.lookup(target) catch |err| {
+                    std.debug.print("Error refreshing bucket {d}: {any}\n", .{ i, err });
+                };
             }
         }
     }
