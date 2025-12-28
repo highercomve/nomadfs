@@ -37,7 +37,8 @@ test "dht: X-node discovery" {
     for (1..NUM_NODES) |i| {
         try dht_nodes[0].routing_table.addPeer(.{
             .id = peers[i].manager.node_id,
-            .address = peers[i].listen_addr,
+            .addresses = .{peers[i].listen_addr} ++ .{undefined} ** (nomadfs.dht.kbucket.MAX_PEER_ADDRESSES - 1),
+            .addrs_count = 1,
             .last_seen = std.time.timestamp(),
         });
     }
@@ -48,7 +49,8 @@ test "dht: X-node discovery" {
     // 3. Last node knows Node 0
     try dht_nodes[last_node_idx].routing_table.addPeer(.{
         .id = peers[0].manager.node_id,
-        .address = peers[0].listen_addr,
+        .addresses = .{peers[0].listen_addr} ++ .{undefined} ** (nomadfs.dht.kbucket.MAX_PEER_ADDRESSES - 1),
+        .addrs_count = 1,
         .last_seen = std.time.timestamp(),
     });
 
@@ -64,7 +66,7 @@ test "dht: X-node discovery" {
         const closest_to_target = try dht_nodes[0].routing_table.getClosestPeers(target_id, 1);
         defer allocator.free(closest_to_target);
         if (closest_to_target.len > 0) {
-            std.debug.print("Node 0 thinks closest to target is: {f} at {any}\n", .{ closest_to_target[0].id, closest_to_target[0].address });
+            std.debug.print("Node 0 thinks closest to target is: {f} at {any}\n", .{ closest_to_target[0].id, closest_to_target[0].addresses[0] });
         }
     }
 

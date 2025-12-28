@@ -4,6 +4,7 @@ const network = @import("mod.zig");
 const config = @import("../config.zig");
 const tcp = @import("tcp.zig");
 const noise = @import("noise.zig");
+const nat = @import("nat.zig");
 const id = @import("../dht/id.zig");
 
 pub const ConnectionManager = struct {
@@ -25,6 +26,8 @@ pub const ConnectionManager = struct {
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     idle_timeout: i64 = 60 * 5,
     reap_interval_ms: u64 = 10000,
+    upnp: nat.UPnP,
+    mdns: ?network.mdns.MDNS = null,
 
     pub fn init(allocator: std.mem.Allocator, transport_type: config.Config.TransportType, key_path: ?[]const u8) !ConnectionManager {
         const keypair = try loadOrGenerateKey(allocator, key_path);
@@ -43,13 +46,20 @@ pub const ConnectionManager = struct {
             .on_connection_fn = null,
             .reaper_thread = null,
             .running = std.atomic.Value(bool).init(true),
+            .upnp = nat.UPnP.init(allocator),
+            .mdns = null,
         };
     }
 
     pub fn start(self: *ConnectionManager) !void {
         if (self.reaper_thread != null) return;
         self.running.store(true, .release);
-        self.reaper_thread = try std.Thread.spawn(.{}, runReaper, .{self});
+        self.reaper_thread = try std.Thread.spawn(.{}, ConnectionManager.runReaper, .{self});
+        
+        // Start mDNS
+        if (self.mdns) |*m| {
+            try m.start();
+        }
     }
 
     fn loadOrGenerateKey(allocator: std.mem.Allocator, explicit_path: ?[]const u8) !noise.KeyPair {
@@ -100,6 +110,9 @@ pub const ConnectionManager = struct {
 
     pub fn stop(self: *ConnectionManager) void {
         self.running.store(false, .release);
+        if (self.mdns) |*m| {
+            m.stop();
+        }
         if (self.reaper_thread) |t| {
             t.join();
             self.reaper_thread = null;
@@ -108,14 +121,18 @@ pub const ConnectionManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.connections.items) |mc| {
-            mc.conn.close();
+            mc.conn.deinit();
         }
         self.connections.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *ConnectionManager) void {
         self.stop();
+        if (self.mdns) |*m| {
+            m.deinit();
+        }
         self.connections.deinit(self.allocator);
+        self.upnp.deinit();
     }
 
     fn runReaper(self: *ConnectionManager) void {
@@ -138,7 +155,7 @@ pub const ConnectionManager = struct {
 
                 if (is_closed or is_idle) {
                     _ = self.connections.orderedRemove(i);
-                    mc.conn.close();
+                    mc.conn.deinit();
                 } else {
                     i += 1;
                 }
@@ -199,8 +216,67 @@ pub const ConnectionManager = struct {
         self.on_connection_fn = Wrapper.wrap;
     }
 
-    pub fn listen(self: *ConnectionManager, port: u16, swarm_key: []const u8, running: ?*std.atomic.Value(bool)) !void {
+    fn onMdnsDiscovery(ctx: ?*anyopaque, peer_id: id.NodeID, addr: std.net.Address) void {
+        // TODO: This should probably be handled by the DHT Node or routing table logic.
+        // For now, ConnectionManager just logs it or maybe preemptively connects?
+        // Actually, ConnectionManager shouldn't automatically connect to everyone.
+        // It should notify an observer. 
+        // But for now, let's just log it. 
+        // Ideally, we'd add it to the DHT routing table.
+        // But ConnectionManager doesn't know about RoutingTable directly (it's in dht/kbucket.zig).
+        // The DHT Node holds the Manager.
+        
+        // Strategy: We need a callback here too?
+        // Or we expose an event queue.
+        std.debug.print("mDNS: Discovered peer {x} at {f}\n", .{peer_id.bytes[0..4], addr});
+        
+        // For Phase 2 MVP: Just logging is fine.
+        // In Phase 2+ or integration, we should call a callback that the Node registers.
+        if (ctx) |c| {
+            const self: *ConnectionManager = @ptrCast(@alignCast(c));
+            _ = self;
+        }
+    }
+
+    pub fn listen(self: *ConnectionManager, port: u16, swarm_key: []const u8, running: ?*std.atomic.Value(bool), enable_mdns: bool, upnp_enabled: bool) !void {
         self.bound_port = port;
+        
+        // Initialize mDNS
+        if (enable_mdns) {
+            self.mdns = network.mdns.MDNS.init(
+                self.allocator, 
+                self.node_id, 
+                port, 
+                onMdnsDiscovery, 
+                self
+            );
+            try self.mdns.?.start();
+        }
+
+        // Attempt UPnP in background
+        if (upnp_enabled) {
+            const thread = try std.Thread.spawn(.{}, struct {
+                fn run(cm: *ConnectionManager, p: u16) void {
+                    cm.upnp.discoverGateway() catch |err| {
+                        std.debug.print("UPnP Discovery failed: {any}\n", .{err});
+                        return;
+                    };
+                    
+                    const local_ip = cm.upnp.getLocalIP() catch |err| {
+                         std.debug.print("UPnP failed to determine local IP: {any}\n", .{err});
+                         return;
+                    };
+                    defer cm.allocator.free(local_ip);
+
+                    cm.upnp.mapPort(p, "TCP", local_ip) catch |err| {
+                        std.debug.print("UPnP Port Mapping failed: {any}\n", .{err});
+                        return;
+                    };
+                }
+            }.run, .{self, port});
+            thread.detach();
+        }
+
         switch (self.transport_type) {
             .tcp => {
                 try tcp.listen(self.allocator, port, swarm_key, self.identity_key, running, self);
@@ -209,6 +285,55 @@ pub const ConnectionManager = struct {
                 return error.QuicNotImplemented;
             },
         }
+    }
+
+    pub fn connectToPeerMulti(self: *ConnectionManager, addresses: []const std.net.Address, swarm_key: []const u8, remote_node_id: ?id.NodeID) !network.Connection {
+        // 1. Check existing connections first
+        self.mutex.lock();
+        for (self.connections.items) |*mc| {
+            if (remote_node_id) |target_id| {
+                if (mc.conn.getRemoteNodeID().eql(target_id)) {
+                    mc.last_active = std.time.timestamp();
+                    const c = mc.conn;
+                    self.mutex.unlock();
+                    return c;
+                }
+            }
+            // Check if any of the target addresses match existing connection
+            for (addresses) |addr| {
+                if (addressesMatch(mc.conn.getPeerAddress(), addr)) {
+                    mc.last_active = std.time.timestamp();
+                    const c = mc.conn;
+                    self.mutex.unlock();
+                    return c;
+                }
+            }
+        }
+        self.mutex.unlock();
+
+        // 2. Try dialing each address (Sorted by Priority)
+        // Make a mutable copy to sort
+        const sorted_addrs = try self.allocator.dupe(std.net.Address, addresses);
+        defer self.allocator.free(sorted_addrs);
+
+        const SortCtx = struct {
+            pub fn lessThan(_: @This(), a: std.net.Address, b: std.net.Address) bool {
+                return network.addressPriority(a) < network.addressPriority(b);
+            }
+        };
+        std.mem.sort(std.net.Address, sorted_addrs, SortCtx{}, SortCtx.lessThan);
+
+        for (sorted_addrs) |addr| {
+            std.debug.print("ConnectionManager: Dialing {f}...\n", .{addr});
+            if (self.connectToPeer(addr, swarm_key, remote_node_id)) |conn| {
+                return conn;
+            } else |err| {
+                std.debug.print("ConnectionManager: Failed to dial {f}: {any}\n", .{ addr, err });
+                continue;
+            }
+        }
+
+        return error.AllAddressesFailed;
     }
 
     pub fn connectToPeer(self: *ConnectionManager, address: std.net.Address, swarm_key: []const u8, remote_node_id: ?id.NodeID) !network.Connection {

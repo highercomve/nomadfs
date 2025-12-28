@@ -34,7 +34,8 @@ test "dht: churn resilience" {
     for (1..NUM_NODES) |i| {
         try dht_nodes[0].routing_table.addPeer(.{
             .id = peers[i].manager.node_id,
-            .address = peers[i].listen_addr,
+            .addresses = .{peers[i].listen_addr} ++ .{undefined} ** (nomadfs.dht.kbucket.MAX_PEER_ADDRESSES - 1),
+            .addrs_count = 1,
             .last_seen = std.time.timestamp(),
         });
     }
@@ -43,7 +44,8 @@ test "dht: churn resilience" {
     // 3. Last node knows Node 0
     try dht_nodes[last_node_idx].routing_table.addPeer(.{
         .id = peers[0].manager.node_id,
-        .address = peers[0].listen_addr,
+        .addresses = .{peers[0].listen_addr} ++ .{undefined} ** (nomadfs.dht.kbucket.MAX_PEER_ADDRESSES - 1),
+        .addrs_count = 1,
         .last_seen = std.time.timestamp(),
     });
 

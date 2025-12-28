@@ -35,6 +35,8 @@ The network layer coordinates several components to provide a seamless experienc
 *   **Listening**: Accepts raw TCP connections and immediately triggers the [Noise Handshake](./noise.md).
 *   **Connecting**: Dials a remote peer and initiates the handshake.
 *   **Session Management**: Once the handshake is complete, it starts the [Yamux Session](./yamux.md) in a dedicated background thread.
+*   **Local Discovery**: The [mDNS](./mdns.md) component broadcasts and listens for peers on the local area network.
+*   **Reachability**: The [NAT & AutoNAT](./nat.md) component handles port forwarding and verifies if the node is reachable from the internet.
 *   **Lifecycle Control**: The [ConnectionManager](./management.md) runs a "Reaper" thread to prune dead or idle connections, ensuring system stability.
 
 ---

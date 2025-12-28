@@ -12,12 +12,14 @@ test "dht: iterative lookup state management" {
     // Create some initial peers
     const p1 = kbucket.PeerInfo{
         .id = id.NodeID{ .bytes = [_]u8{0x10} ** 32 },
-        .address = try std.net.Address.parseIp("127.0.0.1", 9001),
+        .addresses = .{try std.net.Address.parseIp("127.0.0.1", 9001)} ++ .{undefined} ** (kbucket.MAX_PEER_ADDRESSES - 1),
+        .addrs_count = 1,
         .last_seen = 0,
     };
     const p2 = kbucket.PeerInfo{
         .id = id.NodeID{ .bytes = [_]u8{0x80} ** 32 },
-        .address = try std.net.Address.parseIp("127.0.0.1", 9002),
+        .addresses = .{try std.net.Address.parseIp("127.0.0.1", 9002)} ++ .{undefined} ** (kbucket.MAX_PEER_ADDRESSES - 1),
+        .addrs_count = 1,
         .last_seen = 0,
     };
 
@@ -37,7 +39,8 @@ test "dht: iterative lookup state management" {
     // 3. Report a reply with even closer peers
     const p3 = kbucket.PeerInfo{
         .id = id.NodeID{ .bytes = [_]u8{0xf0} ** 32 },
-        .address = try std.net.Address.parseIp("127.0.0.1", 9003),
+        .addresses = .{try std.net.Address.parseIp("127.0.0.1", 9003)} ++ .{undefined} ** (kbucket.MAX_PEER_ADDRESSES - 1),
+        .addrs_count = 1,
         .last_seen = 0,
     };
     

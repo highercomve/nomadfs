@@ -90,14 +90,14 @@ pub const Node = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn start(self: *Node, port: u16, swarm_key: []const u8, running: *std.atomic.Value(bool)) !void {
+    pub fn start(self: *Node, port: u16, swarm_key: []const u8, running: *std.atomic.Value(bool), enable_mdns: bool, upnp_enabled: bool) !void {
         const listen_thread = try std.Thread.spawn(.{}, struct {
-            fn run(m: *network.manager.ConnectionManager, p: u16, key: []const u8, run_flag: *std.atomic.Value(bool)) void {
-                m.listen(p, key, run_flag) catch |err| {
+            fn run(m: *network.manager.ConnectionManager, p: u16, key: []const u8, run_flag: *std.atomic.Value(bool), mdns_flag: bool, upnp_flag: bool) void {
+                m.listen(p, key, run_flag, mdns_flag, upnp_flag) catch |err| {
                     std.debug.print("Listener error: {any}\n", .{err});
                 };
             }
-        }.run, .{ self.net, port, swarm_key, running });
+        }.run, .{ self.net, port, swarm_key, running, enable_mdns, upnp_enabled });
         listen_thread.detach();
     }
 
@@ -132,6 +132,12 @@ pub const Node = struct {
                 if (self.net.connectToPeer(address, swarm_key, null)) |conn| {
                     std.debug.print("Successfully connected to bootstrap peer: {s}\n", .{peer_url});
                     try self.dht_node.ping(conn);
+                    
+                    // Request AutoNAT dial-back
+                    self.dht_node.checkReachability(conn) catch |err| {
+                        std.debug.print("AutoNAT request failed: {any}\n", .{err});
+                    };
+                    
                     break;
                 } else |err| {
                     if (attempts < max_attempts - 1) {

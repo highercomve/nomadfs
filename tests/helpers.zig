@@ -67,7 +67,7 @@ pub const TestPeer = struct {
     }
 
     fn serverLoop(self: *TestPeer) void {
-        self.manager.listen(self.config.network.port, self.config.node.swarm_key, &self.running) catch |err| {
+        self.manager.listen(self.config.network.port, self.config.node.swarm_key, &self.running, self.config.network.enable_mdns, self.config.network.upnp_enabled) catch |err| {
             if (self.running.load(.acquire)) {
                 std.debug.print("TestPeer server error: {}\n", .{err});
             }

@@ -2,6 +2,7 @@ test {
     _ = @import("network/integration.zig");
     _ = @import("network/security_test.zig");
     _ = @import("network/manager_test.zig");
+    _ = @import("network/mdns_test.zig");
     _ = @import("network/yamux_test.zig");
     _ = @import("network/yamux_flow_control_test.zig");
     _ = @import("dht/lookup_test.zig");

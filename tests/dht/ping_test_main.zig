@@ -2,9 +2,14 @@ const std = @import("std");
 const nomadfs = @import("nomadfs");
 const TestPeer = @import("test_helpers").TestPeer;
 
-test "dht: ping/pong integration" {
-    std.debug.print("\n=== Running Test: dht: ping/pong integration ===\n", .{});
-    const allocator = std.testing.allocator;
+pub fn main() !void {
+    // std.testing.allocator detects leaks, but for a standalone run we can use GPA or page_allocator.
+    // Let's use GPA to catch leaks if possible, but print to stderr on failure.
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    std.debug.print("\n=== Running Test Main: dht: ping/pong integration ===\n", .{});
 
     // 1. Create two peers
     var peer1 = try TestPeer.init(allocator, 10001);
@@ -29,22 +34,26 @@ test "dht: ping/pong integration" {
     std.Thread.sleep(100 * std.time.ns_per_ms);
 
     // 5. Peer2 connects to Peer1
+    std.debug.print("Connecting peer2 to peer1...\n", .{});
     const conn = try peer2.manager.connectToPeer(peer1.listen_addr, peer2.config.node.swarm_key, peer1.manager.node_id);
+    std.debug.print("Connected!\n", .{});
 
     // 6. Peer2 pings Peer1
     // We expect this to not time out and succeed
+    std.debug.print("Sending PING...\n", .{});
     try dht2.ping(conn);
+    std.debug.print("PING sent and PONG received!\n", .{});
 
     std.debug.print("Ping test passed!\n", .{});
 
     // Check if dht1 added peer2
     std.Thread.sleep(500 * std.time.ns_per_ms); // Give some time for the thread to process PING
-
+    
     dht1.mutex.lock();
     const peers = try dht1.routing_table.getAllPeers();
     dht1.mutex.unlock();
     defer allocator.free(peers);
-
+    
     if (peers.len != 1) {
         std.debug.print("Expected 1 peer, got {d}\n", .{peers.len});
         return error.TestFailed;
@@ -52,5 +61,5 @@ test "dht: ping/pong integration" {
 
     // 7. Close connection and wait for disconnection logic to run
     conn.close();
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    std.Thread.sleep(1000 * std.time.ns_per_ms);
 }

@@ -58,6 +58,8 @@ To fully understand NomadFS, familiarity with these concepts is helpful. We have
     *   [1.2: Multiplexing with Yamux](./network/yamux.md)
     *   [1.3: Testing Strategy](./network/testing.md)
     *   [1.4: Connection Management](./network/management.md)
+    *   [1.5: Local Discovery (mDNS)](./network/mdns.md)
+    *   [1.6: NAT & AutoNAT](./network/nat.md)
 
 ### Part III: Peer Discovery (DHT)
 5.  **[Chapter 2: Kademlia & The XOR Metric](./dht/overview.md)**

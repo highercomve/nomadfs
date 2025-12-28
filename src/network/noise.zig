@@ -208,6 +208,9 @@ pub const NoiseStream = struct {
     send_cipher: CipherState,
     recv_cipher: CipherState,
     remote_static: [32]u8,
+    read_buffer: [65535]u8 = undefined,
+    read_pos: usize = 0,
+    read_end: usize = 0,
 
     pub fn handshake(inner: network.Stream, swarm_key_bytes: []const u8, static_key: KeyPair, initiator: bool) !NoiseStream {
         const role = if (initiator) "Initiator" else "Responder";
@@ -341,6 +344,9 @@ pub const NoiseStream = struct {
             .send_cipher = if (initiator) ciphers[0] else ciphers[1],
             .recv_cipher = if (initiator) ciphers[1] else ciphers[0],
             .remote_static = hs.rs.?,
+            .read_buffer = undefined,
+            .read_pos = 0,
+            .read_end = 0,
         };
     }
 
@@ -365,34 +371,44 @@ pub const NoiseStream = struct {
     }
 
     pub fn stream(self: *NoiseStream) network.Stream {
-        return network.Stream.init(self, &network.Stream.StreamVTable{
-            .read = read,
-            .write = write,
-            .close = close,
-        });
+        return network.Stream.init(self, &noise_stream_vtable);
     }
 
     fn read(ptr: *anyopaque, buffer: []u8) anyerror!usize {
         const self: *NoiseStream = @ptrCast(@alignCast(ptr));
 
+        // If we have buffered data, use it first
+        if (self.read_pos < self.read_end) {
+            const available = self.read_end - self.read_pos;
+            const to_copy = @min(buffer.len, available);
+            @memcpy(buffer[0..to_copy], self.read_buffer[self.read_pos .. self.read_pos + to_copy]);
+            self.read_pos += to_copy;
+            return to_copy;
+        }
+
+        // Buffer is empty, read next packet
         var len_buf: [2]u8 = undefined;
         try readFull(self.inner, &len_buf);
         const len = std.mem.readInt(u16, &len_buf, .big);
 
         if (len < 16) return error.PacketTooSmall;
         const msg_len = len - 16;
-        if (msg_len > buffer.len) return error.BufferTooSmall;
+        
+        if (len > self.read_buffer.len) return error.PacketTooLarge;
 
-        // Use a stack buffer for small packets or allocate?
-        // Noise max packet is 65535.
-        // For now, let's use a fixed buffer on stack for MVP or allocate if needed.
-        var temp: [2048]u8 = undefined;
-        if (len > temp.len) return error.PacketTooLarge;
+        try readFull(self.inner, self.read_buffer[0..len]);
 
-        try readFull(self.inner, temp[0..len]);
+        try self.recv_cipher.decryptWithAd(&[_]u8{}, self.read_buffer[0..len], self.read_buffer[0..msg_len]);
+        
+        self.read_pos = 0;
+        self.read_end = msg_len;
 
-        try self.recv_cipher.decryptWithAd(&[_]u8{}, temp[0..len], buffer[0..msg_len]);
-        return msg_len;
+        // Now copy to user buffer
+        const to_copy = @min(buffer.len, msg_len);
+        @memcpy(buffer[0..to_copy], self.read_buffer[0..to_copy]);
+        self.read_pos += to_copy;
+        
+        return to_copy;
     }
 
     fn readFull(stream_obj: network.Stream, buffer: []u8) !void {
@@ -431,4 +447,10 @@ pub const NoiseStream = struct {
         const self: *NoiseStream = @ptrCast(@alignCast(ptr));
         self.inner.close();
     }
+};
+
+const noise_stream_vtable = network.Stream.StreamVTable{
+    .read = NoiseStream.read,
+    .write = NoiseStream.write,
+    .close = NoiseStream.close,
 };

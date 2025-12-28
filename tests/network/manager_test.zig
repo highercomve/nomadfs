@@ -14,7 +14,7 @@ test "network: connection manager lifecycle (reaping)" {
     try manager.start();
 
     const pipe1 = Pipe.init(allocator);
-    defer pipe1.deinit();
+    // defer pipe1.deinit(); // Manager will reap and deinit this
     const conn1 = pipe1.connection();
 
     try manager.addConnection(conn1);
@@ -34,7 +34,7 @@ test "network: connection manager lifecycle (reaping)" {
 
     // 2. Test reaping of idle connection
     const pipe2 = Pipe.init(allocator);
-    defer pipe2.deinit();
+    // defer pipe2.deinit(); // Manager will reap and deinit this
     const conn2 = pipe2.connection();
     try manager.addConnection(conn2);
     try std.testing.expectEqual(@as(usize, 1), manager.getConnectionsCount());

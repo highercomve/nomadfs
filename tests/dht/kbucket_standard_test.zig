@@ -34,7 +34,8 @@ test "kbucket: last_updated timestamp" {
     
     try rt.addPeer(.{
         .id = peer_id,
-        .address = peer_addr,
+        .addresses = .{peer_addr} ++ .{undefined} ** (nomadfs.dht.kbucket.MAX_PEER_ADDRESSES - 1),
+        .addrs_count = 1,
         .last_seen = std.time.timestamp(),
     });
 

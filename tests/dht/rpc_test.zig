@@ -15,12 +15,14 @@ test "dht: rpc serialization and deserialization" {
 
     peers[0] = .{
         .id = id.NodeID{ .bytes = [_]u8{0x03} ** 32 },
-        .address = try std.net.Address.parseIp("1.2.3.4", 1234),
+        .addresses = .{try std.net.Address.parseIp("1.2.3.4", 1234)} ++ .{undefined} ** (kbucket.MAX_PEER_ADDRESSES - 1),
+        .addrs_count = 1,
         .last_seen = 0,
     };
     peers[1] = .{
         .id = id.NodeID{ .bytes = [_]u8{0x04} ** 32 },
-        .address = try std.net.Address.parseIp("::1", 5678),
+        .addresses = .{try std.net.Address.parseIp("::1", 5678)} ++ .{undefined} ** (kbucket.MAX_PEER_ADDRESSES - 1),
+        .addrs_count = 1,
         .last_seen = 0,
     };
 
@@ -46,9 +48,9 @@ test "dht: rpc serialization and deserialization" {
         .FIND_NODE_RESPONSE => |p| {
             try std.testing.expectEqual(@as(usize, 2), p.closer_peers.len);
             try std.testing.expect(p.closer_peers[0].id.eql(peers[0].id));
-            try std.testing.expectEqual(@as(u16, 1234), p.closer_peers[0].address.getPort());
+            try std.testing.expectEqual(@as(u16, 1234), p.closer_peers[0].addresses[0].getPort());
             try std.testing.expect(p.closer_peers[1].id.eql(peers[1].id));
-            try std.testing.expectEqual(@as(u16, 5678), p.closer_peers[1].address.getPort());
+            try std.testing.expectEqual(@as(u16, 5678), p.closer_peers[1].addresses[0].getPort());
         },
         else => unreachable,
     }

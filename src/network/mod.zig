@@ -4,6 +4,7 @@ pub const tcp = @import("tcp.zig");
 pub const noise = @import("noise.zig");
 pub const manager = @import("manager.zig");
 pub const yamux = @import("yamux.zig");
+pub const mdns = @import("mdns.zig");
 
 const id = @import("../dht/id.zig");
 
@@ -114,8 +115,11 @@ pub const Connection = struct {
         /// Get the NodeID of the remote peer (derived from handshake)
         getRemoteNodeID: *const fn (ctx: *anyopaque) id.NodeID,
 
-        /// Close the entire connection
+        /// Close the entire connection (shutdown)
         close: *const fn (ctx: *anyopaque) void,
+
+        /// Deinitialize the connection and free memory
+        deinit: *const fn (ctx: *anyopaque) void,
 
         /// Check if the connection is closed
         isClosed: *const fn (ctx: *anyopaque) bool,
@@ -175,9 +179,57 @@ pub const Connection = struct {
         v.close(p);
     }
 
+    pub fn deinit(self: Connection) void {
+        const p = self.ptr orelse return;
+        const v = self.vtable orelse return;
+        v.deinit(p);
+    }
+
     pub fn isClosed(self: Connection) bool {
         const p = self.ptr orelse return true;
         const v = self.vtable orelse return true;
         return v.isClosed(p);
     }
 };
+
+pub fn isLoopback(addr: std.net.Address) bool {
+    switch (addr.any.family) {
+        std.posix.AF.INET => {
+            return (addr.in.sa.addr & 0xFF) == 127;
+        },
+        std.posix.AF.INET6 => {
+            const loopback_bytes = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+            return std.mem.eql(u8, &addr.in6.sa.addr, &loopback_bytes);
+        },
+        else => return false,
+    }
+}
+
+pub fn isPrivate(addr: std.net.Address) bool {
+    if (isLoopback(addr)) return true;
+    switch (addr.any.family) {
+        std.posix.AF.INET => {
+            const ip = std.mem.nativeToBig(u32, addr.in.sa.addr);
+            // 10.0.0.0/8
+            if ((ip & 0xFF000000) == 0x0A000000) return true;
+            // 172.16.0.0/12
+            if ((ip & 0xFFF00000) == 0xAC100000) return true;
+            // 192.168.0.0/16
+            if ((ip & 0xFFFF0000) == 0xC0A80000) return true;
+            return false;
+        },
+        std.posix.AF.INET6 => {
+            // Unique Local Address (fc00::/7)
+            return (addr.in6.sa.addr[0] & 0xFE) == 0xFC;
+        },
+        else => return false,
+    }
+}
+
+/// Returns a priority score: 0 (Best/Loopback) -> 1 (Private LAN) -> 2 (Public WAN)
+pub fn addressPriority(addr: std.net.Address) u8 {
+    if (isLoopback(addr)) return 0;
+    if (isPrivate(addr)) return 1;
+    return 2;
+}
+

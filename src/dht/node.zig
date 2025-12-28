@@ -12,6 +12,7 @@ pub const Node = struct {
     swarm_key: []const u8,
     storage: std.AutoHashMapUnmanaged(id.NodeID, []u8),
     mutex: std.Thread.Mutex,
+    is_public: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, manager: *network.manager.ConnectionManager, swarm_key: []const u8) Node {
         return .{
@@ -21,7 +22,21 @@ pub const Node = struct {
             .swarm_key = swarm_key,
             .storage = .{},
             .mutex = .{},
+            .is_public = false,
         };
+    }
+
+    pub fn checkReachability(self: *Node, conn: network.Connection) !void {
+        const stream = try conn.openStream();
+        defer stream.close();
+
+        const msg = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .DIAL_BACK = .{ .port = self.manager.bound_port } },
+        };
+        try msg.serialize(stream.writer());
+        // We don't wait for a response on this stream. 
+        // We wait for an INCOMING connection on our listen port.
     }
 
     pub fn deinit(self: *Node) void {
@@ -53,11 +68,12 @@ pub const Node = struct {
         if (response.payload == .PONG) {
             self.mutex.lock();
             defer self.mutex.unlock();
-            try self.routing_table.addPeer(.{
+            var info = kbucket.PeerInfo{
                 .id = response.sender_id,
-                .address = conn.getPeerAddress(),
                 .last_seen = std.time.timestamp(),
-            });
+            };
+            _ = info.addAddress(conn.getPeerAddress());
+            try self.routing_table.addPeer(info);
         }
     }
 
@@ -77,8 +93,8 @@ pub const Node = struct {
                 stored_count += 1;
                 continue;
             }
-            self.sendStore(peer.address, key, value, peer.id) catch |err| {
-                std.debug.print("Failed to store at {f}: {any}\n", .{ peer.address, err });
+            self.sendStore(peer.addresses[0..peer.addrs_count], key, value, peer.id) catch |err| {
+                std.debug.print("Failed to store at {x}: {any}\n", .{ peer.id.bytes[0..4], err });
                 continue;
             };
             stored_count += 1;
@@ -120,7 +136,7 @@ pub const Node = struct {
             for (next_peers) |peer| {
                 if (peer.id.eql(self.manager.node_id)) continue;
 
-                const result_or_err = self.sendFindValue(peer.address, target, peer.id);
+                const result_or_err = self.sendFindValue(peer.addresses[0..peer.addrs_count], target, peer.id);
                 if (result_or_err) |result| {
                     switch (result) {
                         .value => |v| {
@@ -147,8 +163,8 @@ pub const Node = struct {
         return null;
     }
 
-    pub fn sendStore(self: *Node, address: std.net.Address, key: id.NodeID, value: []const u8, peer_id: ?id.NodeID) !void {
-        const conn = try self.manager.connectToPeer(address, self.swarm_key, peer_id);
+    pub fn sendStore(self: *Node, addresses: []const std.net.Address, key: id.NodeID, value: []const u8, peer_id: ?id.NodeID) !void {
+        const conn = try self.manager.connectToPeerMulti(addresses, self.swarm_key, peer_id);
 
         const stream = try conn.openStream();
         defer stream.close();
@@ -166,8 +182,8 @@ pub const Node = struct {
         closer_peers: []kbucket.PeerInfo,
     };
 
-    pub fn sendFindValue(self: *Node, address: std.net.Address, key: id.NodeID, peer_id: ?id.NodeID) !FindValueResult {
-        const conn = try self.manager.connectToPeer(address, self.swarm_key, peer_id);
+    pub fn sendFindValue(self: *Node, addresses: []const std.net.Address, key: id.NodeID, peer_id: ?id.NodeID) !FindValueResult {
+        const conn = try self.manager.connectToPeerMulti(addresses, self.swarm_key, peer_id);
 
         const stream = try conn.openStream();
         defer stream.close();
@@ -216,7 +232,7 @@ pub const Node = struct {
             for (next_peers) |peer| {
                 if (peer.id.eql(self.manager.node_id)) continue;
 
-                if (self.sendFindNode(peer.address, target, peer.id)) |closer_peers| {
+                if (self.sendFindNode(peer.addresses[0..peer.addrs_count], target, peer.id)) |closer_peers| {
                     defer self.allocator.free(closer_peers);
                     try state.reportReply(peer.id, closer_peers);
 
@@ -229,7 +245,7 @@ pub const Node = struct {
                     }
                     self.mutex.unlock();
                 } else |err| {
-                    std.debug.print("Lookup: Failed to contact {f}: {any}. Removing from table.\n", .{ peer.address, err });
+                    std.debug.print("Lookup: Failed to contact {x}: {any}. Removing from table.\n", .{ peer.id.bytes[0..4], err });
                     state.reportFailure(peer.id);
                     self.mutex.lock();
                     self.routing_table.markDisconnected(peer.id);
@@ -239,8 +255,8 @@ pub const Node = struct {
         }
     }
 
-    pub fn sendFindNode(self: *Node, address: std.net.Address, target: id.NodeID, peer_id: ?id.NodeID) ![]kbucket.PeerInfo {
-        const conn = try self.manager.connectToPeer(address, self.swarm_key, peer_id);
+    pub fn sendFindNode(self: *Node, addresses: []const std.net.Address, target: id.NodeID, peer_id: ?id.NodeID) ![]kbucket.PeerInfo {
+        const conn = try self.manager.connectToPeerMulti(addresses, self.swarm_key, peer_id);
 
         const stream = try conn.openStream();
         defer stream.close();
@@ -303,6 +319,11 @@ pub const Node = struct {
             const handler = struct {
                 fn run(n: *Node, s: network.Stream, c: network.Connection) void {
                     defer s.close();
+                    if (!n.is_public) {
+                        // Optional: we could still handle requests but not advertise ourselves.
+                        // Or just log that we are in private mode.
+                        // For NomadFS, if we are NOT public, we shouldn't really be in anyone's routing table.
+                    }
                     n.handleRequest(s, c) catch |h_err| {
                         std.debug.print("Error handling DHT request: {any}\n", .{h_err});
                     };
@@ -311,6 +332,7 @@ pub const Node = struct {
             const thread = try std.Thread.spawn(.{}, handler.run, .{ self, stream, conn });
             thread.detach();
         }
+        std.debug.print("DHT Serve loop exiting. (Public: {any})\n", .{self.is_public});
     }
 
     fn handleRequest(self: *Node, stream: network.Stream, conn: network.Connection) !void {
@@ -321,6 +343,9 @@ pub const Node = struct {
 
         switch (msg.payload) {
             .PING => |p| {
+                // If we receive an INCOMING ping, it means we are reachable!
+                self.is_public = true;
+
                 // Construct correct address from socket IP + Payload Port
                 var address = conn.getPeerAddress();
                 std.debug.print("Received PING from {x}. Address from sock: {f}, Port from payload: {d}\n", .{msg.sender_id.bytes[0..4], address, p.port});
@@ -335,11 +360,14 @@ pub const Node = struct {
                 // Add to routing table with CORRECT port
                 self.mutex.lock();
                 defer self.mutex.unlock();
-                self.routing_table.addPeer(.{
+                
+                var info = kbucket.PeerInfo{
                     .id = msg.sender_id,
-                    .address = address,
                     .last_seen = std.time.timestamp(),
-                }) catch |err| {
+                };
+                _ = info.addAddress(address);
+                
+                self.routing_table.addPeer(info) catch |err| {
                     std.debug.print("Failed to update routing table: {any}\n", .{err});
                 };
                 std.debug.print("Added peer to routing table.\n", .{});
@@ -394,6 +422,25 @@ pub const Node = struct {
             },
             .STORE => |p| {
                 try self.localStore(p.key, p.value);
+            },
+            .DIAL_BACK => |p| {
+                var address = conn.getPeerAddress();
+                if (address.any.family == std.posix.AF.INET) {
+                    address.in.sa.port = std.mem.nativeToBig(u16, p.port);
+                } else if (address.any.family == std.posix.AF.INET6) {
+                    address.in6.sa.port = std.mem.nativeToBig(u16, p.port);
+                }
+                std.debug.print("AutoNAT: Attempting dial-back to {f}\n", .{address});
+                
+                // Attempt to dial back. If it succeeds, the other peer knows they are public.
+                const dial_back_conn = self.manager.connectToPeer(address, self.swarm_key, msg.sender_id) catch |err| {
+                    std.debug.print("AutoNAT: Dial-back to {f} failed: {any}\n", .{address, err});
+                    return;
+                };
+                
+                std.debug.print("AutoNAT: Dial-back to {f} successful!\n", .{address});
+                // Send PONG over the NEW connection to confirm
+                try self.ping(dial_back_conn);
             },
             else => {
                 std.debug.print("Received unhandled DHT message type: {any}\n", .{msg.payload});

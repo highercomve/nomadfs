@@ -19,11 +19,7 @@ pub const MemoryStream = struct {
     }
 
     pub fn stream(self: *MemoryStream) network.Stream {
-        return network.Stream.init(self, &network.Stream.StreamVTable{
-            .read = read,
-            .write = write,
-            .close = close,
-        });
+        return network.Stream.init(self, &memory_stream_vtable);
     }
 
     fn read(ptr: *anyopaque, buffer: []u8) anyerror!usize {
@@ -54,6 +50,12 @@ pub const MemoryStream = struct {
     }
 };
 
+const memory_stream_vtable = network.Stream.StreamVTable{
+    .read = MemoryStream.read,
+    .write = MemoryStream.write,
+    .close = MemoryStream.close,
+};
+
 pub const Pipe = struct {
     buffer_a_to_b: std.ArrayListUnmanaged(u8) = .{},
     buffer_b_to_a: std.ArrayListUnmanaged(u8) = .{},
@@ -77,19 +79,11 @@ pub const Pipe = struct {
     }
 
     pub fn client(self: *Pipe) network.Stream {
-        return network.Stream.init(self, &network.Stream.StreamVTable{
-            .read = readClient,
-            .write = writeClient,
-            .close = close,
-        });
+        return network.Stream.init(self, &pipe_client_stream_vtable);
     }
 
     pub fn server(self: *Pipe) network.Stream {
-        return network.Stream.init(self, &network.Stream.StreamVTable{
-            .read = readServer,
-            .write = writeServer,
-            .close = close,
-        });
+        return network.Stream.init(self, &pipe_server_stream_vtable);
     }
 
     fn readClient(ptr: *anyopaque, buffer: []u8) anyerror!usize {
@@ -147,14 +141,12 @@ pub const Pipe = struct {
     }
 
     pub fn connection(self: *Pipe) network.Connection {
-        return network.Connection.init(self, &network.Connection.ConnectionVTable{
-            .openStream = openStream,
-            .acceptStream = acceptStream,
-            .getPeerAddress = getPeerAddress,
-            .getRemoteNodeID = getRemoteNodeID,
-            .close = close,
-            .isClosed = isClosed,
-        });
+        return network.Connection.init(self, &pipe_connection_vtable);
+    }
+
+    fn pipeDeinit(ctx: *anyopaque) void {
+        const self: *Pipe = @ptrCast(@alignCast(ctx));
+        self.deinit();
     }
 
     fn openStream(ctx: *anyopaque) anyerror!network.Stream {
@@ -197,4 +189,26 @@ pub const Pipe = struct {
         const self: *Pipe = @ptrCast(@alignCast(ptr));
         self.stop();
     }
+};
+
+const pipe_connection_vtable = network.Connection.ConnectionVTable{
+    .openStream = Pipe.openStream,
+    .acceptStream = Pipe.acceptStream,
+    .getPeerAddress = Pipe.getPeerAddress,
+    .getRemoteNodeID = Pipe.getRemoteNodeID,
+    .close = Pipe.close,
+    .deinit = Pipe.pipeDeinit,
+    .isClosed = Pipe.isClosed,
+};
+
+const pipe_client_stream_vtable = network.Stream.StreamVTable{
+    .read = Pipe.readClient,
+    .write = Pipe.writeClient,
+    .close = Pipe.close,
+};
+
+const pipe_server_stream_vtable = network.Stream.StreamVTable{
+    .read = Pipe.readServer,
+    .write = Pipe.writeServer,
+    .close = Pipe.close,
 };

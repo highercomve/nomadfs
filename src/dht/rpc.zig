@@ -10,6 +10,7 @@ pub const MessageType = enum(u8) {
     FIND_VALUE = 4,
     FIND_VALUE_RESPONSE = 5,
     STORE = 6,
+    DIAL_BACK = 7,
 };
 
 pub const FindValueResult = union(enum) {
@@ -25,6 +26,7 @@ pub const MessagePayload = union(MessageType) {
     FIND_VALUE: struct { key: id.NodeID },
     FIND_VALUE_RESPONSE: FindValueResult,
     STORE: struct { key: id.NodeID, value: []const u8 },
+    DIAL_BACK: struct { port: u16 },
 };
 
 pub const Message = struct {
@@ -52,7 +54,10 @@ pub const Message = struct {
                 try writer.writeByte(@intCast(p.closer_peers.len));
                 for (p.closer_peers) |peer| {
                     try writer.writeAll(&peer.id.bytes);
-                    try serializeAddress(peer.address, writer);
+                    try writer.writeByte(peer.addrs_count);
+                    for (0..peer.addrs_count) |i| {
+                        try serializeAddress(peer.addresses[i], writer);
+                    }
                 }
             },
             .FIND_VALUE => |p| {
@@ -71,7 +76,10 @@ pub const Message = struct {
                         try writer.writeByte(@intCast(peers.len));
                         for (peers) |peer| {
                             try writer.writeAll(&peer.id.bytes);
-                            try serializeAddress(peer.address, writer);
+                            try writer.writeByte(peer.addrs_count);
+                            for (0..peer.addrs_count) |i| {
+                                try serializeAddress(peer.addresses[i], writer);
+                            }
                         }
                     },
                 }
@@ -80,6 +88,9 @@ pub const Message = struct {
                 try writer.writeAll(&p.key.bytes);
                 try writer.writeInt(u32, @intCast(p.value.len), .big);
                 try writer.writeAll(p.value);
+            },
+            .DIAL_BACK => |p| {
+                try writer.writeInt(u16, p.port, .big);
             },
         }
     }
@@ -112,12 +123,22 @@ pub const Message = struct {
                 for (0..count) |i| {
                     var peer_id: id.NodeID = undefined;
                     try reader.readNoEof(&peer_id.bytes);
-                    const address = try deserializeAddress(reader);
-                    peers[i] = .{
+                    
+                    var peer_info = kbucket.PeerInfo{
                         .id = peer_id,
-                        .address = address,
                         .last_seen = std.time.timestamp(),
                     };
+                    
+                    const addrs_count = try reader.readByte();
+                    // Sanity check
+                    if (addrs_count > kbucket.MAX_PEER_ADDRESSES) return error.TooManyAddresses;
+                    
+                    for (0..addrs_count) |_| {
+                        const addr = try deserializeAddress(reader);
+                        _ = peer_info.addAddress(addr);
+                    }
+                    
+                    peers[i] = peer_info;
                 }
                 break :blk MessagePayload{ .FIND_NODE_RESPONSE = .{ .closer_peers = peers } };
             },
@@ -148,12 +169,21 @@ pub const Message = struct {
                     for (0..count) |i| {
                         var peer_id: id.NodeID = undefined;
                         try reader.readNoEof(&peer_id.bytes);
-                        const address = try deserializeAddress(reader);
-                        peers[i] = .{
+                        
+                        var peer_info = kbucket.PeerInfo{
                             .id = peer_id,
-                            .address = address,
                             .last_seen = std.time.timestamp(),
                         };
+                        
+                        const addrs_count = try reader.readByte();
+                        if (addrs_count > kbucket.MAX_PEER_ADDRESSES) return error.TooManyAddresses;
+                        
+                        for (0..addrs_count) |_| {
+                            const addr = try deserializeAddress(reader);
+                            _ = peer_info.addAddress(addr);
+                        }
+                        
+                        peers[i] = peer_info;
                     }
                     break :blk MessagePayload{ .FIND_VALUE_RESPONSE = .{ .closer_peers = peers } };
                 }
@@ -170,6 +200,10 @@ pub const Message = struct {
                 try reader.readNoEof(val);
 
                 break :blk MessagePayload{ .STORE = .{ .key = key, .value = val } };
+            },
+            .DIAL_BACK => blk: {
+                const port = try reader.readInt(u16, .big);
+                break :blk MessagePayload{ .DIAL_BACK = .{ .port = port } };
             },
         };
 

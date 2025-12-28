@@ -90,6 +90,7 @@ pub const Session = struct {
     accept_queue: std.ArrayListUnmanaged(*YamuxStream),
     mutex: std.Thread.Mutex = .{},
     accept_cond: std.Thread.Condition = .{},
+    accept_waiters: usize = 0,
     is_server: bool,
     closed: bool = false,
 
@@ -101,6 +102,7 @@ pub const Session = struct {
             .transport = transport,
             .streams = .{},
             .accept_queue = .{},
+            .accept_waiters = 0,
             .is_server = is_server,
             .closed = false,
         };
@@ -108,6 +110,16 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        // Wait for all acceptStream waiters to exit
+        self.mutex.lock();
+        while (self.accept_waiters > 0) {
+            self.accept_cond.broadcast();
+            self.mutex.unlock();
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+            self.mutex.lock();
+        }
+        self.mutex.unlock();
+
         var it = self.streams.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit(self.allocator);
@@ -149,6 +161,9 @@ pub const Session = struct {
     pub fn acceptStream(self: *Session) !*YamuxStream {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        self.accept_waiters += 1;
+        defer self.accept_waiters -= 1;
 
         while (self.accept_queue.items.len == 0) {
             if (self.closed) return error.SessionClosed;

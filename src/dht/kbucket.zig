@@ -1,13 +1,65 @@
 const std = @import("std");
 const NodeID = @import("id.zig").NodeID;
+const network = @import("../network/mod.zig");
 
 pub const K = 20;
+pub const MAX_PEER_ADDRESSES = 8;
 
 pub const PeerInfo = struct {
     id: NodeID,
-    address: std.net.Address,
+    addresses: [MAX_PEER_ADDRESSES]std.net.Address = undefined,
+    addrs_count: u8 = 0,
     last_seen: i64,
+
+    pub fn addAddress(self: *PeerInfo, addr: std.net.Address) bool {
+        // Check for duplicates
+        for (0..self.addrs_count) |i| {
+            if (addressesMatch(self.addresses[i], addr)) return false;
+        }
+        if (self.addrs_count < MAX_PEER_ADDRESSES) {
+            self.addresses[self.addrs_count] = addr;
+            self.addrs_count += 1;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn mergeAddresses(self: *PeerInfo, other: PeerInfo) void {
+        for (0..other.addrs_count) |i| {
+            _ = self.addAddress(other.addresses[i]);
+        }
+    }
+
+    pub fn getBestAddress(self: PeerInfo) std.net.Address {
+        if (self.addrs_count == 0) return std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+
+        var best_addr = self.addresses[0];
+        var best_prio = network.addressPriority(best_addr);
+
+        for (1..self.addrs_count) |i| {
+            const addr = self.addresses[i];
+            const prio = network.addressPriority(addr);
+            if (prio < best_prio) {
+                best_addr = addr;
+                best_prio = prio;
+            }
+        }
+        return best_addr;
+    }
 };
+
+fn addressesMatch(a: std.net.Address, b: std.net.Address) bool {
+    if (a.any.family != b.any.family) return false;
+    switch (a.any.family) {
+        std.posix.AF.INET => {
+            return a.in.sa.port == b.in.sa.port and a.in.sa.addr == b.in.sa.addr;
+        },
+        std.posix.AF.INET6 => {
+            return a.in6.sa.port == b.in6.sa.port and std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr);
+        },
+        else => return false,
+    }
+}
 
 const Bucket = struct {
     peers: std.ArrayListUnmanaged(PeerInfo),
@@ -37,7 +89,7 @@ const Bucket = struct {
             if (p.id.eql(peer.id)) {
                 // Move to tail (most recently seen)
                 p.last_seen = peer.last_seen;
-                p.address = peer.address;
+                p.mergeAddresses(peer);
 
                 const removed = self.peers.orderedRemove(i);
                 try self.peers.append(self.allocator, removed);
@@ -49,7 +101,7 @@ const Bucket = struct {
         for (self.replacements.items, 0..) |*p, i| {
             if (p.id.eql(peer.id)) {
                 p.last_seen = peer.last_seen;
-                p.address = peer.address;
+                p.mergeAddresses(peer);
                 const removed = self.replacements.orderedRemove(i);
                 try self.replacements.append(self.allocator, removed);
                 return false;
@@ -188,7 +240,10 @@ pub const RoutingTable = struct {
             if (b.peers.items.len > 0) {
                 std.debug.print("Bucket {d}: {d} peers (+{d} replacements)\n", .{ i, b.peers.items.len, b.replacements.items.len });
                 for (b.peers.items) |p| {
-                    std.debug.print("  - Peer: {x} at {f}\n", .{ p.id.bytes, p.address });
+                    std.debug.print("  - Peer: {x}\n", .{p.id.bytes});
+                    for (0..p.addrs_count) |addr_idx| {
+                        std.debug.print("    -> {f}\n", .{p.addresses[addr_idx]});
+                    }
                 }
                 total_peers += b.peers.items.len;
             }

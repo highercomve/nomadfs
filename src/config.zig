@@ -21,6 +21,8 @@ pub const Config = struct {
         port: u16,
         bootstrap_peers: [][]const u8,
         transport: TransportType,
+        upnp_enabled: bool = true,
+        enable_mdns: bool = true,
     };
 
     pub const TransportType = enum {
@@ -72,7 +74,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
         .network = .{ .port = 9000, .bootstrap_peers = undefined, .transport = .tcp },
     };
 
-    var bootstrap_list = std.ArrayListUnmanaged([]const u8){};
+    var bootstrap_list = std.ArrayList([]const u8){};
     errdefer {
         for (bootstrap_list.items) |item| allocator.free(item);
         bootstrap_list.deinit(allocator);
@@ -112,6 +114,10 @@ pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
             config.storage.storage_path = try allocator.dupe(u8, val);
         } else if (std.mem.eql(u8, key, "port")) {
             config.network.port = try std.fmt.parseInt(u16, val, 10);
+        } else if (std.mem.eql(u8, key, "upnp_enabled")) {
+            config.network.upnp_enabled = std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, key, "enable_mdns")) {
+            config.network.enable_mdns = std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, key, "transport")) {
             if (std.mem.eql(u8, val, "quic")) {
                 config.network.transport = .quic;

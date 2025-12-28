@@ -64,7 +64,7 @@ pub fn main() !void {
     var running = std.atomic.Value(bool).init(true);
 
     // Start the node's network listener
-    try node.start(config.network.port, config.node.swarm_key, &running);
+    try node.start(config.network.port, config.node.swarm_key, &running, config.network.enable_mdns, config.network.upnp_enabled);
 
     // Give listener a moment to start
     std.Thread.sleep(100 * std.time.ns_per_ms);
