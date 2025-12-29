@@ -18,21 +18,21 @@ pub const DagNode = struct {
         // [data_len: u32]
         // [data]
         // This is a placeholder. Real implementation might use Protobuf or IPLD (CBOR).
-        
-        var list = std.ArrayList(u8).init(allocator);
-        
+
+        var list = std.ArrayList(u8){};
+
         // Write num_links
-        try list.writer().writeInt(u32, @intCast(self.links.len), .little);
+        try list.writer(allocator).writeInt(u32, @intCast(self.links.len), .little);
 
         for (self.links) |link| {
-            try list.writer().writeInt(u32, @intCast(link.name.len), .little);
-            try list.writer().writeAll(link.name);
-            try list.writer().writeAll(&link.cid);
-            try list.writer().writeInt(u64, link.size, .little);
+            try list.writer(allocator).writeInt(u32, @intCast(link.name.len), .little);
+            try list.writer(allocator).writeAll(link.name);
+            try list.writer(allocator).writeAll(&link.cid);
+            try list.writer(allocator).writeInt(u64, link.size, .little);
         }
 
-        try list.writer().writeInt(u32, @intCast(self.data.len), .little);
-        try list.writer().writeAll(self.data);
+        try list.writer(allocator).writeInt(u32, @intCast(self.data.len), .little);
+        try list.writer(allocator).writeAll(self.data);
 
         return list.toOwnedSlice();
     }
@@ -48,12 +48,12 @@ pub const DagNode = struct {
             const name_len = try reader.readInt(u32, .little);
             const name = try allocator.alloc(u8, name_len);
             try reader.readNoEof(name);
-            
+
             var cid: [32]u8 = undefined;
             try reader.readNoEof(&cid);
-            
+
             const size = try reader.readInt(u64, .little);
-            
+
             links[i] = Link{ .name = name, .cid = cid, .size = size };
         }
 
@@ -66,7 +66,7 @@ pub const DagNode = struct {
             .links = links,
         };
     }
-    
+
     pub fn deinit(self: *DagNode, allocator: std.mem.Allocator) void {
         allocator.free(self.data);
         for (self.links) |link| {

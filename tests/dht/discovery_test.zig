@@ -10,14 +10,14 @@ test "dht: X-node discovery" {
     var peers = try allocator.alloc(*TestPeer, NUM_NODES);
     defer allocator.free(peers);
 
-    var dht_nodes = try allocator.alloc(nomadfs.dht.Node, NUM_NODES);
+    var dht_nodes = try allocator.alloc(nomadfs.net.discovery.Node, NUM_NODES);
     defer allocator.free(dht_nodes);
 
     // 1. Initialize all peers and DHT nodes
     for (0..NUM_NODES) |i| {
         peers[i] = try TestPeer.init(allocator, @as(u16, 11000 + @as(u16, @intCast(i))));
-        dht_nodes[i] = nomadfs.dht.Node.init(allocator, &peers[i].manager, peers[i].config.node.swarm_key);
-        peers[i].manager.setConnectionHandler(&dht_nodes[i], nomadfs.dht.Node.serve);
+        dht_nodes[i] = nomadfs.net.discovery.Node.init(allocator, &peers[i].manager, peers[i].config.node.swarm_key);
+        peers[i].manager.setConnectionHandler(&dht_nodes[i], nomadfs.net.discovery.Node.serve);
         try peers[i].start();
         std.debug.print("Node {d} ID: {x}\n", .{ i, peers[i].manager.node_id.bytes });
     }
@@ -37,7 +37,7 @@ test "dht: X-node discovery" {
     for (1..NUM_NODES) |i| {
         try dht_nodes[0].routing_table.addPeer(.{
             .id = peers[i].manager.node_id,
-            .addresses = .{peers[i].listen_addr} ++ .{undefined} ** (nomadfs.dht.kbucket.MAX_PEER_ADDRESSES - 1),
+            .addresses = .{peers[i].listen_addr} ++ .{undefined} ** (nomadfs.net.discovery.kbucket.MAX_PEER_ADDRESSES - 1),
             .addrs_count = 1,
             .last_seen = std.time.timestamp(),
         });
@@ -49,7 +49,7 @@ test "dht: X-node discovery" {
     // 3. Last node knows Node 0
     try dht_nodes[last_node_idx].routing_table.addPeer(.{
         .id = peers[0].manager.node_id,
-        .addresses = .{peers[0].listen_addr} ++ .{undefined} ** (nomadfs.dht.kbucket.MAX_PEER_ADDRESSES - 1),
+        .addresses = .{peers[0].listen_addr} ++ .{undefined} ** (nomadfs.net.discovery.kbucket.MAX_PEER_ADDRESSES - 1),
         .addrs_count = 1,
         .last_seen = std.time.timestamp(),
     });

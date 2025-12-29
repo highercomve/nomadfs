@@ -1,6 +1,6 @@
 const std = @import("std");
-const NodeID = @import("id.zig").NodeID;
-const network = @import("../network/mod.zig");
+const NodeID = @import("../id.zig").NodeID;
+const network = @import("../transport/mod.zig");
 
 pub const K = 20;
 pub const MAX_PEER_ADDRESSES = 8;

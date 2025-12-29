@@ -8,14 +8,14 @@ test "yamux: flow control (window management)" {
     const pipe = Pipe.init(allocator);
     defer pipe.deinit();
 
-    const client_session = try nomadfs.network.yamux.Session.init(allocator, pipe.client(), false);
-    const server_session = try nomadfs.network.yamux.Session.init(allocator, pipe.server(), true);
+    const client_session = try nomadfs.net.transport.yamux.Session.init(allocator, pipe.client(), false);
+    const server_session = try nomadfs.net.transport.yamux.Session.init(allocator, pipe.server(), true);
 
     defer client_session.deinit();
     defer server_session.deinit();
 
-    const client_thread = try std.Thread.spawn(.{}, nomadfs.network.yamux.Session.run, .{client_session});
-    const server_thread = try std.Thread.spawn(.{}, nomadfs.network.yamux.Session.run, .{server_session});
+    const client_thread = try std.Thread.spawn(.{}, nomadfs.net.transport.yamux.Session.run, .{client_session});
+    const server_thread = try std.Thread.spawn(.{}, nomadfs.net.transport.yamux.Session.run, .{server_session});
 
     defer {
         pipe.stop();
@@ -40,7 +40,7 @@ test "yamux: flow control (window management)" {
             std.Thread.sleep(100 * std.time.ns_per_ms);
             var buf: [1024]u8 = undefined;
             while (true) {
-                const n = nomadfs.network.yamux.Session.streamRead(stream, &buf) catch break;
+                const n = nomadfs.net.transport.yamux.Session.streamRead(stream, &buf) catch break;
                 if (n == 0) break;
                 std.Thread.sleep(1 * std.time.ns_per_ms); // Slow read
             }
@@ -52,14 +52,14 @@ test "yamux: flow control (window management)" {
     var total_written: usize = 0;
     while (total_written < large_data.len) {
         const chunk_size = @min(large_data.len - total_written, @as(usize, 16384));
-        const n = try nomadfs.network.yamux.Session.streamWrite(client_stream, large_data[total_written..][0..chunk_size]);
+        const n = try nomadfs.net.transport.yamux.Session.streamWrite(client_stream, large_data[total_written..][0..chunk_size]);
         total_written += n;
     }
 
     try std.testing.expectEqual(large_data.len, total_written);
 
     // Close client stream to signal EOF to server
-    nomadfs.network.yamux.Session.streamClose(client_stream);
+    nomadfs.net.transport.yamux.Session.streamClose(client_stream);
 
     reader_thread.join();
 }

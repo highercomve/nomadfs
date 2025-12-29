@@ -6,7 +6,7 @@ pub const manager = @import("manager.zig");
 pub const yamux = @import("yamux.zig");
 pub const mdns = @import("mdns.zig");
 
-const id = @import("../dht/id.zig");
+const id = @import("../id.zig");
 
 /// The generic Stream interface.
 /// Represents a bidirectional binary channel (e.g., a Yamux stream or a QUIC stream).

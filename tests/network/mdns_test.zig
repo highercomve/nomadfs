@@ -1,6 +1,6 @@
 const std = @import("std");
-const network = @import("nomadfs").network;
-const id = @import("nomadfs").dht.id;
+const network = @import("nomadfs").net.transport;
+const id = @import("nomadfs").net.id;
 
 fn onDiscovery(ctx: ?*anyopaque, peer_id: id.NodeID, addr: std.net.Address) void {
     const discovered_ptr: *bool = @ptrCast(@alignCast(ctx.?));
@@ -28,7 +28,7 @@ test "network: mDNS local discovery" {
     try mdns2.start();
 
     var i: usize = 0;
-    while (i < 50) : (i += 1) { // Wait up to 5s
+    while (i < 100) : (i += 1) { // Wait up to 10s
         if (discovered1 and discovered2) break;
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }

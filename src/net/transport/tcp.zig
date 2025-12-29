@@ -3,7 +3,7 @@ const network = @import("mod.zig");
 const noise = @import("noise.zig");
 const YamuxSession = @import("yamux.zig").Session;
 
-const id = @import("../dht/id.zig");
+const id = @import("../id.zig");
 
 /// Concrete implementation for TCP/Noise/Yamux
 const TcpConnectionImpl = struct {
@@ -123,16 +123,24 @@ const tcp_stream_vtable = network.Stream.StreamVTable{
     .close = TcpStream.close,
 };
 
-pub fn listen(allocator: std.mem.Allocator, port: u16, swarm_key: []const u8, static_key: noise.KeyPair, running: ?*std.atomic.Value(bool), manager: ?*network.manager.ConnectionManager) !void {
-    const address = try std.net.Address.parseIp("0.0.0.0", port);
+pub const ListenConfig = struct {
+    port: u16,
+    swarm_key: []const u8,
+    static_key: noise.KeyPair,
+    running: ?*std.atomic.Value(bool) = null,
+    manager: ?*network.manager.ConnectionManager = null,
+};
+
+pub fn listen(allocator: std.mem.Allocator, cfg: ListenConfig) !void {
+    const address = try std.net.Address.parseIp("0.0.0.0", cfg.port);
     var server = try address.listen(.{ .reuse_address = true });
     defer server.deinit();
 
     std.debug.print("Listening for TCP connections on {f}...\n", .{address});
 
-    while (running == null or running.?.load(.acquire)) {
+    while (cfg.running == null or cfg.running.?.load(.acquire)) {
         const conn = server.accept() catch |err| {
-            if (running != null and !running.?.load(.acquire)) break;
+            if (cfg.running != null and !cfg.running.?.load(.acquire)) break;
             return err;
         };
         std.debug.print("Accepted connection from {f}\n", .{conn.address});
@@ -146,7 +154,7 @@ pub fn listen(allocator: std.mem.Allocator, port: u16, swarm_key: []const u8, st
         impl.peer_address = conn.address;
 
         // Perform Noise Handshake (Responder)
-        impl.noise_stream = noise.NoiseStream.handshake(impl.tcp_stream.stream(), swarm_key, static_key, false) catch |err| {
+        impl.noise_stream = noise.NoiseStream.handshake(impl.tcp_stream.stream(), cfg.swarm_key, cfg.static_key, false) catch |err| {
             std.debug.print("Handshake failed: {}\n", .{err});
             conn.stream.close();
             allocator.destroy(impl);
@@ -161,7 +169,7 @@ pub fn listen(allocator: std.mem.Allocator, port: u16, swarm_key: []const u8, st
         impl.closed = false;
 
         const conn_obj = impl.connection();
-        if (manager) |m| {
+        if (cfg.manager) |m| {
             try m.addConnection(conn_obj);
         } else {
             conn_obj.deinit();

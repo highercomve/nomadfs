@@ -1,6 +1,6 @@
 const std = @import("std");
 const network = @import("mod.zig");
-const id = @import("../dht/id.zig");
+const id = @import("../id.zig");
 
 pub const MDNS_MULTICAST_ADDR = "239.255.255.250";
 pub const MDNS_PORT = 5353; // Standard mDNS port, though NomadFS might use a custom one if needed. 

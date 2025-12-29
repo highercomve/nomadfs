@@ -1,7 +1,7 @@
 const std = @import("std");
 const nomadfs = @import("nomadfs");
-const NodeID = nomadfs.dht.id.NodeID;
-const RoutingTable = nomadfs.dht.kbucket.RoutingTable;
+const NodeID = nomadfs.net.id.NodeID;
+const RoutingTable = nomadfs.net.discovery.kbucket.RoutingTable;
 
 test "kbucket: randomIdInBucket correctness" {
     const local_id = NodeID.generate();
@@ -34,7 +34,7 @@ test "kbucket: last_updated timestamp" {
     
     try rt.addPeer(.{
         .id = peer_id,
-        .addresses = .{peer_addr} ++ .{undefined} ** (nomadfs.dht.kbucket.MAX_PEER_ADDRESSES - 1),
+        .addresses = .{peer_addr} ++ .{undefined} ** (nomadfs.net.discovery.kbucket.MAX_PEER_ADDRESSES - 1),
         .addrs_count = 1,
         .last_seen = std.time.timestamp(),
     });
@@ -51,14 +51,14 @@ test "node: refreshBuckets logic" {
     const allocator = std.testing.allocator;
     
     // We need a dummy ConnectionManager to init Node
-    var manager = nomadfs.network.manager.ConnectionManager.initExplicit(
+    var manager = nomadfs.net.transport.manager.ConnectionManager.initExplicit(
         allocator, 
         .tcp, 
-        nomadfs.network.noise.KeyPair.generate()
+        nomadfs.net.transport.noise.KeyPair.generate()
     );
     defer manager.deinit();
 
-    var node = nomadfs.dht.Node.init(allocator, &manager, "test_swarm_key");
+    var node = nomadfs.net.discovery.Node.init(allocator, &manager, "test_swarm_key");
     defer node.deinit();
 
     const now = std.time.timestamp();

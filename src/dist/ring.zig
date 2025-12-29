@@ -1,5 +1,5 @@
 const std = @import("std");
-const NodeID = @import("../dht/id.zig").NodeID;
+const NodeID = @import("../net/id.zig").NodeID;
 
 const Token = struct {
     hash: u64, // Virtual node position on the ring

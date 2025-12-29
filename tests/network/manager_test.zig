@@ -5,7 +5,7 @@ const Pipe = @import("memory_stream.zig").Pipe;
 test "network: connection manager lifecycle (reaping)" {
     const allocator = std.testing.allocator;
 
-    var manager = nomadfs.network.manager.ConnectionManager.initExplicit(allocator, .tcp, nomadfs.network.noise.KeyPair.generate());
+    var manager = nomadfs.net.transport.manager.ConnectionManager.initExplicit(allocator, .tcp, nomadfs.net.transport.noise.KeyPair.generate());
     defer manager.deinit();
 
     manager.reap_interval_ms = 100;

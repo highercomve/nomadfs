@@ -1,5 +1,5 @@
 const std = @import("std");
-const network = @import("nomadfs").network;
+const network = @import("nomadfs").net.transport;
 
 pub const MemoryStream = struct {
     buffer: std.ArrayListUnmanaged(u8),
@@ -164,7 +164,7 @@ pub const Pipe = struct {
         return std.net.Address.parseIp("127.0.0.1", 0) catch unreachable;
     }
 
-    fn getRemoteNodeID(ctx: *anyopaque) @import("nomadfs").dht.id.NodeID {
+    fn getRemoteNodeID(ctx: *anyopaque) @import("nomadfs").net.id.NodeID {
         _ = ctx;
         var bytes: [32]u8 = undefined;
         @memset(&bytes, 0);

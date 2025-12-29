@@ -50,4 +50,4 @@ Because of consistent hashing, only the data that is *actually* moving to the ne
 ---
 
 **Next Chapters:**
-*   [Chapter 4.3: Quorum Logic & Availability](../sync/quorum.md)
+*   [Chapter 4.3: Quorum Logic & Availability](./quorum.md)

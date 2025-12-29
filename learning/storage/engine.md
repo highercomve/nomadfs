@@ -48,4 +48,4 @@ On mobile devices or other client-only nodes, the `StorageEngine` may be disable
 ---
 
 **Next Chapters:**
-*   [Chapter 4: The Sync Layer](../sync/overview.md)
+*   [Chapter 4: The Sync Layer](../dist/overview.md)

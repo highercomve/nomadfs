@@ -1,8 +1,8 @@
 const std = @import("std");
-const id = @import("id.zig");
+const id = @import("../id.zig");
 const kbucket = @import("kbucket.zig");
 const rpc = @import("rpc.zig");
-const network = @import("../network/mod.zig");
+const network = @import("../transport/mod.zig");
 
 pub const Alpha = 3;
 

@@ -1,8 +1,8 @@
 const std = @import("std");
-const id = @import("id.zig");
+const id = @import("../id.zig");
 const kbucket = @import("kbucket.zig");
 const rpc = @import("rpc.zig");
-const network = @import("../network/mod.zig");
+const network = @import("../transport/mod.zig");
 const lookup_mod = @import("lookup.zig");
 
 pub const Node = struct {
@@ -23,6 +23,21 @@ pub const Node = struct {
             .storage = .{},
             .mutex = .{},
             .is_public = false,
+        };
+    }
+
+    pub fn onDiscovery(self: *Node, peer_id: id.NodeID, addr: std.net.Address) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var info = kbucket.PeerInfo{
+            .id = peer_id,
+            .last_seen = std.time.timestamp(),
+        };
+        _ = info.addAddress(addr);
+
+        self.routing_table.addPeer(info) catch |err| {
+            std.debug.print("Failed to add discovered peer to routing table: {any}\n", .{err});
         };
     }
 

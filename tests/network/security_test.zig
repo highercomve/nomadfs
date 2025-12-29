@@ -1,6 +1,6 @@
 const std = @import("std");
 const nomadfs = @import("nomadfs");
-const noise = nomadfs.network.noise;
+const noise = nomadfs.net.transport.noise;
 const TestPeer = @import("test_helpers").TestPeer;
 const MemoryStream = @import("memory_stream.zig").MemoryStream;
 const Pipe = @import("memory_stream.zig").Pipe;

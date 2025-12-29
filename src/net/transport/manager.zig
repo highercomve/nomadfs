@@ -1,16 +1,23 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const network = @import("mod.zig");
-const config = @import("../config.zig");
+const config = @import("../../config.zig");
 const tcp = @import("tcp.zig");
 const noise = @import("noise.zig");
 const nat = @import("nat.zig");
-const id = @import("../dht/id.zig");
+const id = @import("../id.zig");
 
 pub const ConnectionManager = struct {
     const ManagedConnection = struct {
         conn: network.Connection,
         last_active: i64,
+    };
+
+    pub const ListenConfig = struct {
+        port: u16,
+        swarm_key: []const u8,
+        enable_mdns: bool = true,
+        upnp_enabled: bool = true,
     };
 
     allocator: std.mem.Allocator,
@@ -22,6 +29,8 @@ pub const ConnectionManager = struct {
     mutex: std.Thread.Mutex = .{},
     on_connection_ctx: ?*anyopaque = null,
     on_connection_fn: ?*const fn (ctx: *anyopaque, conn: network.Connection) anyerror!void = null,
+    on_discovery_ctx: ?*anyopaque = null,
+    on_discovery_fn: ?*const fn (ctx: *anyopaque, peer_id: id.NodeID, addr: std.net.Address) void = null,
     reaper_thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     idle_timeout: i64 = 60 * 5,
@@ -216,37 +225,38 @@ pub const ConnectionManager = struct {
         self.on_connection_fn = Wrapper.wrap;
     }
 
+    pub fn setDiscoveryHandler(self: *ConnectionManager, ctx: anytype, comptime handler: fn (@TypeOf(ctx), id.NodeID, std.net.Address) void) void {
+        const ContextType = @TypeOf(ctx);
+        const Wrapper = struct {
+            fn wrap(c: *anyopaque, peer_id: id.NodeID, addr: std.net.Address) void {
+                const typed_ctx: ContextType = @ptrCast(@alignCast(c));
+                handler(typed_ctx, peer_id, addr);
+            }
+        };
+        self.on_discovery_ctx = ctx;
+        self.on_discovery_fn = Wrapper.wrap;
+    }
+
     fn onMdnsDiscovery(ctx: ?*anyopaque, peer_id: id.NodeID, addr: std.net.Address) void {
-        // TODO: This should probably be handled by the DHT Node or routing table logic.
-        // For now, ConnectionManager just logs it or maybe preemptively connects?
-        // Actually, ConnectionManager shouldn't automatically connect to everyone.
-        // It should notify an observer. 
-        // But for now, let's just log it. 
-        // Ideally, we'd add it to the DHT routing table.
-        // But ConnectionManager doesn't know about RoutingTable directly (it's in dht/kbucket.zig).
-        // The DHT Node holds the Manager.
-        
-        // Strategy: We need a callback here too?
-        // Or we expose an event queue.
         std.debug.print("mDNS: Discovered peer {x} at {f}\n", .{peer_id.bytes[0..4], addr});
         
-        // For Phase 2 MVP: Just logging is fine.
-        // In Phase 2+ or integration, we should call a callback that the Node registers.
         if (ctx) |c| {
             const self: *ConnectionManager = @ptrCast(@alignCast(c));
-            _ = self;
+            if (self.on_discovery_fn) |cb| {
+                cb(self.on_discovery_ctx.?, peer_id, addr);
+            }
         }
     }
 
-    pub fn listen(self: *ConnectionManager, port: u16, swarm_key: []const u8, running: ?*std.atomic.Value(bool), enable_mdns: bool, upnp_enabled: bool) !void {
-        self.bound_port = port;
+    pub fn listen(self: *ConnectionManager, cfg: ListenConfig, running: ?*std.atomic.Value(bool)) !void {
+        self.bound_port = cfg.port;
         
         // Initialize mDNS
-        if (enable_mdns) {
+        if (cfg.enable_mdns) {
             self.mdns = network.mdns.MDNS.init(
                 self.allocator, 
                 self.node_id, 
-                port, 
+                cfg.port, 
                 onMdnsDiscovery, 
                 self
             );
@@ -254,7 +264,7 @@ pub const ConnectionManager = struct {
         }
 
         // Attempt UPnP in background
-        if (upnp_enabled) {
+        if (cfg.upnp_enabled) {
             const thread = try std.Thread.spawn(.{}, struct {
                 fn run(cm: *ConnectionManager, p: u16) void {
                     cm.upnp.discoverGateway() catch |err| {
@@ -273,13 +283,19 @@ pub const ConnectionManager = struct {
                         return;
                     };
                 }
-            }.run, .{self, port});
+            }.run, .{self, cfg.port});
             thread.detach();
         }
 
         switch (self.transport_type) {
             .tcp => {
-                try tcp.listen(self.allocator, port, swarm_key, self.identity_key, running, self);
+                try tcp.listen(self.allocator, .{
+                    .port = cfg.port,
+                    .swarm_key = cfg.swarm_key,
+                    .static_key = self.identity_key,
+                    .running = running,
+                    .manager = self,
+                });
             },
             .quic => {
                 return error.QuicNotImplemented;

@@ -1,7 +1,7 @@
 const std = @import("std");
 const nomadfs = @import("nomadfs");
 const TestPeer = @import("test_helpers").TestPeer;
-const id = nomadfs.dht.id;
+const id = nomadfs.net.id;
 
 test "dht: store and find_value" {
     std.debug.print("\n=== Running Test: dht: store and find_value ===\n", .{});
@@ -15,15 +15,15 @@ test "dht: store and find_value" {
     defer peer2.deinit();
 
     // 2. Initialize DHT Nodes
-    var dht1 = nomadfs.dht.Node.init(allocator, &peer1.manager, peer1.config.node.swarm_key);
+    var dht1 = nomadfs.net.discovery.Node.init(allocator, &peer1.manager, peer1.config.node.swarm_key);
     defer dht1.deinit();
 
-    var dht2 = nomadfs.dht.Node.init(allocator, &peer2.manager, peer2.config.node.swarm_key);
+    var dht2 = nomadfs.net.discovery.Node.init(allocator, &peer2.manager, peer2.config.node.swarm_key);
     defer dht2.deinit();
 
     // 3. Register DHT serve loop
-    peer1.manager.setConnectionHandler(&dht1, nomadfs.dht.Node.serve);
-    peer2.manager.setConnectionHandler(&dht2, nomadfs.dht.Node.serve);
+    peer1.manager.setConnectionHandler(&dht1, nomadfs.net.discovery.Node.serve);
+    peer2.manager.setConnectionHandler(&dht2, nomadfs.net.discovery.Node.serve);
 
     try peer1.start();
     try peer2.start(); // Start peer2 as well to accept connections if needed (though peer2 is client here)

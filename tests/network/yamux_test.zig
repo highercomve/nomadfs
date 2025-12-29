@@ -1,5 +1,5 @@
 const std = @import("std");
-const network = @import("nomadfs").network;
+const network = @import("nomadfs").net.transport;
 const yamux = network.yamux;
 const Pipe = @import("memory_stream.zig").Pipe;
 

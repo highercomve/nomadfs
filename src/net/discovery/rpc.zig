@@ -1,5 +1,5 @@
 const std = @import("std");
-const id = @import("id.zig");
+const id = @import("../id.zig");
 const kbucket = @import("kbucket.zig");
 
 pub const MessageType = enum(u8) {

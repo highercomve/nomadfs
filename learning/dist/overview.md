@@ -7,7 +7,7 @@ Distribution is easy when you are online, but NomadFS is built for "Roaming Devi
 NomadFS uses **Consistent Hashing** to decide which nodes store which data.
 *   Nodes and Data Blocks are mapped onto a 256-bit circular "Ring."
 *   A block is stored on the $N$ nodes (default $N=3$) that appear clockwise from the block's CID on the ring.
-*   See [Chapter 5.1: Consistent Hashing & The Ring](../dist/ring.md) for details.
+*   See [Chapter 5.1: Consistent Hashing & The Ring](./ring.md) for details.
 
 ## 2. Eventual Consistency ($W=1$)
 

@@ -2,3 +2,5 @@
 zig-out
 /dist
 build
+0.15.2
+.config

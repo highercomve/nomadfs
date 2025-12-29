@@ -1,8 +1,8 @@
 const std = @import("std");
 const nomadfs = @import("nomadfs");
-const id = nomadfs.dht.id;
-const rpc = nomadfs.dht.rpc;
-const kbucket = nomadfs.dht.kbucket;
+const id = nomadfs.net.id;
+const rpc = nomadfs.net.discovery.rpc;
+const kbucket = nomadfs.net.discovery.kbucket;
 
 test "dht: rpc serialization and deserialization" {
     std.debug.print("\n=== Running Test: dht: rpc serialization and deserialization ===\n", .{});

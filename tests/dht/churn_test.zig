@@ -10,14 +10,14 @@ test "dht: churn resilience" {
     var peers = try allocator.alloc(*TestPeer, NUM_NODES);
     defer allocator.free(peers);
 
-    var dht_nodes = try allocator.alloc(nomadfs.dht.Node, NUM_NODES);
+    var dht_nodes = try allocator.alloc(nomadfs.net.discovery.Node, NUM_NODES);
     defer allocator.free(dht_nodes);
 
     // 1. Initialize all peers and DHT nodes
     for (0..NUM_NODES) |i| {
         peers[i] = try TestPeer.init(allocator, @as(u16, 12000 + @as(u16, @intCast(i))));
-        dht_nodes[i] = nomadfs.dht.Node.init(allocator, &peers[i].manager, peers[i].config.node.swarm_key);
-        peers[i].manager.setConnectionHandler(&dht_nodes[i], nomadfs.dht.Node.serve);
+        dht_nodes[i] = nomadfs.net.discovery.Node.init(allocator, &peers[i].manager, peers[i].config.node.swarm_key);
+        peers[i].manager.setConnectionHandler(&dht_nodes[i], nomadfs.net.discovery.Node.serve);
         try peers[i].start();
     }
 
@@ -34,7 +34,7 @@ test "dht: churn resilience" {
     for (1..NUM_NODES) |i| {
         try dht_nodes[0].routing_table.addPeer(.{
             .id = peers[i].manager.node_id,
-            .addresses = .{peers[i].listen_addr} ++ .{undefined} ** (nomadfs.dht.kbucket.MAX_PEER_ADDRESSES - 1),
+            .addresses = .{peers[i].listen_addr} ++ .{undefined} ** (nomadfs.net.discovery.kbucket.MAX_PEER_ADDRESSES - 1),
             .addrs_count = 1,
             .last_seen = std.time.timestamp(),
         });
@@ -44,17 +44,17 @@ test "dht: churn resilience" {
     // 3. Last node knows Node 0
     try dht_nodes[last_node_idx].routing_table.addPeer(.{
         .id = peers[0].manager.node_id,
-        .addresses = .{peers[0].listen_addr} ++ .{undefined} ** (nomadfs.dht.kbucket.MAX_PEER_ADDRESSES - 1),
+        .addresses = .{peers[0].listen_addr} ++ .{undefined} ** (nomadfs.net.discovery.kbucket.MAX_PEER_ADDRESSES - 1),
         .addrs_count = 1,
         .last_seen = std.time.timestamp(),
     });
 
     // 4. Last node performs a general lookup to discover some peers
-    const discovery_target = nomadfs.dht.id.NodeID{ .bytes = [_]u8{0xaa} ** 32 };
+    const discovery_target = nomadfs.net.id.NodeID{ .bytes = [_]u8{0xaa} ** 32 };
     try dht_nodes[last_node_idx].lookup(discovery_target);
 
     // 5. Select a target and find which node is closest to it (among 1..NUM_NODES-2)
-    const target = nomadfs.dht.id.NodeID{ .bytes = [_]u8{0x55} ** 32 };
+    const target = nomadfs.net.id.NodeID{ .bytes = [_]u8{0x55} ** 32 };
 
     var closest_idx: usize = 1;
     var min_dist = peers[1].manager.node_id.distance(target);

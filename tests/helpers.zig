@@ -6,7 +6,7 @@ const nomadfs = @import("nomadfs");
 pub const TestPeer = struct {
     allocator: std.mem.Allocator,
     config: nomadfs.config.Config,
-    manager: nomadfs.network.manager.ConnectionManager,
+    manager: nomadfs.net.transport.manager.ConnectionManager,
     server_thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     listen_addr: std.net.Address,
@@ -28,7 +28,7 @@ pub const TestPeer = struct {
         peer.* = .{
             .allocator = allocator,
             .config = cfg,
-            .manager = nomadfs.network.manager.ConnectionManager.initExplicit(allocator, .tcp, nomadfs.network.noise.KeyPair.generate()),
+            .manager = nomadfs.net.transport.manager.ConnectionManager.initExplicit(allocator, .tcp, nomadfs.net.transport.noise.KeyPair.generate()),
             .listen_addr = addr,
         };
         try peer.manager.start();
@@ -74,7 +74,7 @@ pub const TestPeer = struct {
         };
     }
 
-    pub fn connect(self: *TestPeer, other: *TestPeer) !nomadfs.network.Stream {
+    pub fn connect(self: *TestPeer, other: *TestPeer) !nomadfs.net.transport.Stream {
         const conn = try self.manager.connectToPeer(other.listen_addr, self.config.node.swarm_key, other.manager.node_id);
         // We have a connection, now open a stream
         return conn.openStream();

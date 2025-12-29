@@ -1,5 +1,5 @@
 const std = @import("std");
-const network = @import("../network/mod.zig");
+const network = @import("../net/transport/mod.zig");
 const dag = @import("../storage/dag.zig");
 
 pub const RepairManager = struct {

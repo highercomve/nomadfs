@@ -19,15 +19,15 @@ pub fn main() !void {
     defer peer2.deinit();
 
     // 2. Initialize DHT Nodes for both
-    var dht1 = nomadfs.dht.Node.init(allocator, &peer1.manager, peer1.config.node.swarm_key);
+    var dht1 = nomadfs.net.discovery.Node.init(allocator, &peer1.manager, peer1.config.node.swarm_key);
     defer dht1.deinit();
 
-    var dht2 = nomadfs.dht.Node.init(allocator, &peer2.manager, peer2.config.node.swarm_key);
+    var dht2 = nomadfs.net.discovery.Node.init(allocator, &peer2.manager, peer2.config.node.swarm_key);
     defer dht2.deinit();
 
     // 3. Register DHT serve loop for both
-    peer1.manager.setConnectionHandler(&dht1, nomadfs.dht.Node.serve);
-    peer2.manager.setConnectionHandler(&dht2, nomadfs.dht.Node.serve);
+    peer1.manager.setConnectionHandler(&dht1, nomadfs.net.discovery.Node.serve);
+    peer2.manager.setConnectionHandler(&dht2, nomadfs.net.discovery.Node.serve);
 
     // 4. Start peer1 (the "server")
     try peer1.start();

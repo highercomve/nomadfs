@@ -58,4 +58,4 @@ Directories are also `DagNodes`. Instead of raw file data, the `links` in a dire
 ---
 
 **Next Chapters:**
-*   [Chapter 4: The Sync Layer](../sync/overview.md)
+*   [Chapter 4: The Sync Layer](../dist/overview.md)

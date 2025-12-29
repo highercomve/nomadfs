@@ -2,27 +2,25 @@
 const std = @import("std");
 
 pub const config = @import("config.zig");
-pub const network = @import("network/mod.zig");
+pub const net = @import("net/mod.zig");
 pub const storage = @import("storage/mod.zig");
-pub const sync = @import("sync/mod.zig");
-pub const dht = @import("dht/mod.zig");
 pub const dist = @import("dist/mod.zig");
 
 pub const Node = struct {
     allocator: std.mem.Allocator,
-    net: *network.manager.ConnectionManager,
+    connection_manager: *net.transport.manager.ConnectionManager,
     store: ?*storage.engine.StorageEngine,
-    dht_node: *dht.Node,
+    discovery_node: *net.discovery.Node,
     block_manager: *dist.BlockManager,
     ring: *dist.ring.HashRing,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !*Node {
-        const net = try allocator.create(network.manager.ConnectionManager);
-        net.* = try network.manager.ConnectionManager.init(allocator, cfg.network.transport, cfg.node.key_path);
-        try net.start();
+        const connection_manager = try allocator.create(net.transport.manager.ConnectionManager);
+        connection_manager.* = try net.transport.manager.ConnectionManager.init(allocator, cfg.network.transport, cfg.node.key_path);
+        try connection_manager.start();
         errdefer {
-            net.deinit();
-            allocator.destroy(net);
+            connection_manager.deinit();
+            allocator.destroy(connection_manager);
         }
 
         var store: ?*storage.engine.StorageEngine = null;
@@ -35,19 +33,20 @@ pub const Node = struct {
             allocator.destroy(s);
         };
 
-        const dht_node = try allocator.create(dht.Node);
-        dht_node.* = dht.Node.init(allocator, net, cfg.node.swarm_key);
+        const discovery_node = try allocator.create(net.discovery.Node);
+        discovery_node.* = net.discovery.Node.init(allocator, connection_manager, cfg.node.swarm_key);
         errdefer {
-            dht_node.deinit();
-            allocator.destroy(dht_node);
+            discovery_node.deinit();
+            allocator.destroy(discovery_node);
         }
 
         // Register DHT serve loop for new connections
-        net.setConnectionHandler(dht_node, dht.Node.serve);
+        connection_manager.setConnectionHandler(discovery_node, net.discovery.Node.serve);
+        connection_manager.setDiscoveryHandler(discovery_node, net.discovery.Node.onDiscovery);
 
         const block_manager = try dist.BlockManager.init(allocator, .{
-            .network = net,
-            .dht = dht_node,
+            .network = connection_manager,
+            .dht = discovery_node,
             .storage = store,
         });
         errdefer block_manager.deinit();
@@ -61,15 +60,15 @@ pub const Node = struct {
 
         // If storage is enabled, add ourselves to the ring
         if (cfg.storage.enabled) {
-            try ring.addNode(net.node_id, 10);
+            try ring.addNode(connection_manager.node_id, 10);
         }
 
         const self = try allocator.create(Node);
         self.* = .{
             .allocator = allocator,
-            .net = net,
+            .connection_manager = connection_manager,
             .store = store,
-            .dht_node = dht_node,
+            .discovery_node = discovery_node,
             .block_manager = block_manager,
             .ring = ring,
         };
@@ -80,24 +79,29 @@ pub const Node = struct {
         self.ring.deinit();
         self.allocator.destroy(self.ring);
         self.block_manager.deinit();
-        self.dht_node.deinit();
+        self.discovery_node.deinit();
         if (self.store) |s| {
             s.deinit();
             self.allocator.destroy(s);
         }
-        self.net.deinit();
-        self.allocator.destroy(self.net);
+        self.connection_manager.deinit();
+        self.allocator.destroy(self.connection_manager);
         self.allocator.destroy(self);
     }
 
     pub fn start(self: *Node, port: u16, swarm_key: []const u8, running: *std.atomic.Value(bool), enable_mdns: bool, upnp_enabled: bool) !void {
         const listen_thread = try std.Thread.spawn(.{}, struct {
-            fn run(m: *network.manager.ConnectionManager, p: u16, key: []const u8, run_flag: *std.atomic.Value(bool), mdns_flag: bool, upnp_flag: bool) void {
-                m.listen(p, key, run_flag, mdns_flag, upnp_flag) catch |err| {
+            fn run(m: *net.transport.manager.ConnectionManager, p: u16, key: []const u8, run_flag: *std.atomic.Value(bool), mdns_flag: bool, upnp_flag: bool) void {
+                m.listen(.{
+                    .port = p,
+                    .swarm_key = key,
+                    .enable_mdns = mdns_flag,
+                    .upnp_enabled = upnp_flag,
+                }, run_flag) catch |err| {
                     std.debug.print("Listener error: {any}\n", .{err});
                 };
             }
-        }.run, .{ self.net, port, swarm_key, running, enable_mdns, upnp_enabled });
+        }.run, .{ self.connection_manager, port, swarm_key, running, enable_mdns, upnp_enabled });
         listen_thread.detach();
     }
 
@@ -129,12 +133,12 @@ pub const Node = struct {
             var attempts: usize = 0;
             const max_attempts = 5;
             while (attempts < max_attempts) : (attempts += 1) {
-                if (self.net.connectToPeer(address, swarm_key, null)) |conn| {
+                if (self.connection_manager.connectToPeer(address, swarm_key, null)) |conn| {
                     std.debug.print("Successfully connected to bootstrap peer: {s}\n", .{peer_url});
-                    try self.dht_node.ping(conn);
+                    try self.discovery_node.ping(conn);
                     
                     // Request AutoNAT dial-back
-                    self.dht_node.checkReachability(conn) catch |err| {
+                    self.discovery_node.checkReachability(conn) catch |err| {
                         std.debug.print("AutoNAT request failed: {any}\n", .{err});
                     };
                     
@@ -151,11 +155,11 @@ pub const Node = struct {
         }
 
         std.debug.print("Bootstrap connections complete. Starting periodic peer discovery and maintenance...\n", .{});
-        const dht_node_ptr = self.dht_node;
-        const net_node_id = self.net.node_id;
+        const discovery_node_ptr = self.discovery_node;
+        const net_node_id = self.connection_manager.node_id;
 
         const maintenance_thread = try std.Thread.spawn(.{}, struct {
-            fn run(node: *dht.Node, self_id: dht.id.NodeID) void {
+            fn run(node: *net.discovery.Node, self_id: net.id.NodeID) void {
                 // 1. Initial Self-Lookup (Once)
                 std.debug.print("Starting initial self-lookup...\n", .{});
                 node.lookup(self_id) catch |err| {
@@ -172,7 +176,7 @@ pub const Node = struct {
                     };
                 }
             }
-        }.run, .{ dht_node_ptr, net_node_id });
+        }.run, .{ discovery_node_ptr, net_node_id });
         maintenance_thread.detach();
     }
 };

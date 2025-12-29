@@ -1,7 +1,7 @@
 const std = @import("std");
-const id = @import("nomadfs").dht.id;
-const kbucket = @import("nomadfs").dht.kbucket;
-const lookup = @import("nomadfs").dht.lookup;
+const id = @import("nomadfs").net.id;
+const kbucket = @import("nomadfs").net.discovery.kbucket;
+const lookup = @import("nomadfs").net.discovery.lookup;
 
 test "dht: iterative lookup state management" {
     std.debug.print("\n=== Running Test: dht: iterative lookup state management ===\n", .{});

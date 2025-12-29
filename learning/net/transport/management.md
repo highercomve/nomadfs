@@ -66,4 +66,4 @@ Nodes frequently change IP addresses (roaming). By cleaning up old connections q
 ---
 
 **Next Chapters:**
-*   [Chapter 2.1: DHT Overview: The Phonebook](../dht/overview.md)
+*   [Chapter 2.1: DHT Overview: The Phonebook](../discovery/overview.md)

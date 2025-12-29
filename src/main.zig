@@ -59,7 +59,7 @@ pub fn main() !void {
     var node = try nomadfs.Node.init(allocator, config);
     defer node.deinit();
 
-    std.debug.print("Node Initialized. Local ID: {x}\n", .{node.net.node_id.bytes});
+    std.debug.print("Node Initialized. Local ID: {x}\n", .{node.connection_manager.node_id.bytes});
 
     var running = std.atomic.Value(bool).init(true);
 

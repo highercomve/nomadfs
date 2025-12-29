@@ -47,4 +47,4 @@ The result of AutoNAT determines the node's behavior in the DHT layer:
 ---
 
 **Next Chapters:**
-*   [Chapter 2: Discovery Overview](../dht/overview.md)
+*   [Chapter 2: Discovery Overview](../discovery/overview.md)

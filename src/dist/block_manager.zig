@@ -1,6 +1,6 @@
 const std = @import("std");
-const network = @import("../network/mod.zig");
-const dht = @import("../dht/mod.zig");
+const network = @import("../net/transport/mod.zig");
+const dht = @import("../net/discovery/mod.zig");
 const storage = @import("../storage/mod.zig");
 
 pub const BlockManager = struct {
