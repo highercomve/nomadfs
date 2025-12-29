@@ -9,7 +9,7 @@ CONFIG_FILE = nomadfs.conf
 # Targets
 TARGETS = x86_64-linux aarch64-linux x86_64-macos aarch64-macos x86_64-windows
 
-.PHONY: all clean help $(TARGETS) package
+.PHONY: all clean help $(TARGETS) package docker gen-swarm-key
 
 all: $(TARGETS)
 
@@ -52,6 +52,9 @@ package: $(TARGETS)
 		fi; \
 		rm -rf $$TMP_DIR; \
 	done
+
+docker: 
+	docker buildx build --platform linux/amd64,linux/arm64 -t highercomve/nomadfs:latest --push .
 
 clean:
 	rm -rf $(BUILD_DIR) $(DIST_DIR) zig-out .zig-cache

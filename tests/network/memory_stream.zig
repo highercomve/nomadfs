@@ -66,10 +66,8 @@ pub const Pipe = struct {
     closed: bool = false,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) *Pipe {
-        const self = allocator.create(Pipe) catch @panic("OOM");
-        self.* = .{ .allocator = allocator };
-        return self;
+    pub fn init(allocator: std.mem.Allocator) Pipe {
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *Pipe) void {

@@ -12,8 +12,6 @@ pub const TestPeer = struct {
     listen_addr: std.net.Address,
 
     pub fn init(allocator: std.mem.Allocator, port: u16) !*TestPeer {
-        const peer = try allocator.create(TestPeer);
-
         // Setup minimal config
         var cfg = nomadfs.config.Config{
             .node = .{ .nickname = "TestNode", .swarm_key = "test_key_32_bytes_long_!!!!!!!!!" },
@@ -25,7 +23,7 @@ pub const TestPeer = struct {
 
         const addr = try std.net.Address.parseIp("127.0.0.1", port);
 
-        peer.* = .{
+        var peer = .{
             .allocator = allocator,
             .config = cfg,
             .manager = nomadfs.net.transport.manager.ConnectionManager.initExplicit(allocator, .tcp, nomadfs.net.transport.noise.KeyPair.generate()),
@@ -67,7 +65,12 @@ pub const TestPeer = struct {
     }
 
     fn serverLoop(self: *TestPeer) void {
-        self.manager.listen(self.config.network.port, self.config.node.swarm_key, &self.running, self.config.network.enable_mdns, self.config.network.upnp_enabled) catch |err| {
+        self.manager.listen(.{
+            .port = self.config.network.port,
+            .swarm_key = self.config.node.swarm_key,
+            .enable_mdns = self.config.network.enable_mdns,
+            .upnp_enabled = self.config.network.upnp_enabled,
+        }, &self.running) catch |err| {
             if (self.running.load(.acquire)) {
                 std.debug.print("TestPeer server error: {}\n", .{err});
             }
