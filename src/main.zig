@@ -66,5 +66,5 @@ pub fn main() !void {
         std.debug.print("Bootstrap error: {any}\n", .{err});
     };
     // Start the node's network listener (blocking)
-    try node.run(config.network.port, config.node.swarm_key, &running, config.network.enable_mdns, config.network.upnp_enabled);
+    try node.run(&running, config);
 }

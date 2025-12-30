@@ -13,13 +13,6 @@ pub const ConnectionManager = struct {
         last_active: i64,
     };
 
-    pub const ListenConfig = struct {
-        port: u16,
-        swarm_key: []const u8,
-        enable_mdns: bool = true,
-        upnp_enabled: bool = true,
-    };
-
     allocator: std.mem.Allocator,
     connections: std.ArrayListUnmanaged(ManagedConnection),
     transport_type: config.Config.TransportType,
@@ -81,7 +74,6 @@ pub const ConnectionManager = struct {
             self.upnp.deinit();
         }
     }
-
 
     pub fn start(self: *ConnectionManager) !void {
         if (self.reaper_thread != null) return;
@@ -147,13 +139,13 @@ pub const ConnectionManager = struct {
             return;
         }
         self.stopping = true;
-        
+
         self.running.store(false, .release);
         if (self.mdns) |*m| {
             m.stop();
         }
         self.mutex.unlock();
-        
+
         // Wait for all handshake threads to finish without holding the lock
         // as they might need to acquire it to add themselves or clean up.
         self.handshake_wg.wait();
@@ -275,37 +267,26 @@ pub const ConnectionManager = struct {
         }
     }
 
-    pub fn listen(self: *ConnectionManager, cfg: ListenConfig, running: ?*std.atomic.Value(bool)) !void {
-        self.bound_port = cfg.port;
+    pub fn listen(self: *ConnectionManager, cfg: config.Config, running: ?*std.atomic.Value(bool)) !void {
+        self.bound_port = cfg.network.port;
 
-                // Initialize mDNS
+        // Initialize mDNS
 
-                if (cfg.enable_mdns) {
+        if (cfg.network.enable_mdns) {
+            self.mdns = network.mdns.MDNS.init(
+                self.allocator,
+                self.node_id,
+                cfg.network.port,
+                network.mdns.MDNS_PORT,
+                onMdnsDiscovery,
+                self,
+            );
 
-                    self.mdns = network.mdns.MDNS.init(
-
-                        self.allocator, 
-
-                        self.node_id, 
-
-                        cfg.port, 
-
-                        network.mdns.MDNS_PORT,
-
-                        onMdnsDiscovery, 
-
-                        self
-
-                    );
-
-                    try self.mdns.?.start();
-
-                }
-
-        
+            try self.mdns.?.start();
+        }
 
         // Attempt UPnP in background
-        if (cfg.upnp_enabled) {
+        if (cfg.network.upnp_enabled) {
             const thread = try std.Thread.spawn(.{}, struct {
                 fn run(cm: *ConnectionManager, p: u16) void {
                     cm.upnp.discoverGateway() catch |err| {
@@ -324,15 +305,15 @@ pub const ConnectionManager = struct {
                         return;
                     };
                 }
-            }.run, .{ self, cfg.port });
+            }.run, .{ self, cfg.network.port });
             thread.detach();
         }
 
         switch (self.transport_type) {
             .tcp => {
                 try tcp.listen(self.allocator, .{
-                    .port = cfg.port,
-                    .swarm_key = cfg.swarm_key,
+                    .port = cfg.network.port,
+                    .swarm_key = cfg.node.swarm_key,
                     .static_key = self.identity_key,
                     .running = running,
                     .manager = self,

@@ -95,12 +95,12 @@ pub const Node = struct {
         self.allocator.destroy(self.connection_manager);
     }
 
-    pub fn run(self: *Node, port: u16, swarm_key: []const u8, running: *std.atomic.Value(bool), enable_mdns: bool, upnp_enabled: bool) !void {
+    pub fn run(self: *Node, running: *std.atomic.Value(bool), cfg: config.Config) !void {
         try self.connection_manager.listen(.{
-            .port = port,
-            .swarm_key = swarm_key,
-            .enable_mdns = enable_mdns,
-            .upnp_enabled = upnp_enabled,
+            .port = cfg.network.port,
+            .swarm_key = cfg.node.swarm_key,
+            .enable_mdns = cfg.network.enable_mdns,
+            .upnp_enabled = cfg.network.upnp_enabled,
         }, running);
     }
 

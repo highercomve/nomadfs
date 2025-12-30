@@ -14,9 +14,21 @@ pub const TestPeer = struct {
     pub fn init(allocator: std.mem.Allocator, port: u16) !TestPeer {
         // Setup minimal config
         var cfg = nomadfs.config.Config{
-            .node = .{ .nickname = "TestNode", .swarm_key = "test_key_32_bytes_long_!!!!!!!!!" },
-            .storage = .{ .enabled = true, .storage_path = "./test_data" }, // TODO: Use tmp dir
-            .network = .{ .port = port, .bootstrap_peers = undefined, .transport = .tcp },
+            .node = .{
+                .nickname = "TestNode",
+                .swarm_key = "test_key_32_bytes_long_!!!!!!!!!",
+            },
+            .storage = .{
+                .enabled = true,
+                .storage_path = "./test_data",
+            },
+            .network = .{
+                .port = port,
+                .bootstrap_peers = undefined,
+                .transport = .tcp,
+                .upnp_enabled = false,
+                .enable_mdns = false,
+            },
         };
         // Dummy lists to avoid leaks or complex init for now
         cfg.network.bootstrap_peers = &.{};
@@ -69,12 +81,7 @@ pub const TestPeer = struct {
     }
 
     fn serverLoop(self: *TestPeer) void {
-        self.manager.listen(.{
-            .port = self.config.network.port,
-            .swarm_key = self.config.node.swarm_key,
-            .enable_mdns = self.config.network.enable_mdns,
-            .upnp_enabled = self.config.network.upnp_enabled,
-        }, &self.running) catch |err| {
+        self.manager.listen(self.config, &self.running) catch |err| {
             if (self.running.load(.acquire)) {
                 std.debug.print("TestPeer server error: {}\n", .{err});
             }
