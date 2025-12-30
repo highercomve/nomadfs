@@ -129,10 +129,10 @@ pub const Session = struct {
             return;
         }
         self.closed = true;
-        
+
         // Wake up all waiters
         self.accept_cond.broadcast();
-        
+
         var it = self.streams.iterator();
         while (it.next()) |entry| {
             const stream = entry.value_ptr.*;
@@ -188,104 +188,113 @@ pub const Session = struct {
     }
 
     /// Read loop - must be called from a dedicated thread.
-    pub fn run(self: *Session) !void {
+    pub fn run(self: *Session) void {
         defer self.close();
 
         var header_buf: [12]u8 = undefined;
         while (true) {
             readExactly(self.transport, &header_buf) catch |err| {
-                if (err == error.EndOfStream or err == error.NotOpenForReading or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
-                return err;
+                if (err != error.EndOfStream and err != error.NotOpenForReading and err != error.ConnectionResetByPeer and err != error.BrokenPipe) {
+                    std.debug.print("YamuxSession transport read error: {any}\n", .{err});
+                }
+                return;
             };
 
-            const header = Header.decode(header_buf);
+            self.handleFrame(&header_buf) catch |err| {
+                std.debug.print("YamuxSession frame handling error: {any}\n", .{err});
+                return;
+            };
+        }
+    }
 
-            switch (header.type) {
-                .DATA => {
-                    self.mutex.lock();
-                    var stream_ptr = self.streams.get(header.stream_id);
+    fn handleFrame(self: *Session, header_buf: *const [12]u8) !void {
+        const header = Header.decode(header_buf.*);
 
-                    if (stream_ptr == null) {
-                        const is_incoming = if (self.is_server) (header.stream_id % 2 != 0) else (header.stream_id % 2 == 0);
-                        if (is_incoming) {
-                            const new_s = try self.allocator.create(YamuxStream);
-                            new_s.* = YamuxStream.init(self.allocator, header.stream_id, self);
-                            try self.streams.put(self.allocator, header.stream_id, new_s);
-                            try self.accept_queue.append(self.allocator, new_s);
-                            self.accept_cond.signal();
-                            stream_ptr = new_s;
-                        }
+        switch (header.type) {
+            .DATA => {
+                self.mutex.lock();
+                var stream_ptr = self.streams.get(header.stream_id);
+
+                if (stream_ptr == null) {
+                    const is_incoming = if (self.is_server) (header.stream_id % 2 != 0) else (header.stream_id % 2 == 0);
+                    if (is_incoming) {
+                        const new_s = try self.allocator.create(YamuxStream);
+                        new_s.* = YamuxStream.init(self.allocator, header.stream_id, self);
+                        try self.streams.put(self.allocator, header.stream_id, new_s);
+                        try self.accept_queue.append(self.allocator, new_s);
+                        self.accept_cond.signal();
+                        stream_ptr = new_s;
                     }
-                    self.mutex.unlock();
+                }
+                self.mutex.unlock();
 
-                    if (header.length > 0) {
-                        const payload_buf = try self.allocator.alloc(u8, header.length);
-                        errdefer self.allocator.free(payload_buf);
+                if (header.length > 0) {
+                    const payload_buf = try self.allocator.alloc(u8, header.length);
+                    errdefer self.allocator.free(payload_buf);
 
-                        try readExactly(self.transport, payload_buf);
-
-                        if (stream_ptr) |stream| {
-                            stream.mutex.lock();
-                            try stream.incoming_data.appendSlice(self.allocator, payload_buf);
-                            if (stream.local_window >= header.length) {
-                                stream.local_window -= header.length;
-                            } else {
-                                stream.local_window = 0;
-                            }
-                            if (header.flags & Flags.FIN != 0) {
-                                stream.closed = true;
-                            }
-                            stream.cond.signal();
-                            stream.mutex.unlock();
-                            self.allocator.free(payload_buf);
-                        } else {
-                            self.allocator.free(payload_buf);
-                        }
-                    } else if (header.flags & Flags.FIN != 0) {
-                        if (stream_ptr) |stream| {
-                            stream.mutex.lock();
-                            stream.closed = true;
-                            stream.cond.signal();
-                            stream.mutex.unlock();
-                        }
-                    }
-                },
-                .WINDOW_UPDATE => {
-                    self.mutex.lock();
-                    const stream_ptr = self.streams.get(header.stream_id);
-                    self.mutex.unlock();
+                    try readExactly(self.transport, payload_buf);
 
                     if (stream_ptr) |stream| {
                         stream.mutex.lock();
-                        stream.remote_window += header.length;
-                        stream.write_cond.signal();
+                        try stream.incoming_data.appendSlice(self.allocator, payload_buf);
+                        if (stream.local_window >= header.length) {
+                            stream.local_window -= header.length;
+                        } else {
+                            stream.local_window = 0;
+                        }
+                        if (header.flags & Flags.FIN != 0) {
+                            stream.closed = true;
+                        }
+                        stream.cond.signal();
+                        stream.mutex.unlock();
+                        self.allocator.free(payload_buf);
+                    } else {
+                        self.allocator.free(payload_buf);
+                    }
+                } else if (header.flags & Flags.FIN != 0) {
+                    if (stream_ptr) |stream| {
+                        stream.mutex.lock();
+                        stream.closed = true;
+                        stream.cond.signal();
                         stream.mutex.unlock();
                     }
-                },
-                .PING => {
-                    // If it's a request (no ACK flag), send it back
-                    if (header.flags & Flags.ACK == 0) {
-                        var resp = header;
-                        resp.flags |= Flags.ACK;
-                        
-                        var h_buf: [12]u8 = undefined;
-                        resp.encode(&h_buf);
-                        
-                        self.mutex.lock();
-                        _ = try self.transport.write(&h_buf);
-                        self.mutex.unlock();
-                    }
-                    // If it is an ACK, we just ignore it for now (no PING tracker)
-                },
-                .GO_AWAY => {
-                    // Stop accepting new streams
+                }
+            },
+            .WINDOW_UPDATE => {
+                self.mutex.lock();
+                const stream_ptr = self.streams.get(header.stream_id);
+                self.mutex.unlock();
+
+                if (stream_ptr) |stream| {
+                    stream.mutex.lock();
+                    stream.remote_window += header.length;
+                    stream.write_cond.signal();
+                    stream.mutex.unlock();
+                }
+            },
+            .PING => {
+                // If it's a request (no ACK flag), send it back
+                if (header.flags & Flags.ACK == 0) {
+                    var resp = header;
+                    resp.flags |= Flags.ACK;
+
+                    var h_buf: [12]u8 = undefined;
+                    resp.encode(&h_buf);
+
                     self.mutex.lock();
-                    self.closed = true;
-                    // Wake up anyone waiting for accept
-                    self.accept_cond.broadcast();
+                    _ = try self.transport.write(&h_buf);
                     self.mutex.unlock();
-                },
-            }
+                }
+                // If it is an ACK, we just ignore it for now (no PING tracker)
+            },
+            .GO_AWAY => {
+                // Stop accepting new streams
+                self.mutex.lock();
+                self.closed = true;
+                // Wake up anyone waiting for accept
+                self.accept_cond.broadcast();
+                self.mutex.unlock();
+            },
         }
     }
 

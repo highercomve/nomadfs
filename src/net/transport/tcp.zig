@@ -131,17 +131,33 @@ pub const ListenConfig = struct {
     manager: ?*network.manager.ConnectionManager = null,
 };
 
-pub fn listen(allocator: std.mem.Allocator, cfg: ListenConfig) !void {
+pub fn listen(allocator: std.mem.Allocator, cfg: ListenConfig) !std.net.Server {
     const address = try std.net.Address.parseIp("0.0.0.0", cfg.port);
     var server = try address.listen(.{ .reuse_address = true });
-    defer server.deinit();
+    errdefer server.deinit();
 
     std.debug.print("Listening for TCP connections on {f}...\n", .{address});
 
+    const thread = try std.Thread.spawn(.{}, acceptLoop, .{ allocator, server, cfg });
+    thread.detach();
+
+    return server;
+}
+
+fn acceptLoop(allocator: std.mem.Allocator, mut_server: std.net.Server, cfg: ListenConfig) void {
+    // We work on a copy of the server struct, but it shares the underlying FD.
+    var server = mut_server;
+    
     while (cfg.running == null or cfg.running.?.load(.acquire)) {
         const conn = server.accept() catch |err| {
+            // If the socket was closed (e.g. by stop()), we expect an error.
             if (cfg.running != null and !cfg.running.?.load(.acquire)) break;
-            return err;
+            // Also check for specific errors that imply closure?
+            // For now, if running is false, we break.
+            // If running is true but accept failed, it might be a temporary error or the socket was closed externally.
+            std.debug.print("Accept error: {any}\n", .{err});
+            if (err == error.SocketNotBound or err == error.FileDescriptorClosed or err == error.OperationAborted or err == error.ConnectionAborted) break;
+            continue;
         };
         std.debug.print("Accepted connection from {f}\n", .{conn.address});
 
@@ -150,15 +166,24 @@ pub fn listen(allocator: std.mem.Allocator, cfg: ListenConfig) !void {
             m.handshake_wg.start();
         }
 
-        const thread = try std.Thread.spawn(.{}, handleIncomingConnection, .{
+        const thread = std.Thread.spawn(.{}, handleIncomingConnection, .{
             allocator,
             conn,
             cfg.swarm_key,
             cfg.static_key,
             cfg.manager,
-        });
+        }) catch |err| {
+            std.debug.print("Failed to spawn connection handler thread: {any}\n", .{err});
+            conn.stream.close();
+            if (cfg.manager) |m| {
+                m.handshake_wg.finish();
+                m.deinit();
+            }
+            continue;
+        };
         thread.detach();
     }
+    std.debug.print("TCP Accept loop exiting.\n", .{});
 }
 
 fn handleIncomingConnection(

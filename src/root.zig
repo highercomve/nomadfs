@@ -4,18 +4,18 @@ const std = @import("std");
 pub const config = @import("config.zig");
 pub const net = @import("net/mod.zig");
 pub const storage = @import("storage/mod.zig");
-pub const dist = @import("dist/mod.zig");
+pub const cluster = @import("cluster/mod.zig");
 
 const ConnectionManager = net.transport.manager.ConnectionManager;
 const DiscoveryNode = net.discovery.Node;
-const HashRight = dist.ring.HashRing;
+const HashRight = cluster.ring.HashRing;
 
 pub const Node = struct {
     allocator: std.mem.Allocator,
     connection_manager: *ConnectionManager,
     store: ?*storage.engine.StorageEngine,
     discovery_node: *DiscoveryNode,
-    block_manager: *dist.BlockManager,
+    block_manager: *cluster.BlockManager,
     ring: *HashRight,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !Node {
@@ -52,7 +52,7 @@ pub const Node = struct {
         connection_manager.setConnectionHandler(discovery_node, DiscoveryNode.serve);
         connection_manager.setDiscoveryHandler(discovery_node, DiscoveryNode.onDiscovery);
 
-        const block_manager = try dist.BlockManager.init(allocator, .{
+        const block_manager = try cluster.BlockManager.init(allocator, .{
             .network = connection_manager,
             .dht = discovery_node,
             .storage = store,
@@ -96,12 +96,10 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node, running: *std.atomic.Value(bool), cfg: config.Config) !void {
-        try self.connection_manager.listen(.{
-            .port = cfg.network.port,
-            .swarm_key = cfg.node.swarm_key,
-            .enable_mdns = cfg.network.enable_mdns,
-            .upnp_enabled = cfg.network.upnp_enabled,
-        }, running);
+        try self.connection_manager.listen(cfg, running);
+        while (running.load(.acquire)) {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
     }
 
     pub fn bootstrap(self: *Node, peer_urls: [][]const u8, swarm_key: []const u8) !void {

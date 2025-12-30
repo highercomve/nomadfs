@@ -51,6 +51,14 @@ We chose 256 KB as the default chunk size to balance two competing needs:
 1.  **Deduplication Efficiency**: Smaller chunks increase the chance of finding duplicate data but increase the overhead of managing the Merkle DAG.
 2.  **Network Performance**: Larger chunks are more efficient to transfer over high-latency links but make the system less responsive when resuming interrupted downloads.
 
+## 5. Memory Efficiency (The Zero-Copy Rule)
+
+A core mandate of NomadFS is to avoid unnecessary memory copying.
+
+*   **Slices over Allocations**: The `Block` struct and `Chunker` logic rely on **slices** (`[]const u8`) rather than owning buffers whenever possible.
+*   **Streaming**: When processing large files, we read data into a fixed-size buffer (e.g., 256 KB), hash it, persist it, and discard it *immediately*. We do **not** load the entire file into memory.
+*   **Lifetimes**: A `Block` or `MerkleNode` created during the build process is transient. It exists only long enough to generate its CID and be written to the `StorageEngine`. Only the lightweight CIDs are kept in memory to build the upper layers of the DAG.
+
 ---
 
 **Next Chapters:**

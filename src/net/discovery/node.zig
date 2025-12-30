@@ -50,7 +50,7 @@ pub const Node = struct {
             .payload = .{ .DIAL_BACK = .{ .port = self.manager.bound_port } },
         };
         try msg.serialize(stream.writer());
-        // We don't wait for a response on this stream. 
+        // We don't wait for a response on this stream.
         // We wait for an INCOMING connection on our listen port.
     }
 
@@ -238,16 +238,22 @@ pub const Node = struct {
         var state = try lookup_mod.LookupState.init(self.allocator, target, initial_peers);
         defer state.deinit();
 
+        std.debug.print("Lookup: Starting loop. Initial peers: {d}\n", .{initial_peers.len});
+
         while (!state.isFinished()) {
             const next_peers = try state.nextPeersToQuery();
             defer self.allocator.free(next_peers);
+
+            std.debug.print("Lookup: Next peers count: {d}\n", .{next_peers.len});
 
             if (next_peers.len == 0) break;
 
             for (next_peers) |peer| {
                 if (peer.id.eql(self.manager.node_id)) continue;
+                std.debug.print("Lookup: Querying peer {x}\n", .{peer.id.bytes[0..4]});
 
                 if (self.sendFindNode(peer.addresses[0..peer.addrs_count], target, peer.id)) |closer_peers| {
+                    std.debug.print("Lookup: Peer {x} replied with {d} peers\n", .{ peer.id.bytes[0..4], closer_peers.len });
                     defer self.allocator.free(closer_peers);
                     try state.reportReply(peer.id, closer_peers);
 
@@ -363,7 +369,7 @@ pub const Node = struct {
 
                 // Construct correct address from socket IP + Payload Port
                 var address = conn.getPeerAddress();
-                std.debug.print("Received PING from {x}. Address from sock: {f}, Port from payload: {d}\n", .{msg.sender_id.bytes[0..4], address, p.port});
+                std.debug.print("Received PING from {x}. Address from sock: {f}, Port from payload: {d}\n", .{ msg.sender_id.bytes[0..4], address, p.port });
 
                 if (address.any.family == std.posix.AF.INET) {
                     address.in.sa.port = std.mem.nativeToBig(u16, p.port);
@@ -375,13 +381,13 @@ pub const Node = struct {
                 // Add to routing table with CORRECT port
                 self.mutex.lock();
                 defer self.mutex.unlock();
-                
+
                 var info = kbucket.PeerInfo{
                     .id = msg.sender_id,
                     .last_seen = std.time.timestamp(),
                 };
                 _ = info.addAddress(address);
-                
+
                 self.routing_table.addPeer(info) catch |err| {
                     std.debug.print("Failed to update routing table: {any}\n", .{err});
                 };
@@ -446,13 +452,13 @@ pub const Node = struct {
                     address.in6.sa.port = std.mem.nativeToBig(u16, p.port);
                 }
                 std.debug.print("AutoNAT: Attempting dial-back to {f}\n", .{address});
-                
+
                 // Attempt to dial back. If it succeeds, the other peer knows they are public.
                 const dial_back_conn = self.manager.connectToPeer(address, self.swarm_key, msg.sender_id) catch |err| {
-                    std.debug.print("AutoNAT: Dial-back to {f} failed: {any}\n", .{address, err});
+                    std.debug.print("AutoNAT: Dial-back to {f} failed: {any}\n", .{ address, err });
                     return;
                 };
-                
+
                 std.debug.print("AutoNAT: Dial-back to {f} successful!\n", .{address});
                 // Send PONG over the NEW connection to confirm
                 try self.ping(dial_back_conn);

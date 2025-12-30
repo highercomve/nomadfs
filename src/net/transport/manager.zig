@@ -25,6 +25,7 @@ pub const ConnectionManager = struct {
     on_discovery_ctx: ?*anyopaque = null,
     on_discovery_fn: ?*const fn (ctx: *anyopaque, peer_id: id.NodeID, addr: std.net.Address) void = null,
     reaper_thread: ?std.Thread = null,
+    upnp_thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     idle_timeout: i64 = 60 * 5,
     reap_interval_ms: u64 = 10000,
@@ -33,6 +34,7 @@ pub const ConnectionManager = struct {
     ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
     handshake_wg: std.Thread.WaitGroup = .{},
     stopping: bool = false,
+    tcp_server: ?std.net.Server = null,
 
     pub fn init(allocator: std.mem.Allocator, transport_type: config.Config.TransportType, key_path: ?[]const u8) !ConnectionManager {
         const keypair = try loadOrGenerateKey(allocator, key_path);
@@ -50,11 +52,13 @@ pub const ConnectionManager = struct {
             .on_connection_ctx = null,
             .on_connection_fn = null,
             .reaper_thread = null,
+            .upnp_thread = null,
             .running = std.atomic.Value(bool).init(true),
             .upnp = nat.UPnP.init(allocator),
             .mdns = null,
             .ref_count = std.atomic.Value(usize).init(1),
             .stopping = false,
+            .tcp_server = null,
         };
     }
 
@@ -144,6 +148,10 @@ pub const ConnectionManager = struct {
         if (self.mdns) |*m| {
             m.stop();
         }
+        if (self.tcp_server) |*s| {
+            s.deinit();
+            self.tcp_server = null;
+        }
         self.mutex.unlock();
 
         // Wait for all handshake threads to finish without holding the lock
@@ -153,6 +161,11 @@ pub const ConnectionManager = struct {
         if (self.reaper_thread) |t| {
             t.join();
             self.reaper_thread = null;
+        }
+
+        if (self.upnp_thread) |t| {
+            t.join();
+            self.upnp_thread = null;
         }
 
         self.mutex.lock();
@@ -287,7 +300,7 @@ pub const ConnectionManager = struct {
 
         // Attempt UPnP in background
         if (cfg.network.upnp_enabled) {
-            const thread = try std.Thread.spawn(.{}, struct {
+            self.upnp_thread = try std.Thread.spawn(.{}, struct {
                 fn run(cm: *ConnectionManager, p: u16) void {
                     cm.upnp.discoverGateway() catch |err| {
                         std.debug.print("UPnP Discovery failed: {any}\n", .{err});
@@ -306,12 +319,11 @@ pub const ConnectionManager = struct {
                     };
                 }
             }.run, .{ self, cfg.network.port });
-            thread.detach();
         }
 
         switch (self.transport_type) {
             .tcp => {
-                try tcp.listen(self.allocator, .{
+                self.tcp_server = try tcp.listen(self.allocator, .{
                     .port = cfg.network.port,
                     .swarm_key = cfg.node.swarm_key,
                     .static_key = self.identity_key,
