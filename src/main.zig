@@ -60,22 +60,11 @@ pub fn main() !void {
     defer node.deinit();
 
     std.debug.print("Node Initialized. Local ID: {x}\n", .{node.connection_manager.node_id.bytes});
-
     var running = std.atomic.Value(bool).init(true);
-
-    // Start the node's network listener
-    try node.start(config.network.port, config.node.swarm_key, &running, config.network.enable_mdns, config.network.upnp_enabled);
-
-    // Give listener a moment to start
-    std.Thread.sleep(100 * std.time.ns_per_ms);
-
-    // Join the network via bootstrap peers
+    // Join the network via bootstrap peers (background)
     node.bootstrap(config.network.bootstrap_peers, config.node.swarm_key) catch |err| {
         std.debug.print("Bootstrap error: {any}\n", .{err});
     };
-
-    // Keep main thread alive
-    while (running.load(.acquire)) {
-        std.Thread.sleep(1 * std.time.ns_per_s);
-    }
+    // Start the node's network listener (blocking)
+    try node.run(config.network.port, config.node.swarm_key, &running, config.network.enable_mdns, config.network.upnp_enabled);
 }

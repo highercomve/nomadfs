@@ -14,10 +14,10 @@ test "dht: ping/pong integration" {
     defer peer2.deinit();
 
     // 2. Initialize DHT Nodes for both
-    var dht1 = nomadfs.net.discovery.Node.init(allocator, &peer1.manager, peer1.config.node.swarm_key);
+    var dht1 = nomadfs.net.discovery.Node.init(allocator, peer1.manager, peer1.config.node.swarm_key);
     defer dht1.deinit();
 
-    var dht2 = nomadfs.net.discovery.Node.init(allocator, &peer2.manager, peer2.config.node.swarm_key);
+    var dht2 = nomadfs.net.discovery.Node.init(allocator, peer2.manager, peer2.config.node.swarm_key);
     defer dht2.deinit();
 
     // 3. Register DHT serve loop for both

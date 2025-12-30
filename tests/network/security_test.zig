@@ -23,7 +23,7 @@ test "security: noise handshake and data transfer" {
     std.Thread.sleep(100 * std.time.ns_per_ms);
 
     // 3. Connect peer2 to peer1
-    const stream = try peer2.connect(peer1);
+    const stream = try peer2.connect(&peer1);
     defer stream.close();
 
     const msg = "Secret Message over Noise";
@@ -65,7 +65,7 @@ test "security: noise handshake fails with wrong swarm key" {
     std.Thread.sleep(100 * std.time.ns_per_ms);
 
     // 3. Connect peer2 to peer1 - this should fail during handshake
-    const conn_result = peer2.connect(peer1);
+    const conn_result = peer2.connect(&peer1);
 
     // Handshake should fail. Responder will close connection.
     // The initiator will likely see an error (either during handshake or when using it).
@@ -108,7 +108,7 @@ test "security: connection drop during handshake" {
     defer mem_stream.deinit();
 
     // Case 1: Stream is empty (Immediate EOF)
-    const err1 = noise.NoiseStream.handshake(mem_stream.stream(), swarm_key, noise.KeyPair.generate(), false);
+    const err1 = noise.NoiseStream.handshake(allocator, mem_stream.stream(), swarm_key, noise.KeyPair.generate(), false);
     try std.testing.expectError(error.EndOfStream, err1);
 
     // Case 2: Partial Header (EOF in header)
@@ -116,49 +116,53 @@ test "security: connection drop during handshake" {
     // We need to reset read_pos because write didn't advance it (same stream instance)
     // But wait, MemoryStream append doesn't move read_pos.
     // So if we read now, we read what we wrote.
-    const err2 = noise.NoiseStream.handshake(mem_stream.stream(), swarm_key, noise.KeyPair.generate(), false);
+    const err2 = noise.NoiseStream.handshake(allocator, mem_stream.stream(), swarm_key, noise.KeyPair.generate(), false);
     // Depending on readFull impl, could be EndOfStream or similar.
     try std.testing.expectError(error.EndOfStream, err2);
 }
+
+// Shared context for threads
+const Context = struct {
+    pipe: *Pipe,
+    key: []const u8,
+    allocator: std.mem.Allocator,
+
+    fn runClient(ctx: @This()) !void {
+        var ns = try noise.NoiseStream.handshake(ctx.allocator, ctx.pipe.client(), ctx.key, noise.KeyPair.generate(), true);
+        defer ns.stream().close();
+
+        const msg = "Super Secret Plaintext";
+        _ = try ns.stream().write(msg);
+
+        // Read response
+        var buf: [1024]u8 = undefined;
+        const n = try ns.stream().read(&buf);
+        try std.testing.expectEqualStrings("Server Reply", buf[0..n]);
+    }
+
+    fn runServer(ctx: @This()) !void {
+        var ns = try noise.NoiseStream.handshake(ctx.allocator, ctx.pipe.server(), ctx.key, noise.KeyPair.generate(), false);
+        defer ns.stream().close();
+
+        // Read client message
+        var buf: [1024]u8 = undefined;
+        const n = try ns.stream().read(&buf);
+        try std.testing.expectEqualStrings("Super Secret Plaintext", buf[0..n]);
+
+        // Send reply
+        _ = try ns.stream().write("Server Reply");
+    }
+};
 
 test "security: data on wire is encrypted" {
     std.debug.print("\n=== Running Test: security: data on wire is encrypted ===\n", .{});
     const allocator = std.testing.allocator;
     const swarm_key = "correct_swarm_key_32_bytes_long_";
 
-    const pipe = Pipe.init(allocator);
+    var pipe = Pipe.init(allocator);
     defer pipe.deinit();
 
-    // Shared context for threads
-    const Context = struct {
-        pipe: *Pipe,
-        key: []const u8,
-
-        fn runClient(ctx: @This()) !void {
-            var ns = try noise.NoiseStream.handshake(ctx.pipe.client(), ctx.key, noise.KeyPair.generate(), true);
-            const msg = "Super Secret Plaintext";
-            _ = try ns.stream().write(msg);
-
-            // Read response
-            var buf: [1024]u8 = undefined;
-            const n = try ns.stream().read(&buf);
-            try std.testing.expectEqualStrings("Server Reply", buf[0..n]);
-        }
-
-        fn runServer(ctx: @This()) !void {
-            var ns = try noise.NoiseStream.handshake(ctx.pipe.server(), ctx.key, noise.KeyPair.generate(), false);
-
-            // Read client message
-            var buf: [1024]u8 = undefined;
-            const n = try ns.stream().read(&buf);
-            try std.testing.expectEqualStrings("Super Secret Plaintext", buf[0..n]);
-
-            // Send reply
-            _ = try ns.stream().write("Server Reply");
-        }
-    };
-
-    const ctx = Context{ .pipe = pipe, .key = swarm_key };
+    const ctx = Context{ .pipe = &pipe, .key = swarm_key, .allocator = allocator };
 
     // Run client in a thread
     const client_thread = try std.Thread.spawn(.{}, Context.runClient, .{ctx});

@@ -62,15 +62,15 @@ fn addressesMatch(a: std.net.Address, b: std.net.Address) bool {
 }
 
 const Bucket = struct {
-    peers: std.ArrayListUnmanaged(PeerInfo),
-    replacements: std.ArrayListUnmanaged(PeerInfo),
+    peers: std.ArrayList(PeerInfo),
+    replacements: std.ArrayList(PeerInfo),
     allocator: std.mem.Allocator,
     last_updated: i64,
 
     pub fn init(allocator: std.mem.Allocator) Bucket {
         return Bucket{
-            .peers = std.ArrayListUnmanaged(PeerInfo){},
-            .replacements = std.ArrayListUnmanaged(PeerInfo){},
+            .peers = std.ArrayList(PeerInfo){},
+            .replacements = std.ArrayList(PeerInfo){},
             .allocator = allocator,
             .last_updated = std.time.timestamp(),
         };
@@ -182,7 +182,7 @@ pub const RoutingTable = struct {
         const cpl = self.local_id.commonPrefixLen(peer.id);
 
         const index = @min(cpl, 255);
-        std.debug.print("RoutingTable: Adding peer {x} to bucket {d} (CPL: {d})\n", .{peer.id.bytes[0..4], index, cpl});
+        std.debug.print("RoutingTable: Adding peer {x} to bucket {d} (CPL: {d})\n", .{ peer.id.bytes[0..4], index, cpl });
         _ = try self.buckets[index].add(peer);
     }
 

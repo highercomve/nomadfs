@@ -7,7 +7,7 @@ test "dht: X-node discovery" {
     const allocator = std.testing.allocator;
 
     const NUM_NODES = 5;
-    var peers = try allocator.alloc(*TestPeer, NUM_NODES);
+    var peers = try allocator.alloc(TestPeer, NUM_NODES);
     defer allocator.free(peers);
 
     var dht_nodes = try allocator.alloc(nomadfs.net.discovery.Node, NUM_NODES);
@@ -16,7 +16,7 @@ test "dht: X-node discovery" {
     // 1. Initialize all peers and DHT nodes
     for (0..NUM_NODES) |i| {
         peers[i] = try TestPeer.init(allocator, @as(u16, 11000 + @as(u16, @intCast(i))));
-        dht_nodes[i] = nomadfs.net.discovery.Node.init(allocator, &peers[i].manager, peers[i].config.node.swarm_key);
+        dht_nodes[i] = nomadfs.net.discovery.Node.init(allocator, peers[i].manager, peers[i].config.node.swarm_key);
         peers[i].manager.setConnectionHandler(&dht_nodes[i], nomadfs.net.discovery.Node.serve);
         try peers[i].start();
         std.debug.print("Node {d} ID: {x}\n", .{ i, peers[i].manager.node_id.bytes });

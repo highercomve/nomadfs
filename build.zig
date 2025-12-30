@@ -41,6 +41,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    if (target.result.os.tag == .windows) {
+        mod.link_libc = true;
+    }
+
     // Define the test_helpers module
     const test_helpers_mod = b.createModule(.{
         .root_source_file = b.path("tests/helpers.zig"),
@@ -49,6 +53,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "nomadfs", .module = mod },
         },
     });
+
+    if (target.result.os.tag == .windows) {
+        test_helpers_mod.link_libc = true;
+    }
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -92,6 +100,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    if (target.result.os.tag == .windows) {
+        exe.linkLibC();
+    }
+
+    if (target.result.os.tag != .macos) {
+        exe.lto = .full;
+        exe.link_gc_sections = true;
+    }
+
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
@@ -131,6 +148,10 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
 
+    if (target.result.os.tag == .windows) {
+        mod_tests.linkLibC();
+    }
+
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
@@ -140,6 +161,10 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+
+    if (target.result.os.tag == .windows) {
+        exe_tests.linkLibC();
+    }
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
@@ -164,6 +189,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    if (target.result.os.tag == .windows) {
+        integration_tests.linkLibC();
+    }
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
     run_integration_tests.step.dependOn(&run_exe_tests.step);

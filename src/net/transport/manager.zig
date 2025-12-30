@@ -37,6 +37,9 @@ pub const ConnectionManager = struct {
     reap_interval_ms: u64 = 10000,
     upnp: nat.UPnP,
     mdns: ?network.mdns.MDNS = null,
+    ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+    handshake_wg: std.Thread.WaitGroup = .{},
+    stopping: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, transport_type: config.Config.TransportType, key_path: ?[]const u8) !ConnectionManager {
         const keypair = try loadOrGenerateKey(allocator, key_path);
@@ -57,14 +60,34 @@ pub const ConnectionManager = struct {
             .running = std.atomic.Value(bool).init(true),
             .upnp = nat.UPnP.init(allocator),
             .mdns = null,
+            .ref_count = std.atomic.Value(usize).init(1),
+            .stopping = false,
         };
     }
+
+    pub fn ref(self: *ConnectionManager) void {
+        _ = self.ref_count.fetchAdd(1, .monotonic);
+    }
+
+    pub fn deinit(self: *ConnectionManager) void {
+        if (self.ref_count.fetchSub(1, .release) == 1) {
+            // Ensure we have visibility of all modifications before destruction
+            _ = self.ref_count.load(.acquire);
+            self.stop();
+            if (self.mdns) |*m| {
+                m.deinit();
+            }
+            self.connections.deinit(self.allocator);
+            self.upnp.deinit();
+        }
+    }
+
 
     pub fn start(self: *ConnectionManager) !void {
         if (self.reaper_thread != null) return;
         self.running.store(true, .release);
         self.reaper_thread = try std.Thread.spawn(.{}, ConnectionManager.runReaper, .{self});
-        
+
         // Start mDNS
         if (self.mdns) |*m| {
             try m.start();
@@ -118,10 +141,23 @@ pub const ConnectionManager = struct {
     }
 
     pub fn stop(self: *ConnectionManager) void {
+        self.mutex.lock();
+        if (self.stopping) {
+            self.mutex.unlock();
+            return;
+        }
+        self.stopping = true;
+        
         self.running.store(false, .release);
         if (self.mdns) |*m| {
             m.stop();
         }
+        self.mutex.unlock();
+        
+        // Wait for all handshake threads to finish without holding the lock
+        // as they might need to acquire it to add themselves or clean up.
+        self.handshake_wg.wait();
+
         if (self.reaper_thread) |t| {
             t.join();
             self.reaper_thread = null;
@@ -133,15 +169,6 @@ pub const ConnectionManager = struct {
             mc.conn.deinit();
         }
         self.connections.clearRetainingCapacity();
-    }
-
-    pub fn deinit(self: *ConnectionManager) void {
-        self.stop();
-        if (self.mdns) |*m| {
-            m.deinit();
-        }
-        self.connections.deinit(self.allocator);
-        self.upnp.deinit();
     }
 
     fn runReaper(self: *ConnectionManager) void {
@@ -238,8 +265,8 @@ pub const ConnectionManager = struct {
     }
 
     fn onMdnsDiscovery(ctx: ?*anyopaque, peer_id: id.NodeID, addr: std.net.Address) void {
-        std.debug.print("mDNS: Discovered peer {x} at {f}\n", .{peer_id.bytes[0..4], addr});
-        
+        std.debug.print("mDNS: Discovered peer {x} at {f}\n", .{ peer_id.bytes[0..4], addr });
+
         if (ctx) |c| {
             const self: *ConnectionManager = @ptrCast(@alignCast(c));
             if (self.on_discovery_fn) |cb| {
@@ -250,18 +277,32 @@ pub const ConnectionManager = struct {
 
     pub fn listen(self: *ConnectionManager, cfg: ListenConfig, running: ?*std.atomic.Value(bool)) !void {
         self.bound_port = cfg.port;
+
+                // Initialize mDNS
+
+                if (cfg.enable_mdns) {
+
+                    self.mdns = network.mdns.MDNS.init(
+
+                        self.allocator, 
+
+                        self.node_id, 
+
+                        cfg.port, 
+
+                        network.mdns.MDNS_PORT,
+
+                        onMdnsDiscovery, 
+
+                        self
+
+                    );
+
+                    try self.mdns.?.start();
+
+                }
+
         
-        // Initialize mDNS
-        if (cfg.enable_mdns) {
-            self.mdns = network.mdns.MDNS.init(
-                self.allocator, 
-                self.node_id, 
-                cfg.port, 
-                onMdnsDiscovery, 
-                self
-            );
-            try self.mdns.?.start();
-        }
 
         // Attempt UPnP in background
         if (cfg.upnp_enabled) {
@@ -271,10 +312,10 @@ pub const ConnectionManager = struct {
                         std.debug.print("UPnP Discovery failed: {any}\n", .{err});
                         return;
                     };
-                    
+
                     const local_ip = cm.upnp.getLocalIP() catch |err| {
-                         std.debug.print("UPnP failed to determine local IP: {any}\n", .{err});
-                         return;
+                        std.debug.print("UPnP failed to determine local IP: {any}\n", .{err});
+                        return;
                     };
                     defer cm.allocator.free(local_ip);
 
@@ -283,7 +324,7 @@ pub const ConnectionManager = struct {
                         return;
                     };
                 }
-            }.run, .{self, cfg.port});
+            }.run, .{ self, cfg.port });
             thread.detach();
         }
 

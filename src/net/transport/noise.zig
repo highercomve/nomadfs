@@ -208,11 +208,12 @@ pub const NoiseStream = struct {
     send_cipher: CipherState,
     recv_cipher: CipherState,
     remote_static: [32]u8,
-    read_buffer: [65535]u8 = undefined,
+    read_buffer: []u8,
     read_pos: usize = 0,
     read_end: usize = 0,
+    allocator: std.mem.Allocator,
 
-    pub fn handshake(inner: network.Stream, swarm_key_bytes: []const u8, static_key: KeyPair, initiator: bool) !NoiseStream {
+    pub fn handshake(allocator: std.mem.Allocator, inner: network.Stream, swarm_key_bytes: []const u8, static_key: KeyPair, initiator: bool) !NoiseStream {
         const role = if (initiator) "Initiator" else "Responder";
         std.debug.print("* Noise_XXpsk3 handshake start ({s})\n", .{role});
 
@@ -222,7 +223,7 @@ pub const NoiseStream = struct {
 
         var hs = HandshakeState.init(initiator, static_key, swarm_key);
 
-        const result = try_handshake_steps(inner, &hs, initiator);
+        const result = try_handshake_steps(allocator, inner, &hs, initiator);
         if (result) |ns| {
             std.debug.print("* Noise Handshake complete\n", .{});
             return ns;
@@ -232,7 +233,8 @@ pub const NoiseStream = struct {
         }
     }
 
-    fn try_handshake_steps(inner: network.Stream, hs: *HandshakeState, initiator: bool) !NoiseStream {
+    fn try_handshake_steps(allocator: std.mem.Allocator, inner: network.Stream, hs: *HandshakeState, initiator: bool) !NoiseStream {
+        // ... (existing handshake messages logic remains same until return)
         // Message 1: -> e
         if (initiator) {
             std.debug.print("* Noise (OUT): Message 1 -> sending ephemeral public key (e)\n", .{});
@@ -339,14 +341,18 @@ pub const NoiseStream = struct {
         }
 
         const ciphers = hs.symmetric.split();
+        const read_buf = try allocator.alloc(u8, 65535 + 16);
+        errdefer allocator.free(read_buf);
+
         return NoiseStream{
             .inner = inner,
             .send_cipher = if (initiator) ciphers[0] else ciphers[1],
             .recv_cipher = if (initiator) ciphers[1] else ciphers[0],
             .remote_static = hs.rs.?,
-            .read_buffer = undefined,
+            .read_buffer = read_buf,
             .read_pos = 0,
             .read_end = 0,
+            .allocator = allocator,
         };
     }
 
@@ -446,6 +452,7 @@ pub const NoiseStream = struct {
     fn close(ptr: *anyopaque) void {
         const self: *NoiseStream = @ptrCast(@alignCast(ptr));
         self.inner.close();
+        self.allocator.free(self.read_buffer);
     }
 };
 

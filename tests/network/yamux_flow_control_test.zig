@@ -5,7 +5,7 @@ const Pipe = @import("memory_stream.zig").Pipe;
 test "yamux: flow control (window management)" {
     std.debug.print("Starting flow control test...\n", .{});
     const allocator = std.testing.allocator;
-    const pipe = Pipe.init(allocator);
+    var pipe = Pipe.init(allocator);
     defer pipe.deinit();
 
     const client_session = try nomadfs.net.transport.yamux.Session.init(allocator, pipe.client(), false);

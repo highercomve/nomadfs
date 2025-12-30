@@ -8,15 +8,15 @@ test "yamux: multiple streams over single connection" {
     const allocator = std.testing.allocator;
 
     // 1. Setup Pipe
-    const pipe = Pipe.init(allocator);
+    var pipe = Pipe.init(allocator);
     defer pipe.deinit();
 
     // 2. Setup Sessions
     // Server Session
     // We pass pipe.server() which returns a Stream interface
     const server_session = try yamux.Session.init(allocator, pipe.server(), true);
-    // server_session must be destroyed after threads join to ensure no UAF, 
-    // but threads use session. 
+    // server_session must be destroyed after threads join to ensure no UAF,
+    // but threads use session.
     // Session.run uses session.
     // So we deinit after join.
     defer server_session.deinit();
@@ -62,7 +62,7 @@ test "yamux: multiple streams over single connection" {
         s1_server = server_stream2;
         s2_server = server_stream1;
     }
-    
+
     try std.testing.expectEqual(@as(u32, 1), s1_server.id);
     try std.testing.expectEqual(@as(u32, 3), s2_server.id);
 
@@ -79,7 +79,7 @@ test "yamux: multiple streams over single connection" {
     // Close the pipe to signal EOF to Session.run loops
     // We can use the stream interface from one of the sessions to close it.
     // client_session.transport is a Stream.
-    client_session.transport.close(); 
+    client_session.transport.close();
 
     // Wait for threads to finish
     server_thread.join();

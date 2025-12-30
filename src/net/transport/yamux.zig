@@ -110,15 +110,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
-        // Wait for all acceptStream waiters to exit
-        self.mutex.lock();
-        while (self.accept_waiters > 0) {
-            self.accept_cond.broadcast();
-            self.mutex.unlock();
-            std.Thread.sleep(10 * std.time.ns_per_ms);
-            self.mutex.lock();
-        }
-        self.mutex.unlock();
+        self.close();
 
         var it = self.streams.iterator();
         while (it.next()) |entry| {
@@ -128,6 +120,29 @@ pub const Session = struct {
         self.streams.deinit(self.allocator);
         self.accept_queue.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+
+    pub fn close(self: *Session) void {
+        self.mutex.lock();
+        if (self.closed) {
+            self.mutex.unlock();
+            return;
+        }
+        self.closed = true;
+        
+        // Wake up all waiters
+        self.accept_cond.broadcast();
+        
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            const stream = entry.value_ptr.*;
+            stream.mutex.lock();
+            stream.closed = true;
+            stream.cond.signal();
+            stream.write_cond.signal();
+            stream.mutex.unlock();
+        }
+        self.mutex.unlock();
     }
 
     pub fn newStream(self: *Session) !*YamuxStream {
@@ -174,21 +189,7 @@ pub const Session = struct {
 
     /// Read loop - must be called from a dedicated thread.
     pub fn run(self: *Session) !void {
-        defer {
-            self.mutex.lock();
-            self.closed = true;
-            var it = self.streams.iterator();
-            while (it.next()) |entry| {
-                const stream = entry.value_ptr.*;
-                stream.mutex.lock();
-                stream.closed = true;
-                stream.cond.signal();
-                stream.write_cond.signal();
-                stream.mutex.unlock();
-            }
-            self.accept_cond.broadcast();
-            self.mutex.unlock();
-        }
+        defer self.close();
 
         var header_buf: [12]u8 = undefined;
         while (true) {

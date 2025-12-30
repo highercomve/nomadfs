@@ -33,7 +33,7 @@ test "dht: rpc serialization and deserialization" {
         },
     };
 
-    var buffer = std.ArrayListUnmanaged(u8){};
+    var buffer = std.ArrayList(u8){};
     defer buffer.deinit(allocator);
 
     try original_msg.serialize(buffer.writer(allocator));

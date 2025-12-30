@@ -145,36 +145,78 @@ pub fn listen(allocator: std.mem.Allocator, cfg: ListenConfig) !void {
         };
         std.debug.print("Accepted connection from {f}\n", .{conn.address});
 
-        // Create the connection implementation
-        const impl = try allocator.create(TcpConnectionImpl);
-        errdefer allocator.destroy(impl);
-
-        // Initialize raw TCP stream
-        impl.tcp_stream = .{ .net_stream = conn.stream };
-        impl.peer_address = conn.address;
-
-        // Perform Noise Handshake (Responder)
-        impl.noise_stream = noise.NoiseStream.handshake(impl.tcp_stream.stream(), cfg.swarm_key, cfg.static_key, false) catch |err| {
-            std.debug.print("Handshake failed: {}\n", .{err});
-            conn.stream.close();
-            allocator.destroy(impl);
-            continue;
-        };
-
-        impl.yamux = try YamuxSession.init(allocator, impl.noise_stream.stream(), true);
-        errdefer impl.yamux.deinit();
-
-        impl.yamux_thread = try std.Thread.spawn(.{}, YamuxSession.run, .{impl.yamux});
-        impl.allocator = allocator;
-        impl.closed = false;
-
-        const conn_obj = impl.connection();
         if (cfg.manager) |m| {
-            try m.addConnection(conn_obj);
-        } else {
-            conn_obj.deinit();
+            m.ref();
+            m.handshake_wg.start();
         }
+
+        const thread = try std.Thread.spawn(.{}, handleIncomingConnection, .{
+            allocator,
+            conn,
+            cfg.swarm_key,
+            cfg.static_key,
+            cfg.manager,
+        });
+        thread.detach();
     }
+}
+
+fn handleIncomingConnection(
+    allocator: std.mem.Allocator,
+    conn: std.net.Server.Connection,
+    swarm_key: []const u8,
+    static_key: noise.KeyPair,
+    manager: ?*network.manager.ConnectionManager,
+) void {
+    defer if (manager) |m| {
+        m.handshake_wg.finish();
+    };
+    defer if (manager) |m| {
+        m.deinit();
+    };
+
+    const do_work = struct {
+        fn do(
+            a: std.mem.Allocator,
+            c: std.net.Server.Connection,
+            sk: []const u8,
+            stk: noise.KeyPair,
+            m: ?*network.manager.ConnectionManager,
+        ) !void {
+            // Create the connection implementation
+            const impl = try a.create(TcpConnectionImpl);
+            errdefer a.destroy(impl);
+
+            // Initialize raw TCP stream
+            impl.tcp_stream = .{ .net_stream = c.stream };
+            impl.peer_address = c.address;
+
+            // Perform Noise Handshake (Responder)
+            impl.noise_stream = try noise.NoiseStream.handshake(a, impl.tcp_stream.stream(), sk, stk, false);
+
+            impl.yamux = try YamuxSession.init(a, impl.noise_stream.stream(), true);
+            errdefer impl.yamux.deinit();
+
+            impl.yamux_thread = try std.Thread.spawn(.{}, YamuxSession.run, .{impl.yamux});
+            impl.allocator = a;
+            impl.closed = false;
+
+            const conn_obj = impl.connection();
+            if (m) |mgr| {
+                mgr.addConnection(conn_obj) catch |err| {
+                    conn_obj.deinit();
+                    return err;
+                };
+            } else {
+                conn_obj.deinit();
+            }
+        }
+    }.do;
+
+    do_work(allocator, conn, swarm_key, static_key, manager) catch |err| {
+        std.debug.print("Connection handler error for {f}: {}\n", .{ conn.address, err });
+        conn.stream.close();
+    };
 }
 
 pub fn connect(allocator: std.mem.Allocator, address: std.net.Address, swarm_key: []const u8, static_key: noise.KeyPair) !network.Connection {
@@ -186,7 +228,7 @@ pub fn connect(allocator: std.mem.Allocator, address: std.net.Address, swarm_key
     impl.peer_address = address;
 
     // Perform Noise Handshake (Initiator)
-    impl.noise_stream = try noise.NoiseStream.handshake(impl.tcp_stream.stream(), swarm_key, static_key, true);
+    impl.noise_stream = try noise.NoiseStream.handshake(allocator, impl.tcp_stream.stream(), swarm_key, static_key, true);
 
     impl.yamux = try YamuxSession.init(allocator, impl.noise_stream.stream(), false);
     errdefer impl.yamux.deinit();

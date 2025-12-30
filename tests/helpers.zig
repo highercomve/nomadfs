@@ -6,12 +6,12 @@ const nomadfs = @import("nomadfs");
 pub const TestPeer = struct {
     allocator: std.mem.Allocator,
     config: nomadfs.config.Config,
-    manager: nomadfs.net.transport.manager.ConnectionManager,
+    manager: *nomadfs.net.transport.manager.ConnectionManager,
     server_thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     listen_addr: std.net.Address,
 
-    pub fn init(allocator: std.mem.Allocator, port: u16) !*TestPeer {
+    pub fn init(allocator: std.mem.Allocator, port: u16) !TestPeer {
         // Setup minimal config
         var cfg = nomadfs.config.Config{
             .node = .{ .nickname = "TestNode", .swarm_key = "test_key_32_bytes_long_!!!!!!!!!" },
@@ -23,10 +23,13 @@ pub const TestPeer = struct {
 
         const addr = try std.net.Address.parseIp("127.0.0.1", port);
 
-        var peer = .{
+        const manager = try allocator.create(nomadfs.net.transport.manager.ConnectionManager);
+        manager.* = nomadfs.net.transport.manager.ConnectionManager.initExplicit(allocator, .tcp, nomadfs.net.transport.noise.KeyPair.generate());
+
+        var peer = TestPeer{
             .allocator = allocator,
             .config = cfg,
-            .manager = nomadfs.net.transport.manager.ConnectionManager.initExplicit(allocator, .tcp, nomadfs.net.transport.noise.KeyPair.generate()),
+            .manager = manager,
             .listen_addr = addr,
         };
         try peer.manager.start();
@@ -36,7 +39,7 @@ pub const TestPeer = struct {
     pub fn deinit(self: *TestPeer) void {
         self.stop();
         self.manager.deinit();
-        self.allocator.destroy(self);
+        self.allocator.destroy(self.manager);
     }
 
     pub fn start(self: *TestPeer) !void {
@@ -50,13 +53,14 @@ pub const TestPeer = struct {
         if (!self.running.load(.acquire)) return;
         self.running.store(false, .release);
 
-        // Close all existing connections
-        self.manager.stop();
-
         // Connect to self to unblock accept()
+        // This will spawn a short-lived connection handler
         if (std.net.tcpConnectToAddress(self.listen_addr)) |s| {
             s.close();
         } else |_| {}
+
+        // Close all existing connections and wait for handlers
+        self.manager.stop();
 
         if (self.server_thread) |t| {
             t.join();

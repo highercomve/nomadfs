@@ -2,14 +2,14 @@ const std = @import("std");
 const network = @import("nomadfs").net.transport;
 
 pub const MemoryStream = struct {
-    buffer: std.ArrayListUnmanaged(u8),
+    buffer: std.ArrayList(u8),
     read_pos: usize = 0,
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) MemoryStream {
         return .{
-            .buffer = std.ArrayListUnmanaged(u8){},
+            .buffer = std.ArrayList(u8){},
             .allocator = allocator,
         };
     }
@@ -57,8 +57,8 @@ const memory_stream_vtable = network.Stream.StreamVTable{
 };
 
 pub const Pipe = struct {
-    buffer_a_to_b: std.ArrayListUnmanaged(u8) = .{},
-    buffer_b_to_a: std.ArrayListUnmanaged(u8) = .{},
+    buffer_a_to_b: std.ArrayList(u8) = .{},
+    buffer_b_to_a: std.ArrayList(u8) = .{},
     cursor_a_to_b: usize = 0,
     cursor_b_to_a: usize = 0,
     mutex: std.Thread.Mutex = .{},
@@ -73,7 +73,6 @@ pub const Pipe = struct {
     pub fn deinit(self: *Pipe) void {
         self.buffer_a_to_b.deinit(self.allocator);
         self.buffer_b_to_a.deinit(self.allocator);
-        self.allocator.destroy(self);
     }
 
     pub fn client(self: *Pipe) network.Stream {
