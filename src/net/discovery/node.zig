@@ -13,6 +13,7 @@ pub const Node = struct {
     storage: std.AutoHashMapUnmanaged(id.NodeID, []u8),
     mutex: std.Thread.Mutex,
     is_public: bool = false,
+    handlers_wg: std.Thread.WaitGroup = .{},
 
     pub fn init(allocator: std.mem.Allocator, manager: *network.manager.ConnectionManager, swarm_key: []const u8) Node {
         return .{
@@ -23,6 +24,7 @@ pub const Node = struct {
             .storage = .{},
             .mutex = .{},
             .is_public = false,
+            .handlers_wg = .{},
         };
     }
 
@@ -55,6 +57,10 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        // Wait for all in-flight request handlers to finish.
+        // They might be detached threads accessing 'self'.
+        self.handlers_wg.wait();
+
         self.mutex.lock();
         defer self.mutex.unlock();
         self.routing_table.deinit();
@@ -238,22 +244,22 @@ pub const Node = struct {
         var state = try lookup_mod.LookupState.init(self.allocator, target, initial_peers);
         defer state.deinit();
 
-        std.debug.print("Lookup: Starting loop. Initial peers: {d}\n", .{initial_peers.len});
+        std.debug.print("Lookup: Starting loop for target {x}. Initial peers: {d}\n", .{ target.bytes[0..4], initial_peers.len });
 
         while (!state.isFinished()) {
             const next_peers = try state.nextPeersToQuery();
             defer self.allocator.free(next_peers);
 
-            std.debug.print("Lookup: Next peers count: {d}\n", .{next_peers.len});
+            std.debug.print("Lookup: [{x}] Next peers count: {d}\n", .{ target.bytes[0..4], next_peers.len });
 
             if (next_peers.len == 0) break;
 
             for (next_peers) |peer| {
                 if (peer.id.eql(self.manager.node_id)) continue;
-                std.debug.print("Lookup: Querying peer {x}\n", .{peer.id.bytes[0..4]});
+                std.debug.print("Lookup: [{x}] Querying peer {x}\n", .{ target.bytes[0..4], peer.id.bytes[0..4] });
 
                 if (self.sendFindNode(peer.addresses[0..peer.addrs_count], target, peer.id)) |closer_peers| {
-                    std.debug.print("Lookup: Peer {x} replied with {d} peers\n", .{ peer.id.bytes[0..4], closer_peers.len });
+                    std.debug.print("Lookup: [{x}] Peer {x} replied with {d} peers\n", .{ target.bytes[0..4], peer.id.bytes[0..4], closer_peers.len });
                     defer self.allocator.free(closer_peers);
                     try state.reportReply(peer.id, closer_peers);
 
@@ -266,7 +272,7 @@ pub const Node = struct {
                     }
                     self.mutex.unlock();
                 } else |err| {
-                    std.debug.print("Lookup: Failed to contact {x}: {any}. Removing from table.\n", .{ peer.id.bytes[0..4], err });
+                    std.debug.print("Lookup: [{x}] Failed to contact {x}: {any}. Removing from table.\n", .{ target.bytes[0..4], peer.id.bytes[0..4], err });
                     state.reportFailure(peer.id);
                     self.mutex.lock();
                     self.routing_table.markDisconnected(peer.id);
@@ -274,6 +280,7 @@ pub const Node = struct {
                 }
             }
         }
+        std.debug.print("Lookup: [{x}] Finished loop.\n", .{target.bytes[0..4]});
     }
 
     pub fn sendFindNode(self: *Node, addresses: []const std.net.Address, target: id.NodeID, peer_id: ?id.NodeID) ![]kbucket.PeerInfo {
@@ -339,6 +346,7 @@ pub const Node = struct {
             // Handle stream in a new thread
             const handler = struct {
                 fn run(n: *Node, s: network.Stream, c: network.Connection) void {
+                    defer n.handlers_wg.finish();
                     defer s.close();
                     if (!n.is_public) {
                         // Optional: we could still handle requests but not advertise ourselves.
@@ -350,6 +358,7 @@ pub const Node = struct {
                     };
                 }
             };
+            self.handlers_wg.start();
             const thread = try std.Thread.spawn(.{}, handler.run, .{ self, stream, conn });
             thread.detach();
         }

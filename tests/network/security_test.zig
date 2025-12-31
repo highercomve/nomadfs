@@ -129,7 +129,7 @@ const Context = struct {
 
     fn runClient(ctx: @This()) !void {
         var ns = try noise.NoiseStream.handshake(ctx.allocator, ctx.pipe.client(), ctx.key, noise.KeyPair.generate(), true);
-        defer ns.stream().close();
+        defer ns.deinit();
 
         const msg = "Super Secret Plaintext";
         _ = try ns.stream().write(msg);
@@ -142,7 +142,7 @@ const Context = struct {
 
     fn runServer(ctx: @This()) !void {
         var ns = try noise.NoiseStream.handshake(ctx.allocator, ctx.pipe.server(), ctx.key, noise.KeyPair.generate(), false);
-        defer ns.stream().close();
+        defer ns.deinit();
 
         // Read client message
         var buf: [1024]u8 = undefined;

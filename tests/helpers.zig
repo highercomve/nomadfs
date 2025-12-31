@@ -7,12 +7,11 @@ pub const TestPeer = struct {
     allocator: std.mem.Allocator,
     config: nomadfs.config.Config,
     manager: *nomadfs.net.transport.manager.ConnectionManager,
-    server_thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     listen_addr: std.net.Address,
 
     pub fn init(allocator: std.mem.Allocator, port: u16) !TestPeer {
-        // Setup minimal config
+        // ... (minimal config setup)
         var cfg = nomadfs.config.Config{
             .node = .{
                 .nickname = "TestNode",
@@ -35,8 +34,7 @@ pub const TestPeer = struct {
 
         const addr = try std.net.Address.parseIp("127.0.0.1", port);
 
-        const manager = try allocator.create(nomadfs.net.transport.manager.ConnectionManager);
-        manager.* = nomadfs.net.transport.manager.ConnectionManager.initExplicit(allocator, .tcp, nomadfs.net.transport.noise.KeyPair.generate());
+        const manager = try nomadfs.net.transport.manager.ConnectionManager.createExplicit(allocator, .tcp, nomadfs.net.transport.noise.KeyPair.generate());
 
         var peer = TestPeer{
             .allocator = allocator,
@@ -51,14 +49,13 @@ pub const TestPeer = struct {
     pub fn deinit(self: *TestPeer) void {
         self.stop();
         self.manager.deinit();
-        self.allocator.destroy(self.manager);
     }
 
     pub fn start(self: *TestPeer) !void {
         if (self.running.load(.acquire)) return;
         self.running.store(true, .release);
 
-        self.server_thread = try std.Thread.spawn(.{}, serverLoop, .{self});
+        try self.manager.listen(self.config, &self.running);
     }
 
     pub fn stop(self: *TestPeer) void {
@@ -66,26 +63,12 @@ pub const TestPeer = struct {
         self.running.store(false, .release);
 
         // Connect to self to unblock accept()
-        // This will spawn a short-lived connection handler
         if (std.net.tcpConnectToAddress(self.listen_addr)) |s| {
             s.close();
         } else |_| {}
 
         // Close all existing connections and wait for handlers
         self.manager.stop();
-
-        if (self.server_thread) |t| {
-            t.join();
-            self.server_thread = null;
-        }
-    }
-
-    fn serverLoop(self: *TestPeer) void {
-        self.manager.listen(self.config, &self.running) catch |err| {
-            if (self.running.load(.acquire)) {
-                std.debug.print("TestPeer server error: {}\n", .{err});
-            }
-        };
     }
 
     pub fn connect(self: *TestPeer, other: *TestPeer) !nomadfs.net.transport.Stream {

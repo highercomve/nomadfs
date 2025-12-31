@@ -11,6 +11,7 @@ pub const ConnectionManager = struct {
     const ManagedConnection = struct {
         conn: network.Connection,
         last_active: i64,
+        handler_thread: ?std.Thread = null,
     };
 
     allocator: std.mem.Allocator,
@@ -26,6 +27,7 @@ pub const ConnectionManager = struct {
     on_discovery_fn: ?*const fn (ctx: *anyopaque, peer_id: id.NodeID, addr: std.net.Address) void = null,
     reaper_thread: ?std.Thread = null,
     upnp_thread: ?std.Thread = null,
+    accept_thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     idle_timeout: i64 = 60 * 5,
     reap_interval_ms: u64 = 10000,
@@ -35,10 +37,23 @@ pub const ConnectionManager = struct {
     handshake_wg: std.Thread.WaitGroup = .{},
     stopping: bool = false,
     tcp_server: ?std.net.Server = null,
+    heap_allocated: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, transport_type: config.Config.TransportType, key_path: ?[]const u8) !ConnectionManager {
         const keypair = try loadOrGenerateKey(allocator, key_path);
         return initExplicit(allocator, transport_type, keypair);
+    }
+
+    pub fn create(allocator: std.mem.Allocator, transport_type: config.Config.TransportType, key_path: ?[]const u8) !*ConnectionManager {
+        const keypair = try loadOrGenerateKey(allocator, key_path);
+        return createExplicit(allocator, transport_type, keypair);
+    }
+
+    pub fn createExplicit(allocator: std.mem.Allocator, transport_type: config.Config.TransportType, keypair: noise.KeyPair) !*ConnectionManager {
+        const self = try allocator.create(ConnectionManager);
+        self.* = initExplicit(allocator, transport_type, keypair);
+        self.heap_allocated = true;
+        return self;
     }
 
     pub fn initExplicit(allocator: std.mem.Allocator, transport_type: config.Config.TransportType, keypair: noise.KeyPair) ConnectionManager {
@@ -53,12 +68,14 @@ pub const ConnectionManager = struct {
             .on_connection_fn = null,
             .reaper_thread = null,
             .upnp_thread = null,
+            .accept_thread = null,
             .running = std.atomic.Value(bool).init(true),
             .upnp = nat.UPnP.init(allocator),
             .mdns = null,
             .ref_count = std.atomic.Value(usize).init(1),
             .stopping = false,
             .tcp_server = null,
+            .heap_allocated = false,
         };
     }
 
@@ -70,12 +87,17 @@ pub const ConnectionManager = struct {
         if (self.ref_count.fetchSub(1, .release) == 1) {
             // Ensure we have visibility of all modifications before destruction
             _ = self.ref_count.load(.acquire);
+            const allocator = self.allocator;
+            const is_heap = self.heap_allocated;
             self.stop();
             if (self.mdns) |*m| {
                 m.deinit();
             }
-            self.connections.deinit(self.allocator);
+            self.connections.deinit(allocator);
             self.upnp.deinit();
+            if (is_heap) {
+                allocator.destroy(self);
+            }
         }
     }
 
@@ -154,9 +176,29 @@ pub const ConnectionManager = struct {
         }
         self.mutex.unlock();
 
+        if (self.accept_thread) |t| {
+            t.join();
+            self.accept_thread = null;
+        }
+
         // Wait for all handshake threads to finish without holding the lock
         // as they might need to acquire it to add themselves or clean up.
         self.handshake_wg.wait();
+
+        // Collect and cleanup connections and their handler threads
+        self.mutex.lock();
+        while (self.connections.items.len > 0) {
+            const mc = self.connections.pop().?;
+            self.mutex.unlock();
+            
+            mc.conn.deinit(); // This signals thread to exit
+            if (mc.handler_thread) |t| {
+                t.join();
+            }
+            
+            self.mutex.lock();
+        }
+        self.mutex.unlock();
 
         if (self.reaper_thread) |t| {
             t.join();
@@ -167,13 +209,6 @@ pub const ConnectionManager = struct {
             t.join();
             self.upnp_thread = null;
         }
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        for (self.connections.items) |mc| {
-            mc.conn.deinit();
-        }
-        self.connections.clearRetainingCapacity();
     }
 
     fn runReaper(self: *ConnectionManager) void {
@@ -195,8 +230,11 @@ pub const ConnectionManager = struct {
                 const is_closed = mc.conn.isClosed();
 
                 if (is_closed or is_idle) {
-                    _ = self.connections.orderedRemove(i);
-                    mc.conn.deinit();
+                    var removed_mc = self.connections.orderedRemove(i);
+                    self.mutex.unlock();
+                    removed_mc.conn.deinit();
+                    if (removed_mc.handler_thread) |t| t.join();
+                    self.mutex.lock();
                 } else {
                     i += 1;
                 }
@@ -220,28 +258,30 @@ pub const ConnectionManager = struct {
 
     fn threadWrapper(cb: *const fn (*anyopaque, network.Connection) anyerror!void, ctx: *anyopaque, conn: network.Connection) void {
         cb(ctx, conn) catch |err| {
-            std.debug.print("Connection handler error: {any}\n", .{err});
+            if (err != error.SessionClosed and err != error.EndOfStream and err != error.ConnectionResetByPeer) {
+                std.debug.print("Connection handler error: {any}\n", .{err});
+            }
         };
     }
 
     pub fn addConnection(self: *ConnectionManager, conn: network.Connection) !void {
-        var cb_opt: ?*const fn (*anyopaque, network.Connection) anyerror!void = null;
-        var ctx_opt: ?*anyopaque = null;
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            try self.connections.append(self.allocator, .{
-                .conn = conn,
-                .last_active = std.time.timestamp(),
-            });
-            cb_opt = self.on_connection_fn;
-            ctx_opt = self.on_connection_ctx;
+        if (self.stopping) {
+            conn.deinit();
+            return;
         }
 
-        if (cb_opt) |cb| {
-            const thread = try std.Thread.spawn(.{}, threadWrapper, .{ cb, ctx_opt.?, conn });
-            thread.detach();
+        const mc_ptr = try self.connections.addOne(self.allocator);
+        mc_ptr.* = .{
+            .conn = conn,
+            .last_active = std.time.timestamp(),
+            .handler_thread = null,
+        };
+
+        if (self.on_connection_fn) |cb| {
+            mc_ptr.handler_thread = try std.Thread.spawn(.{}, threadWrapper, .{ cb, self.on_connection_ctx.?, conn });
         }
     }
 
@@ -270,8 +310,6 @@ pub const ConnectionManager = struct {
     }
 
     fn onMdnsDiscovery(ctx: ?*anyopaque, peer_id: id.NodeID, addr: std.net.Address) void {
-        std.debug.print("mDNS: Discovered peer {x} at {f}\n", .{ peer_id.bytes[0..4], addr });
-
         if (ctx) |c| {
             const self: *ConnectionManager = @ptrCast(@alignCast(c));
             if (self.on_discovery_fn) |cb| {
@@ -330,6 +368,18 @@ pub const ConnectionManager = struct {
                     .running = running,
                     .manager = self,
                 });
+
+                self.accept_thread = try std.Thread.spawn(.{}, tcp.runAcceptLoop, .{
+                    self.allocator,
+                    self.tcp_server.?,
+                    tcp.ListenConfig{
+                        .port = cfg.network.port,
+                        .swarm_key = cfg.node.swarm_key,
+                        .static_key = self.identity_key,
+                        .running = running,
+                        .manager = self,
+                    },
+                });
             },
             .quic => {
                 return error.QuicNotImplemented;
@@ -374,7 +424,6 @@ pub const ConnectionManager = struct {
         std.mem.sort(std.net.Address, sorted_addrs, SortCtx{}, SortCtx.lessThan);
 
         for (sorted_addrs) |addr| {
-            std.debug.print("ConnectionManager: Dialing {f}...\n", .{addr});
             if (self.connectToPeer(addr, swarm_key, remote_node_id)) |conn| {
                 return conn;
             } else |err| {
@@ -409,7 +458,6 @@ pub const ConnectionManager = struct {
         }
         self.mutex.unlock();
 
-        std.debug.print("ConnectionManager: Connecting to {f} (New)\n", .{address});
         switch (self.transport_type) {
             .tcp => {
                 const conn = try tcp.connect(self.allocator, address, swarm_key, self.identity_key);

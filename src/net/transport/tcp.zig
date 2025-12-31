@@ -70,6 +70,7 @@ const TcpConnectionImpl = struct {
     pub fn deinit(ctx: *anyopaque) void {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
         TcpConnectionImpl.close(ctx);
+        self.noise_stream.deinit();
         self.allocator.destroy(self);
     }
 };
@@ -131,17 +132,19 @@ pub const ListenConfig = struct {
     manager: ?*network.manager.ConnectionManager = null,
 };
 
-pub fn listen(allocator: std.mem.Allocator, cfg: ListenConfig) !std.net.Server {
+pub fn listen(_: std.mem.Allocator, cfg: ListenConfig) !std.net.Server {
     const address = try std.net.Address.parseIp("0.0.0.0", cfg.port);
     var server = try address.listen(.{ .reuse_address = true });
     errdefer server.deinit();
 
     std.debug.print("Listening for TCP connections on {f}...\n", .{address});
 
-    const thread = try std.Thread.spawn(.{}, acceptLoop, .{ allocator, server, cfg });
-    thread.detach();
-
+    // We no longer spawn the thread here. The caller (ConnectionManager) must do it.
     return server;
+}
+
+pub fn runAcceptLoop(allocator: std.mem.Allocator, mut_server: std.net.Server, cfg: ListenConfig) void {
+    acceptLoop(allocator, mut_server, cfg);
 }
 
 fn acceptLoop(allocator: std.mem.Allocator, mut_server: std.net.Server, cfg: ListenConfig) void {
@@ -194,10 +197,10 @@ fn handleIncomingConnection(
     manager: ?*network.manager.ConnectionManager,
 ) void {
     defer if (manager) |m| {
-        m.handshake_wg.finish();
+        m.deinit();
     };
     defer if (manager) |m| {
-        m.deinit();
+        m.handshake_wg.finish();
     };
 
     const do_work = struct {

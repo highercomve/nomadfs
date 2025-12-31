@@ -449,15 +449,23 @@ pub const NoiseStream = struct {
         return buffer.len;
     }
 
-    fn close(ptr: *anyopaque) void {
-        const self: *NoiseStream = @ptrCast(@alignCast(ptr));
-        self.inner.close();
+    pub fn deinit(self: *NoiseStream) void {
+        self.close();
         self.allocator.free(self.read_buffer);
+    }
+
+    pub fn close(self: *NoiseStream) void {
+        self.inner.close();
+    }
+
+    fn closeVProxy(ptr: *anyopaque) void {
+        const self: *NoiseStream = @ptrCast(@alignCast(ptr));
+        self.close();
     }
 };
 
 const noise_stream_vtable = network.Stream.StreamVTable{
     .read = NoiseStream.read,
     .write = NoiseStream.write,
-    .close = NoiseStream.close,
+    .close = NoiseStream.closeVProxy,
 };
