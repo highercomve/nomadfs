@@ -120,6 +120,7 @@ const Bucket = struct {
         } else {
             // Replacement cache full.
             // MVP: Discard oldest replacement (head)
+            std.log.warn("KBucket replacement cache full, evicting oldest peer", .{});
             _ = self.replacements.orderedRemove(0);
             try self.replacements.append(self.allocator, peer);
         }

@@ -24,9 +24,12 @@ pub const VectorClock = struct {
         }
         self.entries.deinit();
     }
-    
+
     // Increment the clock for a specific node
     pub fn increment(self: *VectorClock, node_id: []const u8) !void {
+        std.debug.assert(node_id.len > 0);
+        std.debug.assert(self.entries.items.len < MAX_VECTOR_CLOCK_ENTRIES);
+
         for (self.entries.items) |*entry| {
             if (std.mem.eql(u8, entry.node_id, node_id)) {
                 entry.counter += 1;
@@ -38,22 +41,35 @@ pub const VectorClock = struct {
             .node_id = try self.allocator.dupe(u8, node_id),
             .counter = 1,
         });
+
+        std.debug.assert(self.entries.items.len <= MAX_VECTOR_CLOCK_ENTRIES);
     }
 
     pub const Order = enum {
         Equal,
-        Less,     // self < other (self happened before other)
-        Greater,  // self > other (other happened before self)
+        Less, // self < other (self happened before other)
+        Greater, // self > other (other happened before self)
         Concurrent,
     };
 
+    const MAX_VECTOR_CLOCK_ENTRIES = 1000;
+
+    /// Compare two vector clocks for causal ordering.
+    ///
+    /// Time Complexity: O(N*M) where N = self.entries.len, M = other.entries.len
+    /// Space Complexity: O(1)
+    ///
+    /// Performance Considerations:
+    /// - For small swarms (N < 100), O(N*M) is acceptable (<10k operations)
+    /// - For large deployments (N > 1000), consider using HashMap for O(N+M) lookups
+    /// - Maximum entry limit enforced to prevent unbounded growth
     pub fn compare(self: VectorClock, other: VectorClock) Order {
         var self_is_less = false;
         var other_is_less = false;
 
         // Iterate over all keys (union of both clocks)
         // This O(N*M) implementation is naive but fine for MVP with small N.
-        
+
         // Check self against other
         for (self.entries.items) |s_entry| {
             var o_counter: u64 = 0;
@@ -85,7 +101,7 @@ pub const VectorClock = struct {
         if (other_is_less) return .Greater;
         return .Equal;
     }
-    
+
     // Merge two vector clocks (element-wise max)
     pub fn merge(self: *VectorClock, other: VectorClock) !void {
         for (other.entries.items) |o_entry| {

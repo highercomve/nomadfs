@@ -18,6 +18,7 @@ pub const LookupState = struct {
     in_flight: std.AutoHashMapUnmanaged(id.NodeID, void),
     /// Set of Peer IDs that failed to respond.
     failed: std.AutoHashMapUnmanaged(id.NodeID, void),
+    mutex: std.Thread.Mutex = .{},
 
     pub const LookupPeer = struct {
         info: kbucket.PeerInfo,
@@ -50,6 +51,9 @@ pub const LookupState = struct {
     }
 
     pub fn addPeer(self: *LookupState, info: kbucket.PeerInfo) !void {
+        std.debug.assert(!info.id.eql(self.target));
+        std.debug.assert(self.best_peers.items.len < 1000);
+
         if (self.queried.contains(info.id) or self.failed.contains(info.id)) return;
 
         // Don't add if already in best_peers
@@ -79,7 +83,12 @@ pub const LookupState = struct {
     }
 
     /// Selects up to Alpha peers that haven't been queried yet.
+    /// Note: This does NOT mark peers as in-flight. Callers must use markInFlight()
+    /// to atomically mark peers when they begin actual query processing.
     pub fn nextPeersToQuery(self: *LookupState) ![]kbucket.PeerInfo {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var count: usize = 0;
         var result = std.ArrayListUnmanaged(kbucket.PeerInfo){};
         errdefer result.deinit(self.allocator);
@@ -87,7 +96,6 @@ pub const LookupState = struct {
         for (self.best_peers.items) |*p| {
             if (!p.queried and !self.in_flight.contains(p.info.id)) {
                 try result.append(self.allocator, p.info);
-                try self.in_flight.put(self.allocator, p.info.id, {});
                 count += 1;
                 if (count >= Alpha) break;
             }
@@ -95,7 +103,18 @@ pub const LookupState = struct {
         return result.toOwnedSlice(self.allocator);
     }
 
+    /// Mark a peer as in-flight atomically.
+    /// This should be called immediately after selecting peers and before sending queries.
+    pub fn markInFlight(self: *LookupState, peer_id: id.NodeID) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.in_flight.put(self.allocator, peer_id, {}) catch {};
+    }
+
     pub fn reportReply(self: *LookupState, sender_id: id.NodeID, closer_peers: []const kbucket.PeerInfo) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         _ = self.in_flight.remove(sender_id);
         try self.queried.put(self.allocator, sender_id, {});
 
@@ -118,6 +137,9 @@ pub const LookupState = struct {
     }
 
     pub fn reportFailure(self: *LookupState, sender_id: id.NodeID) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         _ = self.in_flight.remove(sender_id);
         self.failed.put(self.allocator, sender_id, {}) catch {};
 
@@ -131,6 +153,11 @@ pub const LookupState = struct {
     }
 
     pub fn isFinished(self: *LookupState) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        std.debug.assert(self.best_peers.items.len <= 1000);
+
         // Finished if:
         // 1. We have nothing in flight.
         // AND

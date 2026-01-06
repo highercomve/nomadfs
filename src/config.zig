@@ -1,6 +1,33 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+pub const ConfigError = error{
+    InvalidSwarmKey,
+    ConfigNotFound,
+};
+
+/// Validate and decode swarm key from configuration.
+/// Accepts:
+/// - 64-character hex string (decoded to 32 bytes)
+/// - 32-byte binary string
+/// Rejects all other formats
+fn validateSwarmKey(val: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    if (val.len == 64) {
+        // Validate hex characters
+        for (val) |c| {
+            if (!std.ascii.isHex(c)) return error.InvalidSwarmKey;
+        }
+        const decoded = try allocator.alloc(u8, 32);
+        _ = try std.fmt.hexToBytes(decoded, val);
+        return decoded;
+    } else if (val.len == 32) {
+        // Binary key, just duplicate
+        return try allocator.dupe(u8, val);
+    } else {
+        return error.InvalidSwarmKey;
+    }
+}
+
 pub const Config = struct {
     node: NodeConfig,
     storage: StorageConfig,
@@ -31,6 +58,10 @@ pub const Config = struct {
     };
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
+        std.debug.assert(self.node.nickname.len > 0);
+        std.debug.assert(self.node.swarm_key.len == 32);
+        std.debug.assert(self.storage.storage_path.len > 0);
+
         allocator.free(self.node.nickname);
         allocator.free(self.node.swarm_key);
         if (self.node.key_path) |p| allocator.free(p);
@@ -46,6 +77,8 @@ pub const Config = struct {
 /// Note: In a real-world scenario, we might use a full TOML parser.
 /// For this MVP, we implement a basic line-by-line parser.
 pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
+    std.debug.assert(path.len > 0);
+
     var expanded_path: []const u8 = path;
     var owned_path: ?[]const u8 = null;
     defer if (owned_path) |p| allocator.free(p);
@@ -99,13 +132,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
         if (std.mem.eql(u8, key, "nickname")) {
             config.node.nickname = try allocator.dupe(u8, val);
         } else if (std.mem.eql(u8, key, "swarm_key")) {
-            if (val.len == 64) {
-                const decoded = try allocator.alloc(u8, 32);
-                _ = try std.fmt.hexToBytes(decoded, val);
-                config.node.swarm_key = decoded;
-            } else {
-                config.node.swarm_key = try allocator.dupe(u8, val);
-            }
+            config.node.swarm_key = try validateSwarmKey(val, allocator);
         } else if (std.mem.eql(u8, key, "key_path")) {
             config.node.key_path = try allocator.dupe(u8, val);
         } else if (std.mem.eql(u8, key, "enabled")) {
@@ -141,6 +168,12 @@ pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
     }
 
     config.network.bootstrap_peers = try bootstrap_list.toOwnedSlice(allocator);
+
+    std.debug.assert(config.node.nickname.len > 0);
+    std.debug.assert(config.node.swarm_key.len == 32);
+    std.debug.assert(config.storage.storage_path.len > 0);
+    std.debug.assert(config.network.port > 0);
+
     return config;
 }
 

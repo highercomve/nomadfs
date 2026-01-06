@@ -62,10 +62,9 @@ pub const CipherState = struct {
         self.has_key = true;
     }
 
-    pub fn encryptWithAd(self: *CipherState, ad: []const u8, plaintext: []const u8, out: []u8) void {
+    pub fn encryptWithAd(self: *CipherState, ad: []const u8, plaintext: []const u8, out: []u8) !void {
         if (!self.has_key) {
-            @memcpy(out[0..plaintext.len], plaintext);
-            return;
+            return error.EncryptionNotReady;
         }
 
         var nonce = [_]u8{0} ** 12;
@@ -80,8 +79,7 @@ pub const CipherState = struct {
 
     pub fn decryptWithAd(self: *CipherState, ad: []const u8, ciphertext: []const u8, out: []u8) !void {
         if (!self.has_key) {
-            @memcpy(out[0..ciphertext.len], ciphertext);
-            return;
+            return error.EncryptionNotReady;
         }
 
         if (ciphertext.len < 16) return error.DecryptionFailed;
@@ -156,8 +154,8 @@ pub const SymmetricState = struct {
         self.cipher_state.initializeKey(output[64..96].*);
     }
 
-    pub fn encryptAndHash(self: *SymmetricState, plaintext: []const u8, out: []u8) void {
-        self.cipher_state.encryptWithAd(&self.h, plaintext, out);
+    pub fn encryptAndHash(self: *SymmetricState, plaintext: []const u8, out: []u8) !void {
+        try self.cipher_state.encryptWithAd(&self.h, plaintext, out);
         const ct_len = if (self.cipher_state.has_key) plaintext.len + 16 else plaintext.len;
         self.mixHash(out[0..ct_len]);
     }
@@ -284,7 +282,7 @@ pub const NoiseStream = struct {
 
             // s
             var s_ct: [32 + 16]u8 = undefined;
-            hs.symmetric.encryptAndHash(&hs.s.public_key, &s_ct);
+            try hs.symmetric.encryptAndHash(&hs.s.public_key, &s_ct);
 
             // es
             const es = X25519.scalarmult(hs.s.private_key, hs.re.?) catch |err| return logError("Message 2 DH (es)", err);
@@ -301,7 +299,7 @@ pub const NoiseStream = struct {
             std.debug.print("* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication\n", .{});
             // s
             var s_ct: [32 + 16]u8 = undefined;
-            hs.symmetric.encryptAndHash(&hs.s.public_key, &s_ct);
+            try hs.symmetric.encryptAndHash(&hs.s.public_key, &s_ct);
 
             // se
             const se = X25519.scalarmult(hs.s.private_key, hs.re.?) catch |err| return logError("Message 3 DH (se)", err);
@@ -312,7 +310,7 @@ pub const NoiseStream = struct {
 
             // Final message has s_ct and an empty payload encrypted (just a tag)
             var payload_ct: [16]u8 = undefined;
-            hs.symmetric.encryptAndHash(&[_]u8{}, &payload_ct);
+            try hs.symmetric.encryptAndHash(&[_]u8{}, &payload_ct);
 
             var msg3: [48 + 16]u8 = undefined;
             @memcpy(msg3[0..48], &s_ct);
@@ -399,13 +397,13 @@ pub const NoiseStream = struct {
 
         if (len < 16) return error.PacketTooSmall;
         const msg_len = len - 16;
-        
+
         if (len > self.read_buffer.len) return error.PacketTooLarge;
 
         try readFull(self.inner, self.read_buffer[0..len]);
 
         try self.recv_cipher.decryptWithAd(&[_]u8{}, self.read_buffer[0..len], self.read_buffer[0..msg_len]);
-        
+
         self.read_pos = 0;
         self.read_end = msg_len;
 
@@ -413,7 +411,7 @@ pub const NoiseStream = struct {
         const to_copy = @min(buffer.len, msg_len);
         @memcpy(buffer[0..to_copy], self.read_buffer[0..to_copy]);
         self.read_pos += to_copy;
-        
+
         return to_copy;
     }
 
@@ -436,7 +434,7 @@ pub const NoiseStream = struct {
             const packet_len = chunk_len + 16;
 
             var temp: [max_payload + 16]u8 = undefined;
-            self.send_cipher.encryptWithAd(&[_]u8{}, buffer[i .. i + chunk_len], &temp);
+            try self.send_cipher.encryptWithAd(&[_]u8{}, buffer[i .. i + chunk_len], &temp);
 
             var len_buf: [2]u8 = undefined;
             std.mem.writeInt(u16, &len_buf, @intCast(packet_len), .big);

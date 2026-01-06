@@ -4,6 +4,7 @@ const Block = @import("block.zig").Block;
 
 pub const StorageEngine = struct {
     root_dir: std.fs.Dir,
+    allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !StorageEngine {
         var expanded_path: []const u8 = path;
@@ -28,6 +29,7 @@ pub const StorageEngine = struct {
         const dir = try std.fs.cwd().openDir(expanded_path, .{});
         return StorageEngine{
             .root_dir = dir,
+            .allocator = allocator,
         };
     }
 
@@ -36,17 +38,23 @@ pub const StorageEngine = struct {
     }
 
     pub fn put(self: *StorageEngine, block: Block) !void {
-        const hex_cid = try std.fmt.allocPrint(std.heap.page_allocator, "{s}", .{std.fmt.fmtSliceHexLower(&block.cid)});
-        defer std.heap.page_allocator.free(hex_cid);
+        std.debug.assert(block.data.len > 0);
+        std.debug.assert(block.cid.len == 32);
+        std.debug.assert(self.allocator != null);
+
+        const hex_cid = try std.fmt.allocPrint(self.allocator, "{s}", .{std.fmt.fmtSliceHexLower(&block.cid)});
+        defer self.allocator.free(hex_cid);
 
         const file = try self.root_dir.createFile(hex_cid, .{});
         defer file.close();
 
-        try file.writeAll(block.data);
+        const bytes_written = try file.writeAll(block.data);
+        std.debug.assert(bytes_written == block.data.len);
     }
 
     pub fn get(self: *StorageEngine, cid: []const u8, allocator: std.mem.Allocator) !?Block {
-        if (cid.len != 32) return error.InvalidCid;
+        std.debug.assert(cid.len == 32);
+        std.debug.assert(allocator != null);
 
         const hex_cid = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(cid)});
         defer allocator.free(hex_cid);
@@ -58,6 +66,7 @@ pub const StorageEngine = struct {
         defer file.close();
 
         const size = try file.getEndPos();
+        std.debug.assert(size > 0);
         const buffer = try allocator.alloc(u8, size);
         const read_bytes = try file.readAll(buffer);
 
@@ -65,6 +74,8 @@ pub const StorageEngine = struct {
             allocator.free(buffer);
             return error.ReadError;
         }
+
+        std.debug.assert(read_bytes == size);
 
         // Verify hash? For now just return
         var hash: [32]u8 = undefined;
