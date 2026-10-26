@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const network = @import("mod.zig");
 const compat = @import("../compat.zig");
 
@@ -20,7 +21,7 @@ fn closeSocket(s: posix.socket_t) void {
 fn sendtoSocket(s: posix.socket_t, buf: []const u8, flags: u32, addr: ?*const posix.sockaddr, alen: posix.socklen_t) !usize {
     const rc = system.sendto(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
     return switch (posix.errno(rc)) {
-        .SUCCESS => rc,
+        .SUCCESS => @intCast(rc),
         else => |err| posix.unexpectedErrno(err),
     };
 }
@@ -28,10 +29,32 @@ fn sendtoSocket(s: posix.socket_t, buf: []const u8, flags: u32, addr: ?*const po
 fn recvfromSocket(s: posix.socket_t, buf: []u8, flags: u32, addr: ?*posix.sockaddr, alen: ?*posix.socklen_t) !usize {
     const rc = system.recvfrom(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
     return switch (posix.errno(rc)) {
-        .SUCCESS => rc,
+        .SUCCESS => @intCast(rc),
         .AGAIN => error.WouldBlock,
         else => |err| posix.unexpectedErrno(err),
     };
+}
+
+/// Bound on each UPnP HTTP step. The UPnP thread is joined on shutdown, so an
+/// unresponsive gateway must not be able to block it indefinitely.
+const http_timeout_ms: u32 = 5_000;
+
+/// Connects to the gateway and bounds every later read/write on the stream.
+fn connectGateway(addr: compat.Address) !compat.Stream {
+    const stream = try compat.tcpConnectToAddressTimeout(addr, http_timeout_ms);
+    errdefer stream.close();
+    try stream.setTimeout(http_timeout_ms);
+    return stream;
+}
+
+/// Reads an HTTP response (until EOF) into `out`, capped at 64 KiB.
+fn readResponse(allocator: std.mem.Allocator, stream: compat.Stream, out: *std.ArrayList(u8)) !void {
+    var read_buf: [1024]u8 = undefined;
+    while (out.items.len <= 64 * 1024) {
+        const n = stream.read(&read_buf) catch break;
+        if (n == 0) break;
+        try out.appendSlice(allocator, read_buf[0..n]);
+    }
 }
 
 pub const UPnP = struct {
@@ -41,7 +64,7 @@ pub const UPnP = struct {
     mapped_port: ?u16,
 
     pub fn init(allocator: std.mem.Allocator) UPnP {
-        return .{ 
+        return .{
             .allocator = allocator,
             .gateway_url = null,
             .local_ip = null,
@@ -55,6 +78,11 @@ pub const UPnP = struct {
     }
 
     pub fn discoverGateway(self: *UPnP) !void {
+        // The raw socket helpers are POSIX-only.
+        if (builtin.os.tag == .windows) return error.Unsupported else return self.discoverGatewayPosix();
+    }
+
+    fn discoverGatewayPosix(self: *UPnP) !void {
         const ssdp_msg =
             "M-SEARCH * HTTP/1.1\r\n" ++
             "HOST: 239.255.255.250:1900\r\n" ++
@@ -75,7 +103,7 @@ pub const UPnP = struct {
 
         var buf: [4096]u8 = undefined;
         var attempts: usize = 0;
-        
+
         while (attempts < 3) : (attempts += 1) {
             const len = recvfromSocket(socket, &buf, 0, null, null) catch |err| {
                 if (err == error.WouldBlock) continue;
@@ -84,7 +112,9 @@ pub const UPnP = struct {
 
             const response = buf[0..len];
             if (parseLocation(response)) |location| {
-                self.gateway_url = try self.allocator.dupe(u8, location);
+                const url = try self.allocator.dupe(u8, location);
+                if (self.gateway_url) |old| self.allocator.free(old);
+                self.gateway_url = url;
                 std.debug.print("UPnP: Found gateway at {s}\n", .{location});
                 return;
             }
@@ -114,7 +144,7 @@ pub const UPnP = struct {
         const host = host_comp.percent_encoded;
 
         const addr = try compat.Address.parseIp(host, port);
-        const stream = try compat.tcpConnectToAddress(addr);
+        const stream = try connectGateway(addr);
         defer stream.close();
 
         var req_buf: [1024]u8 = undefined;
@@ -123,13 +153,7 @@ pub const UPnP = struct {
 
         var body_list: std.ArrayList(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        var read_buf: [1024]u8 = undefined;
-        while (true) {
-            const n = stream.read(&read_buf) catch break;
-            if (n == 0) break;
-            try body_list.appendSlice(self.allocator, read_buf[0..n]);
-            if (body_list.items.len > 64 * 1024) break;
-        }
+        try readResponse(self.allocator, stream, &body_list);
         const body = body_list.items;
 
         const header_end = std.mem.indexOf(u8, body, "\r\n\r\n");
@@ -157,6 +181,10 @@ pub const UPnP = struct {
     }
 
     pub fn getLocalIP(self: *UPnP) ![]const u8 {
+        if (builtin.os.tag == .windows) return error.Unsupported else return self.getLocalIPPosix();
+    }
+
+    fn getLocalIPPosix(self: *UPnP) ![]const u8 {
         if (self.gateway_url == null) return error.NoGateway;
         const uri = try std.Uri.parse(self.gateway_url.?);
         const host_comp = uri.host orelse return error.InvalidGatewayUrl;
@@ -194,7 +222,7 @@ pub const UPnP = struct {
         const port_num = uri.port orelse 80;
 
         const addr = try compat.Address.parseIp(host, port_num);
-        const stream = try compat.tcpConnectToAddress(addr);
+        const stream = try connectGateway(addr);
         defer stream.close();
 
         const soap_body = try std.fmt.allocPrint(self.allocator,
@@ -213,9 +241,7 @@ pub const UPnP = struct {
             \\</u:AddPortMapping>
             \\</s:Body>
             \\</s:Envelope>
-            ,
-            .{ port, protocol, port, local_ip_str }
-        );
+        , .{ port, protocol, port, local_ip_str });
         defer self.allocator.free(soap_body);
 
         var req_header: [512]u8 = undefined;
@@ -225,13 +251,7 @@ pub const UPnP = struct {
 
         var body_list: std.ArrayList(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        var read_buf: [1024]u8 = undefined;
-        while (true) {
-            const n = stream.read(&read_buf) catch break;
-            if (n == 0) break;
-            try body_list.appendSlice(self.allocator, read_buf[0..n]);
-            if (body_list.items.len > 64 * 1024) break;
-        }
+        try readResponse(self.allocator, stream, &body_list);
         const response = body_list.items;
 
         if (std.mem.indexOf(u8, response, "200 OK") == null) {
@@ -253,7 +273,7 @@ pub const UPnP = struct {
         const port_num = uri.port orelse 80;
 
         const addr = try compat.Address.parseIp(host, port_num);
-        const stream = try compat.tcpConnectToAddress(addr);
+        const stream = try connectGateway(addr);
         defer stream.close();
 
         const soap_body = try std.fmt.allocPrint(self.allocator,
@@ -267,9 +287,7 @@ pub const UPnP = struct {
             \\</u:DeletePortMapping>
             \\</s:Body>
             \\</s:Envelope>
-            ,
-            .{ port, protocol }
-        );
+        , .{ port, protocol });
         defer self.allocator.free(soap_body);
 
         var req_header: [512]u8 = undefined;
@@ -279,13 +297,7 @@ pub const UPnP = struct {
 
         var body_list: std.ArrayList(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        var read_buf: [1024]u8 = undefined;
-        while (true) {
-            const n = stream.read(&read_buf) catch break;
-            if (n == 0) break;
-            try body_list.appendSlice(self.allocator, read_buf[0..n]);
-            if (body_list.items.len > 64 * 1024) break;
-        }
+        try readResponse(self.allocator, stream, &body_list);
         const response = body_list.items;
 
         if (std.mem.indexOf(u8, response, "200 OK") == null) {

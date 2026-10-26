@@ -5,9 +5,10 @@ const DagLink = node_mod.DagLink;
 const StorageEngine = @import("../engine.zig").StorageEngine;
 const block_mod = @import("../block.zig");
 const Block = block_mod.Block;
+const codec = @import("codec.zig");
 
 // IPFS default chunk size is 256KB
-const CHUNK_SIZE = 256 * 1024;
+pub const CHUNK_SIZE = 256 * 1024;
 const MAX_LINKS = 174;
 
 pub const Layout = enum {
@@ -20,51 +21,30 @@ pub const DagBuilder = struct {
     store: *StorageEngine,
     layout: Layout,
 
-    /// Main entry point: Turns a file reader into a Root CID
+    /// Main entry point: Turns a file reader into a Root CID owned by the caller.
     pub fn build(self: *DagBuilder, reader: anytype) ![]const u8 {
         // We accumulate the leaf nodes' metadata (CIDs and sizes), not their data.
         // This keeps memory usage low even for large files.
         var leaf_metadata: std.ArrayList(DagLink) = .empty;
-        defer {
-            for (leaf_metadata.items) |link| {
-                self.allocator.free(link.name);
-                self.allocator.free(link.cid);
-            }
-            leaf_metadata.deinit(self.allocator);
-        }
+        defer self.freeLinks(&leaf_metadata);
 
-        // Buffer for reading chunks (Zero-Copy Strategy: Reuse this buffer)
-        const buffer = try self.allocator.alloc(u8, CHUNK_SIZE);
+        // Buffer for reading chunks (Zero-Copy Strategy: Reuse this buffer).
+        // Byte 0 holds the leaf tag, so each chunk is read directly into an
+        // encoded leaf block.
+        const buffer = try self.allocator.alloc(u8, 1 + CHUNK_SIZE);
         defer self.allocator.free(buffer);
+        buffer[0] = @intFromEnum(codec.Tag.leaf);
 
         while (true) {
-            const bytes_read = try reader.read(buffer);
+            const bytes_read = try reader.read(buffer[1..]);
             if (bytes_read == 0) break;
 
-            const slice = buffer[0..bytes_read];
+            // Persist the leaf before the buffer is reused by the next read.
+            const leaf_cid = try self.persistBytes(buffer[0 .. 1 + bytes_read]);
+            defer self.allocator.free(leaf_cid);
 
-            // 1. Create a transient Leaf Node (Blob)
-            // We pass the slice directly. Note: We must persist this BEFORE reusing 'buffer'.
-            // Level 0 = Leaf
-            const data_copy = try self.allocator.dupe(u8, slice);
-            var leaf = MerkleNode.init(self.allocator, data_copy, 0);
-            defer leaf.deinit();
-
-            // 2. Persist to Disk (Write-Ahead)
-            // This copies the data from RAM to Disk.
-            const cid = try self.persist(leaf);
-
-            // 3. Keep Metadata only
-            const link_name = try std.fmt.allocPrint(self.allocator, "", .{}); // Empty name for leaves in list
-            const cid_copy = try self.allocator.dupe(u8, cid);
-
-            try leaf_metadata.append(self.allocator, DagLink{
-                .name = link_name,
-                .cid = cid_copy,
-                .size = leaf.totalSize(),
-            });
-
-            // Loop continues, 'buffer' is overwritten in next read.
+            // Empty name for leaves in list
+            try self.appendLink(&leaf_metadata, "", leaf_cid, bytes_read);
         }
 
         // Step B & C: Linking
@@ -76,234 +56,132 @@ pub const DagBuilder = struct {
 
     // Helpers
 
-    /// Implements a Balanced Tree (wide, shallow)
+    /// Appends a link holding its own copies of `name` and `cid`. On error
+    /// nothing is appended and nothing leaks.
+    fn appendLink(self: *DagBuilder, links: *std.ArrayList(DagLink), name: []const u8, cid: []const u8, size: u64) !void {
+        try links.ensureUnusedCapacity(self.allocator, 1);
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        const cid_copy = try self.allocator.dupe(u8, cid);
+        links.appendAssumeCapacity(.{ .name = name_copy, .cid = cid_copy, .size = size });
+    }
+
+    fn freeLinks(self: *DagBuilder, links: *std.ArrayList(DagLink)) void {
+        for (links.items) |link| {
+            self.allocator.free(link.name);
+            self.allocator.free(link.cid);
+        }
+        links.deinit(self.allocator);
+    }
+
+    fn persistEmpty(self: *DagBuilder) ![]const u8 {
+        // Edge case: Empty file. The root is a leaf with no data.
+        return self.persistBytes(&.{@intFromEnum(codec.Tag.leaf)});
+    }
+
+    /// Implements a Balanced Tree (wide, shallow). Builds one parent layer
+    /// per iteration until a single root remains.
     fn buildBalanced(self: *DagBuilder, links: []const DagLink) ![]const u8 {
-        if (links.len == 0) {
-            // Edge case: Empty file. Create an empty node.
-            const empty_data = try self.allocator.dupe(u8, "");
-            var empty = MerkleNode.init(self.allocator, empty_data, 0);
-            defer empty.deinit();
-            return self.persist(empty);
-        }
+        if (links.len == 0) return self.persistEmpty();
 
-        if (links.len == 1) {
-            // Optimization: If we have only 1 chunk, the Root IS that chunk.
-            // But wait, usually the Root is a "Parent" that points to the chunk.
-            // IPFS convention: A small file *can* be just a Blob.
-            // However, to be consistent with our DAG structure where Root is usually a List:
-            // Let's wrap it in a Parent if it was a list logic, but if it's the result of recursion...
-            // Actually, if we are here, 'links' are the children.
-            // If we have 1 child, should we wrap it? Yes, if we want a metadata wrapper.
-            // But standard Merkle trees often collapse the root if it fits.
-            // For simplicity/consistency: We will wrap even single chunks into a root node
-            // if they came from the "leaf metadata" list.
-            // BUT, strictly speaking, buildBalanced is recursive.
-            // If we are at the top level and have 1 link, that link IS the root.
-            return self.allocator.dupe(u8, links[0].cid);
-        }
+        // `links` belongs to the caller; layers built here are owned by `layer`.
+        var layer: std.ArrayList(DagLink) = .empty;
+        defer self.freeLinks(&layer);
 
-        // We need to create a new layer of parents
-        var parent_links: std.ArrayList(DagLink) = .empty;
-        defer {
-            // We don't own the 'links' passed in (they belong to caller),
-            // but we own the NEW links we create here.
-            // The caller handles freeing the passed 'links'.
-            // We must handle the cleanup of 'parent_links' if we fail,
-            // but success returns a CID, so we shouldn't destroy the return value.
-            // Actually, we are building intermediate nodes. We persist them, get CIDs.
-            // We only need to return the Root CID.
-            for (parent_links.items) |link| {
-                self.allocator.free(link.name);
-                self.allocator.free(link.cid);
+        var children: []const DagLink = links;
+        while (children.len > 1) {
+            var parents: std.ArrayList(DagLink) = .empty;
+            errdefer self.freeLinks(&parents);
+
+            var i: usize = 0;
+            while (i < children.len) {
+                const end = @min(i + MAX_LINKS, children.len);
+                try self.appendParent(&parents, children[i..end]);
+                i = end;
             }
-            parent_links.deinit(self.allocator);
+            std.debug.assert(parents.items.len < children.len);
+
+            self.freeLinks(&layer);
+            layer = parents;
+            children = layer.items;
         }
 
-        var i: usize = 0;
-        while (i < links.len) {
-            const end = @min(i + MAX_LINKS, links.len);
-            const batch = links[i..end];
+        // A single chunk (or the converged top layer) is the root.
+        return self.allocator.dupe(u8, children[0].cid);
+    }
 
-            // Create Parent (Level > 0)
-            // Note: We don't know the level easily here without tracking it,
-            // but typically we just say 1 (Parent). Level is mostly debug/metadata.
-            const parent_data = try self.allocator.dupe(u8, "");
-            var parent = MerkleNode.init(self.allocator, parent_data, 1);
-            defer parent.deinit();
+    /// Persists one parent node over `batch` and appends a link to it.
+    fn appendParent(self: *DagBuilder, parents: *std.ArrayList(DagLink), batch: []const DagLink) !void {
+        std.debug.assert(batch.len > 0 and batch.len <= MAX_LINKS);
 
-            for (batch, 0..) |child_link, idx| {
-                // We must duplicate the data because MerkleNode.links owns its data
-                const name = try std.fmt.allocPrint(self.allocator, "link-{d}", .{idx});
-                const cid_copy = try self.allocator.dupe(u8, child_link.cid);
+        // Level is mostly debug/metadata; parents are always level 1.
+        var parent = MerkleNode.init(self.allocator, try self.allocator.dupe(u8, ""), 1);
+        defer parent.deinit();
 
-                try parent.links.append(self.allocator, DagLink{
-                    .name = name,
-                    .cid = cid_copy,
-                    .size = child_link.size,
-                });
-            }
-
-            const parent_cid = try self.persist(parent);
-
-            // Add to next layer
-            const pl_name = try std.fmt.allocPrint(self.allocator, "link-{d}", .{parent_links.items.len});
-            const pl_cid = try self.allocator.dupe(u8, parent_cid);
-
-            // Calculate parent size (sum of children)
-            // Note: parent.totalSize() includes its own data (0) + sum of links
-            const p_size = parent.totalSize();
-
-            try parent_links.append(self.allocator, DagLink{
-                .name = pl_name,
-                .cid = pl_cid,
-                .size = p_size,
-            });
-
-            i = end;
+        var name_buf: [32]u8 = undefined;
+        for (batch, 0..) |child_link, idx| {
+            const name = std.fmt.bufPrint(&name_buf, "link-{d}", .{idx}) catch unreachable;
+            try self.appendLink(&parent.links, name, child_link.cid, child_link.size);
         }
 
-        // Recursion
-        if (parent_links.items.len == 1) {
-            // We have converged to a single root
-            return self.allocator.dupe(u8, parent_links.items[0].cid);
-        } else {
-            return self.buildBalanced(parent_links.items);
-        }
+        const parent_cid = try self.persist(parent);
+        defer self.allocator.free(parent_cid);
+
+        // parent.totalSize() includes its own data (0) + sum of links
+        const name = std.fmt.bufPrint(&name_buf, "link-{d}", .{parents.items.len}) catch unreachable;
+        try self.appendLink(parents, name, parent_cid, parent.totalSize());
     }
 
     /// Implements a Linear Layout (Linked List)
     fn buildLinear(self: *DagBuilder, leaf_links: []const DagLink) ![]const u8 {
-        if (leaf_links.len == 0) {
-            const empty_data = try self.allocator.dupe(u8, "");
-            var empty = MerkleNode.init(self.allocator, empty_data, 0);
-            defer empty.deinit();
-            return self.persist(empty);
-        }
+        if (leaf_links.len == 0) return self.persistEmpty();
 
-        // We iterate backwards.
-        // Last node points to nothing.
-        // Second to last points to Last.
-        // ...
-        // First points to Second.
-
-        var next_cid: ?[]const u8 = null;
+        // We iterate backwards: SpineNode[i] -> [Leaf[i], SpineNode[i+1]].
+        // The leaves are already persisted, so we only build the spine.
+        var next_cid: ?[]const u8 = null; // Owned.
+        defer if (next_cid) |c| self.allocator.free(c);
         var next_size: u64 = 0;
-
-        // We need to manage memory for the CIDs we generate
-        var generated_cids: std.ArrayList([]const u8) = .empty;
-        defer {
-            for (generated_cids.items) |c| self.allocator.free(c);
-            generated_cids.deinit(self.allocator);
-        }
 
         var i: usize = leaf_links.len;
         while (i > 0) {
             i -= 1;
             const current_leaf = leaf_links[i];
 
-            // Create a wrapper node that holds the Leaf + Link to Next
-            // In IPFS trickledags, it's more complex, but for "Linear",
-            // a node essentially wraps the data block and points to the next.
-            // BUT: We already persisted the LEAF nodes (data blobs).
-            // So we are creating a "Spine" of internal nodes.
-            // SpineNode[i] -> [Leaf[i], SpineNode[i+1]]
-
-            const spine_data = try self.allocator.dupe(u8, "");
-            var spine = MerkleNode.init(self.allocator, spine_data, 1); // Internal
+            var spine = MerkleNode.init(self.allocator, try self.allocator.dupe(u8, ""), 1); // Internal
             defer spine.deinit();
 
             // Link 1: The Data Chunk (Leaf)
-            {
-                const name = try std.allocator.dupe(self.allocator, u8, "data");
-                const cid = try self.allocator.dupe(u8, current_leaf.cid);
-                try spine.links.append(self.allocator, DagLink{
-                    .name = name,
-                    .cid = cid,
-                    .size = current_leaf.size,
-                });
-            }
+            try self.appendLink(&spine.links, "data", current_leaf.cid, current_leaf.size);
 
             // Link 2: The Next Node (if exists)
             if (next_cid) |ncid| {
-                const name = try std.allocator.dupe(self.allocator, u8, "next");
-                const cid = try self.allocator.dupe(u8, ncid);
-                try spine.links.append(self.allocator, DagLink{
-                    .name = name,
-                    .cid = cid,
-                    .size = next_size,
-                });
+                try self.appendLink(&spine.links, "next", ncid, next_size);
             }
 
             const spine_cid = try self.persist(spine);
-            try generated_cids.append(self.allocator, spine_cid); // Track for cleanup, though persist dupe returns caller-owned
-
-            // Prepare for next iteration (going backwards)
-            next_cid = spine_cid; // persist returns a new allocated slice
+            if (next_cid) |c| self.allocator.free(c);
+            next_cid = spine_cid;
             next_size = spine.totalSize();
         }
 
-        // We want to return the last generated CID (which corresponds to index 0),
-        // but pass ownership to caller.
-        // generated_cids stores them, we need to extract the last one.
-        // Actually, 'next_cid' holds the root. But 'next_cid' is owned by the loop's alloc logic?
-        // persist() returns an allocated slice.
-        // We put it in generated_cids.
-        // We want to return 'next_cid' and NOT free it in defer.
-
-        // Let's refine the cleanup logic.
-        // persist returns owned slice.
-        // We assign it to next_cid.
-        // In the next loop, we add it to spine.
-        // spine copies it.
-        // So the old next_cid is no longer needed after being added to spine?
-        // Wait, 'spine.links.append' dupes the CID (based on my code above).
-        // So 'next_cid' must be freed after loop, EXCEPT the final one (Root).
-
-        // Simplified cleanup:
-        // We will manually free the intermediate CIDs.
-
-        return self.allocator.dupe(u8, next_cid.?);
+        // Transfer ownership of the root (index 0) to the caller.
+        const root = next_cid.?;
+        next_cid = null;
+        return root;
     }
 
+    /// Encodes and stores a parent node, returning its CID (caller-owned).
     fn persist(self: *DagBuilder, node: MerkleNode) ![]const u8 {
-        // 1. Serialize (Mock serialization: we just use the data if leaf, or encode links)
-        // For this task, we assume 'node.data' is the block content for leaves.
-        // For parents, we should encode the links.
+        std.debug.assert(node.level > 0);
+        const bytes = try codec.encodeParent(self.allocator, node.links.items);
+        defer self.allocator.free(bytes);
+        return self.persistBytes(bytes);
+    }
 
-        // TODO: Real Protobuf/IPLD encoding.
-        // For now, if level > 0, we make a dummy buffer representing the links.
-        // If level == 0, we use data.
-
-        var bytes: []const u8 = undefined;
-        var free_bytes = false;
-
-        if (node.level == 0) {
-            bytes = node.data;
-        } else {
-            // Rudimentary encoding for Parents so we get unique hashes
-            var list: std.ArrayList(u8) = .empty;
-            defer list.deinit(self.allocator);
-            for (node.links.items) |link| {
-                try list.appendSlice(self.allocator, link.cid);
-                try list.appendSlice(self.allocator, link.name);
-            }
-            bytes = try list.toOwnedSlice(self.allocator);
-            free_bytes = true;
-        }
-        defer if (free_bytes) self.allocator.free(bytes);
-
-        // 2. Create Block (Hash)
+    /// Stores encoded block bytes and returns the raw CID bytes (caller-owned).
+    fn persistBytes(self: *DagBuilder, bytes: []const u8) ![]const u8 {
         const block = Block.new(bytes);
-
-        // 3. Put to Store
         try self.store.put(block);
-
-        // 4. Return CID (Hex string or Raw bytes? IPFS uses raw bytes in links, but strings in APIs)
-        // Our DagLink uses []const u8 for CID.
-        // Block.cid is [32]u8.
-
-        // We need to return a slice that fits into DagLink.cid.
-        // Let's assume raw bytes for internal logic.
         return self.allocator.dupe(u8, &block.cid);
     }
 };
@@ -371,4 +249,85 @@ test "DagBuilder build (Linear) functionality" {
     defer allocator.free(cid);
 
     try testing.expect(cid.len > 0);
+}
+
+fn buildOnce(allocator: std.mem.Allocator, engine: *StorageEngine, layout: Layout, data: []const u8) !void {
+    var builder = DagBuilder{ .allocator = allocator, .store = engine, .layout = layout };
+    var reader = BufferReader{ .buffer = data };
+    const cid = try builder.build(&reader);
+    allocator.free(cid);
+}
+
+test "DagBuilder does not leak when allocation fails" {
+    const testing = std.testing;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const test_path = "test_storage_dag_builder_oom";
+    std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+
+    var engine = try StorageEngine.init(testing.allocator, test_path);
+    defer engine.deinit();
+
+    // Three leaves, so both layouts build at least one internal node.
+    const data = try testing.allocator.alloc(u8, CHUNK_SIZE * 2 + 17);
+    defer testing.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 31);
+
+    for ([_]Layout{ .Balanced, .Linear }) |layout| {
+        try testing.checkAllAllocationFailures(testing.allocator, buildOnce, .{ &engine, layout, data });
+    }
+}
+
+test "DagBuilder balanced layout converges over multiple levels" {
+    const testing = std.testing;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const test_path = "test_storage_dag_builder_levels";
+    std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+
+    var engine = try StorageEngine.init(testing.allocator, test_path);
+    defer engine.deinit();
+
+    // More than MAX_LINKS leaves forces a second parent layer.
+    var cids: [MAX_LINKS + 26][32]u8 = undefined;
+    var links: [MAX_LINKS + 26]DagLink = undefined;
+    for (&cids, &links, 0..) |*cid, *link, i| {
+        @memset(cid, @truncate(i));
+        link.* = .{ .name = "", .cid = cid, .size = 1 };
+    }
+
+    const Run = struct {
+        fn run(allocator: std.mem.Allocator, store: *StorageEngine, leaf_links: []const DagLink) !void {
+            var builder = DagBuilder{ .allocator = allocator, .store = store, .layout = .Balanced };
+            const root = try builder.buildBalanced(leaf_links);
+            defer allocator.free(root);
+            try testing.expectEqual(@as(usize, 32), root.len);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{ &engine, @as([]const DagLink, &links) });
+}
+
+test "DagBuilder handles an empty file" {
+    const testing = std.testing;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const test_path = "test_storage_dag_builder_empty";
+    std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+
+    var engine = try StorageEngine.init(testing.allocator, test_path);
+    defer engine.deinit();
+
+    for ([_]Layout{ .Balanced, .Linear }) |layout| {
+        var builder = DagBuilder{ .allocator = testing.allocator, .store = &engine, .layout = layout };
+        var reader = BufferReader{ .buffer = "" };
+        const cid = try builder.build(&reader);
+        defer testing.allocator.free(cid);
+
+        const block = (try engine.get(cid, testing.allocator)).?;
+        defer testing.allocator.free(block.data);
+        try testing.expectEqualStrings("", (try codec.decode(block.data)).leaf);
+    }
 }

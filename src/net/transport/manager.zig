@@ -33,6 +33,7 @@ pub const ConnectionManager = struct {
     accept_thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     idle_timeout: i64 = 60 * 5,
+    handshake_timeout_ms: u32 = tcp.default_handshake_timeout_ms,
     reap_interval_ms: u64 = 10000,
     upnp: nat.UPnP,
     mdns: ?network.mdns.MDNS = null,
@@ -121,23 +122,21 @@ pub const ConnectionManager = struct {
         }
     }
 
+    /// Loads the node key, generating one only where none exists yet. An
+    /// existing but unreadable or corrupt key is an error: replacing it
+    /// would silently change the node's identity.
     fn loadOrGenerateKey(allocator: std.mem.Allocator, explicit_path: ?[]const u8) !noise.KeyPair {
-        if (explicit_path) |path| {
-            if (noise.KeyPair.loadFromFile(path)) |kp| {
-                return kp;
-            } else |_| {
-                const kp = noise.KeyPair.generate();
-                try kp.saveToFile(path);
-                return kp;
-            }
-        }
+        if (explicit_path) |path| return loadOrCreateKeyAt(path);
 
         const key_filename = "node.key";
 
         // 1. Try CWD
         if (noise.KeyPair.loadFromFile(key_filename)) |kp| {
             return kp;
-        } else |_| {}
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
 
         // 2. Try Home directory
         const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
@@ -152,19 +151,25 @@ pub const ConnectionManager = struct {
 
             const key_path = try std.fs.path.join(allocator, &.{ dot_nomad, key_filename });
             defer allocator.free(key_path);
-
-            if (noise.KeyPair.loadFromFile(key_path)) |kp| {
-                return kp;
-            } else |_| {
-                const kp = noise.KeyPair.generate();
-                try kp.saveToFile(key_path);
-                return kp;
-            }
+            return loadOrCreateKeyAt(key_path);
         }
 
         // 3. Fallback: Generate and save in CWD
+        return loadOrCreateKeyAt(key_filename);
+    }
+
+    fn loadOrCreateKeyAt(path: []const u8) !noise.KeyPair {
+        if (noise.KeyPair.loadFromFile(path)) |kp| {
+            return kp;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => {
+                std.debug.print("Refusing to replace unusable key file '{s}': {any}\n", .{ path, err });
+                return err;
+            },
+        }
         const kp = noise.KeyPair.generate();
-        try kp.saveToFile(key_filename);
+        try kp.saveToFile(path);
         return kp;
     }
 
@@ -204,10 +209,7 @@ pub const ConnectionManager = struct {
             const mc = self.connections.pop().?;
             self.mutex.unlock();
 
-            mc.conn.deinit(); // This signals thread to exit
-            if (mc.handler_thread) |t| {
-                t.join();
-            }
+            retireConnection(mc);
 
             self.mutex.lock();
         }
@@ -221,6 +223,14 @@ pub const ConnectionManager = struct {
         if (self.upnp_thread) |t| {
             t.join();
             self.upnp_thread = null;
+        }
+
+        // Mappings use an infinite lease; remove ours so the router does not
+        // keep forwarding the port after we exit. Bounded by UPnP timeouts.
+        if (self.upnp.mapped_port) |port| {
+            self.upnp.deletePortMap(port, "TCP") catch |err| {
+                std.debug.print("UPnP: Failed to delete port mapping {d}: {any}\n", .{ port, err });
+            };
         }
     }
 
@@ -238,15 +248,16 @@ pub const ConnectionManager = struct {
             var i: usize = 0;
             const now = sync.timestamp();
             while (i < self.connections.items.len) {
-                const mc = self.connections.items[i];
+                const mc = &self.connections.items[i];
+                // A connection someone is using is active by definition.
+                if (mc.conn.isInUse()) mc.last_active = now;
                 const is_idle = (now - mc.last_active) > self.idle_timeout;
                 const is_closed = mc.conn.isClosed();
 
                 if (is_closed or is_idle) {
-                    var removed_mc = self.connections.orderedRemove(i);
+                    const removed_mc = self.connections.orderedRemove(i);
                     self.mutex.unlock();
-                    removed_mc.conn.deinit();
-                    if (removed_mc.handler_thread) |t| t.join();
+                    retireConnection(removed_mc);
                     self.mutex.lock();
                 } else {
                     i += 1;
@@ -256,17 +267,50 @@ pub const ConnectionManager = struct {
         }
     }
 
+    /// Tears down a connection already removed from `connections`: signal
+    /// shutdown, wait for its handler, then drop the manager's reference.
+    /// Other holders keep the connection alive until they release it.
+    fn retireConnection(mc: ManagedConnection) void {
+        mc.conn.close();
+        if (mc.handler_thread) |t| t.join();
+        mc.conn.deinit();
+    }
+
     pub fn getConnectionsCount(self: *ConnectionManager) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.connections.items.len;
     }
 
+    /// Returns a new reference; the caller must deinit() it.
     pub fn getConnection(self: *ConnectionManager, index: usize) ?network.Connection {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (index >= self.connections.items.len) return null;
-        return self.connections.items[index].conn;
+        const conn = self.connections.items[index].conn;
+        conn.retain();
+        return conn;
+    }
+
+    /// Finds a live connection and returns a new reference to it. With a
+    /// node ID only the authenticated ID counts (another node may now sit at
+    /// a known address); without one, any of `addresses` matches.
+    /// Caller holds self.mutex.
+    fn findConnectionLocked(self: *ConnectionManager, addresses: []const network.Address, remote_node_id: ?id.NodeID) ?network.Connection {
+        for (self.connections.items) |*mc| {
+            if (mc.conn.isClosed()) continue;
+            const matches = if (remote_node_id) |target_id|
+                mc.conn.getRemoteNodeID().eql(target_id)
+            else for (addresses) |addr| {
+                if (addressesMatch(mc.conn.getPeerAddress(), addr)) break true;
+            } else false;
+            if (matches) {
+                mc.last_active = sync.timestamp();
+                mc.conn.retain();
+                return mc.conn;
+            }
+        }
+        return null;
     }
 
     fn threadWrapper(cb: *const fn (*anyopaque, network.Connection) anyerror!void, ctx: *anyopaque, conn: network.Connection) void {
@@ -277,25 +321,28 @@ pub const ConnectionManager = struct {
         };
     }
 
+    /// Registers `conn` and starts its handler. On success the manager takes
+    /// over the caller's reference; on error the caller still owns it and
+    /// nothing was registered.
     pub fn addConnection(self: *ConnectionManager, conn: network.Connection) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.stopping) {
-            conn.deinit();
-            return;
+        if (self.stopping) return error.ManagerStopping;
+
+        // Reserve first so that nothing can fail after the handler starts.
+        try self.connections.ensureUnusedCapacity(self.allocator, 1);
+
+        var handler_thread: ?std.Thread = null;
+        if (self.on_connection_fn) |cb| {
+            handler_thread = try std.Thread.spawn(.{}, threadWrapper, .{ cb, self.on_connection_ctx.?, conn });
         }
 
-        const mc_ptr = try self.connections.addOne(self.allocator);
-        mc_ptr.* = .{
+        self.connections.appendAssumeCapacity(.{
             .conn = conn,
             .last_active = sync.timestamp(),
-            .handler_thread = null,
-        };
-
-        if (self.on_connection_fn) |cb| {
-            mc_ptr.handler_thread = try std.Thread.spawn(.{}, threadWrapper, .{ cb, self.on_connection_ctx.?, conn });
-        }
+            .handler_thread = handler_thread,
+        });
     }
 
     pub fn setConnectionHandler(self: *ConnectionManager, ctx: anytype, comptime handler: fn (@TypeOf(ctx), network.Connection) anyerror!void) void {
@@ -376,6 +423,7 @@ pub const ConnectionManager = struct {
             .tcp => {
                 self.tcp_server = try tcp.listen(self.allocator, .{
                     .port = cfg.network.port,
+                    .handshake_timeout_ms = self.handshake_timeout_ms,
                     .swarm_key = cfg.node.swarm_key,
                     .static_key = self.identity_key,
                     .running = running,
@@ -387,6 +435,7 @@ pub const ConnectionManager = struct {
                     self.tcp_server.?,
                     tcp.ListenConfig{
                         .port = cfg.network.port,
+                        .handshake_timeout_ms = self.handshake_timeout_ms,
                         .swarm_key = cfg.node.swarm_key,
                         .static_key = self.identity_key,
                         .running = running,
@@ -400,29 +449,14 @@ pub const ConnectionManager = struct {
         }
     }
 
+    /// Returns a connection reference the caller must deinit().
     pub fn connectToPeerMulti(self: *ConnectionManager, addresses: []const network.Address, swarm_key: []const u8, remote_node_id: ?id.NodeID) !network.Connection {
         // 1. Check existing connections first
-        self.mutex.lock();
-        for (self.connections.items) |*mc| {
-            if (remote_node_id) |target_id| {
-                if (mc.conn.getRemoteNodeID().eql(target_id)) {
-                    mc.last_active = sync.timestamp();
-                    const c = mc.conn;
-                    self.mutex.unlock();
-                    return c;
-                }
-            }
-            // Check if any of the target addresses match existing connection
-            for (addresses) |addr| {
-                if (addressesMatch(mc.conn.getPeerAddress(), addr)) {
-                    mc.last_active = sync.timestamp();
-                    const c = mc.conn;
-                    self.mutex.unlock();
-                    return c;
-                }
-            }
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.findConnectionLocked(addresses, remote_node_id)) |c| return c;
         }
-        self.mutex.unlock();
 
         // 2. Try dialing each address (Sorted by Priority)
         // Make a mutable copy to sort
@@ -448,33 +482,31 @@ pub const ConnectionManager = struct {
         return error.AllAddressesFailed;
     }
 
+    /// Returns a connection reference the caller must deinit().
     pub fn connectToPeer(self: *ConnectionManager, address: network.Address, swarm_key: []const u8, remote_node_id: ?id.NodeID) !network.Connection {
-        self.mutex.lock();
-        for (self.connections.items) |*mc| {
-            // Check for NodeID match (preferred)
-            if (remote_node_id) |target_id| {
-                if (mc.conn.getRemoteNodeID().eql(target_id)) {
-                    mc.last_active = sync.timestamp();
-                    const c = mc.conn;
-                    self.mutex.unlock();
-                    return c;
-                }
-            }
-
-            // Check for Address match (fallback)
-            if (addressesMatch(mc.conn.getPeerAddress(), address)) {
-                mc.last_active = sync.timestamp();
-                const c = mc.conn;
-                self.mutex.unlock();
-                return c;
-            }
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.findConnectionLocked(&.{address}, remote_node_id)) |c| return c;
         }
-        self.mutex.unlock();
 
         switch (self.transport_type) {
             .tcp => {
-                const conn = try tcp.connect(self.allocator, address, swarm_key, self.identity_key);
-                try self.addConnection(conn);
+                const conn = try tcp.connect(self.allocator, address, swarm_key, self.identity_key, self.handshake_timeout_ms);
+                errdefer conn.deinit();
+
+                // The Noise handshake authenticated the remote key; make sure
+                // it belongs to the node we meant to reach.
+                if (remote_node_id) |expected| {
+                    if (!conn.getRemoteNodeID().eql(expected)) return error.PeerIdMismatch;
+                }
+
+                // One reference for the manager, one for the caller.
+                conn.retain();
+                self.addConnection(conn) catch |err| {
+                    conn.deinit();
+                    return err;
+                };
                 return conn;
             },
             .quic => {

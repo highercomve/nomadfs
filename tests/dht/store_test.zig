@@ -38,7 +38,7 @@ test "dht: store and find_value (with timeout)" {
     nomadfs.sync.sleep(100 * std.time.ns_per_ms);
 
     // Connect peer2 to peer1 explicitly
-    _ = try peer2.manager.connectToPeer(peer1.listen_addr, peer2.config.node.swarm_key, peer1.manager.node_id);
+    (try peer2.manager.connectToPeer(peer1.listen_addr, peer2.config.node.swarm_key, peer1.manager.node_id)).deinit();
     nomadfs.sync.sleep(200 * std.time.ns_per_ms); // Wait for handshake
 
     // Add peer1 to dht2 routing table manually so it knows where to store
@@ -124,6 +124,7 @@ test "dht: store and find_value (with timeout)" {
     // Cleanup
     const conn = try peer2.manager.connectToPeer(peer1.listen_addr, peer2.config.node.swarm_key, peer1.manager.node_id);
     conn.close();
+    conn.deinit();
     nomadfs.sync.sleep(100 * std.time.ns_per_ms);
 
     // Stop peers explicitly to ensure dht handlers are not used during deinit

@@ -41,61 +41,78 @@ pub const StorageEngine = struct {
         self.root_dir.close(io);
     }
 
+    /// Stores a block after checking its hash. Content addressing makes this
+    /// idempotent; the block is written to a temporary file and renamed into
+    /// place, so a crash never leaves a truncated block under its CID.
     pub fn put(self: *StorageEngine, block: Block) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (block.data.len == 0) return error.InvalidBlock;
-        if (block.cid.len != 32) return error.InvalidBlock;
-
         var hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(block.data, &hash);
+        std.crypto.hash.sha2.Sha256.hash(block.data, &hash, .{});
         if (!std.mem.eql(u8, &hash, &block.cid)) {
             return error.HashMismatch;
         }
 
-        const hex_cid = try std.fmt.allocPrint(self.allocator, "{s}", .{std.fmt.fmtSliceHexLower(&block.cid)});
-        defer self.allocator.free(hex_cid);
-
-        const io = std.Io.Threaded.global_single_threaded.io();
-        var file = try self.root_dir.createFile(io, hex_cid, .{});
-        defer file.close(io);
-
-        try file.writePositionalAll(io, block.data, 0);
-    }
-
-    pub fn get(self: *StorageEngine, cid: []const u8, allocator: std.mem.Allocator) !?Block {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (cid.len != 32) return error.InvalidBlock;
-
-        const hex_cid = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(cid)});
-        defer allocator.free(hex_cid);
+        const hex_cid = std.fmt.bytesToHex(block.cid, .lower);
+        if (self.hasLocked(&hex_cid)) return;
 
         const io = std.Io.Threaded.global_single_threaded.io();
-        var file = self.root_dir.openFile(io, hex_cid, .{}) catch |err| switch (err) {
-            error.FileNotFound => return null,
-            else => return err,
-        };
-        defer file.close(io);
+        const tmp_name = hex_cid ++ ".tmp".*;
+        {
+            var file = try self.root_dir.createFile(io, &tmp_name, .{});
+            defer file.close(io);
+            try file.writePositionalAll(io, block.data, 0);
+        }
+        errdefer self.root_dir.deleteFile(io, &tmp_name) catch {};
+        try self.root_dir.rename(&tmp_name, self.root_dir, &hex_cid, io);
+    }
 
-        const stat = try file.stat(io);
-        const size = stat.size;
-        if (size == 0) return error.InvalidBlock;
-        const buffer = try allocator.alloc(u8, size);
+    pub fn has(self: *StorageEngine, cid: []const u8) bool {
+        if (cid.len != 32) return false;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const hex_cid = std.fmt.bytesToHex(cid[0..32], .lower);
+        return self.hasLocked(&hex_cid);
+    }
+
+    fn hasLocked(self: *StorageEngine, hex_cid: []const u8) bool {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        _ = self.root_dir.statFile(io, hex_cid, .{}) catch return false;
+        return true;
+    }
+
+    /// Returns the block, or null if it is not stored. The data is verified
+    /// against the CID so on-disk corruption is reported, not returned.
+    pub fn get(self: *StorageEngine, cid: []const u8, allocator: std.mem.Allocator) !?Block {
+        if (cid.len != 32) return error.InvalidBlock;
+        const hex_cid = std.fmt.bytesToHex(cid[0..32], .lower);
+
+        const buffer = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const io = std.Io.Threaded.global_single_threaded.io();
+            var file = self.root_dir.openFile(io, &hex_cid, .{}) catch |err| switch (err) {
+                error.FileNotFound => return null,
+                else => return err,
+            };
+            defer file.close(io);
+
+            const size = (try file.stat(io)).size;
+            const buffer = try allocator.alloc(u8, size);
+            errdefer allocator.free(buffer);
+            if (try file.readPositionalAll(io, buffer, 0) != size) return error.ReadError;
+            break :blk buffer;
+        };
         errdefer allocator.free(buffer);
 
-        const read_bytes = try file.readPositionalAll(io, buffer, 0);
-        if (read_bytes != size) {
-            return error.ReadError;
-        }
-
         var hash: [32]u8 = undefined;
-        @memcpy(&hash, cid);
+        std.crypto.hash.sha2.Sha256.hash(buffer, &hash, .{});
+        if (!std.mem.eql(u8, &hash, cid)) return error.CorruptBlock;
 
         return Block{
-            .cid = hash,
+            .cid = cid[0..32].*,
             .data = buffer,
         };
     }

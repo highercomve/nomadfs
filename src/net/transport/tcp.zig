@@ -5,7 +5,11 @@ const YamuxSession = @import("yamux.zig").Session;
 
 const id = @import("../id.zig");
 
-/// Concrete implementation for TCP/Noise/Yamux
+/// Concrete implementation for TCP/Noise/Yamux.
+///
+/// Reference counted (see network.Connection). close() shuts the socket down
+/// and wakes every waiter; the final deinit() joins the Yamux reader, then
+/// frees the session, its streams, the Noise buffers and the descriptor.
 const TcpConnectionImpl = struct {
     tcp_stream: TcpStream,
     noise_stream: noise.NoiseStream,
@@ -14,6 +18,7 @@ const TcpConnectionImpl = struct {
     allocator: std.mem.Allocator,
     peer_address: network.Address,
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
     pub fn connection(self: *TcpConnectionImpl) network.Connection {
         return network.Connection.init(self, &tcp_connection_vtable);
@@ -49,27 +54,44 @@ const TcpConnectionImpl = struct {
 
     pub fn isClosed(ctx: *anyopaque) bool {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
-        return self.closed.load(.acquire) or self.yamux.closed;
+        return self.closed.load(.acquire) or self.yamux.isClosed();
     }
 
+    /// The manager holds one reference; any other reference or a live stream
+    /// means the connection is in use.
+    pub fn isInUse(ctx: *anyopaque) bool {
+        const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
+        return self.refs.load(.acquire) > 1 or self.yamux.streamCount() > 0;
+    }
+
+    /// Signals shutdown. Safe while other threads still use the connection.
     pub fn close(ctx: *anyopaque) void {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
         if (self.closed.swap(true, .acq_rel)) return;
 
-        // 1. Close underlying noise stream (which closes TCP)
-        // This will cause yamux_thread to exit
-        var ns = self.noise_stream.stream();
-        ns.close();
-
-        // 2. Join thread and clean up yamux session
-        self.yamux_thread.join();
-        self.yamux.deinit();
+        // Shutdown (not close) the socket: the Yamux reader may be blocked in
+        // read() on this descriptor, so it must stay allocated until joined.
+        self.tcp_stream.shutdown();
+        self.yamux.close();
     }
 
+    pub fn retain(ctx: *anyopaque) void {
+        const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
+        const prev = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(prev > 0);
+    }
+
+    /// Drops one reference; the last one tears the connection down.
     pub fn deinit(ctx: *anyopaque) void {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
+        const prev = self.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
+        if (prev != 1) return;
+
         TcpConnectionImpl.close(ctx);
-        self.noise_stream.deinit();
+        self.yamux_thread.join();
+        self.yamux.deinit();
+        self.noise_stream.deinit(); // Releases the descriptor.
         self.allocator.destroy(self);
     }
 };
@@ -80,14 +102,17 @@ const tcp_connection_vtable = network.Connection.ConnectionVTable{
     .getPeerAddress = TcpConnectionImpl.getPeerAddress,
     .getRemoteNodeID = TcpConnectionImpl.getRemoteNodeID,
     .close = TcpConnectionImpl.close,
+    .retain = TcpConnectionImpl.retain,
     .deinit = TcpConnectionImpl.deinit,
     .isClosed = TcpConnectionImpl.isClosed,
+    .isInUse = TcpConnectionImpl.isInUse,
 };
 
 const yamux_stream_vtable = network.Stream.StreamVTable{
     .read = YamuxSession.streamRead,
     .write = YamuxSession.streamWrite,
     .close = YamuxSession.streamClose,
+    .setTimeout = YamuxSession.streamSetTimeout,
 };
 
 pub const TcpStream = struct {
@@ -108,6 +133,12 @@ pub const TcpStream = struct {
         return self.net_stream.write(buffer);
     }
 
+    /// Unblocks readers and writers; the descriptor stays valid.
+    fn shutdown(self: *TcpStream) void {
+        if (self.closed.load(.acquire)) return;
+        self.net_stream.shutdown();
+    }
+
     fn close(ptr: *anyopaque) void {
         const self: *TcpStream = @ptrCast(@alignCast(ptr));
         if (self.closed.swap(true, .acq_rel)) return;
@@ -121,8 +152,13 @@ const tcp_stream_vtable = network.Stream.StreamVTable{
     .close = TcpStream.close,
 };
 
+/// Upper bound on the Noise handshake. Without it a peer that connects and
+/// stays silent pins a handshake thread and blocks manager shutdown.
+pub const default_handshake_timeout_ms: u32 = 10_000;
+
 pub const ListenConfig = struct {
     port: u16,
+    handshake_timeout_ms: u32 = default_handshake_timeout_ms,
     swarm_key: []const u8,
     static_key: noise.KeyPair,
     running: ?*std.atomic.Value(bool) = null,
@@ -165,6 +201,7 @@ fn acceptLoop(allocator: std.mem.Allocator, mut_server: network.Server, cfg: Lis
             conn,
             cfg.swarm_key,
             cfg.static_key,
+            cfg.handshake_timeout_ms,
             cfg.manager,
         }) catch |err| {
             std.debug.print("Failed to spawn connection handler thread: {any}\n", .{err});
@@ -185,76 +222,82 @@ fn handleIncomingConnection(
     conn: network.Server.Connection,
     swarm_key: []const u8,
     static_key: noise.KeyPair,
+    handshake_timeout_ms: u32,
     manager: ?*network.manager.ConnectionManager,
 ) void {
     defer if (manager) |m| {
+        m.handshake_wg.finish();
         m.deinit();
     };
-    defer if (manager) |m| {
-        m.handshake_wg.finish();
+
+    const connection = establish(allocator, conn.stream, conn.address, swarm_key, static_key, false, handshake_timeout_ms) catch |err| {
+        std.debug.print("Connection handler error for {f}: {}\n", .{ conn.address, err });
+        return;
     };
 
-    const do_work = struct {
-        fn do(
-            a: std.mem.Allocator,
-            c: network.Server.Connection,
-            sk: []const u8,
-            stk: noise.KeyPair,
-            m: ?*network.manager.ConnectionManager,
-        ) !void {
-            // Create the connection implementation
-            const impl = try a.create(TcpConnectionImpl);
-            errdefer a.destroy(impl);
-
-            // Initialize raw TCP stream
-            impl.tcp_stream = .{ .net_stream = c.stream, .closed = std.atomic.Value(bool).init(false) };
-            impl.peer_address = c.address;
-
-            // Perform Noise Handshake (Responder)
-            impl.noise_stream = try noise.NoiseStream.handshake(a, impl.tcp_stream.stream(), sk, stk, false);
-
-            impl.yamux = try YamuxSession.init(a, impl.noise_stream.stream(), true);
-            errdefer impl.yamux.deinit();
-
-            impl.yamux_thread = try std.Thread.spawn(.{}, YamuxSession.run, .{impl.yamux});
-            impl.allocator = a;
-            impl.closed = std.atomic.Value(bool).init(false);
-
-            const conn_obj = impl.connection();
-            if (m) |mgr| {
-                mgr.addConnection(conn_obj) catch |err| {
-                    conn_obj.deinit();
-                    return err;
-                };
-            } else {
-                conn_obj.deinit();
-            }
-        }
-    }.do;
-
-    do_work(allocator, conn, swarm_key, static_key, manager) catch |err| {
-        std.debug.print("Connection handler error for {f}: {}\n", .{ conn.address, err });
-        conn.stream.close();
+    const m = manager orelse {
+        connection.deinit();
+        return;
+    };
+    // On success the manager owns our reference; on failure we still do.
+    m.addConnection(connection) catch |err| {
+        std.debug.print("Failed to register connection from {f}: {}\n", .{ conn.address, err });
+        connection.deinit();
     };
 }
 
-pub fn connect(allocator: std.mem.Allocator, address: network.Address, swarm_key: []const u8, static_key: noise.KeyPair) !network.Connection {
-    const stream = try network.compat.tcpConnectToAddress(address);
+pub fn connect(
+    allocator: std.mem.Allocator,
+    address: network.Address,
+    swarm_key: []const u8,
+    static_key: noise.KeyPair,
+    handshake_timeout_ms: u32,
+) !network.Connection {
+    // The handshake bound doubles as the connect bound.
+    const stream = try network.compat.tcpConnectToAddressTimeout(address, handshake_timeout_ms);
+    return establish(allocator, stream, address, swarm_key, static_key, true, handshake_timeout_ms);
+}
 
-    const impl = try allocator.create(TcpConnectionImpl);
+/// Runs the Noise handshake and starts Yamux over `net_stream`, returning a
+/// connection holding one reference. Takes ownership of the socket: on error
+/// every partially initialized resource, including the socket, is released.
+fn establish(
+    allocator: std.mem.Allocator,
+    net_stream: network.TcpStream,
+    address: network.Address,
+    swarm_key: []const u8,
+    static_key: noise.KeyPair,
+    initiator: bool,
+    handshake_timeout_ms: u32,
+) !network.Connection {
+    std.debug.assert(handshake_timeout_ms > 0);
+    const impl = allocator.create(TcpConnectionImpl) catch |err| {
+        net_stream.close();
+        return err;
+    };
     errdefer allocator.destroy(impl);
-    impl.tcp_stream = .{ .net_stream = stream, .closed = std.atomic.Value(bool).init(false) };
-    impl.peer_address = address;
 
-    // Perform Noise Handshake (Initiator)
-    impl.noise_stream = try noise.NoiseStream.handshake(allocator, impl.tcp_stream.stream(), swarm_key, static_key, true);
+    impl.* = .{
+        .tcp_stream = .{ .net_stream = net_stream },
+        .noise_stream = undefined,
+        .yamux = undefined,
+        .yamux_thread = undefined,
+        .allocator = allocator,
+        .peer_address = address,
+    };
+    // Guarded by TcpStream.closed, so the Noise cleanup below closing the
+    // same socket first is harmless.
+    errdefer TcpStream.close(&impl.tcp_stream);
 
-    impl.yamux = try YamuxSession.init(allocator, impl.noise_stream.stream(), false);
+    try net_stream.setTimeout(handshake_timeout_ms);
+    impl.noise_stream = try noise.NoiseStream.handshake(allocator, impl.tcp_stream.stream(), swarm_key, static_key, initiator);
+    errdefer impl.noise_stream.deinit();
+    // Established connections idle legitimately; Yamux reads block forever.
+    try net_stream.setTimeout(0);
+
+    impl.yamux = try YamuxSession.init(allocator, impl.noise_stream.stream(), !initiator);
     errdefer impl.yamux.deinit();
 
     impl.yamux_thread = try std.Thread.spawn(.{}, YamuxSession.run, .{impl.yamux});
-    impl.allocator = allocator;
-    impl.closed = std.atomic.Value(bool).init(false);
-
     return impl.connection();
 }

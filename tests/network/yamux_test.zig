@@ -1,5 +1,6 @@
 const std = @import("std");
-const network = @import("nomadfs").net.transport;
+const nomadfs = @import("nomadfs");
+const network = nomadfs.net.transport;
 const yamux = network.yamux;
 const Pipe = @import("memory_stream.zig").Pipe;
 
@@ -84,4 +85,157 @@ test "yamux: multiple streams over single connection" {
     // Wait for threads to finish
     server_thread.join();
     client_thread.join();
+}
+
+fn writeRawFrame(stream: nomadfs.net.transport.Stream, header: yamux.Header) !void {
+    var buf: [12]u8 = undefined;
+    header.encode(&buf);
+    _ = try stream.write(&buf);
+}
+
+fn liveStreamCount(session: *yamux.Session) usize {
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    return session.streams.count();
+}
+
+test "yamux: invalid frame type closes the session instead of panicking" {
+    const allocator = std.testing.allocator;
+    var pipe = Pipe.init(allocator);
+    defer pipe.deinit();
+
+    const server_session = try yamux.Session.init(allocator, pipe.server(), true);
+    defer server_session.deinit();
+    const server_thread = try std.Thread.spawn(.{}, yamux.Session.run, .{server_session});
+
+    // Type byte 0x7f is not a valid yamux frame type.
+    _ = try pipe.client().write(&[_]u8{ 0, 0x7f, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0 });
+
+    server_thread.join();
+    try std.testing.expect(server_session.isClosed());
+}
+
+test "yamux: frame larger than the receive window is rejected before allocating" {
+    const allocator = std.testing.allocator;
+    var pipe = Pipe.init(allocator);
+    defer pipe.deinit();
+
+    const server_session = try yamux.Session.init(allocator, pipe.server(), true);
+    defer server_session.deinit();
+    const server_thread = try std.Thread.spawn(.{}, yamux.Session.run, .{server_session});
+
+    // Advertise a 4 GiB payload on a new stream. The session must fail the
+    // window check instead of allocating or waiting for the payload.
+    try writeRawFrame(pipe.client(), .{
+        .type = .DATA,
+        .flags = yamux.Flags.SYN,
+        .stream_id = 1,
+        .length = std.math.maxInt(u32),
+    });
+
+    server_thread.join();
+    try std.testing.expect(server_session.isClosed());
+}
+
+test "yamux: incoming streams beyond MaxStreams are reset" {
+    const allocator = std.testing.allocator;
+    var pipe = Pipe.init(allocator);
+    defer pipe.deinit();
+
+    const server_session = try yamux.Session.init(allocator, pipe.server(), true);
+    defer server_session.deinit();
+    const server_thread = try std.Thread.spawn(.{}, yamux.Session.run, .{server_session});
+    defer {
+        pipe.stop();
+        server_thread.join();
+    }
+
+    var i: u32 = 0;
+    while (i <= yamux.MaxStreams) : (i += 1) {
+        try writeRawFrame(pipe.client(), .{
+            .type = .DATA,
+            .flags = yamux.Flags.SYN,
+            .stream_id = 2 * i + 1,
+            .length = 0,
+        });
+    }
+
+    // The only frame the server sends back is the RST for the extra stream.
+    var buf: [12]u8 = undefined;
+    var got: usize = 0;
+    while (got < buf.len) got += try pipe.client().read(buf[got..]);
+    const reply = try yamux.Header.decode(buf);
+    try std.testing.expectEqual(yamux.Type.WINDOW_UPDATE, reply.type);
+    try std.testing.expect(reply.flags & yamux.Flags.RST != 0);
+    try std.testing.expectEqual(2 * yamux.MaxStreams + 1, reply.stream_id);
+    try std.testing.expectEqual(@as(usize, yamux.MaxStreams), liveStreamCount(server_session));
+}
+
+test "yamux: streams are freed once both sides close" {
+    const allocator = std.testing.allocator;
+    var pipe = Pipe.init(allocator);
+    defer pipe.deinit();
+
+    const server_session = try yamux.Session.init(allocator, pipe.server(), true);
+    defer server_session.deinit();
+    const client_session = try yamux.Session.init(allocator, pipe.client(), false);
+    defer client_session.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, yamux.Session.run, .{server_session});
+    const client_thread = try std.Thread.spawn(.{}, yamux.Session.run, .{client_session});
+    defer {
+        pipe.stop();
+        server_thread.join();
+        client_thread.join();
+    }
+
+    var round: usize = 0;
+    while (round < 3 * yamux.MaxStreams) : (round += 1) {
+        const client_stream = try client_session.newStream();
+        _ = try yamux.Session.streamWrite(client_stream, "ping");
+        const server_stream = try server_session.acceptStream();
+
+        var buf: [8]u8 = undefined;
+        const n = try yamux.Session.streamRead(server_stream, &buf);
+        try std.testing.expectEqualStrings("ping", buf[0..n]);
+
+        yamux.Session.streamClose(client_stream);
+        yamux.Session.streamClose(server_stream);
+    }
+
+    // Without reaping, opening 3 * MaxStreams streams would have failed.
+    var retries: usize = 0;
+    while (liveStreamCount(server_session) + liveStreamCount(client_session) > 0) {
+        if (retries > 100) return error.TestTimeout;
+        nomadfs.sync.sleep(10 * std.time.ns_per_ms);
+        retries += 1;
+    }
+}
+
+test "yamux: reads honour the stream deadline" {
+    const allocator = std.testing.allocator;
+    var pipe = Pipe.init(allocator);
+    defer pipe.deinit();
+
+    const server_session = try yamux.Session.init(allocator, pipe.server(), true);
+    defer server_session.deinit();
+    const client_session = try yamux.Session.init(allocator, pipe.client(), false);
+    defer client_session.deinit();
+    const server_thread = try std.Thread.spawn(.{}, yamux.Session.run, .{server_session});
+    const client_thread = try std.Thread.spawn(.{}, yamux.Session.run, .{client_session});
+    defer {
+        pipe.stop();
+        server_thread.join();
+        client_thread.join();
+    }
+
+    const client_stream = try client_session.newStream();
+    defer yamux.Session.streamClose(client_stream);
+    yamux.Session.streamSetTimeout(client_stream, 100);
+
+    // The peer never writes: the read must give up instead of blocking.
+    var buf: [8]u8 = undefined;
+    const started = nomadfs.sync.monotonicMillis();
+    try std.testing.expectError(error.Timeout, yamux.Session.streamRead(client_stream, &buf));
+    try std.testing.expect(nomadfs.sync.monotonicMillis() - started < 2000);
 }

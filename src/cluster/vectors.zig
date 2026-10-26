@@ -49,13 +49,18 @@ pub const VectorClock = struct {
             self.entries.items[index].counter += 1;
         } else {
             // Not found, insert at index to maintain sort order
-            try self.entries.insert(self.allocator, index, Entry{
-                .node_id = try self.allocator.dupe(u8, node_id),
-                .counter = 1,
-            });
+            try self.insertCopy(index, node_id, 1);
         }
 
         std.debug.assert(self.entries.items.len <= MAX_VECTOR_CLOCK_ENTRIES);
+    }
+
+    /// Inserts an entry owning a copy of `node_id`. On error nothing is
+    /// inserted and nothing leaks. Caller holds the write lock.
+    fn insertCopy(self: *VectorClock, index: usize, node_id: []const u8, counter: u64) !void {
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        const node_id_copy = try self.allocator.dupe(u8, node_id);
+        self.entries.insertAssumeCapacity(index, .{ .node_id = node_id_copy, .counter = counter });
     }
 
     pub const Order = enum {
@@ -144,10 +149,7 @@ pub const VectorClock = struct {
 
             // If we reached end of self, just append remaining from other
             if (i >= self.entries.items.len) {
-                try self.entries.append(self.allocator, Entry{
-                    .node_id = try self.allocator.dupe(u8, o_entry.node_id),
-                    .counter = o_entry.counter,
-                });
+                try self.insertCopy(i, o_entry.node_id, o_entry.counter);
                 j += 1;
                 i += 1;
                 continue;
@@ -168,10 +170,7 @@ pub const VectorClock = struct {
                 },
                 .gt => {
                     // other has node that self doesn't, insert it at i
-                    try self.entries.insert(self.allocator, i, Entry{
-                        .node_id = try self.allocator.dupe(u8, o_entry.node_id),
-                        .counter = o_entry.counter,
-                    });
+                    try self.insertCopy(i, o_entry.node_id, o_entry.counter);
                     i += 1; // Point to next element (after insertion)
                     j += 1;
                 },
@@ -226,4 +225,22 @@ test "VectorClock operations" {
     try vc3.increment("C");
 
     try std.testing.expectEqual(VectorClock.Order.Equal, vc1.compare(&vc3));
+}
+
+test "VectorClock does not leak when allocation fails" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var a = VectorClock.init(allocator);
+            defer a.deinit();
+            var b = VectorClock.init(allocator);
+            defer b.deinit();
+
+            try a.increment("B");
+            try a.increment("E");
+            try b.increment("A");
+            try b.increment("C");
+            try b.increment("F");
+            try a.merge(&b);
+        }
+    }.run, .{});
 }

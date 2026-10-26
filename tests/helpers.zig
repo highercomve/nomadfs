@@ -73,7 +73,9 @@ pub const TestPeer = struct {
 
     pub fn connect(self: *TestPeer, other: *TestPeer) !nomadfs.net.transport.Stream {
         const conn = try self.manager.connectToPeer(other.listen_addr, self.config.node.swarm_key, other.manager.node_id);
-        // We have a connection, now open a stream
+        // The manager's own reference keeps the connection (and so the
+        // stream) alive until this peer is stopped.
+        defer conn.deinit();
         return conn.openStream();
     }
 };

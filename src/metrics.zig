@@ -8,6 +8,7 @@ pub const MetricType = enum {
 };
 
 pub const Metric = struct {
+    /// Not owned: callers pass names with static lifetime (string literals).
     name: []const u8,
     type: MetricType,
     value: f64,
@@ -18,87 +19,78 @@ pub const Metric = struct {
             .name = name,
             .type = metric_type,
             .value = value,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = sync.milliTimestamp(),
         };
     }
 };
 
+/// Fixed-capacity ring of the most recent samples. Recording never allocates
+/// and never fails; the oldest sample is overwritten when full.
 pub const MetricsCollector = struct {
-    metrics: std.ArrayList(Metric),
+    pub const capacity = 10_000;
+
+    samples: []Metric,
+    /// Index of the oldest sample.
+    head: usize = 0,
+    len: usize = 0,
+    allocator: std.mem.Allocator,
     mutex: sync.Mutex = .{},
 
-    pub fn init(allocator: std.mem.Allocator) MetricsCollector {
+    pub fn init(allocator: std.mem.Allocator) !MetricsCollector {
         return .{
-            .metrics = std.ArrayList(Metric).init(allocator),
-            .mutex = .{},
+            .samples = try allocator.alloc(Metric, capacity),
+            .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *MetricsCollector) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        self.metrics.deinit();
+        self.allocator.free(self.samples);
     }
 
-    const MAX_METRICS = 10000;
-
     pub fn incrementCounter(self: *MetricsCollector, name: []const u8, value: f64) void {
-        std.debug.assert(name.len > 0);
         std.debug.assert(value >= 0);
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.metrics.items.len >= MAX_METRICS) {
-            _ = self.metrics.orderedRemove(0);
-        }
-
-        const metric = Metric.init(name, .Counter, value);
-        self.metrics.append(metric) catch {};
+        self.record(Metric.init(name, .Counter, value));
     }
 
     pub fn recordGauge(self: *MetricsCollector, name: []const u8, value: f64) void {
-        std.debug.assert(name.len > 0);
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.metrics.items.len >= MAX_METRICS) {
-            _ = self.metrics.orderedRemove(0);
-        }
-
-        const metric = Metric.init(name, .Gauge, value);
-        self.metrics.append(metric) catch {};
+        self.record(Metric.init(name, .Gauge, value));
     }
 
     pub fn recordHistogram(self: *MetricsCollector, name: []const u8, value: f64) void {
-        std.debug.assert(name.len > 0);
         std.debug.assert(value >= 0);
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.metrics.items.len >= MAX_METRICS) {
-            _ = self.metrics.orderedRemove(0);
-        }
-
-        const metric = Metric.init(name, .Histogram, value);
-        self.metrics.append(metric) catch {};
+        self.record(Metric.init(name, .Histogram, value));
     }
 
-    pub fn getMetrics(self: *MetricsCollector) []Metric {
+    fn record(self: *MetricsCollector, metric: Metric) void {
+        std.debug.assert(metric.name.len > 0);
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        return self.metrics.items;
+        if (self.len < capacity) {
+            self.samples[(self.head + self.len) % capacity] = metric;
+            self.len += 1;
+        } else {
+            self.samples[self.head] = metric;
+            self.head = (self.head + 1) % capacity;
+        }
+    }
+
+    /// Returns a caller-owned snapshot, oldest first. (Returning the internal
+    /// buffer would let callers read it while other threads overwrite it.)
+    pub fn snapshot(self: *MetricsCollector, allocator: std.mem.Allocator) ![]Metric {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const out = try allocator.alloc(Metric, self.len);
+        for (out, 0..) |*m, i| m.* = self.samples[(self.head + i) % capacity];
+        return out;
     }
 
     pub fn clear(self: *MetricsCollector) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-
-        self.metrics.clearRetainingCapacity();
+        self.head = 0;
+        self.len = 0;
     }
 };
 
@@ -109,18 +101,18 @@ pub const Span = struct {
     parent: ?*Span = null,
     children: std.ArrayList(*Span),
     allocator: std.mem.Allocator,
-    metadata: std.StringHashMap([]const u8, []const u8),
+    metadata: std.StringHashMapUnmanaged([]const u8),
 
-    pub fn start(allocator: std.mem.Allocator, name: []const u8) ?*Span {
-        if (name.len == 0) return null;
+    pub fn start(allocator: std.mem.Allocator, name: []const u8) !*Span {
+        std.debug.assert(name.len > 0);
 
-        const span = allocator.create(Span) catch return null;
+        const span = try allocator.create(Span);
         span.* = .{
             .name = name,
-            .start_time = std.time.nanoTimestamp(),
-            .children = std.ArrayList(*Span).init(allocator),
+            .start_time = sync.monotonicMillis(),
+            .children = .empty,
             .allocator = allocator,
-            .metadata = std.StringHashMap([]const u8, []const u8).init(allocator),
+            .metadata = .empty,
         };
         return span;
     }
@@ -128,26 +120,21 @@ pub const Span = struct {
     pub fn end(self: *Span) void {
         std.debug.assert(self.end_time == null);
 
-        self.end_time = std.time.nanoTimestamp();
-
-        const duration_ns = self.end_time.? - self.start_time;
-        const duration_ms = @as(f64, @floatFromInt(duration_ns)) / 1_000_000.0;
-
-        std.debug.print("Span '{s}' completed in {d:.2}ms\n", .{ self.name, duration_ms });
+        self.end_time = sync.monotonicMillis();
+        std.debug.print("Span '{s}' completed in {d}ms\n", .{ self.name, self.end_time.? - self.start_time });
     }
 
-    pub fn addChild(self: *Span, child: *Span) void {
+    /// Takes ownership of `child`: it is freed with this span.
+    pub fn addChild(self: *Span, child: *Span) !void {
         std.debug.assert(child.parent == null);
-
+        try self.children.append(self.allocator, child);
         child.parent = self;
-        self.children.append(child) catch {};
     }
 
+    /// Key and value are not copied and must outlive the span.
     pub fn setMetadata(self: *Span, key: []const u8, value: []const u8) !void {
         std.debug.assert(key.len > 0);
-        std.debug.assert(value.len > 0);
-
-        try self.metadata.put(key, value);
+        try self.metadata.put(self.allocator, key, value);
     }
 
     pub fn getMetadata(self: *Span, key: []const u8) ?[]const u8 {
@@ -158,47 +145,40 @@ pub const Span = struct {
         for (self.children.items) |child| {
             child.deinit();
         }
-        self.children.deinit();
-        self.metadata.deinit();
+        self.children.deinit(self.allocator);
+        self.metadata.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 };
 
-pub var global_metrics: ?MetricsCollector = null;
+test "MetricsCollector keeps the most recent samples" {
+    var metrics = try MetricsCollector.init(std.testing.allocator);
+    defer metrics.deinit();
 
-pub fn initGlobalMetrics(allocator: std.mem.Allocator) void {
-    if (global_metrics == null) {
-        global_metrics = allocator.create(MetricsCollector) catch unreachable;
-        global_metrics.?.* = MetricsCollector.init(allocator);
+    var i: usize = 0;
+    while (i < MetricsCollector.capacity + 5) : (i += 1) {
+        metrics.recordGauge("queue_depth", @floatFromInt(i));
     }
+
+    const snap = try metrics.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snap);
+    try std.testing.expectEqual(@as(usize, MetricsCollector.capacity), snap.len);
+    try std.testing.expectEqual(@as(f64, 5), snap[0].value);
+    try std.testing.expectEqual(@as(f64, MetricsCollector.capacity + 4), snap[snap.len - 1].value);
+
+    metrics.clear();
+    const empty = try metrics.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
-pub fn deinitGlobalMetrics(allocator: std.mem.Allocator) void {
-    if (global_metrics) |*metrics| {
-        metrics.deinit();
-        allocator.destroy(metrics);
-        global_metrics = null;
-    }
-}
-
-pub fn incrementCounter(name: []const u8, value: f64) void {
-    if (global_metrics) |*metrics| {
-        metrics.incrementCounter(name, value);
-    }
-}
-
-pub fn recordGauge(name: []const u8, value: f64) void {
-    if (global_metrics) |*metrics| {
-        metrics.recordGauge(name, value);
-    }
-}
-
-pub fn recordHistogram(name: []const u8, value: f64) void {
-    if (global_metrics) |*metrics| {
-        metrics.recordHistogram(name, value);
-    }
-}
-
-pub fn startSpan(allocator: std.mem.Allocator, name: []const u8) ?*Span {
-    return Span.start(allocator, name);
+test "Span owns its children" {
+    const root = try Span.start(std.testing.allocator, "root");
+    defer root.deinit();
+    const child = try Span.start(std.testing.allocator, "child");
+    try root.addChild(child);
+    try root.setMetadata("peer", "abc");
+    try std.testing.expectEqualStrings("abc", root.getMetadata("peer").?);
+    child.end();
+    root.end();
 }

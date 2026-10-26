@@ -18,23 +18,44 @@ pub const Mutex = struct {
     }
 };
 
-/// Thread condition variable compatible with Zig 0.16.
+/// Condition variable built on a futex sequence counter, so that it can
+/// offer a timed wait (std.Io.Condition has none in Zig 0.16).
+/// Waiters must re-check their predicate after waking (spurious wakeups).
 pub const Condition = struct {
-    inner: std.Io.Condition = .init,
+    seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
+    /// Caller holds `mutex`.
     pub fn wait(self: *Condition, mutex: *Mutex) void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        self.inner.waitUncancelable(io, &mutex.inner);
+        const observed = self.seq.load(.acquire);
+        mutex.unlock();
+        io.futexWaitUncancelable(u32, &self.seq.raw, observed);
+        mutex.lock();
+    }
+
+    /// Like wait, but also returns once `timeout_ns` has elapsed.
+    /// Caller holds `mutex`.
+    pub fn timedWait(self: *Condition, mutex: *Mutex, timeout_ns: u64) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const observed = self.seq.load(.acquire);
+        mutex.unlock();
+        io.futexWaitTimeout(u32, &self.seq.raw, observed, .{ .duration = .{
+            .raw = .fromNanoseconds(@intCast(timeout_ns)),
+            .clock = .awake,
+        } }) catch {};
+        mutex.lock();
     }
 
     pub fn signal(self: *Condition) void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        self.inner.signal(io);
+        _ = self.seq.fetchAdd(1, .release);
+        io.futexWake(u32, &self.seq.raw, 1);
     }
 
     pub fn broadcast(self: *Condition) void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        self.inner.broadcast(io);
+        _ = self.seq.fetchAdd(1, .release);
+        io.futexWake(u32, &self.seq.raw, std.math.maxInt(u32));
     }
 };
 
@@ -63,30 +84,31 @@ pub const RwLock = struct {
     }
 };
 
-/// WaitGroup compatible with Zig 0.16.
+/// WaitGroup compatible with Zig 0.16. Supports any number of waiters and
+/// reuse after reaching zero.
 pub const WaitGroup = struct {
-    state: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    event: std.Io.Event = .unset,
-
-    const is_waiting: usize = 1 << 0;
-    const one_pending: usize = 1 << 1;
+    mutex: Mutex = .{},
+    cond: Condition = .{},
+    pending: usize = 0,
 
     pub fn start(wg: *WaitGroup) void {
-        _ = wg.state.fetchAdd(one_pending, .monotonic);
+        wg.mutex.lock();
+        defer wg.mutex.unlock();
+        wg.pending += 1;
     }
 
     pub fn wait(wg: *WaitGroup) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const prev_state = wg.state.fetchAdd(is_waiting, .acquire);
-        if ((prev_state / one_pending) > 0) wg.event.wait(io) catch {};
+        wg.mutex.lock();
+        defer wg.mutex.unlock();
+        while (wg.pending > 0) wg.cond.wait(&wg.mutex);
     }
 
     pub fn finish(wg: *WaitGroup) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const state = wg.state.fetchSub(one_pending, .acq_rel);
-        if (state == (one_pending | is_waiting)) {
-            wg.event.set(io);
-        }
+        wg.mutex.lock();
+        defer wg.mutex.unlock();
+        std.debug.assert(wg.pending > 0);
+        wg.pending -= 1;
+        if (wg.pending == 0) wg.cond.broadcast();
     }
 };
 
@@ -102,7 +124,7 @@ pub fn sleep(nanoseconds: u64) void {
         const io = std.Io.Threaded.global_single_threaded.io();
         const duration: std.Io.Clock.Duration = .{
             .raw = .{ .nanoseconds = @intCast(nanoseconds) },
-            .clock = .monotonic,
+            .clock = .awake,
         };
         _ = duration.sleep(io) catch {};
     }
@@ -112,6 +134,12 @@ pub fn sleep(nanoseconds: u64) void {
 pub fn timestamp() i64 {
     const io = std.Io.Threaded.global_single_threaded.io();
     return std.Io.Clock.real.now(io).toSeconds();
+}
+
+/// Milliseconds on a clock that never jumps; use for deadlines.
+pub fn monotonicMillis() i64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return @intCast(std.Io.Clock.awake.now(io).toMilliseconds());
 }
 
 /// Returns current Unix timestamp in milliseconds.
@@ -150,4 +178,37 @@ test "sync primitives work correctly" {
     m.unlock();
 
     wg.wait();
+}
+
+test "WaitGroup supports reuse and concurrent waiters" {
+    var wg: WaitGroup = .{};
+    wg.wait(); // Nothing pending: returns immediately.
+
+    var round: usize = 0;
+    while (round < 2) : (round += 1) {
+        wg.start();
+        wg.start();
+        const Waiter = struct {
+            fn run(group: *WaitGroup) void {
+                group.wait();
+            }
+        };
+        const w1 = try std.Thread.spawn(.{}, Waiter.run, .{&wg});
+        const w2 = try std.Thread.spawn(.{}, Waiter.run, .{&wg});
+        wg.finish();
+        wg.finish();
+        w1.join();
+        w2.join();
+        try std.testing.expectEqual(@as(usize, 0), wg.pending);
+    }
+}
+
+test "Condition.timedWait returns after the timeout" {
+    var m: Mutex = .{};
+    var c: Condition = .{};
+    m.lock();
+    defer m.unlock();
+    const start = monotonicMillis();
+    c.timedWait(&m, 50 * std.time.ns_per_ms);
+    try std.testing.expect(monotonicMillis() - start >= 40);
 }

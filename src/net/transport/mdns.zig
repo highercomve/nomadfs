@@ -50,7 +50,7 @@ fn bindSocket(s: posix.socket_t, addr: *const posix.sockaddr, len: posix.socklen
 fn sendtoSocket(s: posix.socket_t, buf: []const u8, flags: u32, addr: ?*const posix.sockaddr, alen: posix.socklen_t) !usize {
     const rc = system.sendto(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
     return switch (posix.errno(rc)) {
-        .SUCCESS => rc,
+        .SUCCESS => @intCast(rc),
         else => |err| posix.unexpectedErrno(err),
     };
 }
@@ -58,7 +58,7 @@ fn sendtoSocket(s: posix.socket_t, buf: []const u8, flags: u32, addr: ?*const po
 fn recvfromSocket(s: posix.socket_t, buf: []u8, flags: u32, addr: ?*posix.sockaddr, alen: ?*posix.socklen_t) !usize {
     const rc = system.recvfrom(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
     return switch (posix.errno(rc)) {
-        .SUCCESS => rc,
+        .SUCCESS => @intCast(rc),
         .AGAIN => error.WouldBlock,
         else => |err| posix.unexpectedErrno(err),
     };
@@ -91,45 +91,74 @@ pub const MDNS = struct {
         self.stop();
     }
 
+    /// Opens and configures the sockets on the calling thread, then starts the
+    /// worker. If the sockets cannot be set up, mDNS stays disabled (as before)
+    /// and start() still succeeds.
     pub fn start(self: *MDNS) !void {
+        if (builtin.os.tag == .windows) {
+            // The raw socket helpers below are POSIX-only.
+            std.debug.print("mDNS: not supported on Windows; discovery disabled\n", .{});
+            return;
+        } else return self.startPosix();
+    }
+
+    fn startPosix(self: *MDNS) !void {
         if (self.running.load(.acquire)) return;
 
-        self.running.store(true, .release);
-        self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
-    }
-
-    pub fn stop(self: *MDNS) void {
-        self.running.store(false, .release);
-        if (self.send_socket) |s| {
-            shutdownSocket(s, posix.SHUT.RDWR);
-            closeSocket(s);
-            self.send_socket = null;
-        }
-        if (self.recv_socket) |s| {
-            shutdownSocket(s, posix.SHUT.RDWR);
-            closeSocket(s);
-            self.recv_socket = null;
-        }
-        if (self.thread) |t| {
-            t.join();
-            self.thread = null;
-        }
-    }
-
-    fn runLoop(self: *MDNS) void {
         const recv_socket = createSocket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch |err| {
             std.debug.print("mDNS: Failed to create recv socket: {any}\n", .{err});
             return;
         };
-        self.recv_socket = recv_socket;
+        errdefer closeSocket(recv_socket);
 
         const send_socket = createSocket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch |err| {
             std.debug.print("mDNS: Failed to create send socket: {any}\n", .{err});
+            closeSocket(recv_socket);
             return;
         };
-        self.send_socket = send_socket;
+        errdefer closeSocket(send_socket);
 
-        // --- Configure Recv Socket ---
+        self.configureRecvSocket(recv_socket) catch |err| {
+            std.debug.print("mDNS: Failed to bind recv socket: {any}\n", .{err});
+            closeSocket(send_socket);
+            closeSocket(recv_socket);
+            return;
+        };
+        configureSendSocket(send_socket);
+
+        self.recv_socket = recv_socket;
+        self.send_socket = send_socket;
+        self.running.store(true, .release);
+        self.thread = std.Thread.spawn(.{}, runLoop, .{self}) catch |err| {
+            self.running.store(false, .release);
+            self.recv_socket = null;
+            self.send_socket = null;
+            return err;
+        };
+    }
+
+    /// Stops the worker. Sockets are shut down to unblock it, and closed only
+    /// after it has been joined so it never touches a released descriptor.
+    pub fn stop(self: *MDNS) void {
+        if (builtin.os.tag == .windows) return;
+        self.running.store(false, .release);
+        if (self.recv_socket) |s| shutdownSocket(s, posix.SHUT.RDWR);
+        if (self.send_socket) |s| shutdownSocket(s, posix.SHUT.RDWR);
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        if (self.send_socket) |s| {
+            closeSocket(s);
+            self.send_socket = null;
+        }
+        if (self.recv_socket) |s| {
+            closeSocket(s);
+            self.recv_socket = null;
+        }
+    }
+
+    fn configureRecvSocket(self: *MDNS, recv_socket: posix.socket_t) !void {
         const enable: i32 = 1;
         posix.setsockopt(recv_socket, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enable)) catch {};
         if (builtin.os.tag != .windows) {
@@ -138,10 +167,7 @@ pub const MDNS = struct {
 
         const addr = Address.parseIp("0.0.0.0", self.mdns_port) catch unreachable;
         const sa = addr.toPosix();
-        bindSocket(recv_socket, @ptrCast(&sa), @sizeOf(@TypeOf(sa))) catch |err| {
-            std.debug.print("mDNS: Failed to bind recv socket: {any}\n", .{err});
-            return;
-        };
+        try bindSocket(recv_socket, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
 
         const mcast_sa = (Address.parseIp(MDNS_MULTICAST_ADDR, 0) catch unreachable).toPosix();
         const mreq = ip_mreq{
@@ -153,13 +179,20 @@ pub const MDNS = struct {
             std.debug.print("mDNS: Failed to join multicast group: {any}\n", .{err});
         };
 
-        // --- Configure Send Socket ---
-        const multicast_loop = if (@hasDecl(posix, "IP_MULTICAST_LOOP")) posix.IP_MULTICAST_LOOP else 34;
-        posix.setsockopt(send_socket, posix.IPPROTO.IP, multicast_loop, std.mem.asBytes(&enable)) catch {};
-
-        // Set timeout for recv
+        // Bounded receive so the loop re-checks `running` and keeps announcing.
         const timeout = posix.timeval{ .sec = 1, .usec = 0 };
         posix.setsockopt(recv_socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    }
+
+    fn configureSendSocket(send_socket: posix.socket_t) void {
+        const enable: i32 = 1;
+        const multicast_loop = if (@hasDecl(posix, "IP_MULTICAST_LOOP")) posix.IP_MULTICAST_LOOP else 34;
+        posix.setsockopt(send_socket, posix.IPPROTO.IP, multicast_loop, std.mem.asBytes(&enable)) catch {};
+    }
+
+    fn runLoop(self: *MDNS) void {
+        const recv_socket = self.recv_socket.?;
+        const send_socket = self.send_socket.?;
 
         var last_announce: i64 = 0;
         const announce_interval = 2; // seconds
@@ -178,19 +211,16 @@ pub const MDNS = struct {
             var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
 
             const bytes_read = recvfromSocket(recv_socket, &buf, 0, @ptrCast(&src_sa), &len) catch |err| {
-                if (err == error.WouldBlock) continue;
-                std.debug.print("mDNS: recv error: {any}\n", .{err});
+                if (err != error.WouldBlock) std.debug.print("mDNS: recv error: {any}\n", .{err});
                 continue;
             };
+            if (bytes_read == 0) continue;
 
-            if (bytes_read > 0) {
-                const src_addr = Address.fromPosix(src_sa);
-                self.handlePacket(buf[0..bytes_read], src_addr) catch |err| {
-                    if (err != error.InvalidFormat) {
-                        std.debug.print("mDNS: Packet handling error: {any}\n", .{err});
-                    }
-                };
-            }
+            self.handlePacket(buf[0..bytes_read], Address.fromPosix(src_sa)) catch |err| {
+                if (err != error.InvalidFormat) {
+                    std.debug.print("mDNS: Packet handling error: {any}\n", .{err});
+                }
+            };
         }
     }
 
@@ -229,10 +259,14 @@ pub const MDNS = struct {
         if (port_end == null) return error.InvalidFormat;
         const port_str = payload[port_val_start .. port_val_start + port_end.?];
 
-        const port = try std.fmt.parseInt(u16, port_str, 10);
+        const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidFormat;
+        if (port == 0) return error.InvalidFormat;
 
+        // hexToBytes accepts short input and leaves the rest of the output
+        // undefined, so insist on exactly one full ID.
         var peer_id_bytes: [32]u8 = undefined;
-        _ = try std.fmt.hexToBytes(&peer_id_bytes, id_hex);
+        if (id_hex.len != peer_id_bytes.len * 2) return error.InvalidFormat;
+        _ = std.fmt.hexToBytes(&peer_id_bytes, id_hex) catch return error.InvalidFormat;
         const peer_id = id.NodeID{ .bytes = peer_id_bytes };
 
         // Don't discover self
@@ -245,3 +279,26 @@ pub const MDNS = struct {
         self.found_peers_callback(self.callback_ctx, peer_id, tcp_addr);
     }
 };
+
+test "handlePacket rejects malformed announcements" {
+    const Ctx = struct {
+        var calls: usize = 0;
+        fn found(_: ?*anyopaque, _: id.NodeID, _: Address) void {
+            calls += 1;
+        }
+    };
+    var mdns = MDNS.init(std.testing.allocator, .{ .bytes = [_]u8{1} ** 32 }, 9000, MDNS_PORT, Ctx.found, null);
+    const src = try Address.parseIp("192.168.1.10", MDNS_PORT);
+
+    // Short ID: would leave most of the 32-byte ID undefined.
+    try std.testing.expectError(error.InvalidFormat, mdns.handlePacket("NMFS{\"id\":\"ab\",\"port\":9000}", src));
+    // Port 0 and non-numeric ports.
+    const id_hex = "22" ** 32;
+    try std.testing.expectError(error.InvalidFormat, mdns.handlePacket("NMFS{\"id\":\"" ++ id_hex ++ "\",\"port\":0}", src));
+    try std.testing.expectError(error.InvalidFormat, mdns.handlePacket("NMFS{\"id\":\"" ++ id_hex ++ "\",\"port\":x}", src));
+    try std.testing.expectEqual(@as(usize, 0), Ctx.calls);
+
+    // A well-formed announcement is delivered.
+    try mdns.handlePacket("NMFS{\"id\":\"" ++ id_hex ++ "\",\"port\":9000}", src);
+    try std.testing.expectEqual(@as(usize, 1), Ctx.calls);
+}

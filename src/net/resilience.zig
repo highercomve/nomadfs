@@ -40,10 +40,10 @@ pub const CircuitBreaker = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const now = std.time.milliTimestamp();
+        const now = sync.milliTimestamp();
 
         if (self.state == .Open) {
-            if (now - self.last_failure_time > self.timeout_ms) {
+            if (now - self.last_failure_time > @as(i64, @intCast(self.timeout_ms))) {
                 std.debug.print("Circuit breaker: Transitioning from Open to HalfOpen\n", .{});
                 self.state = .HalfOpen;
             } else {
@@ -73,7 +73,7 @@ pub const CircuitBreaker = struct {
         defer self.mutex.unlock();
 
         self.failure_count += 1;
-        self.last_failure_time = std.time.milliTimestamp();
+        self.last_failure_time = sync.milliTimestamp();
 
         if (self.failure_count >= self.threshold) {
             std.debug.print("Circuit breaker: Opening after {d} failures\n", .{self.failure_count});
@@ -96,7 +96,7 @@ pub const CircuitBreaker = struct {
     }
 };
 
-pub fn retryWithBackoff(comptime T: type, config: RetryConfig, operation: fn () !T) !T {
+pub fn retryWithBackoff(comptime T: type, config: RetryConfig, operation: fn () anyerror!T) anyerror!T {
     std.debug.assert(config.max_attempts > 0);
     std.debug.assert(config.base_delay_ms > 0);
 
@@ -104,7 +104,7 @@ pub fn retryWithBackoff(comptime T: type, config: RetryConfig, operation: fn () 
     var delay: u64 = config.base_delay_ms;
 
     while (attempt < config.max_attempts) : (attempt += 1) {
-        const result = operation() catch |err| {
+        return operation() catch |err| {
             if (attempt >= config.max_attempts - 1) return err;
 
             if (!isRetriableError(err)) {
@@ -112,22 +112,13 @@ pub fn retryWithBackoff(comptime T: type, config: RetryConfig, operation: fn () 
             }
 
             std.debug.print("Retry attempt {d}/{d} after error: {any}\n", .{ attempt + 1, config.max_attempts, err });
-            std.time.sleep(delay * 1_000_000);
+            sync.sleep(delay * std.time.ns_per_ms);
 
             if (config.exponential_backoff) {
                 delay = @min(delay * 2, config.max_delay_ms);
             }
+            continue;
         };
-
-        return result;
-    }
-}
-            } else {
-                return err;
-            }
-        };
-
-        return result;
     }
     unreachable;
 }
@@ -142,4 +133,26 @@ fn isRetriableError(err: anyerror) bool {
         error.TimedOut => true,
         else => false,
     };
+}
+
+test "retryWithBackoff retries retriable errors" {
+    const Op = struct {
+        var calls: u8 = 0;
+        fn run() anyerror!u32 {
+            calls += 1;
+            if (calls < 3) return error.ConnectionRefused;
+            return 42;
+        }
+    };
+    const value = try retryWithBackoff(u32, .{ .base_delay_ms = 1 }, Op.run);
+    try std.testing.expectEqual(@as(u32, 42), value);
+    try std.testing.expectEqual(@as(u8, 3), Op.calls);
+}
+
+test "CircuitBreaker opens after threshold failures" {
+    var breaker = CircuitBreaker.init(2, 60_000);
+    try breaker.acquire();
+    breaker.recordFailure();
+    breaker.recordFailure();
+    try std.testing.expectError(error.CircuitBreakerOpen, breaker.acquire());
 }

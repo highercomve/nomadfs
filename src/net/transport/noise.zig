@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const network = @import("mod.zig");
 
 const Hash = std.crypto.hash.blake2.Blake2s256;
@@ -20,20 +21,35 @@ pub const KeyPair = struct {
         };
     }
 
+    /// Loads and validates a key file. error.FileNotFound means there is no
+    /// key yet; any other error means an existing key is unusable and must
+    /// not be silently replaced.
     pub fn loadFromFile(path: []const u8) !KeyPair {
         const io = std.Io.Threaded.global_single_threaded.io();
         var file = try std.Io.Dir.cwd().openFile(io, path, .{});
         defer file.close(io);
 
+        if ((try file.stat(io)).size != @sizeOf(KeyPair)) return error.InvalidKeyFile;
         var kp: KeyPair = undefined;
         const bytes_read = try file.readPositionalAll(io, std.mem.asBytes(&kp), 0);
         if (bytes_read != @sizeOf(KeyPair)) return error.InvalidKeyFile;
+
+        const derived = X25519.recoverPublicKey(kp.private_key) catch return error.InvalidKeyFile;
+        if (!std.mem.eql(u8, &derived, &kp.public_key)) return error.InvalidKeyFile;
         return kp;
     }
 
+    /// Owner-only: the file holds the node's private key.
+    const key_file_permissions: std.Io.File.Permissions =
+        if (builtin.os.tag == .windows) .default_file else @enumFromInt(0o600);
+
+    /// Writes a new key file. Never overwrites an existing one.
     pub fn saveToFile(self: KeyPair, path: []const u8) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{
+            .exclusive = true,
+            .permissions = key_file_permissions,
+        });
         defer file.close(io);
 
         try file.writePositionalAll(io, std.mem.asBytes(&self), 0);
@@ -218,7 +234,7 @@ pub const NoiseStream = struct {
 
         var hs = HandshakeState.init(initiator, static_key, swarm_key);
 
-        const result = try_handshake_steps(allocator, inner, &hs, initiator);
+        const result = runHandshakeSteps(allocator, inner, &hs, initiator);
         if (result) |ns| {
             std.debug.print("* Noise Handshake complete\n", .{});
             return ns;
@@ -228,110 +244,15 @@ pub const NoiseStream = struct {
         }
     }
 
-    fn try_handshake_steps(allocator: std.mem.Allocator, inner: network.Stream, hs: *HandshakeState, initiator: bool) !NoiseStream {
-        // Message 1: -> e
+    fn runHandshakeSteps(allocator: std.mem.Allocator, inner: network.Stream, hs: *HandshakeState, initiator: bool) !NoiseStream {
         if (initiator) {
-            std.debug.print("* Noise (OUT): Message 1 -> sending ephemeral public key (e)\n", .{});
-            hs.e = KeyPair.generate();
-            hs.symmetric.mixHash(&hs.e.?.public_key);
-            writeHandshakeMessage(inner, &hs.e.?.public_key) catch |err| return logError("Message 1 write", err);
+            try writeMessage1(inner, hs);
+            try readMessage2(inner, hs);
+            try writeMessage3(inner, hs);
         } else {
-            var re: [32]u8 = undefined;
-            readHandshakeMessage(inner, &re) catch |err| return logError("Message 1 read", err);
-            std.debug.print("* Noise (IN):  Message 1 <- received ephemeral public key (e)\n", .{});
-            hs.re = re;
-            hs.symmetric.mixHash(&re);
-        }
-
-        // Message 2: <- e, ee, s, es
-        if (initiator) {
-            var buf: [32 + 48]u8 = undefined; // re, rs (encrypted)
-            readHandshakeMessage(inner, &buf) catch |err| return logError("Message 2 read", err);
-            std.debug.print("* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)\n", .{});
-
-            // e
-            var re: [32]u8 = undefined;
-            @memcpy(&re, buf[0..32]);
-            hs.re = re;
-            hs.symmetric.mixHash(buf[0..32]);
-
-            // ee
-            const ee = X25519.scalarmult(hs.e.?.private_key, hs.re.?) catch |err| return logError("Message 2 DH (ee)", err);
-            hs.symmetric.mixKey(&ee);
-
-            // s
-            var rs: [32]u8 = undefined;
-            hs.symmetric.decryptAndHash(buf[32..80], &rs) catch |err| return logError("Message 2 Decrypt (s)", err);
-            hs.rs = rs;
-
-            // es
-            const es = X25519.scalarmult(hs.e.?.private_key, hs.rs.?) catch |err| return logError("Message 2 DH (es)", err);
-            hs.symmetric.mixKey(&es);
-        } else {
-            std.debug.print("* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)\n", .{});
-            hs.e = KeyPair.generate();
-            hs.symmetric.mixHash(&hs.e.?.public_key);
-
-            // ee
-            const ee = X25519.scalarmult(hs.e.?.private_key, hs.re.?) catch |err| return logError("Message 2 DH (ee)", err);
-            hs.symmetric.mixKey(&ee);
-
-            // s
-            var s_ct: [32 + 16]u8 = undefined;
-            try hs.symmetric.encryptAndHash(&hs.s.public_key, &s_ct);
-
-            // es
-            const es = X25519.scalarmult(hs.s.private_key, hs.re.?) catch |err| return logError("Message 2 DH (es)", err);
-            hs.symmetric.mixKey(&es);
-
-            var msg2: [32 + 48]u8 = undefined;
-            @memcpy(msg2[0..32], &hs.e.?.public_key);
-            @memcpy(msg2[32..80], &s_ct);
-            writeHandshakeMessage(inner, &msg2) catch |err| return logError("Message 2 write", err);
-        }
-
-        // Message 3: -> s, se, psk
-        if (initiator) {
-            std.debug.print("* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication\n", .{});
-            // s
-            var s_ct: [32 + 16]u8 = undefined;
-            try hs.symmetric.encryptAndHash(&hs.s.public_key, &s_ct);
-
-            // se
-            const se = X25519.scalarmult(hs.s.private_key, hs.re.?) catch |err| return logError("Message 3 DH (se)", err);
-            hs.symmetric.mixKey(&se);
-
-            // psk
-            hs.symmetric.mixKeyAndHash(&hs.psk);
-
-            // Final message has s_ct and an empty payload encrypted (just a tag)
-            var payload_ct: [16]u8 = undefined;
-            try hs.symmetric.encryptAndHash(&[_]u8{}, &payload_ct);
-
-            var msg3: [48 + 16]u8 = undefined;
-            @memcpy(msg3[0..48], &s_ct);
-            @memcpy(msg3[48..64], &payload_ct);
-            writeHandshakeMessage(inner, &msg3) catch |err| return logError("Message 3 write", err);
-        } else {
-            var buf: [48 + 16]u8 = undefined;
-            readHandshakeMessage(inner, &buf) catch |err| return logError("Message 3 read", err);
-            std.debug.print("* Noise (IN):  Message 3 <- received static key (s) and PSK authentication\n", .{});
-
-            // s
-            var rs: [32]u8 = undefined;
-            hs.symmetric.decryptAndHash(buf[0..48], &rs) catch |err| return logError("Message 3 Decrypt (s)", err);
-            hs.rs = rs;
-
-            // se
-            const se = X25519.scalarmult(hs.e.?.private_key, hs.rs.?) catch |err| return logError("Message 3 DH (se)", err);
-            hs.symmetric.mixKey(&se);
-
-            // psk
-            hs.symmetric.mixKeyAndHash(&hs.psk);
-
-            // payload
-            var payload: [0]u8 = undefined;
-            hs.symmetric.decryptAndHash(buf[48..64], &payload) catch |err| return logError("Message 3 Decrypt (payload/psk verify)", err);
+            try readMessage1(inner, hs);
+            try writeMessage2(inner, hs);
+            try readMessage3(inner, hs);
         }
 
         const ciphers = hs.symmetric.split();
@@ -350,6 +271,118 @@ pub const NoiseStream = struct {
         };
     }
 
+    /// Message 1 (initiator): -> e
+    fn writeMessage1(inner: network.Stream, hs: *HandshakeState) !void {
+        std.debug.print("* Noise (OUT): Message 1 -> sending ephemeral public key (e)\n", .{});
+        hs.e = KeyPair.generate();
+        hs.symmetric.mixHash(&hs.e.?.public_key);
+        writeHandshakeMessage(inner, &hs.e.?.public_key) catch |err| return logError("Message 1 write", err);
+    }
+
+    /// Message 1 (responder): -> e
+    fn readMessage1(inner: network.Stream, hs: *HandshakeState) !void {
+        var re: [32]u8 = undefined;
+        readHandshakeMessage(inner, &re) catch |err| return logError("Message 1 read", err);
+        std.debug.print("* Noise (IN):  Message 1 <- received ephemeral public key (e)\n", .{});
+        hs.re = re;
+        hs.symmetric.mixHash(&re);
+    }
+
+    /// Message 2 (responder): <- e, ee, s, es
+    fn writeMessage2(inner: network.Stream, hs: *HandshakeState) !void {
+        std.debug.print("* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)\n", .{});
+        hs.e = KeyPair.generate();
+        hs.symmetric.mixHash(&hs.e.?.public_key);
+
+        // ee
+        const ee = X25519.scalarmult(hs.e.?.private_key, hs.re.?) catch |err| return logError("Message 2 DH (ee)", err);
+        hs.symmetric.mixKey(&ee);
+
+        // s
+        var s_ct: [32 + 16]u8 = undefined;
+        try hs.symmetric.encryptAndHash(&hs.s.public_key, &s_ct);
+
+        // es
+        const es = X25519.scalarmult(hs.s.private_key, hs.re.?) catch |err| return logError("Message 2 DH (es)", err);
+        hs.symmetric.mixKey(&es);
+
+        var msg2: [32 + 48]u8 = undefined;
+        @memcpy(msg2[0..32], &hs.e.?.public_key);
+        @memcpy(msg2[32..80], &s_ct);
+        writeHandshakeMessage(inner, &msg2) catch |err| return logError("Message 2 write", err);
+    }
+
+    /// Message 2 (initiator): <- e, ee, s, es
+    fn readMessage2(inner: network.Stream, hs: *HandshakeState) !void {
+        var buf: [32 + 48]u8 = undefined; // re, rs (encrypted)
+        readHandshakeMessage(inner, &buf) catch |err| return logError("Message 2 read", err);
+        std.debug.print("* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)\n", .{});
+
+        // e
+        hs.re = buf[0..32].*;
+        hs.symmetric.mixHash(buf[0..32]);
+
+        // ee
+        const ee = X25519.scalarmult(hs.e.?.private_key, hs.re.?) catch |err| return logError("Message 2 DH (ee)", err);
+        hs.symmetric.mixKey(&ee);
+
+        // s
+        var rs: [32]u8 = undefined;
+        hs.symmetric.decryptAndHash(buf[32..80], &rs) catch |err| return logError("Message 2 Decrypt (s)", err);
+        hs.rs = rs;
+
+        // es
+        const es = X25519.scalarmult(hs.e.?.private_key, hs.rs.?) catch |err| return logError("Message 2 DH (es)", err);
+        hs.symmetric.mixKey(&es);
+    }
+
+    /// Message 3 (initiator): -> s, se, psk
+    fn writeMessage3(inner: network.Stream, hs: *HandshakeState) !void {
+        std.debug.print("* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication\n", .{});
+        // s
+        var s_ct: [32 + 16]u8 = undefined;
+        try hs.symmetric.encryptAndHash(&hs.s.public_key, &s_ct);
+
+        // se
+        const se = X25519.scalarmult(hs.s.private_key, hs.re.?) catch |err| return logError("Message 3 DH (se)", err);
+        hs.symmetric.mixKey(&se);
+
+        // psk
+        hs.symmetric.mixKeyAndHash(&hs.psk);
+
+        // Final message has s_ct and an empty payload encrypted (just a tag)
+        var payload_ct: [16]u8 = undefined;
+        try hs.symmetric.encryptAndHash(&[_]u8{}, &payload_ct);
+
+        var msg3: [48 + 16]u8 = undefined;
+        @memcpy(msg3[0..48], &s_ct);
+        @memcpy(msg3[48..64], &payload_ct);
+        writeHandshakeMessage(inner, &msg3) catch |err| return logError("Message 3 write", err);
+    }
+
+    /// Message 3 (responder): -> s, se, psk
+    fn readMessage3(inner: network.Stream, hs: *HandshakeState) !void {
+        var buf: [48 + 16]u8 = undefined;
+        readHandshakeMessage(inner, &buf) catch |err| return logError("Message 3 read", err);
+        std.debug.print("* Noise (IN):  Message 3 <- received static key (s) and PSK authentication\n", .{});
+
+        // s
+        var rs: [32]u8 = undefined;
+        hs.symmetric.decryptAndHash(buf[0..48], &rs) catch |err| return logError("Message 3 Decrypt (s)", err);
+        hs.rs = rs;
+
+        // se
+        const se = X25519.scalarmult(hs.e.?.private_key, hs.rs.?) catch |err| return logError("Message 3 DH (se)", err);
+        hs.symmetric.mixKey(&se);
+
+        // psk
+        hs.symmetric.mixKeyAndHash(&hs.psk);
+
+        // payload
+        var payload: [0]u8 = undefined;
+        hs.symmetric.decryptAndHash(buf[48..64], &payload) catch |err| return logError("Message 3 Decrypt (payload/psk verify)", err);
+    }
+
     fn logError(step: []const u8, err: anyerror) anyerror {
         std.debug.print("* Noise Error at step '{s}': {}\n", .{ step, err });
         return err;
@@ -358,8 +391,18 @@ pub const NoiseStream = struct {
     fn writeHandshakeMessage(inner: network.Stream, msg: []const u8) !void {
         var len_buf: [2]u8 = undefined;
         std.mem.writeInt(u16, &len_buf, @intCast(msg.len), .big);
-        _ = try inner.write(&len_buf);
-        _ = try inner.write(msg);
+        try writeFull(inner, &len_buf);
+        try writeFull(inner, msg);
+    }
+
+    /// Writes all of `buffer`; a short write would desynchronize the framing.
+    fn writeFull(stream_obj: network.Stream, buffer: []const u8) !void {
+        var total_written: usize = 0;
+        while (total_written < buffer.len) {
+            const n = try stream_obj.write(buffer[total_written..]);
+            if (n == 0) return error.WriteZero;
+            total_written += n;
+        }
     }
 
     fn readHandshakeMessage(inner: network.Stream, out: []u8) !void {
@@ -434,8 +477,8 @@ pub const NoiseStream = struct {
 
             var len_buf: [2]u8 = undefined;
             std.mem.writeInt(u16, &len_buf, @intCast(packet_len), .big);
-            _ = try self.inner.write(&len_buf);
-            _ = try self.inner.write(temp[0..packet_len]);
+            try writeFull(self.inner, &len_buf);
+            try writeFull(self.inner, temp[0..packet_len]);
 
             i += chunk_len;
         }
@@ -463,3 +506,34 @@ const noise_stream_vtable = network.Stream.StreamVTable{
     .write = NoiseStream.write,
     .close = NoiseStream.closeVProxy,
 };
+
+test "KeyPair files are private and never silently replaced" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "test_noise_keypair.key";
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const kp = KeyPair.generate();
+    try kp.saveToFile(path);
+    const loaded = try KeyPair.loadFromFile(path);
+    try std.testing.expectEqualSlices(u8, &kp.private_key, &loaded.private_key);
+
+    if (builtin.os.tag != .windows) {
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const mode = @intFromEnum((try file.stat(io)).permissions);
+        try std.testing.expectEqual(@as(@TypeOf(mode), 0), mode & 0o077);
+    }
+
+    // Saving again must not clobber the existing identity.
+    try std.testing.expectError(error.PathAlreadyExists, KeyPair.generate().saveToFile(path));
+
+    // A truncated file is rejected rather than treated as missing.
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, "short", 0);
+    }
+    try std.testing.expectError(error.InvalidKeyFile, KeyPair.loadFromFile(path));
+}

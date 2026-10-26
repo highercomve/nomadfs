@@ -12,7 +12,7 @@ test "kbucket: randomIdInBucket correctness" {
         const cpl = local_id.commonPrefixLen(target);
 
         // CPL must be exactly i
-        try std.testing.expectEqual(@as(u8, @intCast(i)), cpl);
+        try std.testing.expectEqual(@as(u16, @intCast(i)), cpl);
 
         // Target must not be equal to local_id
         try std.testing.expect(!local_id.eql(target));

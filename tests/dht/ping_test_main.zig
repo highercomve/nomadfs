@@ -48,12 +48,12 @@ pub fn main() !void {
 
     // Check if dht1 added peer2
     nomadfs.sync.sleep(500 * std.time.ns_per_ms); // Give some time for the thread to process PING
-    
+
     dht1.mutex.lock();
     const peers = try dht1.routing_table.getAllPeers();
     dht1.mutex.unlock();
     defer allocator.free(peers);
-    
+
     if (peers.len != 1) {
         std.debug.print("Expected 1 peer, got {d}\n", .{peers.len});
         return error.TestFailed;
@@ -61,5 +61,6 @@ pub fn main() !void {
 
     // 7. Close connection and wait for disconnection logic to run
     conn.close();
+    conn.deinit();
     nomadfs.sync.sleep(1000 * std.time.ns_per_ms);
 }

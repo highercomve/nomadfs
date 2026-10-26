@@ -5,6 +5,16 @@ const kbucket = @import("kbucket.zig");
 const rpc = @import("rpc.zig");
 const network = @import("../transport/mod.zig");
 const lookup_mod = @import("lookup.zig");
+const StorageEngine = @import("../../storage/engine.zig").StorageEngine;
+const providers_mod = @import("providers.zig");
+
+/// Bounds on values peers can STORE here. Without them any peer could fill
+/// our memory with arbitrary values.
+pub const StoreLimits = struct {
+    max_value_len: usize = 64 * 1024,
+    max_total_bytes: usize = 64 * 1024 * 1024,
+    max_keys: usize = 100_000,
+};
 
 pub const Node = struct {
     allocator: std.mem.Allocator,
@@ -13,8 +23,20 @@ pub const Node = struct {
     swarm_key: []const u8,
     storage: std.AutoHashMapUnmanaged(id.NodeID, []u8),
     mutex: sync.Mutex = .{},
-    is_public: bool = false,
+    /// Set by request threads when an inbound PING proves we are reachable.
+    is_public: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     handlers_wg: sync.WaitGroup = .{},
+    /// Bound on every blocking step of a DHT RPC, in both directions, so a
+    /// peer that accepts a stream and goes silent cannot stall a lookup or
+    /// pin a request thread.
+    rpc_timeout_ms: u32 = 10_000,
+    /// Blocks served to peers via GET_BLOCK. Null on nodes without storage.
+    block_store: ?*StorageEngine = null,
+    store_limits: StoreLimits = .{},
+    /// Sum of value lengths in `storage`. Guarded by `mutex`.
+    stored_bytes: usize = 0,
+    /// Who holds content for which key. Guarded by `mutex`.
+    providers: providers_mod.ProviderStore = .{},
 
     pub fn init(allocator: std.mem.Allocator, manager: *network.manager.ConnectionManager, swarm_key: []const u8) Node {
         return .{
@@ -24,24 +46,31 @@ pub const Node = struct {
             .swarm_key = swarm_key,
             .storage = .empty,
             .mutex = .{},
-            .is_public = false,
+            .is_public = std.atomic.Value(bool).init(false),
             .handlers_wg = .{},
         };
     }
 
+    /// mDNS announcements are unauthenticated, so a new peer is only added
+    /// after we dial it (the handshake proves the ID) and it answers a PING.
     pub fn onDiscovery(self: *Node, peer_id: id.NodeID, addr: network.Address) void {
-        var info = kbucket.PeerInfo{
-            .id = peer_id,
-            .last_seen = sync.timestamp(),
+        if (peer_id.eql(self.manager.node_id)) return;
+        const known = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :blk self.routing_table.contains(peer_id);
         };
-        _ = info.addAddress(addr);
-        self.addVerifiedPeer(info);
+        if (known) return;
+
+        const conn = self.manager.connectToPeer(addr, self.swarm_key, peer_id) catch return;
+        defer conn.deinit();
+        self.ping(conn) catch {};
     }
 
     fn pingLruAndEvict(self: *Node, lru: kbucket.PeerInfo) void {
         const addr = lru.getBestAddress();
         if (self.manager.connectToPeer(addr, self.swarm_key, lru.id)) |conn| {
-            defer conn.close();
+            defer conn.deinit();
             self.ping(conn) catch {
                 self.mutex.lock();
                 self.routing_table.markDisconnected(lru.id);
@@ -57,6 +86,7 @@ pub const Node = struct {
     pub fn checkReachability(self: *Node, conn: network.Connection) !void {
         const stream = try conn.openStream();
         defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
 
         const msg = rpc.Message{
             .sender_id = self.manager.node_id,
@@ -80,11 +110,13 @@ pub const Node = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.storage.deinit(self.allocator);
+        self.providers.deinit(self.allocator);
     }
 
     pub fn ping(self: *Node, conn: network.Connection) !void {
         const stream = try conn.openStream();
         defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
 
         const msg = rpc.Message{
             .sender_id = self.manager.node_id,
@@ -96,52 +128,179 @@ pub const Node = struct {
         // Wait for PONG
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         defer response.deinit(self.allocator);
+        if (response.payload != .PONG) return error.InvalidResponse;
 
-        if (response.payload == .PONG) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            var info = kbucket.PeerInfo{
-                .id = response.sender_id,
-                .last_seen = sync.timestamp(),
-            };
-            _ = info.addAddress(conn.getPeerAddress());
-            _ = try self.routing_table.addPeer(info);
-        }
+        // Record the ID the handshake authenticated, not the claimed one.
+        const peer_id = conn.getRemoteNodeID();
+        if (!response.sender_id.eql(peer_id)) return error.PeerIdMismatch;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var info = kbucket.PeerInfo{
+            .id = peer_id,
+            .last_seen = sync.timestamp(),
+        };
+        _ = info.addAddress(conn.getPeerAddress());
+        _ = try self.routing_table.addPeer(info);
     }
 
+    /// Stores `value` at the K closest peers to `key`. Fails unless at least
+    /// one peer acknowledged keeping it.
     pub fn store(self: *Node, key: id.NodeID, value: []const u8) !void {
+        if (try self.storeReplicated(key, value) == 0) return error.StoreFailed;
+    }
+
+    /// Stores `value` at the K closest peers to `key` and returns how many
+    /// acknowledged keeping it (sent but unacknowledged STOREs do not count).
+    pub fn storeReplicated(self: *Node, key: id.NodeID, value: []const u8) !usize {
         // Ensure we know about the closest nodes
         try self.lookup(key);
 
-        self.mutex.lock();
-        const closest = try self.routing_table.getClosestPeers(key, kbucket.K);
-        self.mutex.unlock();
+        const closest = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :blk try self.routing_table.getClosestPeers(key, kbucket.K);
+        };
         defer self.allocator.free(closest);
 
-        var stored_count: usize = 0;
+        // Our own ID is never in the routing table, so every target is remote.
+        var acked: usize = 0;
         for (closest) |peer| {
-            if (peer.id.eql(self.manager.node_id)) {
-                try self.localStore(key, value);
-                stored_count += 1;
-                continue;
-            }
             self.sendStore(peer.addresses[0..peer.addrs_count], key, value, peer.id) catch |err| {
                 std.debug.print("Failed to store at {x}: {any}\n", .{ peer.id.bytes[0..4], err });
                 continue;
             };
-            stored_count += 1;
+            acked += 1;
         }
+        return acked;
     }
 
+    /// Stores a value locally, within `store_limits`.
     pub fn localStore(self: *Node, key: id.NodeID, value: []const u8) !void {
+        const limits = self.store_limits;
+        if (value.len > limits.max_value_len) return error.ValueTooLarge;
+
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        const existing = self.storage.get(key);
+        if (existing == null and self.storage.count() >= limits.max_keys) return error.StorageFull;
+        const old_len = if (existing) |old| old.len else 0;
+        const new_total = self.stored_bytes - old_len + value.len;
+        if (new_total > limits.max_total_bytes) return error.StorageFull;
+
         const v_copy = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(v_copy);
         const res = try self.storage.getOrPut(self.allocator, key);
         if (res.found_existing) {
             self.allocator.free(res.value_ptr.*);
         }
         res.value_ptr.* = v_copy;
+        self.stored_bytes = new_total;
+    }
+
+    /// Registers this node as a provider of `key` with the K closest peers
+    /// and returns how many acknowledged it.
+    pub fn addProvider(self: *Node, key: id.NodeID) !usize {
+        try self.lookup(key);
+        const closest = try self.closestPeers(key);
+        defer self.allocator.free(closest);
+
+        var acked: usize = 0;
+        for (closest) |peer| {
+            self.sendAddProvider(peer, key) catch |err| {
+                std.debug.print("Failed to announce provider to {x}: {any}\n", .{ peer.id.bytes[0..4], err });
+                continue;
+            };
+            acked += 1;
+        }
+        return acked;
+    }
+
+    /// Returns up to providers.max_per_key other nodes holding content for
+    /// `key` (caller-owned): known locally plus those the K closest peers
+    /// report.
+    pub fn findProviders(self: *Node, key: id.NodeID) ![]id.NodeID {
+        var found: std.ArrayList(id.NodeID) = .empty;
+        errdefer found.deinit(self.allocator);
+
+        {
+            var local: [providers_mod.max_per_key]id.NodeID = undefined;
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (self.providers.get(key, sync.timestamp(), &local)) |p| {
+                try self.appendProvider(&found, p);
+            }
+        }
+
+        try self.lookup(key);
+        const closest = try self.closestPeers(key);
+        defer self.allocator.free(closest);
+
+        for (closest) |peer| {
+            if (found.items.len >= providers_mod.max_per_key) break;
+            const remote = self.queryProviders(peer, key) catch continue;
+            defer self.allocator.free(remote);
+            for (remote) |p| {
+                if (found.items.len >= providers_mod.max_per_key) break;
+                try self.appendProvider(&found, p);
+            }
+        }
+        return found.toOwnedSlice(self.allocator);
+    }
+
+    fn appendProvider(self: *Node, list: *std.ArrayList(id.NodeID), provider: id.NodeID) !void {
+        if (provider.eql(self.manager.node_id)) return;
+        for (list.items) |p| {
+            if (p.eql(provider)) return;
+        }
+        try list.append(self.allocator, provider);
+    }
+
+    fn closestPeers(self: *Node, key: id.NodeID) ![]kbucket.PeerInfo {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.routing_table.getClosestPeers(key, kbucket.K);
+    }
+
+    fn sendAddProvider(self: *Node, peer: kbucket.PeerInfo, key: id.NodeID) !void {
+        const conn = try self.manager.connectToPeerMulti(peer.addresses[0..peer.addrs_count], self.swarm_key, peer.id);
+        defer conn.deinit();
+        const stream = try conn.openStream();
+        defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
+
+        const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .ADD_PROVIDER = .{ .key = key } } };
+        try msg.serialize(stream.writer());
+
+        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
+        defer response.deinit(self.allocator);
+        switch (response.payload) {
+            .STORE_ACK => |ack| if (!ack.stored) return error.StoreRejected,
+            else => return error.InvalidResponse,
+        }
+    }
+
+    /// Returns the providers `peer` knows for `key` (caller-owned).
+    fn queryProviders(self: *Node, peer: kbucket.PeerInfo, key: id.NodeID) ![]const id.NodeID {
+        const conn = try self.manager.connectToPeerMulti(peer.addresses[0..peer.addrs_count], self.swarm_key, peer.id);
+        defer conn.deinit();
+        const stream = try conn.openStream();
+        defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
+
+        const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .GET_PROVIDERS = .{ .key = key } } };
+        try msg.serialize(stream.writer());
+
+        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
+        switch (response.payload) {
+            // Ownership of the list moves to the caller.
+            .PROVIDERS => |p| return p.providers,
+            else => {
+                response.deinit(self.allocator);
+                return error.InvalidResponse;
+            },
+        }
     }
 
     fn lookupValueWorker(node: *Node, state: *lookup_mod.LookupState, peer: kbucket.PeerInfo, target: id.NodeID, result_ptr: *?[]u8, result_mutex: *sync.Mutex) void {
@@ -179,28 +338,26 @@ pub const Node = struct {
 
     pub fn lookupValue(self: *Node, target: id.NodeID) !?[]u8 {
         // Check local storage first
-        self.mutex.lock();
-        if (self.storage.get(target)) |val| {
-            const v = try self.allocator.dupe(u8, val);
-            self.mutex.unlock();
-            return v;
-        }
-        const initial_peers = try self.routing_table.getClosestPeers(target, kbucket.K);
-        self.mutex.unlock();
+        const initial_peers = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.storage.get(target)) |val| return try self.allocator.dupe(u8, val);
+            break :blk try self.routing_table.getClosestPeers(target, kbucket.K);
+        };
         defer self.allocator.free(initial_peers);
 
         var state = try lookup_mod.LookupState.init(self.allocator, target, initial_peers);
         defer state.deinit();
 
+        // Workers write through pointers to these locals. runLookupRound joins
+        // every worker it starts, so none can outlive this frame.
         var result: ?[]u8 = null;
         var result_mutex = sync.Mutex{};
+        errdefer if (result) |v| self.allocator.free(v);
 
         while (!state.isFinished()) {
-            {
-                result_mutex.lock();
-                defer result_mutex.unlock();
-                if (result) |v| return v;
-            }
+            // No worker is running between rounds.
+            if (result) |v| return v;
 
             const next_peers = try state.nextPeersToQuery();
             defer self.allocator.free(next_peers);
@@ -213,40 +370,88 @@ pub const Node = struct {
                 break;
             }
 
-            var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
-            defer threads.deinit(self.allocator);
-
-            for (next_peers) |peer| {
-                if (peer.id.eql(self.manager.node_id)) {
-                    state.reportFailure(peer.id);
-                    continue;
-                }
-                state.markInFlight(peer.id);
-                const thread = try std.Thread.spawn(.{}, lookupValueWorker, .{ self, &state, peer, target, &result, &result_mutex });
-                try threads.append(self.allocator, thread);
-            }
-
-            for (threads.items) |t| {
-                t.join();
-            }
+            self.runLookupRound(&state, next_peers, lookupValueWorker, .{ target, &result, &result_mutex });
         }
 
-        // Final check
-        if (result) |v| return v;
-        return null;
+        return result;
     }
 
+    /// Queries `peers` in parallel and joins every worker it started before
+    /// returning. A peer whose worker cannot be spawned counts as failed.
+    fn runLookupRound(
+        self: *Node,
+        state: *lookup_mod.LookupState,
+        peers: []const kbucket.PeerInfo,
+        comptime worker: anytype,
+        extra_args: anytype,
+    ) void {
+        std.debug.assert(peers.len <= lookup_mod.Alpha);
+
+        var threads: [lookup_mod.Alpha]std.Thread = undefined;
+        var started: usize = 0;
+        defer for (threads[0..started]) |t| t.join();
+
+        for (peers) |peer| {
+            if (peer.id.eql(self.manager.node_id)) {
+                state.reportFailure(peer.id);
+                continue;
+            }
+            state.markInFlight(peer.id);
+            threads[started] = std.Thread.spawn(.{}, worker, .{ self, state, peer } ++ extra_args) catch |err| {
+                std.debug.print("Lookup: failed to spawn worker: {any}\n", .{err});
+                state.reportFailure(peer.id);
+                continue;
+            };
+            started += 1;
+        }
+    }
+
+    /// Sends STORE and waits for the peer's STORE_ACK.
     pub fn sendStore(self: *Node, addresses: []const network.Address, key: id.NodeID, value: []const u8, peer_id: ?id.NodeID) !void {
         const conn = try self.manager.connectToPeerMulti(addresses, self.swarm_key, peer_id);
+        defer conn.deinit();
 
         const stream = try conn.openStream();
         defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
 
         const msg = rpc.Message{
             .sender_id = self.manager.node_id,
             .payload = .{ .STORE = .{ .key = key, .value = value } },
         };
         try msg.serialize(stream.writer());
+
+        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
+        defer response.deinit(self.allocator);
+        switch (response.payload) {
+            .STORE_ACK => |ack| if (!ack.stored) return error.StoreRejected,
+            else => return error.InvalidResponse,
+        }
+    }
+
+    /// Asks `conn`'s peer for a block. Returns the caller-owned block bytes,
+    /// or null if the peer does not hold it. The bytes are NOT verified here;
+    /// StorageEngine.put checks them against the CID.
+    pub fn fetchBlock(self: *Node, conn: network.Connection, cid: [32]u8) !?[]u8 {
+        const stream = try conn.openStream();
+        defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
+
+        const msg = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .GET_BLOCK = .{ .cid = cid } },
+        };
+        try msg.serialize(stream.writer());
+
+        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
+        switch (response.payload) {
+            // Ownership of the data moves to the caller; nothing else to free.
+            .BLOCK => |b| return @constCast(b.data),
+            else => {
+                response.deinit(self.allocator);
+                return error.InvalidResponse;
+            },
+        }
     }
 
     // Returns either the value (allocated) or closer peers (allocated)
@@ -257,9 +462,11 @@ pub const Node = struct {
 
     pub fn sendFindValue(self: *Node, addresses: []const network.Address, key: id.NodeID, peer_id: ?id.NodeID) !FindValueResult {
         const conn = try self.manager.connectToPeerMulti(addresses, self.swarm_key, peer_id);
+        defer conn.deinit();
 
         const stream = try conn.openStream();
         defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
 
         const msg = rpc.Message{
             .sender_id = self.manager.node_id,
@@ -332,21 +539,19 @@ pub const Node = struct {
     }
 
     pub fn lookup(self: *Node, target: id.NodeID) !void {
-        self.mutex.lock();
-        const initial_peers = try self.routing_table.getClosestPeers(target, kbucket.K);
-        self.mutex.unlock();
+        const initial_peers = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :blk try self.routing_table.getClosestPeers(target, kbucket.K);
+        };
         defer self.allocator.free(initial_peers);
 
         var state = try lookup_mod.LookupState.init(self.allocator, target, initial_peers);
         defer state.deinit();
 
-        // std.debug.print("Lookup: Starting loop for target {x}. Initial peers: {d}\n", .{ target.bytes[0..4], initial_peers.len });
-
         while (!state.isFinished()) {
             const next_peers = try state.nextPeersToQuery();
             defer self.allocator.free(next_peers);
-
-            // std.debug.print("Lookup: [{x}] Next peers count: {d}\n", .{ target.bytes[0..4], next_peers.len });
 
             if (next_peers.len == 0) {
                 // Nothing to query right now.
@@ -357,31 +562,17 @@ pub const Node = struct {
                 break;
             }
 
-            var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
-            defer threads.deinit(self.allocator);
-
-            for (next_peers) |peer| {
-                if (peer.id.eql(self.manager.node_id)) {
-                    state.reportFailure(peer.id);
-                    continue;
-                }
-                state.markInFlight(peer.id);
-                const thread = try std.Thread.spawn(.{}, lookupNodeWorker, .{ self, &state, peer, target });
-                try threads.append(self.allocator, thread);
-            }
-
-            for (threads.items) |t| {
-                t.join();
-            }
+            self.runLookupRound(&state, next_peers, lookupNodeWorker, .{target});
         }
-        // std.debug.print("Lookup: [{x}] Finished loop.\n", .{target.bytes[0..4]});
     }
 
     pub fn sendFindNode(self: *Node, addresses: []const network.Address, target: id.NodeID, peer_id: ?id.NodeID) ![]kbucket.PeerInfo {
         const conn = try self.manager.connectToPeerMulti(addresses, self.swarm_key, peer_id);
+        defer conn.deinit();
 
         const stream = try conn.openStream();
         defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
 
         const msg = rpc.Message{
             .sender_id = self.manager.node_id,
@@ -437,26 +628,31 @@ pub const Node = struct {
                 break;
             };
 
-            // Handle stream in a new thread
+            // Handle stream in a new thread. The thread holds its own
+            // connection reference so the stream outlives connection reaping.
             const handler = struct {
                 fn run(n: *Node, s: network.Stream, c: network.Connection) void {
                     defer n.handlers_wg.finish();
+                    defer c.deinit();
                     defer s.close();
-                    if (!n.is_public) {
-                        // Optional: we could still handle requests but not advertise ourselves.
-                        // Or just log that we are in private mode.
-                        // For NomadFS, if we are NOT public, we shouldn't really be in anyone's routing table.
-                    }
+                    s.setTimeout(n.rpc_timeout_ms);
                     n.handleRequest(s, c) catch |h_err| {
                         std.debug.print("Error handling DHT request: {any}\n", .{h_err});
                     };
                 }
             };
+            conn.retain();
             self.handlers_wg.start();
-            const thread = try std.Thread.spawn(.{}, handler.run, .{ self, stream, conn });
+            const thread = std.Thread.spawn(.{}, handler.run, .{ self, stream, conn }) catch |err| {
+                std.debug.print("Failed to spawn DHT request handler: {any}\n", .{err});
+                self.handlers_wg.finish();
+                conn.deinit();
+                stream.close();
+                continue;
+            };
             thread.detach();
         }
-        std.debug.print("DHT Serve loop exiting. (Public: {any})\n", .{self.is_public});
+        std.debug.print("DHT Serve loop exiting. (Public: {any})\n", .{self.is_public.load(.acquire)});
     }
 
     fn handleRequest(self: *Node, stream: network.Stream, conn: network.Connection) !void {
@@ -466,101 +662,188 @@ pub const Node = struct {
         // NOTE: We do NOT add the peer here anymore. We wait for PING to get the correct port.
 
         switch (msg.payload) {
-            .PING => |p| {
-                // If we receive an INCOMING ping, it means we are reachable!
-                self.is_public = true;
-
-                // Construct correct address from socket IP + Payload Port
-                var address = conn.getPeerAddress();
-                std.debug.print("Received PING from {x}. Address from sock: {f}, Port from payload: {d}\n", .{ msg.sender_id.bytes[0..4], address, p.port });
-
-                address.setPort(p.port);
-                std.debug.print("Address adjusted to: {f}\n", .{address});
-
-                // Add to routing table with CORRECT port
-
-                var info = kbucket.PeerInfo{
-                    .id = msg.sender_id,
-                    .last_seen = sync.timestamp(),
-                };
-                _ = info.addAddress(address);
-                self.addVerifiedPeer(info);
-
-                std.debug.print("Added peer to routing table.\n", .{});
-
-                const response = rpc.Message{
-                    .sender_id = self.manager.node_id,
-                    .payload = .{ .PONG = {} },
-                };
-                try response.serialize(stream.writer());
-            },
-            .FIND_NODE => |p| {
-                self.mutex.lock();
-                const closer = try self.routing_table.getClosestPeers(p.target, kbucket.K);
-                self.mutex.unlock();
-                defer self.allocator.free(closer);
-
-                const response = rpc.Message{
-                    .sender_id = self.manager.node_id,
-                    .payload = .{ .FIND_NODE_RESPONSE = .{ .closer_peers = closer } },
-                };
-                try response.serialize(stream.writer());
-            },
-            .FIND_VALUE => |p| {
-                var val_opt: ?[]u8 = null;
-                self.mutex.lock();
-                if (self.storage.get(p.key)) |val| {
-                    val_opt = try self.allocator.dupe(u8, val);
-                }
-                self.mutex.unlock();
-
-                if (val_opt) |val| {
-                    defer self.allocator.free(val);
-                    // Return value
-                    const response = rpc.Message{
-                        .sender_id = self.manager.node_id,
-                        .payload = .{ .FIND_VALUE_RESPONSE = .{ .value = val } },
-                    };
-                    try response.serialize(stream.writer());
-                } else {
-                    // Return closest peers
-                    self.mutex.lock();
-                    const closer = try self.routing_table.getClosestPeers(p.key, kbucket.K);
-                    self.mutex.unlock();
-                    defer self.allocator.free(closer);
-
-                    const response = rpc.Message{
-                        .sender_id = self.manager.node_id,
-                        .payload = .{ .FIND_VALUE_RESPONSE = .{ .closer_peers = closer } },
-                    };
-                    try response.serialize(stream.writer());
-                }
-            },
-            .STORE => |p| {
-                try self.localStore(p.key, p.value);
-            },
-            .DIAL_BACK => |p| {
-                var address = conn.getPeerAddress();
-                address.setPort(p.port);
-                std.debug.print("AutoNAT: Attempting dial-back to {f}\n", .{address});
-
-                // Attempt to dial back. If it succeeds, the other peer knows they are public.
-                const dial_back_conn = self.manager.connectToPeer(address, self.swarm_key, msg.sender_id) catch |err| {
-                    std.debug.print("AutoNAT: Dial-back to {f} failed: {any}\n", .{ address, err });
-                    return;
-                };
-
-                std.debug.print("AutoNAT: Dial-back to {f} successful!\n", .{address});
-                // Send PONG over the NEW connection to confirm
-                try self.ping(dial_back_conn);
-            },
+            .PING => |p| try self.handlePing(stream, conn, msg.sender_id, p.port),
+            .FIND_NODE => |p| try self.respondCloserPeers(stream, p.target, .find_node),
+            .FIND_VALUE => |p| try self.handleFindValue(stream, p.key),
+            .STORE => |p| try self.handleStore(stream, p.key, p.value),
+            .GET_BLOCK => |p| try self.handleGetBlock(stream, p.cid),
+            .ADD_PROVIDER => |p| try self.handleAddProvider(stream, conn, p.key),
+            .GET_PROVIDERS => |p| try self.handleGetProviders(stream, p.key),
+            .DIAL_BACK => |p| try self.handleDialBack(conn, p.port),
             else => {
                 std.debug.print("Received unhandled DHT message type: {any}\n", .{msg.payload});
             },
         }
     }
+
+    fn handlePing(self: *Node, stream: network.Stream, conn: network.Connection, claimed_id: id.NodeID, port: u16) !void {
+        // The handshake authenticated the connection; a PING may not claim
+        // another node's identity (or ours) to plant it in the routing table.
+        const sender_id = conn.getRemoteNodeID();
+        if (!claimed_id.eql(sender_id)) return error.PeerIdMismatch;
+
+        // If we receive an INCOMING ping, it means we are reachable!
+        self.is_public.store(true, .release);
+
+        // Construct correct address from socket IP + Payload Port
+        var address = conn.getPeerAddress();
+        std.debug.print("Received PING from {x}. Address from sock: {f}, Port from payload: {d}\n", .{ sender_id.bytes[0..4], address, port });
+        address.setPort(port);
+
+        // Add to routing table with CORRECT port
+        var info = kbucket.PeerInfo{
+            .id = sender_id,
+            .last_seen = sync.timestamp(),
+        };
+        _ = info.addAddress(address);
+        self.addVerifiedPeer(info);
+        std.debug.print("Added peer {f} to routing table.\n", .{address});
+
+        const response = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .PONG = {} },
+        };
+        try response.serialize(stream.writer());
+    }
+
+    /// Replies with the K closest known peers to `target`.
+    fn respondCloserPeers(self: *Node, stream: network.Stream, target: id.NodeID, kind: enum { find_node, find_value }) !void {
+        const closer = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :blk try self.routing_table.getClosestPeers(target, kbucket.K);
+        };
+        defer self.allocator.free(closer);
+
+        const response = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = switch (kind) {
+                .find_node => .{ .FIND_NODE_RESPONSE = .{ .closer_peers = closer } },
+                .find_value => .{ .FIND_VALUE_RESPONSE = .{ .closer_peers = closer } },
+            },
+        };
+        try response.serialize(stream.writer());
+    }
+
+    fn handleStore(self: *Node, stream: network.Stream, key: id.NodeID, value: []const u8) !void {
+        var stored = true;
+        self.localStore(key, value) catch |err| {
+            std.debug.print("STORE rejected: {any}\n", .{err});
+            stored = false;
+        };
+        const response = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .STORE_ACK = .{ .stored = stored } },
+        };
+        try response.serialize(stream.writer());
+    }
+
+    fn handleAddProvider(self: *Node, stream: network.Stream, conn: network.Connection, key: id.NodeID) !void {
+        const provider = conn.getRemoteNodeID();
+        var stored = true;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.providers.add(self.allocator, key, provider, sync.timestamp()) catch |err| {
+                std.debug.print("ADD_PROVIDER rejected: {any}\n", .{err});
+                stored = false;
+            };
+        }
+        const response = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .STORE_ACK = .{ .stored = stored } },
+        };
+        try response.serialize(stream.writer());
+    }
+
+    fn handleGetProviders(self: *Node, stream: network.Stream, key: id.NodeID) !void {
+        var buf: [providers_mod.max_per_key]id.NodeID = undefined;
+        const list = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :blk self.providers.get(key, sync.timestamp(), &buf);
+        };
+        const response = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .PROVIDERS = .{ .providers = list } },
+        };
+        try response.serialize(stream.writer());
+    }
+
+    fn handleGetBlock(self: *Node, stream: network.Stream, cid: [32]u8) !void {
+        var data: ?[]const u8 = null;
+        defer if (data) |d| self.allocator.free(d);
+        if (self.block_store) |block_store| {
+            if (try block_store.get(&cid, self.allocator)) |block| data = block.data;
+        }
+        const response = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .BLOCK = .{ .data = data } },
+        };
+        try response.serialize(stream.writer());
+    }
+
+    fn handleFindValue(self: *Node, stream: network.Stream, key: id.NodeID) !void {
+        // Copy under the lock: the stored slice may be replaced concurrently.
+        const val_opt: ?[]u8 = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const val = self.storage.get(key) orelse break :blk null;
+            break :blk try self.allocator.dupe(u8, val);
+        };
+
+        const val = val_opt orelse return self.respondCloserPeers(stream, key, .find_value);
+        defer self.allocator.free(val);
+
+        const response = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .FIND_VALUE_RESPONSE = .{ .value = val } },
+        };
+        try response.serialize(stream.writer());
+    }
+
+    fn handleDialBack(self: *Node, conn: network.Connection, port: u16) !void {
+        // Dial back the authenticated peer, never an ID taken from the payload.
+        const sender_id = conn.getRemoteNodeID();
+        var address = conn.getPeerAddress();
+        address.setPort(port);
+        std.debug.print("AutoNAT: Attempting dial-back to {f}\n", .{address});
+
+        // Attempt to dial back. If it succeeds, the other peer knows they are public.
+        const dial_back_conn = self.manager.connectToPeer(address, self.swarm_key, sender_id) catch |err| {
+            std.debug.print("AutoNAT: Dial-back to {f} failed: {any}\n", .{ address, err });
+            return;
+        };
+        defer dial_back_conn.deinit();
+
+        std.debug.print("AutoNAT: Dial-back to {f} successful!\n", .{address});
+        // Send PING over the NEW connection to confirm
+        try self.ping(dial_back_conn);
+    }
 };
 
 fn addressesMatch(a: network.Address, b: network.Address) bool {
     return a.eql(b);
+}
+
+test "localStore enforces value, byte and key limits" {
+    const allocator = std.testing.allocator;
+    var manager = network.manager.ConnectionManager.initExplicit(allocator, .tcp, network.noise.KeyPair.generate());
+    defer manager.deinit();
+    var node = Node.init(allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    node.store_limits = .{ .max_value_len = 8, .max_total_bytes = 12, .max_keys = 2 };
+
+    const k1 = id.NodeID{ .bytes = [_]u8{1} ** 32 };
+    const k2 = id.NodeID{ .bytes = [_]u8{2} ** 32 };
+    const k3 = id.NodeID{ .bytes = [_]u8{3} ** 32 };
+
+    try std.testing.expectError(error.ValueTooLarge, node.localStore(k1, "123456789"));
+    try node.localStore(k1, "12345678");
+    try std.testing.expectError(error.StorageFull, node.localStore(k2, "12345"));
+    try node.localStore(k2, "1234");
+    // Replacing a value counts only the difference.
+    try node.localStore(k1, "1234");
+    try std.testing.expectEqual(@as(usize, 8), node.stored_bytes);
+    try std.testing.expectError(error.StorageFull, node.localStore(k3, "1"));
 }

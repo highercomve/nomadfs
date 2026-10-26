@@ -65,6 +65,8 @@ pub const Pipe = struct {
     mutex: sync.Mutex = .{},
     cond: sync.Condition = .{},
     closed: bool = false,
+    /// Lets tests mark the connection as in use to exercise idle reaping.
+    in_use: bool = false,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Pipe {
@@ -176,6 +178,19 @@ pub const Pipe = struct {
         return self.closed;
     }
 
+    fn isInUse(ctx: *anyopaque) bool {
+        const self: *Pipe = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.in_use;
+    }
+
+    pub fn setInUse(self: *Pipe, in_use: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.in_use = in_use;
+    }
+
     pub fn stop(self: *Pipe) void {
         self.mutex.lock();
         self.closed = true;
@@ -187,6 +202,11 @@ pub const Pipe = struct {
         const self: *Pipe = @ptrCast(@alignCast(ptr));
         self.stop();
     }
+
+    /// Pipes are single-owner in tests; the last holder calls deinit.
+    fn retain(ctx: *anyopaque) void {
+        _ = ctx;
+    }
 };
 
 const pipe_connection_vtable = network.Connection.ConnectionVTable{
@@ -195,8 +215,10 @@ const pipe_connection_vtable = network.Connection.ConnectionVTable{
     .getPeerAddress = Pipe.getPeerAddress,
     .getRemoteNodeID = Pipe.getRemoteNodeID,
     .close = Pipe.close,
+    .retain = Pipe.retain,
     .deinit = Pipe.pipeDeinit,
     .isClosed = Pipe.isClosed,
+    .isInUse = Pipe.isInUse,
 };
 
 const pipe_client_stream_vtable = network.Stream.StreamVTable{

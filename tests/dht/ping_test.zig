@@ -52,5 +52,6 @@ test "dht: ping/pong integration" {
 
     // 7. Close connection and wait for disconnection logic to run
     conn.close();
+    conn.deinit();
     nomadfs.sync.sleep(100 * std.time.ns_per_ms);
 }

@@ -12,4 +12,6 @@ test {
     _ = @import("dht/discovery_test.zig");
     _ = @import("dht/churn_test.zig");
     _ = @import("dht/kbucket_standard_test.zig");
+    _ = @import("dht/auth_test.zig");
+    _ = @import("cluster/transfer_test.zig");
 }

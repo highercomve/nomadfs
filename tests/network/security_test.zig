@@ -38,6 +38,7 @@ test "security: noise handshake and data transfer" {
     }
 
     const server_conn = peer1.manager.getConnection(0).?;
+    defer server_conn.deinit();
     const server_stream = try server_conn.acceptStream();
     defer server_stream.close();
 
@@ -193,4 +194,26 @@ test "security: data on wire is encrypted" {
     // Sanity check: ensure we actually transmitted something significant
     try std.testing.expect(wire_data_1.len > 50);
     try std.testing.expect(wire_data_2.len > 50);
+}
+
+test "security: silent peer cannot stall the handshake or shutdown" {
+    std.debug.print("\n=== Running Test: security: silent peer cannot stall the handshake or shutdown ===\n", .{});
+    const allocator = std.testing.allocator;
+
+    var peer1 = try TestPeer.init(allocator, 9009);
+    defer peer1.deinit();
+    peer1.manager.handshake_timeout_ms = 200;
+    try peer1.start();
+    nomadfs.sync.sleep(100 * std.time.ns_per_ms);
+
+    // Connect and never send a byte.
+    const silent = try nomadfs.net.compat.tcpConnectToAddress(peer1.listen_addr);
+    defer silent.close();
+    nomadfs.sync.sleep(100 * std.time.ns_per_ms);
+
+    // stop() waits for in-flight handshakes; without the timeout it would hang.
+    const started = nomadfs.sync.milliTimestamp();
+    peer1.stop();
+    const elapsed = nomadfs.sync.milliTimestamp() - started;
+    try std.testing.expect(elapsed < 2000);
 }

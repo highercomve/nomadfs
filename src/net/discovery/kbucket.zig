@@ -175,26 +175,40 @@ pub const RoutingTable = struct {
         }
     }
 
+    /// Adds or refreshes a peer. Our own ID is never stored; peer IDs can
+    /// come from the network, so this is a normal rejection, not an assert.
     pub fn addPeer(self: *RoutingTable, peer: PeerInfo) !bool {
-        std.debug.assert(!peer.id.eql(self.local_id));
-        const cpl = self.local_id.commonPrefixLen(peer.id);
-
-        const index = @min(cpl, 255);
-        // std.debug.print("RoutingTable: Adding peer {x} to bucket {d} (CPL: {d})\n", .{ peer.id.bytes[0..4], index, cpl });
-        return try self.buckets[index].add(peer);
+        if (peer.id.eql(self.local_id)) return false;
+        return try self.bucketFor(peer.id).add(peer);
     }
 
     pub fn getLRU(self: *RoutingTable, peer_id: NodeID) ?PeerInfo {
-        const cpl = self.local_id.commonPrefixLen(peer_id);
-        const index = @min(cpl, 255);
-        return self.buckets[index].getLRU();
+        return self.bucketFor(peer_id).getLRU();
     }
 
     pub fn markDisconnected(self: *RoutingTable, peer_id: NodeID) void {
+        _ = self.bucketFor(peer_id).remove(peer_id);
+    }
+
+    /// Whether `peer_id` is in the main bucket (replacements do not count).
+    pub fn contains(self: *RoutingTable, peer_id: NodeID) bool {
+        for (self.bucketFor(peer_id).peers.items) |p| {
+            if (p.id.eql(peer_id)) return true;
+        }
+        return false;
+    }
+
+    /// Returns a copy of `peer_id`'s entry in the main bucket, if present.
+    pub fn getPeer(self: *RoutingTable, peer_id: NodeID) ?PeerInfo {
+        for (self.bucketFor(peer_id).peers.items) |p| {
+            if (p.id.eql(peer_id)) return p;
+        }
+        return null;
+    }
+
+    fn bucketFor(self: *RoutingTable, peer_id: NodeID) *Bucket {
         const cpl = self.local_id.commonPrefixLen(peer_id);
-        const index = @min(cpl, 255);
-        const bucket = &self.buckets[index];
-        _ = bucket.remove(peer_id);
+        return &self.buckets[@min(cpl, 255)];
     }
 
     pub fn getClosestPeers(self: *RoutingTable, target: NodeID, count: usize) ![]PeerInfo {
@@ -256,3 +270,14 @@ pub const RoutingTable = struct {
         std.debug.print("--------------------------\n", .{});
     }
 };
+
+test "RoutingTable ignores our own ID instead of asserting" {
+    const local_id = NodeID{ .bytes = [_]u8{7} ** 32 };
+    var rt = RoutingTable.init(std.testing.allocator, local_id);
+    defer rt.deinit();
+
+    try std.testing.expect(!try rt.addPeer(.{ .id = local_id, .last_seen = 0 }));
+    try std.testing.expect(!rt.contains(local_id));
+    rt.markDisconnected(local_id);
+    try std.testing.expect(rt.getLRU(local_id) == null);
+}

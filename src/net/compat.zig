@@ -134,11 +134,30 @@ pub const Stream = struct {
         }
     }
 
+    /// Bounds each blocking read and write to `timeout_ms`; 0 removes the
+    /// bound. Expiry surfaces as error.WouldBlock. Not wired up on Windows yet.
+    pub fn setTimeout(self: Stream, timeout_ms: u32) !void {
+        if (builtin.os.tag == .windows) return;
+        const tv = std.posix.timeval{
+            .sec = @intCast(timeout_ms / std.time.ms_per_s),
+            .usec = @intCast((timeout_ms % std.time.ms_per_s) * std.time.us_per_ms),
+        };
+        const fd = self.inner.socket.handle;
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
+    }
+
+    /// Unblocks pending reads and writes without releasing the descriptor.
+    /// Safe to call while another thread is blocked on this stream.
+    pub fn shutdown(self: Stream) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.inner.shutdown(io, .both) catch {};
+    }
+
+    /// Releases the descriptor. No other thread may be using the stream.
     pub fn close(self: Stream) void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        if (builtin.os.tag != .windows) {
-            _ = std.posix.system.shutdown(@intCast(self.inner.socket.handle), std.posix.SHUT.RDWR);
-        }
+        self.shutdown();
         self.inner.close(io);
     }
 };
@@ -181,4 +200,84 @@ pub fn tcpConnectToAddress(address: Address) !Stream {
     const io = std.Io.Threaded.global_single_threaded.io();
     const s = try address.ip.connect(io, .{ .mode = .stream });
     return .{ .inner = s };
+}
+
+/// Like tcpConnectToAddress, but gives up after `timeout_ms` instead of
+/// waiting out the kernel's SYN retries (minutes on Linux). std.Io's connect
+/// timeout is not implemented in Zig 0.16, so Linux uses a non-blocking
+/// connect + poll; other targets fall back to the blocking connect.
+pub fn tcpConnectToAddressTimeout(address: Address, timeout_ms: u32) !Stream {
+    std.debug.assert(timeout_ms > 0);
+    if (builtin.os.tag != .linux) return tcpConnectToAddress(address);
+
+    const linux = std.os.linux;
+    const family: u32 = switch (address.ip) {
+        .ip4 => linux.AF.INET,
+        .ip6 => linux.AF.INET6,
+    };
+    const sock_rc = linux.socket(family, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
+    switch (linux.errno(sock_rc)) {
+        .SUCCESS => {},
+        .MFILE, .NFILE => return error.SystemResources,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+    const fd: i32 = @intCast(sock_rc);
+    errdefer _ = linux.close(fd);
+
+    var sa4: linux.sockaddr.in = undefined;
+    var sa6: linux.sockaddr.in6 = undefined;
+    const sa_ptr: *const linux.sockaddr, const sa_len: linux.socklen_t = switch (address.ip) {
+        .ip4 => |ip4| blk: {
+            sa4 = .{ .port = std.mem.nativeToBig(u16, ip4.port), .addr = @bitCast(ip4.bytes) };
+            break :blk .{ @ptrCast(&sa4), @sizeOf(linux.sockaddr.in) };
+        },
+        .ip6 => |ip6| blk: {
+            sa6 = .{ .port = std.mem.nativeToBig(u16, ip6.port), .flowinfo = 0, .addr = ip6.bytes, .scope_id = 0 };
+            break :blk .{ @ptrCast(&sa6), @sizeOf(linux.sockaddr.in6) };
+        },
+    };
+
+    switch (linux.errno(linux.connect(fd, sa_ptr, sa_len))) {
+        .SUCCESS => {},
+        .INPROGRESS => try awaitConnect(fd, timeout_ms),
+        else => |err| return connectErrno(err),
+    }
+
+    // Back to blocking mode: the rest of the stack uses blocking I/O.
+    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
+    _ = linux.fcntl(fd, linux.F.SETFL, flags & ~nonblock);
+
+    return .{ .inner = .{ .socket = .{ .handle = fd, .address = address.ip } } };
+}
+
+fn awaitConnect(fd: i32, timeout_ms: u32) !void {
+    const linux = std.os.linux;
+    var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
+    const ready = linux.poll(&fds, 1, @intCast(@min(timeout_ms, std.math.maxInt(i32))));
+    switch (linux.errno(ready)) {
+        .SUCCESS => {},
+        .INTR => return error.ConnectionTimedOut,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+    if (ready == 0) return error.ConnectionTimedOut;
+
+    var so_error: i32 = 0;
+    var len: linux.socklen_t = @sizeOf(i32);
+    switch (linux.errno(linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.ERROR, @ptrCast(&so_error), &len))) {
+        .SUCCESS => {},
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+    if (so_error != 0) return connectErrno(@enumFromInt(so_error));
+}
+
+fn connectErrno(err: std.os.linux.E) anyerror {
+    return switch (err) {
+        .CONNREFUSED => error.ConnectionRefused,
+        .NETUNREACH => error.NetworkUnreachable,
+        .HOSTUNREACH => error.HostUnreachable,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .ADDRNOTAVAIL => error.AddressUnavailable,
+        else => std.posix.unexpectedErrno(err),
+    };
 }
