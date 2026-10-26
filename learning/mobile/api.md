@@ -107,6 +107,44 @@ activity's lifetime (`open` in `onCreate`, `close` in `onDestroy`); the
 listener and bootstrap threads are joined by the same calls, so no native
 threads outlive the object.
 
+## 4b. Gradle (library module)
+
+`src/mobile/android/library/` is a self-contained Android library module
+that produces the artifact an app consumes:
+
+```
+settings.gradle + build.gradle
+java/...        (via sourceSets: the same binding class as the CLI uses)
+local.properties (sdk.dir; gitignored, one line: sdk.dir=<Android Sdk>)
+```
+
+It drives the whole pipeline itself:
+
+1. per-ABI `zig build lib` into `zig-out/android/<abi>` (`NOMADFS_ANDROID_ABI`),
+2. one `ndk-build` pass for the JNI bridge over both ABIs,
+3. `stageJni` copies the `.so` set into `build/staged/libs/<abi>/`,
+4. AGP packages `classes.jar + jni/{arm64-v8a,x86_64}/{libnomadfs,libnomadfs_jni}.so`
+   into `build/outputs/aar/nomadfs-android-debug.aar`.
+
+Run it with any Gradle between 8.10 and 9.5 (AGP 8.13 compatibility):
+
+```sh
+gradle -p src/mobile/android/library assembleDebug
+```
+
+The AAR is consumable like any Android library:
+
+```gradle
+dependencies {
+    implementation(files("path/to/nomadfs-android-debug.aar"))
+}
+```
+
+and then the same `net.nomadfs.NomadFs` API, with Gradle doing the
+`Packaged`→`CODE` packaging for phones, emulators, and Googlebook
+classpath arrays alike (both ABIs live inside one AAR; the OS picks its
+own).
+
 ## 5. Chromebooks & Googlebook
 
 Googlebook devices run Android apps through the ChromeOS Android runtime

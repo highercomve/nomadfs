@@ -8,3 +8,6 @@ build
 src/mobile/.build/
 src/mobile/android/obj/
 src/mobile/android/libs/
+src/mobile/android/library/local.properties
+src/mobile/android/library/build/
+src/mobile/android/library/.gradle/

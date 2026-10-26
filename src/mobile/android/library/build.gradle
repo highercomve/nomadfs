@@ -1,0 +1,85 @@
+plugins {
+    id 'com.android.library' version '8.13.2'
+}
+
+// Layout: src/mobile/android/library/{settings.gradle,build.gradle}
+// repoRoot = ../../../.., mobile dir = ../..
+def repoRoot    = new File(projectDir, '../../../..').canonicalFile
+def mobileDir   = new File(projectDir, '../..').canonicalFile
+def zigAndroid  = new File(repoRoot, 'zig-out/android')
+def ndkLibs     = new File(mobileDir, 'android/libs')
+def javaSrc     = new File(mobileDir, 'android/java')
+def stagedLibs  = layout.buildDirectory.dir('staged/libs').get().asFile
+
+// Prebuilt ABIs the zig toolchain ships; AGP staging makes one AAR
+// containing both, so the same artifact runs on phones, tablets,
+// emulators and Chromebook/Googlebook ARC VMs.
+def abis = ['arm64-v8a', 'x86_64']
+
+android {
+    namespace 'net.nomadfs'
+    compileSdk 35
+    ndkVersion '28.2.13676358'
+
+    defaultConfig {
+        minSdk 29
+        consumerProguardFiles file('consumer-rules.pro')
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs += [javaSrc]
+            jniLibs.srcDirs += [stagedLibs.absolutePath]
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        buildConfig false
+        renderScript false
+        shaders false
+    }
+}
+
+// 1. Build the zig C ABI library for each ABI.
+abis.each { abi ->
+    tasks.register("zigBuild_${abi.replace('-', '_')}", Exec) {
+        workingDir repoRoot
+        environment 'NOMADFS_ANDROID_ABI', abi
+        commandLine 'zig', 'build', 'lib', '-p', "zig-out/android/${abi}"
+    }
+}
+
+// 2. Compile the JNI bridge for both ABIs in one ndk-build pass. The
+// script lives next to the NDK so plain `ndk-build` on PATH also works.
+tasks.register('ndkBuildBridge', Exec) {
+    workingDir new File(mobileDir, 'android')
+    def ndkHome = providers.systemProperty('nomadfs.ndkHome')
+        .orElse(providers.environmentVariable('ANDROID_NDK_HOME'))
+        .getOrNull()
+    if (ndkHome != null) environment 'ANDROID_NDK_HOME', ndkHome
+    environment 'PATH',
+        "${ndkHome != null ? "${ndkHome}:" : ''}${System.getenv('PATH')}"
+    commandLine 'ndk-build'
+}
+
+tasks.register('cleanStaged', Delete) {
+    delete stagedLibs
+}
+
+// 3. Stage the .so tree that AGP packages into the AAR.
+tasks.register('stageJni', Copy) {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    into stagedLibs
+    dependsOn 'cleanStaged', abis.collect { "zigBuild_${it.replace('-', '_')}" }, 'ndkBuildBridge'
+    abis.each { abi ->
+        from(new File(zigAndroid, "${abi}/lib-android")) { include 'libnomadfs.so'; into "libs/$abi" }
+        from(new File(ndkLibs, abi))            { include '*.so'; into "libs/$abi" }
+    }
+}
+
+preBuild.dependsOn stageJni
