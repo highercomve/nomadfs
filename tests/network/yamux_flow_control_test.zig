@@ -37,12 +37,12 @@ test "yamux: flow control (window management)" {
     // Start a thread to read slowly from the server
     const Reader = struct {
         fn run(stream: anytype) void {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            nomadfs.sync.sleep(100 * std.time.ns_per_ms);
             var buf: [1024]u8 = undefined;
             while (true) {
                 const n = nomadfs.net.transport.yamux.Session.streamRead(stream, &buf) catch break;
                 if (n == 0) break;
-                std.Thread.sleep(1 * std.time.ns_per_ms); // Slow read
+                nomadfs.sync.sleep(1 * std.time.ns_per_ms); // Slow read
             }
         }
     };

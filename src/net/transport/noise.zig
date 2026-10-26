@@ -12,7 +12,8 @@ pub const KeyPair = struct {
     private_key: [32]u8,
 
     pub fn generate() KeyPair {
-        const kp = X25519.KeyPair.generate();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const kp = X25519.KeyPair.generate(io);
         return .{
             .public_key = kp.public_key,
             .private_key = kp.secret_key,
@@ -20,26 +21,22 @@ pub const KeyPair = struct {
     }
 
     pub fn loadFromFile(path: []const u8) !KeyPair {
-        const file = if (std.fs.path.isAbsolute(path))
-            try std.fs.openFileAbsolute(path, .{})
-        else
-            try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
 
         var kp: KeyPair = undefined;
-        const bytes_read = try file.readAll(std.mem.asBytes(&kp));
+        const bytes_read = try file.readPositionalAll(io, std.mem.asBytes(&kp), 0);
         if (bytes_read != @sizeOf(KeyPair)) return error.InvalidKeyFile;
         return kp;
     }
 
     pub fn saveToFile(self: KeyPair, path: []const u8) !void {
-        const file = if (std.fs.path.isAbsolute(path))
-            try std.fs.createFileAbsolute(path, .{})
-        else
-            try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
 
-        try file.writeAll(std.mem.asBytes(&self));
+        try file.writePositionalAll(io, std.mem.asBytes(&self), 0);
     }
 };
 
@@ -232,7 +229,6 @@ pub const NoiseStream = struct {
     }
 
     fn try_handshake_steps(allocator: std.mem.Allocator, inner: network.Stream, hs: *HandshakeState, initiator: bool) !NoiseStream {
-        // ... (existing handshake messages logic remains same until return)
         // Message 1: -> e
         if (initiator) {
             std.debug.print("* Noise (OUT): Message 1 -> sending ephemeral public key (e)\n", .{});

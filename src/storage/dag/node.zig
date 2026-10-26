@@ -18,7 +18,7 @@ pub const MerkleNode = struct {
 
     pub fn init(allocator: Allocator, data: []const u8, level: u8) MerkleNode {
         return .{
-            .links = std.ArrayListUnmanaged(DagLink){},
+            .links = .empty,
             .data = data, 
             .level = level,
             .allocator = allocator,

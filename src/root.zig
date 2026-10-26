@@ -5,6 +5,8 @@ pub const config = @import("config.zig");
 pub const net = @import("net/mod.zig");
 pub const storage = @import("storage/mod.zig");
 pub const cluster = @import("cluster/mod.zig");
+pub const sync = @import("sync.zig");
+pub const env = @import("env.zig");
 
 const ConnectionManager = net.transport.manager.ConnectionManager;
 const DiscoveryNode = net.discovery.Node;
@@ -17,6 +19,8 @@ pub const Node = struct {
     discovery_node: *DiscoveryNode,
     block_manager: *cluster.BlockManager,
     ring: *HashRight,
+    bootstrap_thread: ?std.Thread = null,
+    bootstrap_running: *std.atomic.Value(bool),
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !Node {
         const connection_manager = try allocator.create(ConnectionManager);
@@ -71,6 +75,9 @@ pub const Node = struct {
             try ring.addNode(connection_manager.node_id, 10);
         }
 
+        const bootstrap_running = try allocator.create(std.atomic.Value(bool));
+        bootstrap_running.* = std.atomic.Value(bool).init(true);
+
         return Node{
             .allocator = allocator,
             .connection_manager = connection_manager,
@@ -78,10 +85,21 @@ pub const Node = struct {
             .discovery_node = discovery_node,
             .block_manager = block_manager,
             .ring = ring,
+            .bootstrap_running = bootstrap_running,
+            .bootstrap_thread = null,
         };
     }
 
     pub fn deinit(self: *Node) void {
+        self.bootstrap_running.store(false, .release);
+        if (self.bootstrap_thread) |t| {
+            t.join();
+        }
+        self.allocator.destroy(self.bootstrap_running);
+
+        // Stop network traffic and callbacks BEFORE destroying handlers
+        self.connection_manager.stop();
+
         self.ring.deinit();
         self.allocator.destroy(self.ring);
         self.block_manager.deinit();
@@ -98,8 +116,10 @@ pub const Node = struct {
     pub fn run(self: *Node, running: *std.atomic.Value(bool), cfg: config.Config) !void {
         try self.connection_manager.listen(cfg, running);
         while (running.load(.acquire)) {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            sync.sleep(100 * std.time.ns_per_ms);
         }
+        // Signal bootstrap thread to stop if main loop stops
+        self.bootstrap_running.store(false, .release);
     }
 
     pub fn bootstrap(self: *Node, peer_urls: [][]const u8, swarm_key: []const u8) !void {
@@ -110,6 +130,8 @@ pub const Node = struct {
 
             fn run(ctx: @This()) void {
                 for (ctx.urls) |peer_url| {
+                    if (!ctx.node.bootstrap_running.load(.acquire)) return;
+
                     var addr_part = peer_url;
                     if (std.mem.startsWith(u8, addr_part, "tcp://")) {
                         addr_part = addr_part[6..];
@@ -126,7 +148,7 @@ pub const Node = struct {
                         continue;
                     };
 
-                    const address = std.net.Address.parseIp(host, port) catch {
+                    const address = net.compat.Address.parseIp(host, port) catch {
                         std.debug.print("Failed to parse IP for bootstrap peer: {s}\n", .{peer_url});
                         continue;
                     };
@@ -136,6 +158,8 @@ pub const Node = struct {
                     var attempts: usize = 0;
                     const max_attempts = 5;
                     while (attempts < max_attempts) : (attempts += 1) {
+                        if (!ctx.node.bootstrap_running.load(.acquire)) return;
+
                         if (ctx.node.connection_manager.connectToPeer(address, ctx.key, null)) |conn| {
                             std.debug.print("Successfully connected to bootstrap peer: {s}\n", .{peer_url});
                             ctx.node.discovery_node.ping(conn) catch {};
@@ -149,7 +173,14 @@ pub const Node = struct {
                         } else |err| {
                             if (attempts < max_attempts - 1) {
                                 std.debug.print("Retry {d}/{d} for {s}: {any}\n", .{ attempts + 1, max_attempts, peer_url, err });
-                                std.Thread.sleep(1 * std.time.ns_per_s);
+
+                                // Sleep with check
+                                var sleep_elapsed: u64 = 0;
+                                const sleep_chunk = 100 * std.time.ns_per_ms;
+                                while (sleep_elapsed < 1 * std.time.ns_per_s) : (sleep_elapsed += sleep_chunk) {
+                                    if (!ctx.node.bootstrap_running.load(.acquire)) return;
+                                    sync.sleep(sleep_chunk);
+                                }
                             } else {
                                 std.debug.print("Failed to connect to bootstrap peer {s} after {d} attempts: {any}\n", .{ peer_url, max_attempts, err });
                             }
@@ -162,16 +193,26 @@ pub const Node = struct {
                 const net_node_id = ctx.node.connection_manager.node_id;
 
                 // 1. Initial Self-Lookup (Once)
-                std.debug.print("Starting initial self-lookup...\n", .{});
-                discovery_node_ptr.lookup(net_node_id) catch |err| {
-                    std.debug.print("Error during self-lookup: {any}\n", .{err});
-                };
-                std.debug.print("Initial self-lookup complete. Routing table dump:\n", .{});
-                discovery_node_ptr.routing_table.dump();
+                if (ctx.node.bootstrap_running.load(.acquire)) {
+                    std.debug.print("Starting initial self-lookup...\n", .{});
+                    discovery_node_ptr.lookup(net_node_id) catch |err| {
+                        std.debug.print("Error during self-lookup: {any}\n", .{err});
+                    };
+                    std.debug.print("Initial self-lookup complete. Routing table dump:\n", .{});
+                    discovery_node_ptr.routing_table.dump();
+                }
 
                 // 2. Periodic Bucket Refresh (Standard Kademlia Maintenance)
-                while (true) {
-                    std.Thread.sleep(60 * std.time.ns_per_s); // Check for stale buckets every minute
+                while (ctx.node.bootstrap_running.load(.acquire)) {
+                    var sleep_elapsed: u64 = 0;
+                    const sleep_total = 60 * std.time.ns_per_s;
+                    const sleep_chunk = 100 * std.time.ns_per_ms;
+
+                    while (sleep_elapsed < sleep_total) : (sleep_elapsed += sleep_chunk) {
+                        if (!ctx.node.bootstrap_running.load(.acquire)) return;
+                        sync.sleep(sleep_chunk);
+                    }
+
                     discovery_node_ptr.refreshBuckets() catch |err| {
                         std.debug.print("Bucket refresh error: {any}\n", .{err});
                     };
@@ -179,11 +220,23 @@ pub const Node = struct {
             }
         };
 
-        const thread = try std.Thread.spawn(.{}, Ctx.run, .{Ctx{
+        if (self.bootstrap_thread) |t| {
+            // Signal stop
+            self.bootstrap_running.store(false, .release);
+            t.join();
+            // Reset flag for new thread
+            self.bootstrap_running.store(true, .release);
+        }
+
+        self.bootstrap_thread = try std.Thread.spawn(.{}, Ctx.run, .{Ctx{
             .node = self,
             .urls = peer_urls,
             .key = swarm_key,
         }});
-        thread.detach();
     }
 };
+
+test {
+    _ = @import("cluster/vectors.zig");
+    _ = @import("net/transport/yamux.zig");
+}

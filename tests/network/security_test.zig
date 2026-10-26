@@ -20,7 +20,7 @@ test "security: noise handshake and data transfer" {
 
     // 2. Start peer1 listener
     try peer1.start();
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    nomadfs.sync.sleep(100 * std.time.ns_per_ms);
 
     // 3. Connect peer2 to peer1
     const stream = try peer2.connect(&peer1);
@@ -33,7 +33,7 @@ test "security: noise handshake and data transfer" {
     var retries: usize = 0;
     while (peer1.manager.getConnectionsCount() == 0) {
         if (retries > 10) return error.TestTimeout;
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        nomadfs.sync.sleep(50 * std.time.ns_per_ms);
         retries += 1;
     }
 
@@ -62,7 +62,7 @@ test "security: noise handshake fails with wrong swarm key" {
 
     // 2. Start peer1 listener
     try peer1.start();
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    nomadfs.sync.sleep(100 * std.time.ns_per_ms);
 
     // 3. Connect peer2 to peer1 - this should fail during handshake
     const conn_result = peer2.connect(&peer1);

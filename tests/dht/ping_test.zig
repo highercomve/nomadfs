@@ -26,7 +26,7 @@ test "dht: ping/pong integration" {
 
     // 4. Start peer1 (the "server")
     try peer1.start();
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    nomadfs.sync.sleep(100 * std.time.ns_per_ms);
 
     // 5. Peer2 connects to Peer1
     const conn = try peer2.manager.connectToPeer(peer1.listen_addr, peer2.config.node.swarm_key, peer1.manager.node_id);
@@ -38,7 +38,7 @@ test "dht: ping/pong integration" {
     std.debug.print("Ping test passed!\n", .{});
 
     // Check if dht1 added peer2
-    std.Thread.sleep(500 * std.time.ns_per_ms); // Give some time for the thread to process PING
+    nomadfs.sync.sleep(500 * std.time.ns_per_ms); // Give some time for the thread to process PING
 
     dht1.mutex.lock();
     const peers = try dht1.routing_table.getAllPeers();
@@ -52,5 +52,5 @@ test "dht: ping/pong integration" {
 
     // 7. Close connection and wait for disconnection logic to run
     conn.close();
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    nomadfs.sync.sleep(100 * std.time.ns_per_ms);
 }

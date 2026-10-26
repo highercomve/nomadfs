@@ -4,3 +4,4 @@ zig-out
 build
 0.15.2
 .config
+.serena

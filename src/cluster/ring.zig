@@ -1,4 +1,5 @@
 const std = @import("std");
+const sync = @import("../sync.zig");
 const NodeID = @import("../net/id.zig").NodeID;
 
 const Token = struct {
@@ -9,11 +10,13 @@ const Token = struct {
 pub const HashRing = struct {
     tokens: std.ArrayListUnmanaged(Token),
     allocator: std.mem.Allocator,
+    mutex: sync.RwLock = .{},
 
     pub fn init(allocator: std.mem.Allocator) HashRing {
         return HashRing{
-            .tokens = std.ArrayListUnmanaged(Token){},
+            .tokens = .empty,
             .allocator = allocator,
+            .mutex = .{},
         };
     }
 
@@ -23,6 +26,9 @@ pub const HashRing = struct {
 
     // Add a node to the ring with 'weight' virtual nodes
     pub fn addNode(self: *HashRing, node_id: NodeID, weight: usize) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         // Generate 'weight' tokens derived from node_id
         for (0..weight) |i| {
             var hasher = std.hash.Fnv1a_64.init();
@@ -32,7 +38,7 @@ pub const HashRing = struct {
 
             try self.tokens.append(self.allocator, Token{ .hash = hash, .node_id = node_id });
         }
-        
+
         // Sort tokens by hash
         const Context = struct {
             pub fn lessThan(_: @This(), a: Token, b: Token) bool {
@@ -44,6 +50,9 @@ pub const HashRing = struct {
 
     // Find the node responsible for 'key'
     pub fn getNode(self: *HashRing, key: []const u8) ?NodeID {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+
         if (self.tokens.items.len == 0) return null;
 
         var hasher = std.hash.Fnv1a_64.init();

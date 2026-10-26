@@ -5,7 +5,7 @@ const TestPeer = @import("test_helpers").TestPeer;
 pub fn main() !void {
     // std.testing.allocator detects leaks, but for a standalone run we can use GPA or page_allocator.
     // Let's use GPA to catch leaks if possible, but print to stderr on failure.
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -31,7 +31,7 @@ pub fn main() !void {
 
     // 4. Start peer1 (the "server")
     try peer1.start();
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    nomadfs.sync.sleep(100 * std.time.ns_per_ms);
 
     // 5. Peer2 connects to Peer1
     std.debug.print("Connecting peer2 to peer1...\n", .{});
@@ -47,7 +47,7 @@ pub fn main() !void {
     std.debug.print("Ping test passed!\n", .{});
 
     // Check if dht1 added peer2
-    std.Thread.sleep(500 * std.time.ns_per_ms); // Give some time for the thread to process PING
+    nomadfs.sync.sleep(500 * std.time.ns_per_ms); // Give some time for the thread to process PING
     
     dht1.mutex.lock();
     const peers = try dht1.routing_table.getAllPeers();
@@ -61,5 +61,5 @@ pub fn main() !void {
 
     // 7. Close connection and wait for disconnection logic to run
     conn.close();
-    std.Thread.sleep(1000 * std.time.ns_per_ms);
+    nomadfs.sync.sleep(1000 * std.time.ns_per_ms);
 }

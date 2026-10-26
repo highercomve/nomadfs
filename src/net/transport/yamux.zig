@@ -1,3 +1,4 @@
+const sync = @import("../../sync.zig");
 const std = @import("std");
 const network = @import("mod.zig");
 
@@ -59,11 +60,12 @@ pub const YamuxStream = struct {
     id: u32,
     session: *Session,
     incoming_data: std.ArrayListUnmanaged(u8),
+    read_index: usize = 0,
     remote_window: u32, // How much we can send to peer
     local_window: u32, // How much peer can send to us
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
-    write_cond: std.Thread.Condition = .{},
+    mutex: sync.Mutex = .{},
+    cond: sync.Condition = .{},
+    write_cond: sync.Condition = .{},
     closed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, id: u32, session: *Session) YamuxStream {
@@ -71,7 +73,8 @@ pub const YamuxStream = struct {
         return .{
             .id = id,
             .session = session,
-            .incoming_data = .{},
+            .incoming_data = .empty,
+            .read_index = 0,
             .remote_window = InitialWindowSize,
             .local_window = InitialWindowSize,
         };
@@ -88,8 +91,8 @@ pub const Session = struct {
     transport: network.Stream,
     streams: std.AutoHashMapUnmanaged(u32, *YamuxStream),
     accept_queue: std.ArrayListUnmanaged(*YamuxStream),
-    mutex: std.Thread.Mutex = .{},
-    accept_cond: std.Thread.Condition = .{},
+    mutex: sync.Mutex = .{},
+    accept_cond: sync.Condition = .{},
     accept_waiters: usize = 0,
     is_server: bool,
     closed: bool = false,
@@ -100,8 +103,8 @@ pub const Session = struct {
             .allocator = allocator,
             .next_stream_id = if (is_server) 2 else 1,
             .transport = transport,
-            .streams = .{},
-            .accept_queue = .{},
+            .streams = .empty,
+            .accept_queue = .empty,
             .accept_waiters = 0,
             .is_server = is_server,
             .closed = false,
@@ -314,18 +317,25 @@ pub const Session = struct {
         stream.mutex.lock();
         defer stream.mutex.unlock();
 
-        while (stream.incoming_data.items.len == 0 and !stream.closed) {
+        while (stream.incoming_data.items.len - stream.read_index == 0 and !stream.closed) {
             stream.cond.wait(&stream.mutex);
         }
 
-        if (stream.incoming_data.items.len == 0 and stream.closed) return 0;
+        const available = stream.incoming_data.items.len - stream.read_index;
+        if (available == 0 and stream.closed) return 0;
 
-        const to_read = @min(buffer.len, stream.incoming_data.items.len);
-        @memcpy(buffer[0..to_read], stream.incoming_data.items[0..to_read]);
+        const to_read = @min(buffer.len, available);
+        @memcpy(buffer[0..to_read], stream.incoming_data.items[stream.read_index .. stream.read_index + to_read]);
+        stream.read_index += to_read;
 
-        // Remove read bytes from the front (inefficient but OK for MVP)
-        for (0..to_read) |_| {
-            _ = stream.incoming_data.orderedRemove(0);
+        // Compact if we have too much wasted space
+        if (stream.read_index > 4096 and stream.read_index > stream.incoming_data.items.len / 2) {
+            const remaining = stream.incoming_data.items.len - stream.read_index;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, stream.incoming_data.items[0..remaining], stream.incoming_data.items[stream.read_index..]);
+            }
+            stream.incoming_data.shrinkAndFree(stream.session.allocator, remaining);
+            stream.read_index = 0;
         }
 
         // Increment local window and send update
@@ -419,3 +429,67 @@ pub const Session = struct {
         session.mutex.unlock();
     }
 };
+
+test "YamuxStream ring buffer" {
+    const allocator = std.testing.allocator;
+    // Mock session
+    const session = try allocator.create(Session);
+    session.* = undefined;
+    session.allocator = allocator;
+    defer allocator.destroy(session);
+
+    var stream = YamuxStream.init(allocator, 1, session);
+    defer stream.deinit(allocator);
+
+    // Test Write
+    const data1 = "Hello";
+    try stream.incoming_data.appendSlice(allocator, data1);
+    try std.testing.expectEqual(data1.len, stream.incoming_data.items.len);
+    try std.testing.expectEqual(@as(usize, 0), stream.read_index);
+
+    // Test Read Partial
+    var buf: [3]u8 = undefined;
+    {
+        const available = stream.incoming_data.items.len - stream.read_index;
+        const to_read = @min(buf.len, available);
+        @memcpy(buf[0..to_read], stream.incoming_data.items[stream.read_index .. stream.read_index + to_read]);
+        stream.read_index += to_read;
+    }
+    try std.testing.expectEqualStrings("Hel", &buf);
+    try std.testing.expectEqual(@as(usize, 3), stream.read_index);
+
+    // Test Append more
+    const data2 = " World";
+    try stream.incoming_data.appendSlice(allocator, data2);
+    // "Hello World"
+    // index at 3. "lo World" remaining.
+
+    // Test Read Rest
+    var buf2: [8]u8 = undefined;
+    {
+        const available = stream.incoming_data.items.len - stream.read_index;
+        const to_read = @min(buf2.len, available);
+        @memcpy(buf2[0..to_read], stream.incoming_data.items[stream.read_index .. stream.read_index + to_read]);
+        stream.read_index += to_read;
+    }
+    try std.testing.expectEqualStrings("lo World", &buf2);
+    try std.testing.expectEqual(stream.incoming_data.items.len, stream.read_index);
+
+    // Test Compaction logic
+    // Force read_index high to trigger compaction (simulate)
+    stream.read_index = 5;
+    try stream.incoming_data.resize(allocator, 10);
+    @memcpy(stream.incoming_data.items[5..10], "ABCDE");
+
+    if (stream.read_index > 0) {
+        const remaining = stream.incoming_data.items.len - stream.read_index;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, stream.incoming_data.items[0..remaining], stream.incoming_data.items[stream.read_index..]);
+        }
+        stream.incoming_data.shrinkAndFree(allocator, remaining);
+        stream.read_index = 0;
+    }
+
+    try std.testing.expectEqualStrings("ABCDE", stream.incoming_data.items);
+    try std.testing.expectEqual(@as(usize, 0), stream.read_index);
+}

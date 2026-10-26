@@ -1,4 +1,5 @@
 const std = @import("std");
+const sync = @import("../../sync.zig");
 const NodeID = @import("../id.zig").NodeID;
 const network = @import("../transport/mod.zig");
 
@@ -7,11 +8,11 @@ pub const MAX_PEER_ADDRESSES = 8;
 
 pub const PeerInfo = struct {
     id: NodeID,
-    addresses: [MAX_PEER_ADDRESSES]std.net.Address = undefined,
+    addresses: [MAX_PEER_ADDRESSES]network.Address = undefined,
     addrs_count: u8 = 0,
     last_seen: i64,
 
-    pub fn addAddress(self: *PeerInfo, addr: std.net.Address) bool {
+    pub fn addAddress(self: *PeerInfo, addr: network.Address) bool {
         // Check for duplicates
         for (0..self.addrs_count) |i| {
             if (addressesMatch(self.addresses[i], addr)) return false;
@@ -30,8 +31,8 @@ pub const PeerInfo = struct {
         }
     }
 
-    pub fn getBestAddress(self: PeerInfo) std.net.Address {
-        if (self.addrs_count == 0) return std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+    pub fn getBestAddress(self: PeerInfo) network.Address {
+        if (self.addrs_count == 0) return network.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
 
         var best_addr = self.addresses[0];
         var best_prio = network.addressPriority(best_addr);
@@ -48,17 +49,8 @@ pub const PeerInfo = struct {
     }
 };
 
-fn addressesMatch(a: std.net.Address, b: std.net.Address) bool {
-    if (a.any.family != b.any.family) return false;
-    switch (a.any.family) {
-        std.posix.AF.INET => {
-            return a.in.sa.port == b.in.sa.port and a.in.sa.addr == b.in.sa.addr;
-        },
-        std.posix.AF.INET6 => {
-            return a.in6.sa.port == b.in6.sa.port and std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr);
-        },
-        else => return false,
-    }
+fn addressesMatch(a: network.Address, b: network.Address) bool {
+    return a.eql(b);
 }
 
 const Bucket = struct {
@@ -69,10 +61,10 @@ const Bucket = struct {
 
     pub fn init(allocator: std.mem.Allocator) Bucket {
         return Bucket{
-            .peers = std.ArrayList(PeerInfo){},
-            .replacements = std.ArrayList(PeerInfo){},
+            .peers = .empty,
+            .replacements = .empty,
             .allocator = allocator,
-            .last_updated = std.time.timestamp(),
+            .last_updated = sync.timestamp(),
         };
     }
 
@@ -83,7 +75,7 @@ const Bucket = struct {
 
     // Returns true if added/updated, false if bucket full and peer added to replacement cache
     pub fn add(self: *Bucket, peer: PeerInfo) !bool {
-        self.last_updated = std.time.timestamp();
+        self.last_updated = sync.timestamp();
         // Check if exists in peers (Main Bucket), update
         for (self.peers.items, 0..) |*p, i| {
             if (p.id.eql(peer.id)) {
@@ -153,6 +145,11 @@ const Bucket = struct {
         }
         return false;
     }
+
+    pub fn getLRU(self: *Bucket) ?PeerInfo {
+        if (self.peers.items.len == 0) return null;
+        return self.peers.items[0];
+    }
 };
 
 pub const RoutingTable = struct {
@@ -178,13 +175,19 @@ pub const RoutingTable = struct {
         }
     }
 
-    pub fn addPeer(self: *RoutingTable, peer: PeerInfo) !void {
+    pub fn addPeer(self: *RoutingTable, peer: PeerInfo) !bool {
         std.debug.assert(!peer.id.eql(self.local_id));
         const cpl = self.local_id.commonPrefixLen(peer.id);
 
         const index = @min(cpl, 255);
-        std.debug.print("RoutingTable: Adding peer {x} to bucket {d} (CPL: {d})\n", .{ peer.id.bytes[0..4], index, cpl });
-        _ = try self.buckets[index].add(peer);
+        // std.debug.print("RoutingTable: Adding peer {x} to bucket {d} (CPL: {d})\n", .{ peer.id.bytes[0..4], index, cpl });
+        return try self.buckets[index].add(peer);
+    }
+
+    pub fn getLRU(self: *RoutingTable, peer_id: NodeID) ?PeerInfo {
+        const cpl = self.local_id.commonPrefixLen(peer_id);
+        const index = @min(cpl, 255);
+        return self.buckets[index].getLRU();
     }
 
     pub fn markDisconnected(self: *RoutingTable, peer_id: NodeID) void {
@@ -196,7 +199,7 @@ pub const RoutingTable = struct {
 
     pub fn getClosestPeers(self: *RoutingTable, target: NodeID, count: usize) ![]PeerInfo {
         std.debug.assert(count > 0);
-        var all_peers = std.ArrayListUnmanaged(PeerInfo){};
+        var all_peers: std.ArrayListUnmanaged(PeerInfo) = .empty;
         defer all_peers.deinit(self.allocator);
 
         for (&self.buckets) |*b| {
@@ -224,7 +227,7 @@ pub const RoutingTable = struct {
     }
 
     pub fn getAllPeers(self: *RoutingTable) ![]PeerInfo {
-        var all_peers = std.ArrayListUnmanaged(PeerInfo){};
+        var all_peers: std.ArrayListUnmanaged(PeerInfo) = .empty;
         defer all_peers.deinit(self.allocator);
 
         for (&self.buckets) |*b| {

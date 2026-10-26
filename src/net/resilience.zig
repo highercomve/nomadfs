@@ -1,3 +1,4 @@
+const sync = @import("../sync.zig");
 const std = @import("std");
 
 pub const RetryConfig = struct {
@@ -23,7 +24,7 @@ pub const CircuitBreaker = struct {
     last_failure_time: i64 = 0,
     threshold: u32 = 5,
     timeout_ms: u64 = 60_000,
-    mutex: std.Thread.Mutex = .{},
+    mutex: sync.Mutex = .{},
 
     pub fn init(threshold: u32, timeout_ms: u64) CircuitBreaker {
         std.debug.assert(threshold > 0);

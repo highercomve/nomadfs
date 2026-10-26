@@ -1,3 +1,4 @@
+const sync = @import("../../sync.zig");
 const std = @import("std");
 const id = @import("../id.zig");
 const kbucket = @import("kbucket.zig");
@@ -18,7 +19,7 @@ pub const LookupState = struct {
     in_flight: std.AutoHashMapUnmanaged(id.NodeID, void),
     /// Set of Peer IDs that failed to respond.
     failed: std.AutoHashMapUnmanaged(id.NodeID, void),
-    mutex: std.Thread.Mutex = .{},
+    mutex: sync.Mutex = .{},
 
     pub const LookupPeer = struct {
         info: kbucket.PeerInfo,
@@ -51,7 +52,6 @@ pub const LookupState = struct {
     }
 
     pub fn addPeer(self: *LookupState, info: kbucket.PeerInfo) !void {
-        std.debug.assert(!info.id.eql(self.target));
         std.debug.assert(self.best_peers.items.len < 1000);
 
         if (self.queried.contains(info.id) or self.failed.contains(info.id)) return;
@@ -90,7 +90,7 @@ pub const LookupState = struct {
         defer self.mutex.unlock();
 
         var count: usize = 0;
-        var result = std.ArrayListUnmanaged(kbucket.PeerInfo){};
+        var result: std.ArrayListUnmanaged(kbucket.PeerInfo) = .empty;
         errdefer result.deinit(self.allocator);
 
         for (self.best_peers.items) |*p| {

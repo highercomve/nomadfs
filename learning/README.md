@@ -79,6 +79,17 @@ To fully understand NomadFS, familiarity with these concepts is helpful. We have
 8.  **[Chapter 5: Distribution](./dist/ring.md)**
     *   [5.1: Consistent Hashing & The Ring](./dist/ring.md)
 
+### Part V: Operations & Reference
+9.  **[Chapter 6: Operations & Deployment](./ops/deployment.md)**
+    *   [6.1: Installation & Running](./ops/deployment.md)
+    *   [6.2: Configuration Reference](./ops/configuration.md)
+    *   [6.3: Observability & Metrics](./ops/observability.md)
+    *   [6.4: Performance Targets](./ops/performance.md)
+10. **[Chapter 7: Security & API](./security/model.md)**
+    *   [7.1: Security Model](./security/model.md)
+    *   [7.2: API Reference](./api/reference.md)
+    *   [7.3: Testing Strategy](./testing.md)
+
 ## 5. Getting Started with the Code
 
 If you are reading the source code alongside this documentation, start here:

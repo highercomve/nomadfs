@@ -1,3 +1,4 @@
+const nomadfs = @import("nomadfs");
 const std = @import("std");
 const network = @import("nomadfs").net.transport;
 const id = @import("nomadfs").net.id;
@@ -7,7 +8,7 @@ const TestCtx = struct {
     found: bool = false,
 };
 
-fn onDiscovery(ctx: ?*anyopaque, peer_id: id.NodeID, addr: std.net.Address) void {
+fn onDiscovery(ctx: ?*anyopaque, peer_id: id.NodeID, addr: nomadfs.net.compat.Address) void {
     const t_ctx: *TestCtx = @ptrCast(@alignCast(ctx.?));
     if (peer_id.eql(t_ctx.target_id)) {
         t_ctx.found = true;
@@ -34,7 +35,7 @@ test "network: mDNS local discovery" {
     var i: usize = 0;
     while (i < 150) : (i += 1) { // Wait up to 15s
         if (ctx1.found and ctx2.found) break;
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        nomadfs.sync.sleep(100 * std.time.ns_per_ms);
     }
 
     if (!ctx1.found or !ctx2.found) {

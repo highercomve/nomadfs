@@ -1,5 +1,38 @@
 const std = @import("std");
 const network = @import("mod.zig");
+const compat = @import("../compat.zig");
+
+const posix = std.posix;
+const system = posix.system;
+
+fn createSocket(domain: u32, sock_type: u32, protocol: u32) !posix.socket_t {
+    const rc = system.socket(domain, sock_type, protocol);
+    return switch (posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        else => |err| posix.unexpectedErrno(err),
+    };
+}
+
+fn closeSocket(s: posix.socket_t) void {
+    _ = system.close(@intCast(s));
+}
+
+fn sendtoSocket(s: posix.socket_t, buf: []const u8, flags: u32, addr: ?*const posix.sockaddr, alen: posix.socklen_t) !usize {
+    const rc = system.sendto(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
+    return switch (posix.errno(rc)) {
+        .SUCCESS => rc,
+        else => |err| posix.unexpectedErrno(err),
+    };
+}
+
+fn recvfromSocket(s: posix.socket_t, buf: []u8, flags: u32, addr: ?*posix.sockaddr, alen: ?*posix.socklen_t) !usize {
+    const rc = system.recvfrom(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
+    return switch (posix.errno(rc)) {
+        .SUCCESS => rc,
+        .AGAIN => error.WouldBlock,
+        else => |err| posix.unexpectedErrno(err),
+    };
+}
 
 pub const UPnP = struct {
     allocator: std.mem.Allocator,
@@ -30,20 +63,21 @@ pub const UPnP = struct {
             "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n" ++
             "\r\n";
 
-        const socket = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
-        defer std.posix.close(socket);
+        const socket = try createSocket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+        defer closeSocket(socket);
 
-        const timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-        try std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+        const timeout = posix.timeval{ .sec = 2, .usec = 0 };
+        posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 
-        const dest_addr = try std.net.Address.parseIp("239.255.255.250", 1900);
-        _ = try std.posix.sendto(socket, ssdp_msg, 0, &dest_addr.any, dest_addr.getOsSockLen());
+        const dest_addr = try compat.Address.parseIp("239.255.255.250", 1900);
+        const dest_sa = dest_addr.toPosix();
+        _ = try sendtoSocket(socket, ssdp_msg, 0, @ptrCast(&dest_sa), @sizeOf(@TypeOf(dest_sa)));
 
         var buf: [4096]u8 = undefined;
         var attempts: usize = 0;
         
         while (attempts < 3) : (attempts += 1) {
-             const len = std.posix.recvfrom(socket, &buf, 0, null, null) catch |err| {
+            const len = recvfromSocket(socket, &buf, 0, null, null) catch |err| {
                 if (err == error.WouldBlock) continue;
                 return err;
             };
@@ -79,20 +113,24 @@ pub const UPnP = struct {
         const host_comp = uri.host orelse return error.InvalidGatewayUrl;
         const host = host_comp.percent_encoded;
 
-        const addr = try std.net.Address.parseIp(host, port);
-        const stream = try std.net.tcpConnectToAddress(addr);
+        const addr = try compat.Address.parseIp(host, port);
+        const stream = try compat.tcpConnectToAddress(addr);
         defer stream.close();
 
-        var write_buf: [4096]u8 = undefined;
-        var writer = stream.writer(&write_buf);
-        try writer.interface.print("GET {s} HTTP/1.0\r\n", .{uri.path.percent_encoded});
-        try writer.interface.print("Host: {s}\r\n", .{host});
-        try writer.interface.print("Connection: close\r\n\r\n", .{});
+        var req_buf: [1024]u8 = undefined;
+        const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.0\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{ uri.path.percent_encoded, host });
+        try stream.writeAll(req);
 
-        var read_buf: [4096]u8 = undefined;
-        var r = stream.reader(&read_buf);
-        const body = try r.interface().allocRemaining(self.allocator, std.Io.Limit.limited(64 * 1024));
-        defer self.allocator.free(body);
+        var body_list: std.ArrayList(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        var read_buf: [1024]u8 = undefined;
+        while (true) {
+            const n = stream.read(&read_buf) catch break;
+            if (n == 0) break;
+            try body_list.appendSlice(self.allocator, read_buf[0..n]);
+            if (body_list.items.len > 64 * 1024) break;
+        }
+        const body = body_list.items;
 
         const header_end = std.mem.indexOf(u8, body, "\r\n\r\n");
         if (header_end == null) return error.InvalidResponse;
@@ -108,9 +146,9 @@ pub const UPnP = struct {
                 if (std.mem.indexOf(u8, remaining[start..], end_tag)) |end| {
                     const relative_url = remaining[start + start_tag.len .. start + end];
                     if (std.mem.startsWith(u8, relative_url, "/")) {
-                         return try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}{s}", .{uri.scheme, host, port, relative_url});
+                        return try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}{s}", .{ uri.scheme, host, port, relative_url });
                     } else {
-                         return try std.fmt.allocPrint(self.allocator, "{s}{s}", .{url_str, relative_url});
+                        return try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url_str, relative_url });
                     }
                 }
             }
@@ -123,23 +161,27 @@ pub const UPnP = struct {
         const uri = try std.Uri.parse(self.gateway_url.?);
         const host_comp = uri.host orelse return error.InvalidGatewayUrl;
         const host = host_comp.percent_encoded;
-        const gateway_addr = try std.net.Address.parseIp(host, 0);
+        const gateway_addr = try compat.Address.parseIp(host, 0);
 
-        const socket = try std.posix.socket(gateway_addr.any.family, std.posix.SOCK.DGRAM, 0);
-        defer std.posix.close(socket);
-        try std.posix.connect(socket, &gateway_addr.any, gateway_addr.getOsSockLen());
+        const socket = try createSocket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+        defer closeSocket(socket);
+        const gw_sa = gateway_addr.toPosix();
+        const rc = system.connect(@intCast(socket), @ptrCast(&gw_sa), @sizeOf(@TypeOf(gw_sa)));
+        _ = switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            else => |err| return posix.unexpectedErrno(err),
+        };
 
-        var local_addr: std.net.Address = undefined;
-        var len: std.posix.socklen_t = @sizeOf(std.net.Address);
-        try std.posix.getsockname(socket, &local_addr.any, &len);
+        var local_sa: posix.sockaddr.in = undefined;
+        var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+        const rc_name = system.getsockname(@intCast(socket), @ptrCast(&local_sa), &len);
+        _ = switch (posix.errno(rc_name)) {
+            .SUCCESS => {},
+            else => |err| return posix.unexpectedErrno(err),
+        };
 
-        switch (local_addr.any.family) {
-             std.posix.AF.INET => {
-                 const bytes = std.mem.asBytes(&local_addr.in.sa.addr);
-                 return try std.fmt.allocPrint(self.allocator, "{d}.{d}.{d}.{d}", .{bytes[0], bytes[1], bytes[2], bytes[3]});
-             },
-             else => return error.UnsupportedAddressFamily,
-        }
+        const bytes = @as([4]u8, @bitCast(local_sa.addr));
+        return try std.fmt.allocPrint(self.allocator, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
     }
 
     pub fn mapPort(self: *UPnP, port: u16, protocol: []const u8, local_ip_str: []const u8) !void {
@@ -151,8 +193,8 @@ pub const UPnP = struct {
         const host = host_comp.percent_encoded;
         const port_num = uri.port orelse 80;
 
-        const addr = try std.net.Address.parseIp(host, port_num);
-        const stream = try std.net.tcpConnectToAddress(addr);
+        const addr = try compat.Address.parseIp(host, port_num);
+        const stream = try compat.tcpConnectToAddress(addr);
         defer stream.close();
 
         const soap_body = try std.fmt.allocPrint(self.allocator,
@@ -176,27 +218,81 @@ pub const UPnP = struct {
         );
         defer self.allocator.free(soap_body);
 
-        var write_buf: [4096]u8 = undefined;
-        var writer = stream.writer(&write_buf);
-        try writer.interface.print("POST {s} HTTP/1.0\r\n", .{uri.path.percent_encoded});
-        try writer.interface.print("Host: {s}\r\n", .{host});
-        try writer.interface.print("Content-Length: {d}\r\n", .{soap_body.len});
-        try writer.interface.print("Content-Type: text/xml\r\n", .{});
-        try writer.interface.print("SOAPAction: \"urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping\"\r\n", .{});
-        try writer.interface.print("Connection: close\r\n\r\n", .{});
-        try writer.interface.writeAll(soap_body);
+        var req_header: [512]u8 = undefined;
+        const header = try std.fmt.bufPrint(&req_header, "POST {s} HTTP/1.0\r\nHost: {s}\r\nContent-Length: {d}\r\nContent-Type: text/xml\r\nSOAPAction: \"urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping\"\r\nConnection: close\r\n\r\n", .{ uri.path.percent_encoded, host, soap_body.len });
+        try stream.writeAll(header);
+        try stream.writeAll(soap_body);
 
-        var read_buf: [4096]u8 = undefined;
-        var r = stream.reader(&read_buf);
-        const response = try r.interface().allocRemaining(self.allocator, std.Io.Limit.limited(64 * 1024));
-        defer self.allocator.free(response);
+        var body_list: std.ArrayList(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        var read_buf: [1024]u8 = undefined;
+        while (true) {
+            const n = stream.read(&read_buf) catch break;
+            if (n == 0) break;
+            try body_list.appendSlice(self.allocator, read_buf[0..n]);
+            if (body_list.items.len > 64 * 1024) break;
+        }
+        const response = body_list.items;
 
         if (std.mem.indexOf(u8, response, "200 OK") == null) {
-             std.debug.print("UPnP Failed: {s}\n", .{response});
-             return error.SoapError;
+            std.debug.print("UPnP Failed: {s}\n", .{response});
+            return error.SoapError;
         }
 
         self.mapped_port = port;
         std.debug.print("UPnP: Successfully mapped port {d}\n", .{port});
+    }
+
+    pub fn deletePortMap(self: *UPnP, port: u16, protocol: []const u8) !void {
+        const control_url_str = try self.fetchControlUrl();
+        defer self.allocator.free(control_url_str);
+
+        const uri = try std.Uri.parse(control_url_str);
+        const host_comp = uri.host orelse return error.InvalidGatewayUrl;
+        const host = host_comp.percent_encoded;
+        const port_num = uri.port orelse 80;
+
+        const addr = try compat.Address.parseIp(host, port_num);
+        const stream = try compat.tcpConnectToAddress(addr);
+        defer stream.close();
+
+        const soap_body = try std.fmt.allocPrint(self.allocator,
+            \\<?xml version="1.0"?>
+            \\<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+            \\<s:Body>
+            \\<u:DeletePortMapping xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">
+            \\<NewRemoteHost></NewRemoteHost>
+            \\<NewExternalPort>{d}</NewExternalPort>
+            \\<NewProtocol>{s}</NewProtocol>
+            \\</u:DeletePortMapping>
+            \\</s:Body>
+            \\</s:Envelope>
+            ,
+            .{ port, protocol }
+        );
+        defer self.allocator.free(soap_body);
+
+        var req_header: [512]u8 = undefined;
+        const header = try std.fmt.bufPrint(&req_header, "POST {s} HTTP/1.0\r\nHost: {s}\r\nContent-Length: {d}\r\nContent-Type: text/xml\r\nSOAPAction: \"urn:schemas-upnp-org:service:WANIPConnection:1#DeletePortMapping\"\r\nConnection: close\r\n\r\n", .{ uri.path.percent_encoded, host, soap_body.len });
+        try stream.writeAll(header);
+        try stream.writeAll(soap_body);
+
+        var body_list: std.ArrayList(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        var read_buf: [1024]u8 = undefined;
+        while (true) {
+            const n = stream.read(&read_buf) catch break;
+            if (n == 0) break;
+            try body_list.appendSlice(self.allocator, read_buf[0..n]);
+            if (body_list.items.len > 64 * 1024) break;
+        }
+        const response = body_list.items;
+
+        if (std.mem.indexOf(u8, response, "200 OK") == null) {
+            return error.SoapError;
+        }
+
+        self.mapped_port = null;
+        std.debug.print("UPnP: Successfully deleted port mapping for {d}\n", .{port});
     }
 };

@@ -13,8 +13,9 @@ pub const NodeID = struct {
     }
 
     pub fn generate() NodeID {
+        const io = std.Io.Threaded.global_single_threaded.io();
         var id: NodeID = undefined;
-        std.crypto.random.bytes(&id.bytes);
+        io.random(&id.bytes);
         return id;
     }
 
@@ -74,19 +75,20 @@ pub const NodeID = struct {
         // Flip the determining bit
         new_id.bytes[byte_idx] ^= bit_mask;
 
+        const io = std.Io.Threaded.global_single_threaded.io();
         // Randomize remaining bits in this byte
         // Mask of bits to randomize (those to the right of bit_offset)
         const rand_mask = bit_mask - 1;
         if (rand_mask > 0) {
             var rand_byte: u8 = undefined;
-            std.crypto.random.bytes(std.mem.asBytes(&rand_byte));
+            io.random(std.mem.asBytes(&rand_byte));
             new_id.bytes[byte_idx] &= ~rand_mask; // Clear random bits
             new_id.bytes[byte_idx] |= (rand_byte & rand_mask); // Set new random bits
         }
 
         // Randomize all subsequent bytes
         if (byte_idx + 1 < 32) {
-            std.crypto.random.bytes(new_id.bytes[byte_idx + 1 ..]);
+            io.random(new_id.bytes[byte_idx + 1 ..]);
         }
 
         return new_id;

@@ -1,3 +1,4 @@
+const sync = @import("sync.zig");
 const std = @import("std");
 
 pub const MetricType = enum {
@@ -24,7 +25,7 @@ pub const Metric = struct {
 
 pub const MetricsCollector = struct {
     metrics: std.ArrayList(Metric),
-    mutex: std.Thread.Mutex = .{},
+    mutex: sync.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) MetricsCollector {
         return .{
@@ -40,12 +41,18 @@ pub const MetricsCollector = struct {
         self.metrics.deinit();
     }
 
+    const MAX_METRICS = 10000;
+
     pub fn incrementCounter(self: *MetricsCollector, name: []const u8, value: f64) void {
         std.debug.assert(name.len > 0);
         std.debug.assert(value >= 0);
 
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        if (self.metrics.items.len >= MAX_METRICS) {
+            _ = self.metrics.orderedRemove(0);
+        }
 
         const metric = Metric.init(name, .Counter, value);
         self.metrics.append(metric) catch {};
@@ -57,6 +64,10 @@ pub const MetricsCollector = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        if (self.metrics.items.len >= MAX_METRICS) {
+            _ = self.metrics.orderedRemove(0);
+        }
+
         const metric = Metric.init(name, .Gauge, value);
         self.metrics.append(metric) catch {};
     }
@@ -67,6 +78,10 @@ pub const MetricsCollector = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        if (self.metrics.items.len >= MAX_METRICS) {
+            _ = self.metrics.orderedRemove(0);
+        }
 
         const metric = Metric.init(name, .Histogram, value);
         self.metrics.append(metric) catch {};
@@ -96,10 +111,10 @@ pub const Span = struct {
     allocator: std.mem.Allocator,
     metadata: std.StringHashMap([]const u8, []const u8),
 
-    pub fn start(allocator: std.mem.Allocator, name: []const u8) Span {
-        std.debug.assert(name.len > 0);
+    pub fn start(allocator: std.mem.Allocator, name: []const u8) ?*Span {
+        if (name.len == 0) return null;
 
-        const span = allocator.create(Span) catch unreachable;
+        const span = allocator.create(Span) catch return null;
         span.* = .{
             .name = name,
             .start_time = std.time.nanoTimestamp(),
@@ -184,6 +199,6 @@ pub fn recordHistogram(name: []const u8, value: f64) void {
     }
 }
 
-pub fn startSpan(allocator: std.mem.Allocator, name: []const u8) Span {
+pub fn startSpan(allocator: std.mem.Allocator, name: []const u8) ?*Span {
     return Span.start(allocator, name);
 }

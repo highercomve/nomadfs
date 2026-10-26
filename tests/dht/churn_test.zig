@@ -28,25 +28,25 @@ test "dht: churn resilience" {
         }
     }
 
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    nomadfs.sync.sleep(100 * std.time.ns_per_ms);
 
     // 2. Bootstrap: Node 0 knows everyone else (correct ports)
     for (1..NUM_NODES) |i| {
-        try dht_nodes[0].routing_table.addPeer(.{
+        _ = try dht_nodes[0].routing_table.addPeer(.{
             .id = peers[i].manager.node_id,
             .addresses = .{peers[i].listen_addr} ++ .{undefined} ** (nomadfs.net.discovery.kbucket.MAX_PEER_ADDRESSES - 1),
             .addrs_count = 1,
-            .last_seen = std.time.timestamp(),
+            .last_seen = nomadfs.sync.timestamp(),
         });
     }
 
     const last_node_idx = NUM_NODES - 1;
     // 3. Last node knows Node 0
-    try dht_nodes[last_node_idx].routing_table.addPeer(.{
+    _ = try dht_nodes[last_node_idx].routing_table.addPeer(.{
         .id = peers[0].manager.node_id,
         .addresses = .{peers[0].listen_addr} ++ .{undefined} ** (nomadfs.net.discovery.kbucket.MAX_PEER_ADDRESSES - 1),
         .addrs_count = 1,
-        .last_seen = std.time.timestamp(),
+        .last_seen = nomadfs.sync.timestamp(),
     });
 
     // 4. Last node performs a general lookup to discover some peers
@@ -77,7 +77,7 @@ test "dht: churn resilience" {
     // 6. Stop the closest node to simulate churn
     std.debug.print("Stopping Node {d} to simulate churn...\n", .{closest_idx});
     peers[closest_idx].stop();
-    std.Thread.sleep(1 * std.time.ns_per_s);
+    nomadfs.sync.sleep(1 * std.time.ns_per_s);
 
     // Verify Last Node HAS the stopped node in its routing table before lookup
     {
@@ -117,5 +117,5 @@ test "dht: churn resilience" {
     for (0..NUM_NODES) |i| {
         peers[i].stop();
     }
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    nomadfs.sync.sleep(100 * std.time.ns_per_ms);
 }

@@ -1,3 +1,4 @@
+const sync = @import("../../sync.zig");
 const std = @import("std");
 const id = @import("../id.zig");
 const kbucket = @import("kbucket.zig");
@@ -11,9 +12,9 @@ pub const Node = struct {
     routing_table: kbucket.RoutingTable,
     swarm_key: []const u8,
     storage: std.AutoHashMapUnmanaged(id.NodeID, []u8),
-    mutex: std.Thread.Mutex,
+    mutex: sync.Mutex = .{},
     is_public: bool = false,
-    handlers_wg: std.Thread.WaitGroup = .{},
+    handlers_wg: sync.WaitGroup = .{},
 
     pub fn init(allocator: std.mem.Allocator, manager: *network.manager.ConnectionManager, swarm_key: []const u8) Node {
         return .{
@@ -21,26 +22,36 @@ pub const Node = struct {
             .manager = manager,
             .routing_table = kbucket.RoutingTable.init(allocator, manager.node_id),
             .swarm_key = swarm_key,
-            .storage = .{},
+            .storage = .empty,
             .mutex = .{},
             .is_public = false,
             .handlers_wg = .{},
         };
     }
 
-    pub fn onDiscovery(self: *Node, peer_id: id.NodeID, addr: std.net.Address) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
+    pub fn onDiscovery(self: *Node, peer_id: id.NodeID, addr: network.Address) void {
         var info = kbucket.PeerInfo{
             .id = peer_id,
-            .last_seen = std.time.timestamp(),
+            .last_seen = sync.timestamp(),
         };
         _ = info.addAddress(addr);
+        self.addVerifiedPeer(info);
+    }
 
-        self.routing_table.addPeer(info) catch |err| {
-            std.debug.print("Failed to add discovered peer to routing table: {any}\n", .{err});
-        };
+    fn pingLruAndEvict(self: *Node, lru: kbucket.PeerInfo) void {
+        const addr = lru.getBestAddress();
+        if (self.manager.connectToPeer(addr, self.swarm_key, lru.id)) |conn| {
+            defer conn.close();
+            self.ping(conn) catch {
+                self.mutex.lock();
+                self.routing_table.markDisconnected(lru.id);
+                self.mutex.unlock();
+            };
+        } else |_| {
+            self.mutex.lock();
+            self.routing_table.markDisconnected(lru.id);
+            self.mutex.unlock();
+        }
     }
 
     pub fn checkReachability(self: *Node, conn: network.Connection) !void {
@@ -91,10 +102,10 @@ pub const Node = struct {
             defer self.mutex.unlock();
             var info = kbucket.PeerInfo{
                 .id = response.sender_id,
-                .last_seen = std.time.timestamp(),
+                .last_seen = sync.timestamp(),
             };
             _ = info.addAddress(conn.getPeerAddress());
-            try self.routing_table.addPeer(info);
+            _ = try self.routing_table.addPeer(info);
         }
     }
 
@@ -133,6 +144,39 @@ pub const Node = struct {
         res.value_ptr.* = v_copy;
     }
 
+    fn lookupValueWorker(node: *Node, state: *lookup_mod.LookupState, peer: kbucket.PeerInfo, target: id.NodeID, result_ptr: *?[]u8, result_mutex: *sync.Mutex) void {
+        const result_or_err = node.sendFindValue(peer.addresses[0..peer.addrs_count], target, peer.id);
+        if (result_or_err) |result| {
+            // Successful response, verify peer
+            var p_updates = peer;
+            p_updates.last_seen = sync.timestamp();
+            node.addVerifiedPeer(p_updates);
+
+            switch (result) {
+                .value => |v| {
+                    // Found it!
+                    result_mutex.lock();
+                    if (result_ptr.* == null) {
+                        result_ptr.* = v;
+                    } else {
+                        node.allocator.free(v);
+                    }
+                    result_mutex.unlock();
+                },
+                .closer_peers => |closer| {
+                    defer node.allocator.free(closer);
+                    state.reportReply(peer.id, closer) catch {};
+                    // NOTE: Hearsay peers not added to RT.
+                },
+            }
+        } else |_| {
+            state.reportFailure(peer.id);
+            node.mutex.lock();
+            defer node.mutex.unlock();
+            node.routing_table.markDisconnected(peer.id);
+        }
+    }
+
     pub fn lookupValue(self: *Node, target: id.NodeID) !?[]u8 {
         // Check local storage first
         self.mutex.lock();
@@ -148,43 +192,51 @@ pub const Node = struct {
         var state = try lookup_mod.LookupState.init(self.allocator, target, initial_peers);
         defer state.deinit();
 
+        var result: ?[]u8 = null;
+        var result_mutex = sync.Mutex{};
+
         while (!state.isFinished()) {
+            {
+                result_mutex.lock();
+                defer result_mutex.unlock();
+                if (result) |v| return v;
+            }
+
             const next_peers = try state.nextPeersToQuery();
             defer self.allocator.free(next_peers);
 
-            if (next_peers.len == 0) break;
+            if (next_peers.len == 0) {
+                if (state.in_flight.count() > 0) {
+                    sync.sleep(10 * std.time.ns_per_ms);
+                    continue;
+                }
+                break;
+            }
+
+            var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
+            defer threads.deinit(self.allocator);
 
             for (next_peers) |peer| {
-                if (peer.id.eql(self.manager.node_id)) continue;
-
-                const result_or_err = self.sendFindValue(peer.addresses[0..peer.addrs_count], target, peer.id);
-                if (result_or_err) |result| {
-                    switch (result) {
-                        .value => |v| {
-                            // Found it!
-                            return v;
-                        },
-                        .closer_peers => |closer| {
-                            defer self.allocator.free(closer);
-                            try state.reportReply(peer.id, closer);
-                            self.mutex.lock();
-                            for (closer) |p| {
-                                if (p.id.eql(self.manager.node_id)) continue;
-                                if (state.failed.contains(p.id)) continue;
-                                try self.routing_table.addPeer(p);
-                            }
-                            self.mutex.unlock();
-                        },
-                    }
-                } else |_| {
+                if (peer.id.eql(self.manager.node_id)) {
                     state.reportFailure(peer.id);
+                    continue;
                 }
+                state.markInFlight(peer.id);
+                const thread = try std.Thread.spawn(.{}, lookupValueWorker, .{ self, &state, peer, target, &result, &result_mutex });
+                try threads.append(self.allocator, thread);
+            }
+
+            for (threads.items) |t| {
+                t.join();
             }
         }
+
+        // Final check
+        if (result) |v| return v;
         return null;
     }
 
-    pub fn sendStore(self: *Node, addresses: []const std.net.Address, key: id.NodeID, value: []const u8, peer_id: ?id.NodeID) !void {
+    pub fn sendStore(self: *Node, addresses: []const network.Address, key: id.NodeID, value: []const u8, peer_id: ?id.NodeID) !void {
         const conn = try self.manager.connectToPeerMulti(addresses, self.swarm_key, peer_id);
 
         const stream = try conn.openStream();
@@ -203,7 +255,7 @@ pub const Node = struct {
         closer_peers: []kbucket.PeerInfo,
     };
 
-    pub fn sendFindValue(self: *Node, addresses: []const std.net.Address, key: id.NodeID, peer_id: ?id.NodeID) !FindValueResult {
+    pub fn sendFindValue(self: *Node, addresses: []const network.Address, key: id.NodeID, peer_id: ?id.NodeID) !FindValueResult {
         const conn = try self.manager.connectToPeerMulti(addresses, self.swarm_key, peer_id);
 
         const stream = try conn.openStream();
@@ -235,6 +287,50 @@ pub const Node = struct {
         }
     }
 
+    fn addVerifiedPeer(self: *Node, peer: kbucket.PeerInfo) void {
+        var lru_to_ping: ?kbucket.PeerInfo = null;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (self.routing_table.addPeer(peer)) |added| {
+                if (!added) {
+                    lru_to_ping = self.routing_table.getLRU(peer.id);
+                }
+            } else |err| {
+                std.debug.print("Failed to add verified peer to routing table: {any}\n", .{err});
+            }
+        }
+
+        if (lru_to_ping) |lru| {
+            self.pingLruAndEvict(lru);
+        }
+    }
+
+    fn lookupNodeWorker(node: *Node, state: *lookup_mod.LookupState, peer: kbucket.PeerInfo, target: id.NodeID) void {
+        // std.debug.print("Lookup: [{x}] Querying peer {x}\n", .{ target.bytes[0..4], peer.id.bytes[0..4] });
+
+        if (node.sendFindNode(peer.addresses[0..peer.addrs_count], target, peer.id)) |closer_peers| {
+            // std.debug.print("Lookup: [{x}] Peer {x} replied with {d} peers\n", .{ target.bytes[0..4], peer.id.bytes[0..4], closer_peers.len });
+            defer node.allocator.free(closer_peers);
+            state.reportReply(peer.id, closer_peers) catch {};
+
+            // We successfully contacted 'peer'. Update it in our routing table.
+            var p_updates = peer;
+            p_updates.last_seen = sync.timestamp();
+            node.addVerifiedPeer(p_updates);
+
+            // NOTE: We do NOT add closer_peers to the routing table anymore (Hearsay).
+            // They will be added only if we query them and they reply.
+        } else |_| {
+            // std.debug.print("Lookup: [{x}] Failed to contact {x}: {any}. Removing from table.\n", .{ target.bytes[0..4], peer.id.bytes[0..4], err });
+            state.reportFailure(peer.id);
+            node.mutex.lock();
+            defer node.mutex.unlock();
+            node.routing_table.markDisconnected(peer.id);
+        }
+    }
+
     pub fn lookup(self: *Node, target: id.NodeID) !void {
         self.mutex.lock();
         const initial_peers = try self.routing_table.getClosestPeers(target, kbucket.K);
@@ -244,46 +340,44 @@ pub const Node = struct {
         var state = try lookup_mod.LookupState.init(self.allocator, target, initial_peers);
         defer state.deinit();
 
-        std.debug.print("Lookup: Starting loop for target {x}. Initial peers: {d}\n", .{ target.bytes[0..4], initial_peers.len });
+        // std.debug.print("Lookup: Starting loop for target {x}. Initial peers: {d}\n", .{ target.bytes[0..4], initial_peers.len });
 
         while (!state.isFinished()) {
             const next_peers = try state.nextPeersToQuery();
             defer self.allocator.free(next_peers);
 
-            std.debug.print("Lookup: [{x}] Next peers count: {d}\n", .{ target.bytes[0..4], next_peers.len });
+            // std.debug.print("Lookup: [{x}] Next peers count: {d}\n", .{ target.bytes[0..4], next_peers.len });
 
-            if (next_peers.len == 0) break;
+            if (next_peers.len == 0) {
+                // Nothing to query right now.
+                if (state.in_flight.count() > 0) {
+                    sync.sleep(10 * std.time.ns_per_ms);
+                    continue;
+                }
+                break;
+            }
+
+            var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
+            defer threads.deinit(self.allocator);
 
             for (next_peers) |peer| {
-                if (peer.id.eql(self.manager.node_id)) continue;
-                std.debug.print("Lookup: [{x}] Querying peer {x}\n", .{ target.bytes[0..4], peer.id.bytes[0..4] });
-
-                if (self.sendFindNode(peer.addresses[0..peer.addrs_count], target, peer.id)) |closer_peers| {
-                    std.debug.print("Lookup: [{x}] Peer {x} replied with {d} peers\n", .{ target.bytes[0..4], peer.id.bytes[0..4], closer_peers.len });
-                    defer self.allocator.free(closer_peers);
-                    try state.reportReply(peer.id, closer_peers);
-
-                    // Add discovered peers to routing table
-                    self.mutex.lock();
-                    for (closer_peers) |p| {
-                        if (p.id.eql(self.manager.node_id)) continue;
-                        if (state.failed.contains(p.id)) continue;
-                        try self.routing_table.addPeer(p);
-                    }
-                    self.mutex.unlock();
-                } else |err| {
-                    std.debug.print("Lookup: [{x}] Failed to contact {x}: {any}. Removing from table.\n", .{ target.bytes[0..4], peer.id.bytes[0..4], err });
+                if (peer.id.eql(self.manager.node_id)) {
                     state.reportFailure(peer.id);
-                    self.mutex.lock();
-                    self.routing_table.markDisconnected(peer.id);
-                    self.mutex.unlock();
+                    continue;
                 }
+                state.markInFlight(peer.id);
+                const thread = try std.Thread.spawn(.{}, lookupNodeWorker, .{ self, &state, peer, target });
+                try threads.append(self.allocator, thread);
+            }
+
+            for (threads.items) |t| {
+                t.join();
             }
         }
-        std.debug.print("Lookup: [{x}] Finished loop.\n", .{target.bytes[0..4]});
+        // std.debug.print("Lookup: [{x}] Finished loop.\n", .{target.bytes[0..4]});
     }
 
-    pub fn sendFindNode(self: *Node, addresses: []const std.net.Address, target: id.NodeID, peer_id: ?id.NodeID) ![]kbucket.PeerInfo {
+    pub fn sendFindNode(self: *Node, addresses: []const network.Address, target: id.NodeID, peer_id: ?id.NodeID) ![]kbucket.PeerInfo {
         const conn = try self.manager.connectToPeerMulti(addresses, self.swarm_key, peer_id);
 
         const stream = try conn.openStream();
@@ -309,7 +403,7 @@ pub const Node = struct {
     }
 
     pub fn refreshBuckets(self: *Node) !void {
-        const now = std.time.timestamp();
+        const now = sync.timestamp();
         var i: usize = 0;
         while (i < 256) : (i += 1) {
             var needs_refresh = false;
@@ -380,26 +474,18 @@ pub const Node = struct {
                 var address = conn.getPeerAddress();
                 std.debug.print("Received PING from {x}. Address from sock: {f}, Port from payload: {d}\n", .{ msg.sender_id.bytes[0..4], address, p.port });
 
-                if (address.any.family == std.posix.AF.INET) {
-                    address.in.sa.port = std.mem.nativeToBig(u16, p.port);
-                } else if (address.any.family == std.posix.AF.INET6) {
-                    address.in6.sa.port = std.mem.nativeToBig(u16, p.port);
-                }
+                address.setPort(p.port);
                 std.debug.print("Address adjusted to: {f}\n", .{address});
 
                 // Add to routing table with CORRECT port
-                self.mutex.lock();
-                defer self.mutex.unlock();
 
                 var info = kbucket.PeerInfo{
                     .id = msg.sender_id,
-                    .last_seen = std.time.timestamp(),
+                    .last_seen = sync.timestamp(),
                 };
                 _ = info.addAddress(address);
+                self.addVerifiedPeer(info);
 
-                self.routing_table.addPeer(info) catch |err| {
-                    std.debug.print("Failed to update routing table: {any}\n", .{err});
-                };
                 std.debug.print("Added peer to routing table.\n", .{});
 
                 const response = rpc.Message{
@@ -455,11 +541,7 @@ pub const Node = struct {
             },
             .DIAL_BACK => |p| {
                 var address = conn.getPeerAddress();
-                if (address.any.family == std.posix.AF.INET) {
-                    address.in.sa.port = std.mem.nativeToBig(u16, p.port);
-                } else if (address.any.family == std.posix.AF.INET6) {
-                    address.in6.sa.port = std.mem.nativeToBig(u16, p.port);
-                }
+                address.setPort(p.port);
                 std.debug.print("AutoNAT: Attempting dial-back to {f}\n", .{address});
 
                 // Attempt to dial back. If it succeeds, the other peer knows they are public.
@@ -479,15 +561,6 @@ pub const Node = struct {
     }
 };
 
-fn addressesMatch(a: std.net.Address, b: std.net.Address) bool {
-    if (a.any.family != b.any.family) return false;
-    switch (a.any.family) {
-        std.posix.AF.INET => {
-            return a.in.sa.port == b.in.sa.port and a.in.sa.addr == b.in.sa.addr;
-        },
-        std.posix.AF.INET6 => {
-            return a.in6.sa.port == b.in6.sa.port and std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr);
-        },
-        else => return false,
-    }
+fn addressesMatch(a: network.Address, b: network.Address) bool {
+    return a.eql(b);
 }

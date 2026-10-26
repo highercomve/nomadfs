@@ -12,8 +12,8 @@ const TcpConnectionImpl = struct {
     yamux: *YamuxSession,
     yamux_thread: std.Thread,
     allocator: std.mem.Allocator,
-    peer_address: std.net.Address,
-    closed: bool = false,
+    peer_address: network.Address,
+    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn connection(self: *TcpConnectionImpl) network.Connection {
         return network.Connection.init(self, &tcp_connection_vtable);
@@ -37,7 +37,7 @@ const TcpConnectionImpl = struct {
         return network.Stream.init(yamux_stream, &yamux_stream_vtable);
     }
 
-    pub fn getPeerAddress(ctx: *anyopaque) std.net.Address {
+    pub fn getPeerAddress(ctx: *anyopaque) network.Address {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
         return self.peer_address;
     }
@@ -49,13 +49,12 @@ const TcpConnectionImpl = struct {
 
     pub fn isClosed(ctx: *anyopaque) bool {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
-        return self.closed or self.yamux.closed;
+        return self.closed.load(.acquire) or self.yamux.closed;
     }
 
     pub fn close(ctx: *anyopaque) void {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
-        if (self.closed) return;
-        self.closed = true;
+        if (self.closed.swap(true, .acq_rel)) return;
 
         // 1. Close underlying noise stream (which closes TCP)
         // This will cause yamux_thread to exit
@@ -92,8 +91,8 @@ const yamux_stream_vtable = network.Stream.StreamVTable{
 };
 
 pub const TcpStream = struct {
-    net_stream: std.net.Stream,
-    closed: bool = false,
+    net_stream: network.TcpStream,
+    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn stream(self: *TcpStream) network.Stream {
         return network.Stream.init(self, &tcp_stream_vtable);
@@ -111,10 +110,8 @@ pub const TcpStream = struct {
 
     fn close(ptr: *anyopaque) void {
         const self: *TcpStream = @ptrCast(@alignCast(ptr));
-        if (self.closed) return;
-        std.posix.shutdown(self.net_stream.handle, .both) catch {};
+        if (self.closed.swap(true, .acq_rel)) return;
         self.net_stream.close();
-        self.closed = true;
     }
 };
 
@@ -132,25 +129,19 @@ pub const ListenConfig = struct {
     manager: ?*network.manager.ConnectionManager = null,
 };
 
-pub fn listen(_: std.mem.Allocator, cfg: ListenConfig) !std.net.Server {
-    const address = try std.net.Address.parseIp("0.0.0.0", cfg.port);
-    var server = try address.listen(.{ .reuse_address = true });
-    errdefer server.deinit();
-
-    std.debug.print("Listening for TCP connections on {f}...\n", .{address});
-
-    // We no longer spawn the thread here. The caller (ConnectionManager) must do it.
-    return server;
+pub fn listen(_: std.mem.Allocator, cfg: ListenConfig) !network.Server {
+    std.debug.print("Listening for TCP connections on port {d}...\n", .{cfg.port});
+    return network.compat.listen(cfg.port);
 }
 
-pub fn runAcceptLoop(allocator: std.mem.Allocator, mut_server: std.net.Server, cfg: ListenConfig) void {
+pub fn runAcceptLoop(allocator: std.mem.Allocator, mut_server: network.Server, cfg: ListenConfig) void {
     acceptLoop(allocator, mut_server, cfg);
 }
 
-fn acceptLoop(allocator: std.mem.Allocator, mut_server: std.net.Server, cfg: ListenConfig) void {
+fn acceptLoop(allocator: std.mem.Allocator, mut_server: network.Server, cfg: ListenConfig) void {
     // We work on a copy of the server struct, but it shares the underlying FD.
     var server = mut_server;
-    
+
     while (cfg.running == null or cfg.running.?.load(.acquire)) {
         const conn = server.accept() catch |err| {
             // If the socket was closed (e.g. by stop()), we expect an error.
@@ -191,7 +182,7 @@ fn acceptLoop(allocator: std.mem.Allocator, mut_server: std.net.Server, cfg: Lis
 
 fn handleIncomingConnection(
     allocator: std.mem.Allocator,
-    conn: std.net.Server.Connection,
+    conn: network.Server.Connection,
     swarm_key: []const u8,
     static_key: noise.KeyPair,
     manager: ?*network.manager.ConnectionManager,
@@ -206,7 +197,7 @@ fn handleIncomingConnection(
     const do_work = struct {
         fn do(
             a: std.mem.Allocator,
-            c: std.net.Server.Connection,
+            c: network.Server.Connection,
             sk: []const u8,
             stk: noise.KeyPair,
             m: ?*network.manager.ConnectionManager,
@@ -216,7 +207,7 @@ fn handleIncomingConnection(
             errdefer a.destroy(impl);
 
             // Initialize raw TCP stream
-            impl.tcp_stream = .{ .net_stream = c.stream };
+            impl.tcp_stream = .{ .net_stream = c.stream, .closed = std.atomic.Value(bool).init(false) };
             impl.peer_address = c.address;
 
             // Perform Noise Handshake (Responder)
@@ -227,7 +218,7 @@ fn handleIncomingConnection(
 
             impl.yamux_thread = try std.Thread.spawn(.{}, YamuxSession.run, .{impl.yamux});
             impl.allocator = a;
-            impl.closed = false;
+            impl.closed = std.atomic.Value(bool).init(false);
 
             const conn_obj = impl.connection();
             if (m) |mgr| {
@@ -247,12 +238,12 @@ fn handleIncomingConnection(
     };
 }
 
-pub fn connect(allocator: std.mem.Allocator, address: std.net.Address, swarm_key: []const u8, static_key: noise.KeyPair) !network.Connection {
-    const stream = try std.net.tcpConnectToAddress(address);
+pub fn connect(allocator: std.mem.Allocator, address: network.Address, swarm_key: []const u8, static_key: noise.KeyPair) !network.Connection {
+    const stream = try network.compat.tcpConnectToAddress(address);
 
     const impl = try allocator.create(TcpConnectionImpl);
     errdefer allocator.destroy(impl);
-    impl.tcp_stream = .{ .net_stream = stream };
+    impl.tcp_stream = .{ .net_stream = stream, .closed = std.atomic.Value(bool).init(false) };
     impl.peer_address = address;
 
     // Perform Noise Handshake (Initiator)
@@ -263,7 +254,7 @@ pub fn connect(allocator: std.mem.Allocator, address: std.net.Address, swarm_key
 
     impl.yamux_thread = try std.Thread.spawn(.{}, YamuxSession.run, .{impl.yamux});
     impl.allocator = allocator;
-    impl.closed = false;
+    impl.closed = std.atomic.Value(bool).init(false);
 
     return impl.connection();
 }

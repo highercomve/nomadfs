@@ -8,7 +8,7 @@ pub const TestPeer = struct {
     config: nomadfs.config.Config,
     manager: *nomadfs.net.transport.manager.ConnectionManager,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    listen_addr: std.net.Address,
+    listen_addr: nomadfs.net.compat.Address,
 
     pub fn init(allocator: std.mem.Allocator, port: u16) !TestPeer {
         // ... (minimal config setup)
@@ -32,7 +32,7 @@ pub const TestPeer = struct {
         // Dummy lists to avoid leaks or complex init for now
         cfg.network.bootstrap_peers = &.{};
 
-        const addr = try std.net.Address.parseIp("127.0.0.1", port);
+        const addr = try nomadfs.net.compat.Address.parseIp("127.0.0.1", port);
 
         const manager = try nomadfs.net.transport.manager.ConnectionManager.createExplicit(allocator, .tcp, nomadfs.net.transport.noise.KeyPair.generate());
 
@@ -63,7 +63,7 @@ pub const TestPeer = struct {
         self.running.store(false, .release);
 
         // Connect to self to unblock accept()
-        if (std.net.tcpConnectToAddress(self.listen_addr)) |s| {
+        if (nomadfs.net.compat.tcpConnectToAddress(self.listen_addr)) |s| {
             s.close();
         } else |_| {}
 

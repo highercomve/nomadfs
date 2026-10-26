@@ -24,22 +24,23 @@ test "dht: X-node discovery" {
 
     defer {
         for (0..NUM_NODES) |i| {
+            peers[i].stop();
             dht_nodes[i].deinit();
             peers[i].deinit();
         }
     }
 
     // Wait for all to start listening
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    nomadfs.sync.sleep(200 * std.time.ns_per_ms);
 
     // 2. Bootstrap: Node 0 knows everyone else (correct ports)
     // In a real system, they would connect to Node 0.
     for (1..NUM_NODES) |i| {
-        try dht_nodes[0].routing_table.addPeer(.{
+        _ = try dht_nodes[0].routing_table.addPeer(.{
             .id = peers[i].manager.node_id,
             .addresses = .{peers[i].listen_addr} ++ .{undefined} ** (nomadfs.net.discovery.kbucket.MAX_PEER_ADDRESSES - 1),
             .addrs_count = 1,
-            .last_seen = std.time.timestamp(),
+            .last_seen = nomadfs.sync.timestamp(),
         });
     }
 
@@ -47,11 +48,11 @@ test "dht: X-node discovery" {
 
     const last_node_idx = NUM_NODES - 1;
     // 3. Last node knows Node 0
-    try dht_nodes[last_node_idx].routing_table.addPeer(.{
+    _ = try dht_nodes[last_node_idx].routing_table.addPeer(.{
         .id = peers[0].manager.node_id,
         .addresses = .{peers[0].listen_addr} ++ .{undefined} ** (nomadfs.net.discovery.kbucket.MAX_PEER_ADDRESSES - 1),
         .addrs_count = 1,
-        .last_seen = std.time.timestamp(),
+        .last_seen = nomadfs.sync.timestamp(),
     });
 
     // 4. Last node tries to find Node 5 (or 2 if NUM_NODES=5)
@@ -90,5 +91,5 @@ test "dht: X-node discovery" {
     for (0..NUM_NODES) |i| {
         peers[i].stop();
     }
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    nomadfs.sync.sleep(200 * std.time.ns_per_ms);
 }

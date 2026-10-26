@@ -101,7 +101,7 @@ pub fn build(b: *std.Build) void {
     });
 
     if (target.result.os.tag == .windows) {
-        exe.linkLibC();
+        exe.root_module.link_libc = true;
     }
 
     // This declares intent for the executable to be installed into the
@@ -144,7 +144,7 @@ pub fn build(b: *std.Build) void {
     });
 
     if (target.result.os.tag == .windows) {
-        mod_tests.linkLibC();
+        mod_tests.root_module.link_libc = true;
     }
 
     // A run step that will run the test executable.
@@ -158,7 +158,7 @@ pub fn build(b: *std.Build) void {
     });
 
     if (target.result.os.tag == .windows) {
-        exe_tests.linkLibC();
+        exe_tests.root_module.link_libc = true;
     }
 
     // A run step that will run the second test executable.
@@ -186,7 +186,7 @@ pub fn build(b: *std.Build) void {
     });
 
     if (target.result.os.tag == .windows) {
-        integration_tests.linkLibC();
+        integration_tests.root_module.link_libc = true;
     }
     const run_integration_tests = b.addRunArtifact(integration_tests);
 

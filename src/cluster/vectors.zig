@@ -1,3 +1,4 @@
+const sync = @import("../sync.zig");
 const std = @import("std");
 
 pub const VectorClock = struct {
@@ -10,11 +11,13 @@ pub const VectorClock = struct {
 
     entries: std.ArrayList(Entry),
     allocator: std.mem.Allocator,
+    mutex: sync.RwLock = .{},
 
     pub fn init(allocator: std.mem.Allocator) VectorClock {
         return VectorClock{
-            .entries = std.ArrayList(Entry).init(allocator),
+            .entries = .empty,
             .allocator = allocator,
+            .mutex = .{},
         };
     }
 
@@ -22,25 +25,35 @@ pub const VectorClock = struct {
         for (self.entries.items) |entry| {
             self.allocator.free(entry.node_id);
         }
-        self.entries.deinit();
+        self.entries.deinit(self.allocator);
     }
 
     // Increment the clock for a specific node
     pub fn increment(self: *VectorClock, node_id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         std.debug.assert(node_id.len > 0);
         std.debug.assert(self.entries.items.len < MAX_VECTOR_CLOCK_ENTRIES);
 
-        for (self.entries.items) |*entry| {
-            if (std.mem.eql(u8, entry.node_id, node_id)) {
-                entry.counter += 1;
-                return;
+        const Context = struct {
+            pub fn compare(key: []const u8, entry: Entry) std.math.Order {
+                return std.mem.order(u8, key, entry.node_id);
             }
+        };
+
+        // Binary search for the node_id
+        const index = std.sort.lowerBound(Entry, self.entries.items, node_id, Context.compare);
+
+        if (index < self.entries.items.len and std.mem.eql(u8, self.entries.items[index].node_id, node_id)) {
+            self.entries.items[index].counter += 1;
+        } else {
+            // Not found, insert at index to maintain sort order
+            try self.entries.insert(self.allocator, index, Entry{
+                .node_id = try self.allocator.dupe(u8, node_id),
+                .counter = 1,
+            });
         }
-        // Not found, add new
-        try self.entries.append(Entry{
-            .node_id = try self.allocator.dupe(u8, node_id),
-            .counter = 1,
-        });
 
         std.debug.assert(self.entries.items.len <= MAX_VECTOR_CLOCK_ENTRIES);
     }
@@ -56,44 +69,55 @@ pub const VectorClock = struct {
 
     /// Compare two vector clocks for causal ordering.
     ///
-    /// Time Complexity: O(N*M) where N = self.entries.len, M = other.entries.len
+    /// Time Complexity: O(N+M) where N = self.entries.len, M = other.entries.len
     /// Space Complexity: O(1)
-    ///
-    /// Performance Considerations:
-    /// - For small swarms (N < 100), O(N*M) is acceptable (<10k operations)
-    /// - For large deployments (N > 1000), consider using HashMap for O(N+M) lookups
-    /// - Maximum entry limit enforced to prevent unbounded growth
-    pub fn compare(self: VectorClock, other: VectorClock) Order {
+    pub fn compare(self: *VectorClock, other: *VectorClock) Order {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        other.mutex.lockShared();
+        defer other.mutex.unlockShared();
+
         var self_is_less = false;
         var other_is_less = false;
 
-        // Iterate over all keys (union of both clocks)
-        // This O(N*M) implementation is naive but fine for MVP with small N.
+        var i: usize = 0;
+        var j: usize = 0;
 
-        // Check self against other
-        for (self.entries.items) |s_entry| {
-            var o_counter: u64 = 0;
-            for (other.entries.items) |o_entry| {
-                if (std.mem.eql(u8, s_entry.node_id, o_entry.node_id)) {
-                    o_counter = o_entry.counter;
-                    break;
-                }
+        while (i < self.entries.items.len and j < other.entries.items.len) {
+            const s_entry = self.entries.items[i];
+            const o_entry = other.entries.items[j];
+
+            const order = std.mem.order(u8, s_entry.node_id, o_entry.node_id);
+            switch (order) {
+                .eq => {
+                    if (s_entry.counter < o_entry.counter) self_is_less = true;
+                    if (s_entry.counter > o_entry.counter) other_is_less = true;
+                    i += 1;
+                    j += 1;
+                },
+                .lt => {
+                    // self has a node that other doesn't have (implicitly 0 in other)
+                    // s_entry.counter > 0, so other is less
+                    other_is_less = true;
+                    i += 1;
+                },
+                .gt => {
+                    // other has a node that self doesn't have (implicitly 0 in self)
+                    // o_entry.counter > 0, so self is less
+                    self_is_less = true;
+                    j += 1;
+                },
             }
-            if (s_entry.counter > o_counter) other_is_less = true;
-            if (s_entry.counter < o_counter) self_is_less = true;
         }
 
-        // Check other against self (for keys missing in self)
-        for (other.entries.items) |o_entry| {
-            var s_counter: u64 = 0;
-            for (self.entries.items) |s_entry| {
-                if (std.mem.eql(u8, s_entry.node_id, o_entry.node_id)) {
-                    s_counter = s_entry.counter;
-                    break;
-                }
-            }
-            if (o_entry.counter > s_counter) self_is_less = true;
-            if (o_entry.counter < s_counter) other_is_less = true;
+        // Process remaining elements
+        while (i < self.entries.items.len) {
+            other_is_less = true;
+            i += 1;
+        }
+        while (j < other.entries.items.len) {
+            self_is_less = true;
+            j += 1;
         }
 
         if (self_is_less and other_is_less) return .Concurrent;
@@ -103,22 +127,103 @@ pub const VectorClock = struct {
     }
 
     // Merge two vector clocks (element-wise max)
-    pub fn merge(self: *VectorClock, other: VectorClock) !void {
-        for (other.entries.items) |o_entry| {
-            var found = false;
-            for (self.entries.items) |*s_entry| {
-                if (std.mem.eql(u8, s_entry.node_id, o_entry.node_id)) {
-                    s_entry.counter = @max(s_entry.counter, o_entry.counter);
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                try self.entries.append(Entry{
+    pub fn merge(self: *VectorClock, other: *VectorClock) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        other.mutex.lockShared();
+        defer other.mutex.unlockShared();
+
+        var i: usize = 0;
+        var j: usize = 0;
+
+        // We need to mutate self.entries. We will iterate and insert/update.
+        // Since inserting can shift elements, we need to be careful with index 'i'.
+
+        while (j < other.entries.items.len) {
+            const o_entry = other.entries.items[j];
+
+            // If we reached end of self, just append remaining from other
+            if (i >= self.entries.items.len) {
+                try self.entries.append(self.allocator, Entry{
                     .node_id = try self.allocator.dupe(u8, o_entry.node_id),
                     .counter = o_entry.counter,
                 });
+                j += 1;
+                i += 1;
+                continue;
+            }
+
+            const s_entry = &self.entries.items[i];
+            const order = std.mem.order(u8, s_entry.node_id, o_entry.node_id);
+
+            switch (order) {
+                .eq => {
+                    s_entry.counter = @max(s_entry.counter, o_entry.counter);
+                    i += 1;
+                    j += 1;
+                },
+                .lt => {
+                    // self has node that other doesn't, skip it
+                    i += 1;
+                },
+                .gt => {
+                    // other has node that self doesn't, insert it at i
+                    try self.entries.insert(self.allocator, i, Entry{
+                        .node_id = try self.allocator.dupe(u8, o_entry.node_id),
+                        .counter = o_entry.counter,
+                    });
+                    i += 1; // Point to next element (after insertion)
+                    j += 1;
+                },
             }
         }
     }
 };
+
+test "VectorClock operations" {
+    const allocator = std.testing.allocator;
+    var vc1 = VectorClock.init(allocator);
+    defer vc1.deinit();
+
+    try vc1.increment("A");
+    try vc1.increment("A");
+    try vc1.increment("B");
+
+    try std.testing.expectEqual(@as(u64, 2), vc1.entries.items[0].counter); // "A"
+    try std.testing.expectEqualStrings("A", vc1.entries.items[0].node_id);
+    try std.testing.expectEqual(@as(u64, 1), vc1.entries.items[1].counter); // "B"
+    try std.testing.expectEqualStrings("B", vc1.entries.items[1].node_id);
+
+    var vc2 = VectorClock.init(allocator);
+    defer vc2.deinit();
+
+    try vc2.increment("A");
+    try vc2.increment("C");
+
+    // Compare
+    // vc1: {A:2, B:1}
+    // vc2: {A:1, C:1}
+    // A: 2 > 1 (vc1 > vc2)
+    // B: 1 > 0 (vc1 > vc2)
+    // C: 0 < 1 (vc1 < vc2)
+    // -> Concurrent
+    try std.testing.expectEqual(VectorClock.Order.Concurrent, vc1.compare(&vc2));
+
+    // Merge vc2 into vc1
+    try vc1.merge(&vc2);
+    // vc1 should be {A:2, B:1, C:1}
+    try std.testing.expectEqual(@as(usize, 3), vc1.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 2), vc1.entries.items[0].counter);
+    try std.testing.expectEqual(@as(u64, 1), vc1.entries.items[1].counter);
+    try std.testing.expectEqual(@as(u64, 1), vc1.entries.items[2].counter);
+
+    // Test Equal
+    var vc3 = VectorClock.init(allocator);
+    defer vc3.deinit();
+    try vc3.increment("A");
+    try vc3.increment("A");
+    try vc3.increment("B");
+    try vc3.increment("C");
+
+    try std.testing.expectEqual(VectorClock.Order.Equal, vc1.compare(&vc3));
+}

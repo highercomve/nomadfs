@@ -2,13 +2,9 @@ const std = @import("std");
 const nomadfs = @import("nomadfs");
 const config_mod = nomadfs.config;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var config_path: ?[]const u8 = null;
     var i: usize = 1;

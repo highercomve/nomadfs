@@ -1,3 +1,6 @@
+const sync = @import("../../sync.zig");
+const network = @import("../transport/mod.zig");
+const Address = network.Address;
 const std = @import("std");
 const id = @import("../id.zig");
 const kbucket = @import("kbucket.zig");
@@ -97,7 +100,7 @@ pub const Message = struct {
 
     pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Message {
         const type_byte = try reader.readByte();
-        const msg_type = std.meta.intToEnum(MessageType, type_byte) catch return error.InvalidMessageType;
+        const msg_type = std.enums.fromInt(MessageType, type_byte) orelse return error.InvalidMessageType;
 
         var sender_id: id.NodeID = undefined;
         try reader.readNoEof(&sender_id.bytes);
@@ -126,7 +129,7 @@ pub const Message = struct {
                     
                     var peer_info = kbucket.PeerInfo{
                         .id = peer_id,
-                        .last_seen = std.time.timestamp(),
+                        .last_seen = sync.timestamp(),
                     };
                     
                     const addrs_count = try reader.readByte();
@@ -172,7 +175,7 @@ pub const Message = struct {
                         
                         var peer_info = kbucket.PeerInfo{
                             .id = peer_id,
-                            .last_seen = std.time.timestamp(),
+                            .last_seen = sync.timestamp(),
                         };
                         
                         const addrs_count = try reader.readByte();
@@ -228,25 +231,24 @@ pub const Message = struct {
     }
 };
 
-fn serializeAddress(addr: std.net.Address, writer: anytype) !void {
-    switch (addr.any.family) {
-        std.posix.AF.INET => {
+fn serializeAddress(addr: Address, writer: anytype) !void {
+    switch (addr.ip) {
+        .ip4 => |ip4| {
             try writer.writeByte(4);
-            try writer.writeAll(std.mem.asBytes(&addr.in.sa.addr));
-            // addr.in.sa.port is already big-endian
-            try writer.writeAll(std.mem.asBytes(&addr.in.sa.port));
+            try writer.writeAll(&ip4.bytes);
+            const port_be = std.mem.nativeToBig(u16, ip4.port);
+            try writer.writeAll(std.mem.asBytes(&port_be));
         },
-        std.posix.AF.INET6 => {
+        .ip6 => |ip6| {
             try writer.writeByte(6);
-            try writer.writeAll(&addr.in6.sa.addr);
-            // addr.in6.sa.port is already big-endian
-            try writer.writeAll(std.mem.asBytes(&addr.in6.sa.port));
+            try writer.writeAll(&ip6.bytes);
+            const port_be = std.mem.nativeToBig(u16, ip6.port);
+            try writer.writeAll(std.mem.asBytes(&port_be));
         },
-        else => return error.UnsupportedAddressFamily,
     }
 }
 
-fn deserializeAddress(reader: anytype) !std.net.Address {
+fn deserializeAddress(reader: anytype) !Address {
     const family = try reader.readByte();
     switch (family) {
         4 => {
@@ -254,18 +256,16 @@ fn deserializeAddress(reader: anytype) !std.net.Address {
             try reader.readNoEof(&ipv4);
             var port_be: u16 = undefined;
             try reader.readNoEof(std.mem.asBytes(&port_be));
-            // initIp4 expects host-endian port
             const port = std.mem.bigToNative(u16, port_be);
-            return std.net.Address.initIp4(ipv4, port);
+            return Address.initIp4(ipv4, port);
         },
         6 => {
             var ipv6: [16]u8 = undefined;
             try reader.readNoEof(&ipv6);
             var port_be: u16 = undefined;
             try reader.readNoEof(std.mem.asBytes(&port_be));
-            // initIp6 expects host-endian port
             const port = std.mem.bigToNative(u16, port_be);
-            return std.net.Address.initIp6(ipv6, port, 0, 0);
+            return Address.initIp6(ipv6, port, 0, 0);
         },
         else => return error.InvalidAddressFamily,
     }

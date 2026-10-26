@@ -1,3 +1,7 @@
+pub const compat = @import("../compat.zig");
+pub const Address = compat.Address;
+pub const Server = compat.Server;
+pub const TcpStream = compat.Stream;
 const std = @import("std");
 
 pub const tcp = @import("tcp.zig");
@@ -33,7 +37,84 @@ pub const Stream = struct {
         };
     }
 
-    pub const StreamVTable = struct {
+    pub fn GenericReader(
+    comptime Context: type,
+    comptime ReadError: type,
+    comptime readFn: fn (context: Context, buffer: []u8) ReadError!usize,
+) type {
+    return struct {
+        context: Context,
+
+        pub const Error = ReadError;
+
+        pub fn read(self: @This(), buffer: []u8) Error!usize {
+            return readFn(self.context, buffer);
+        }
+
+        pub fn readAll(self: @This(), buffer: []u8) Error!usize {
+            var index: usize = 0;
+            while (index < buffer.len) {
+                const amt = try self.read(buffer[index..]);
+                if (amt == 0) break;
+                index += amt;
+            }
+            return index;
+        }
+
+        pub fn readNoEof(self: @This(), buffer: []u8) (Error || error{EndOfStream})!void {
+            const amt = try self.readAll(buffer);
+            if (amt < buffer.len) return error.EndOfStream;
+        }
+
+        pub fn readByte(self: @This()) (Error || error{EndOfStream})!u8 {
+            var b: [1]u8 = undefined;
+            try self.readNoEof(&b);
+            return b[0];
+        }
+
+        pub fn readInt(self: @This(), comptime T: type, endian: std.builtin.Endian) (Error || error{EndOfStream})!T {
+            var bytes: [@sizeOf(T)]u8 = undefined;
+            try self.readNoEof(&bytes);
+            return std.mem.readInt(T, &bytes, endian);
+        }
+    };
+}
+
+pub fn GenericWriter(
+    comptime Context: type,
+    comptime WriteError: type,
+    comptime writeFn: fn (context: Context, bytes: []const u8) WriteError!usize,
+) type {
+    return struct {
+        context: Context,
+
+        pub const Error = WriteError;
+
+        pub fn write(self: @This(), bytes: []const u8) Error!usize {
+            return writeFn(self.context, bytes);
+        }
+
+        pub fn writeAll(self: @This(), bytes: []const u8) Error!void {
+            var index: usize = 0;
+            while (index < bytes.len) {
+                index += try self.write(bytes[index..]);
+            }
+        }
+
+        pub fn writeByte(self: @This(), byte: u8) Error!void {
+            const b = [1]u8{byte};
+            return self.writeAll(&b);
+        }
+
+        pub fn writeInt(self: @This(), comptime T: type, value: T, endian: std.builtin.Endian) Error!void {
+            var bytes: [@sizeOf(T)]u8 = undefined;
+            std.mem.writeInt(T, &bytes, value, endian);
+            return self.writeAll(&bytes);
+        }
+    };
+}
+
+pub const StreamVTable = struct {
         read: *const fn (ctx: *anyopaque, buffer: []u8) anyerror!usize,
         write: *const fn (ctx: *anyopaque, buffer: []const u8) anyerror!usize,
         close: *const fn (ctx: *anyopaque) void,
@@ -66,12 +147,12 @@ pub const Stream = struct {
         v.close(p);
     }
 
-    // Helper to integrate with Zig's standard library IO (Reader/Writer)
-    pub fn reader(self: Stream) std.io.GenericReader(Stream, anyerror, read) {
+    // Helper to integrate with Reader/Writer
+    pub fn reader(self: Stream) GenericReader(Stream, anyerror, read) {
         return .{ .context = self };
     }
 
-    pub fn writer(self: Stream) std.io.GenericWriter(Stream, anyerror, write) {
+    pub fn writer(self: Stream) GenericWriter(Stream, anyerror, write) {
         return .{ .context = self };
     }
 };
@@ -110,7 +191,7 @@ pub const Connection = struct {
         acceptStream: *const fn (ctx: *anyopaque) anyerror!Stream,
 
         /// Get the address of the remote peer
-        getPeerAddress: *const fn (ctx: *anyopaque) std.net.Address,
+        getPeerAddress: *const fn (ctx: *anyopaque) Address,
 
         /// Get the NodeID of the remote peer (derived from handshake)
         getRemoteNodeID: *const fn (ctx: *anyopaque) id.NodeID,
@@ -149,7 +230,7 @@ pub const Connection = struct {
         return v.acceptStream(p);
     }
 
-    pub fn getPeerAddress(self: Connection) std.net.Address {
+    pub fn getPeerAddress(self: Connection) Address {
         const p = self.ptr orelse {
             @panic("Connection.getPeerAddress: ptr is null");
         };
@@ -192,42 +273,16 @@ pub const Connection = struct {
     }
 };
 
-pub fn isLoopback(addr: std.net.Address) bool {
-    switch (addr.any.family) {
-        std.posix.AF.INET => {
-            return (addr.in.sa.addr & 0xFF) == 127;
-        },
-        std.posix.AF.INET6 => {
-            const loopback_bytes = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
-            return std.mem.eql(u8, &addr.in6.sa.addr, &loopback_bytes);
-        },
-        else => return false,
-    }
+pub fn isLoopback(addr: Address) bool {
+    return addr.isLoopback();
 }
 
-pub fn isPrivate(addr: std.net.Address) bool {
-    if (isLoopback(addr)) return true;
-    switch (addr.any.family) {
-        std.posix.AF.INET => {
-            const ip = std.mem.nativeToBig(u32, addr.in.sa.addr);
-            // 10.0.0.0/8
-            if ((ip & 0xFF000000) == 0x0A000000) return true;
-            // 172.16.0.0/12
-            if ((ip & 0xFFF00000) == 0xAC100000) return true;
-            // 192.168.0.0/16
-            if ((ip & 0xFFFF0000) == 0xC0A80000) return true;
-            return false;
-        },
-        std.posix.AF.INET6 => {
-            // Unique Local Address (fc00::/7)
-            return (addr.in6.sa.addr[0] & 0xFE) == 0xFC;
-        },
-        else => return false,
-    }
+pub fn isPrivate(addr: Address) bool {
+    return addr.isPrivate();
 }
 
 /// Returns a priority score: 0 (Best/Loopback) -> 1 (Private LAN) -> 2 (Public WAN)
-pub fn addressPriority(addr: std.net.Address) u8 {
+pub fn addressPriority(addr: Address) u8 {
     if (isLoopback(addr)) return 0;
     if (isPrivate(addr)) return 1;
     return 2;

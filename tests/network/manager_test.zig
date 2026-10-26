@@ -27,7 +27,7 @@ test "network: connection manager lifecycle (reaping)" {
     var retries: usize = 0;
     while (manager.getConnectionsCount() > 0) {
         if (retries > 20) return error.TestTimeout;
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        nomadfs.sync.sleep(50 * std.time.ns_per_ms);
         retries += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), manager.getConnectionsCount());
@@ -40,12 +40,12 @@ test "network: connection manager lifecycle (reaping)" {
     try std.testing.expectEqual(@as(usize, 1), manager.getConnectionsCount());
 
     // Wait for idle timeout (1s)
-    std.Thread.sleep(1500 * std.time.ns_per_ms);
+    nomadfs.sync.sleep(1500 * std.time.ns_per_ms);
 
     retries = 0;
     while (manager.getConnectionsCount() > 0) {
         if (retries > 20) return error.TestTimeout;
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        nomadfs.sync.sleep(50 * std.time.ns_per_ms);
         retries += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), manager.getConnectionsCount());

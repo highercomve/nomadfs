@@ -6,6 +6,8 @@ const tcp = @import("tcp.zig");
 const noise = @import("noise.zig");
 const nat = @import("nat.zig");
 const id = @import("../id.zig");
+const sync = @import("../../sync.zig");
+const env_mod = @import("../../env.zig");
 
 pub const ConnectionManager = struct {
     const ManagedConnection = struct {
@@ -20,11 +22,12 @@ pub const ConnectionManager = struct {
     identity_key: noise.KeyPair,
     node_id: id.NodeID,
     bound_port: u16 = 0,
-    mutex: std.Thread.Mutex = .{},
+    mutex: sync.Mutex = .{},
+    stop_mutex: sync.Mutex = .{},
     on_connection_ctx: ?*anyopaque = null,
     on_connection_fn: ?*const fn (ctx: *anyopaque, conn: network.Connection) anyerror!void = null,
     on_discovery_ctx: ?*anyopaque = null,
-    on_discovery_fn: ?*const fn (ctx: *anyopaque, peer_id: id.NodeID, addr: std.net.Address) void = null,
+    on_discovery_fn: ?*const fn (ctx: *anyopaque, peer_id: id.NodeID, addr: network.Address) void = null,
     reaper_thread: ?std.Thread = null,
     upnp_thread: ?std.Thread = null,
     accept_thread: ?std.Thread = null,
@@ -34,9 +37,9 @@ pub const ConnectionManager = struct {
     upnp: nat.UPnP,
     mdns: ?network.mdns.MDNS = null,
     ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
-    handshake_wg: std.Thread.WaitGroup = .{},
+    handshake_wg: sync.WaitGroup = .{},
     stopping: bool = false,
-    tcp_server: ?std.net.Server = null,
+    tcp_server: ?network.Server = null,
     heap_allocated: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, transport_type: config.Config.TransportType, key_path: ?[]const u8) !ConnectionManager {
@@ -59,11 +62,13 @@ pub const ConnectionManager = struct {
     pub fn initExplicit(allocator: std.mem.Allocator, transport_type: config.Config.TransportType, keypair: noise.KeyPair) ConnectionManager {
         return .{
             .allocator = allocator,
-            .connections = std.ArrayListUnmanaged(ManagedConnection){},
+            .connections = .empty,
             .transport_type = transport_type,
             .identity_key = keypair,
             .node_id = id.NodeID.fromPublicKey(keypair.public_key),
             .bound_port = 0,
+            .mutex = .{},
+            .stop_mutex = .{},
             .on_connection_ctx = null,
             .on_connection_fn = null,
             .reaper_thread = null,
@@ -80,13 +85,12 @@ pub const ConnectionManager = struct {
     }
 
     pub fn ref(self: *ConnectionManager) void {
-        _ = self.ref_count.fetchAdd(1, .monotonic);
+        _ = self.ref_count.fetchAdd(1, .acquire);
     }
 
     pub fn deinit(self: *ConnectionManager) void {
-        if (self.ref_count.fetchSub(1, .release) == 1) {
+        if (self.ref_count.fetchSub(1, .acq_rel) == 1) {
             // Ensure we have visibility of all modifications before destruction
-            _ = self.ref_count.load(.acquire);
             const allocator = self.allocator;
             const is_heap = self.heap_allocated;
             self.stop();
@@ -102,7 +106,12 @@ pub const ConnectionManager = struct {
     }
 
     pub fn start(self: *ConnectionManager) !void {
+        self.stop_mutex.lock();
+        defer self.stop_mutex.unlock();
+
+        if (self.stopping) return error.ManagerStopping;
         if (self.reaper_thread != null) return;
+
         self.running.store(true, .release);
         self.reaper_thread = try std.Thread.spawn(.{}, ConnectionManager.runReaper, .{self});
 
@@ -132,13 +141,14 @@ pub const ConnectionManager = struct {
 
         // 2. Try Home directory
         const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
-        if (std.process.getEnvVarOwned(allocator, home_env)) |home| {
+        if (env_mod.getEnv(allocator, home_env)) |home| {
             defer allocator.free(home);
             const dot_nomad = try std.fs.path.join(allocator, &.{ home, ".nomadfs" });
             defer allocator.free(dot_nomad);
 
             // Ensure directory exists
-            std.fs.cwd().makePath(dot_nomad) catch {};
+            const io = std.Io.Threaded.global_single_threaded.io();
+            std.Io.Dir.cwd().createDirPath(io, dot_nomad) catch {};
 
             const key_path = try std.fs.path.join(allocator, &.{ dot_nomad, key_filename });
             defer allocator.free(key_path);
@@ -150,7 +160,7 @@ pub const ConnectionManager = struct {
                 try kp.saveToFile(key_path);
                 return kp;
             }
-        } else |_| {}
+        }
 
         // 3. Fallback: Generate and save in CWD
         const kp = noise.KeyPair.generate();
@@ -159,6 +169,9 @@ pub const ConnectionManager = struct {
     }
 
     pub fn stop(self: *ConnectionManager) void {
+        self.stop_mutex.lock();
+        defer self.stop_mutex.unlock();
+
         self.mutex.lock();
         if (self.stopping) {
             self.mutex.unlock();
@@ -190,12 +203,12 @@ pub const ConnectionManager = struct {
         while (self.connections.items.len > 0) {
             const mc = self.connections.pop().?;
             self.mutex.unlock();
-            
+
             mc.conn.deinit(); // This signals thread to exit
             if (mc.handler_thread) |t| {
                 t.join();
             }
-            
+
             self.mutex.lock();
         }
         self.mutex.unlock();
@@ -217,13 +230,13 @@ pub const ConnectionManager = struct {
             const sleep_interval = 100; // ms
             var total_slept: u64 = 0;
             while (total_slept < self.reap_interval_ms and self.running.load(.acquire)) : (total_slept += sleep_interval) {
-                std.Thread.sleep(sleep_interval * std.time.ns_per_ms);
+                sync.sleep(sleep_interval * std.time.ns_per_ms);
             }
             if (!self.running.load(.acquire)) break;
 
             self.mutex.lock();
             var i: usize = 0;
-            const now = std.time.timestamp();
+            const now = sync.timestamp();
             while (i < self.connections.items.len) {
                 const mc = self.connections.items[i];
                 const is_idle = (now - mc.last_active) > self.idle_timeout;
@@ -276,7 +289,7 @@ pub const ConnectionManager = struct {
         const mc_ptr = try self.connections.addOne(self.allocator);
         mc_ptr.* = .{
             .conn = conn,
-            .last_active = std.time.timestamp(),
+            .last_active = sync.timestamp(),
             .handler_thread = null,
         };
 
@@ -297,10 +310,10 @@ pub const ConnectionManager = struct {
         self.on_connection_fn = Wrapper.wrap;
     }
 
-    pub fn setDiscoveryHandler(self: *ConnectionManager, ctx: anytype, comptime handler: fn (@TypeOf(ctx), id.NodeID, std.net.Address) void) void {
+    pub fn setDiscoveryHandler(self: *ConnectionManager, ctx: anytype, comptime handler: fn (@TypeOf(ctx), id.NodeID, network.Address) void) void {
         const ContextType = @TypeOf(ctx);
         const Wrapper = struct {
-            fn wrap(c: *anyopaque, peer_id: id.NodeID, addr: std.net.Address) void {
+            fn wrap(c: *anyopaque, peer_id: id.NodeID, addr: network.Address) void {
                 const typed_ctx: ContextType = @ptrCast(@alignCast(c));
                 handler(typed_ctx, peer_id, addr);
             }
@@ -309,7 +322,7 @@ pub const ConnectionManager = struct {
         self.on_discovery_fn = Wrapper.wrap;
     }
 
-    fn onMdnsDiscovery(ctx: ?*anyopaque, peer_id: id.NodeID, addr: std.net.Address) void {
+    fn onMdnsDiscovery(ctx: ?*anyopaque, peer_id: id.NodeID, addr: network.Address) void {
         if (ctx) |c| {
             const self: *ConnectionManager = @ptrCast(@alignCast(c));
             if (self.on_discovery_fn) |cb| {
@@ -387,13 +400,13 @@ pub const ConnectionManager = struct {
         }
     }
 
-    pub fn connectToPeerMulti(self: *ConnectionManager, addresses: []const std.net.Address, swarm_key: []const u8, remote_node_id: ?id.NodeID) !network.Connection {
+    pub fn connectToPeerMulti(self: *ConnectionManager, addresses: []const network.Address, swarm_key: []const u8, remote_node_id: ?id.NodeID) !network.Connection {
         // 1. Check existing connections first
         self.mutex.lock();
         for (self.connections.items) |*mc| {
             if (remote_node_id) |target_id| {
                 if (mc.conn.getRemoteNodeID().eql(target_id)) {
-                    mc.last_active = std.time.timestamp();
+                    mc.last_active = sync.timestamp();
                     const c = mc.conn;
                     self.mutex.unlock();
                     return c;
@@ -402,7 +415,7 @@ pub const ConnectionManager = struct {
             // Check if any of the target addresses match existing connection
             for (addresses) |addr| {
                 if (addressesMatch(mc.conn.getPeerAddress(), addr)) {
-                    mc.last_active = std.time.timestamp();
+                    mc.last_active = sync.timestamp();
                     const c = mc.conn;
                     self.mutex.unlock();
                     return c;
@@ -413,15 +426,15 @@ pub const ConnectionManager = struct {
 
         // 2. Try dialing each address (Sorted by Priority)
         // Make a mutable copy to sort
-        const sorted_addrs = try self.allocator.dupe(std.net.Address, addresses);
+        const sorted_addrs = try self.allocator.dupe(network.Address, addresses);
         defer self.allocator.free(sorted_addrs);
 
         const SortCtx = struct {
-            pub fn lessThan(_: @This(), a: std.net.Address, b: std.net.Address) bool {
+            pub fn lessThan(_: @This(), a: network.Address, b: network.Address) bool {
                 return network.addressPriority(a) < network.addressPriority(b);
             }
         };
-        std.mem.sort(std.net.Address, sorted_addrs, SortCtx{}, SortCtx.lessThan);
+        std.mem.sort(network.Address, sorted_addrs, SortCtx{}, SortCtx.lessThan);
 
         for (sorted_addrs) |addr| {
             if (self.connectToPeer(addr, swarm_key, remote_node_id)) |conn| {
@@ -435,13 +448,13 @@ pub const ConnectionManager = struct {
         return error.AllAddressesFailed;
     }
 
-    pub fn connectToPeer(self: *ConnectionManager, address: std.net.Address, swarm_key: []const u8, remote_node_id: ?id.NodeID) !network.Connection {
+    pub fn connectToPeer(self: *ConnectionManager, address: network.Address, swarm_key: []const u8, remote_node_id: ?id.NodeID) !network.Connection {
         self.mutex.lock();
         for (self.connections.items) |*mc| {
             // Check for NodeID match (preferred)
             if (remote_node_id) |target_id| {
                 if (mc.conn.getRemoteNodeID().eql(target_id)) {
-                    mc.last_active = std.time.timestamp();
+                    mc.last_active = sync.timestamp();
                     const c = mc.conn;
                     self.mutex.unlock();
                     return c;
@@ -450,7 +463,7 @@ pub const ConnectionManager = struct {
 
             // Check for Address match (fallback)
             if (addressesMatch(mc.conn.getPeerAddress(), address)) {
-                mc.last_active = std.time.timestamp();
+                mc.last_active = sync.timestamp();
                 const c = mc.conn;
                 self.mutex.unlock();
                 return c;
@@ -471,15 +484,6 @@ pub const ConnectionManager = struct {
     }
 };
 
-fn addressesMatch(a: std.net.Address, b: std.net.Address) bool {
-    if (a.any.family != b.any.family) return false;
-    switch (a.any.family) {
-        std.posix.AF.INET => {
-            return a.in.sa.port == b.in.sa.port and a.in.sa.addr == b.in.sa.addr;
-        },
-        std.posix.AF.INET6 => {
-            return a.in6.sa.port == b.in6.sa.port and std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr);
-        },
-        else => return false,
-    }
+fn addressesMatch(a: network.Address, b: network.Address) bool {
+    return a.eql(b);
 }

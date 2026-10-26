@@ -1,9 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const env_mod = @import("env.zig");
 
 pub const ConfigError = error{
     InvalidSwarmKey,
     ConfigNotFound,
+    MissingRequiredField,
 };
 
 /// Validate and decode swarm key from configuration.
@@ -58,14 +60,10 @@ pub const Config = struct {
     };
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
-        std.debug.assert(self.node.nickname.len > 0);
-        std.debug.assert(self.node.swarm_key.len == 32);
-        std.debug.assert(self.storage.storage_path.len > 0);
-
-        allocator.free(self.node.nickname);
-        allocator.free(self.node.swarm_key);
+        if (self.node.nickname.len > 0) allocator.free(self.node.nickname);
+        if (self.node.swarm_key.len > 0) allocator.free(self.node.swarm_key);
         if (self.node.key_path) |p| allocator.free(p);
-        allocator.free(self.storage.storage_path);
+        if (self.storage.storage_path.len > 0) allocator.free(self.storage.storage_path);
         for (self.network.bootstrap_peers) |peer| {
             allocator.free(peer);
         }
@@ -85,21 +83,20 @@ pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
 
     if (std.mem.startsWith(u8, path, "~")) {
         const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
-        if (std.process.getEnvVarOwned(allocator, home_env)) |home| {
+        if (env_mod.getEnv(allocator, home_env)) |home| {
             defer allocator.free(home);
             owned_path = try std.fs.path.join(allocator, &.{ home, path[1..] });
             expanded_path = owned_path.?;
-        } else |_| {}
+        }
     }
 
-    const file = if (std.fs.path.isAbsolute(expanded_path))
-        try std.fs.openFileAbsolute(expanded_path, .{})
-    else
-        try std.fs.cwd().openFile(expanded_path, .{});
-    defer file.close();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try std.Io.Dir.cwd().openFile(io, expanded_path, .{});
+    defer file.close(io);
 
-    var file_buffer: [4096]u8 = undefined;
-    var in_stream = file.reader(&file_buffer);
+    var file_buffer: [16384]u8 = undefined;
+    const n = try file.readPositionalAll(io, &file_buffer, 0);
+    const content = file_buffer[0..n];
 
     var config = Config{
         .node = .{ .nickname = "", .swarm_key = "", .key_path = null },
@@ -107,13 +104,14 @@ pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
         .network = .{ .port = 9000, .bootstrap_peers = undefined, .transport = .tcp },
     };
 
-    var bootstrap_list = std.ArrayList([]const u8){};
+    var bootstrap_list: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
         for (bootstrap_list.items) |item| allocator.free(item);
         bootstrap_list.deinit(allocator);
     }
 
-    while (try in_stream.interface.takeDelimiter('\n')) |line| {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
 
@@ -169,10 +167,10 @@ pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
 
     config.network.bootstrap_peers = try bootstrap_list.toOwnedSlice(allocator);
 
-    std.debug.assert(config.node.nickname.len > 0);
-    std.debug.assert(config.node.swarm_key.len == 32);
-    std.debug.assert(config.storage.storage_path.len > 0);
-    std.debug.assert(config.network.port > 0);
+    if (config.node.nickname.len == 0) return error.MissingRequiredField;
+    if (config.node.swarm_key.len != 32) return error.MissingRequiredField;
+    if (config.storage.storage_path.len == 0) return error.MissingRequiredField;
+    if (config.network.port == 0) return error.MissingRequiredField;
 
     return config;
 }
@@ -185,14 +183,14 @@ pub fn findAndParseConfig(allocator: std.mem.Allocator) !Config {
 
     // 2. Home directory: ~/.nomadfs/nomadfs.conf
     const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
-    if (std.process.getEnvVarOwned(allocator, home_env)) |home| {
+    if (env_mod.getEnv(allocator, home_env)) |home| {
         defer allocator.free(home);
         const path = try std.fs.path.join(allocator, &.{ home, ".nomadfs", "nomadfs.conf" });
         defer allocator.free(path);
         if (parseConfig(allocator, path)) |cfg| {
             return cfg;
         } else |_| {}
-    } else |_| {}
+    }
 
     // 3. System-wide standard: /etc/nomadfs/nomadfs.conf
     if (parseConfig(allocator, "/etc/nomadfs/nomadfs.conf")) |cfg| {
@@ -200,11 +198,9 @@ pub fn findAndParseConfig(allocator: std.mem.Allocator) !Config {
     } else |_| {}
 
     // 4. System-wide: /usr/share/nomadfs/nomadfs.conf
-    // On Windows, this path might not make sense, but we keep it for Linux/macOS as requested.
     if (parseConfig(allocator, "/usr/share/nomadfs/nomadfs.conf")) |cfg| {
         return cfg;
     } else |err| {
-        // If all fail, return the last error (likely FileNotFoundError)
         return err;
     }
 }
