@@ -262,7 +262,7 @@ fn pairedStore(
     const io = std.Io.Threaded.global_single_threaded.io();
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    var store = try nomadfs.device.trust.Store.load(allocator, path);
+    var store = try nomadfs.device.trust.Store.load(allocator, path, null);
     errdefer store.deinit();
 
     const ticket = try nomadfs.device.pairing.Ticket.init(

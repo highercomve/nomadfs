@@ -9,6 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const pairing = @import("pairing.zig");
 const identity_mod = @import("identity.zig");
+const sync = @import("../sync.zig");
 const NodeID = @import("../net/id.zig").NodeID;
 
 pub const magic = "NMDFSTR1";
@@ -28,6 +29,8 @@ pub const Error = error{
     TrustStoreFull,
     InvalidDeviceQuery,
     AmbiguousDeviceQuery,
+    UnsignedTrustStore,
+    BadStoreSignature,
 };
 
 /// Sentinel written when an entry has no recorded transport key (files saved
@@ -103,6 +106,28 @@ pub fn applyRevocation(
     return store.revokeDevice(device_id, signer_id, now);
 }
 
+/// Format marker of the trailing integrity line.
+const signature_marker = "\nSIG ";
+const signature_len = 64;
+
+/// Verifies that `content` ends with a valid `SIG` line covering everything
+/// above it, produced by the device owning `signing_seed`, and returns the
+/// body to parse. Store files are local configuration, so the same device
+/// that runs the node must be able to prove it wrote the file.
+fn stripSignature(content: []const u8, signing_seed: [identity_mod.seed_len]u8) ![]const u8 {
+    if (content.len == 0 or content[content.len - 1] != '\n') return Error.CorruptTrustStore;
+    const pos = std.mem.lastIndexOf(u8, content, signature_marker) orelse return Error.UnsignedTrustStore;
+
+    const body = content[0 .. pos + 1];
+    const sig_text = content[pos + signature_marker.len .. content.len - 1];
+    var signature: [signature_len]u8 = undefined;
+    _ = std.fmt.hexToBytes(&signature, sig_text) catch return Error.CorruptTrustStore;
+
+    const identity = identity_mod.Identity.fromSeed(signing_seed) catch return Error.CorruptTrustStore;
+    identity_mod.Identity.verify(identity.publicKey(), body, signature) catch return Error.BadStoreSignature;
+    return body;
+}
+
 /// Records that a device was ordered removed by a trusted signer. Kept so
 /// the removal can be propagated again to peers that were not connected
 /// when it happened; re-pairing clears it.
@@ -117,15 +142,24 @@ pub const Store = struct {
     path: []u8,
     entries: std.ArrayList(Entry),
     revocations: std.ArrayList(Revocation),
+    /// Guards in-process readers against list mutation from revocation
+    /// handlers; the CLI always runs as its own process.
+    mutex: sync.Mutex = .{},
+    /// Serializes save() so concurrent acceptances cannot interleave temp
+    /// file writes at the same path.
+    save_mutex: sync.Mutex = .{},
+    /// When set, saves append a `SIG <hex>` line and loads demand it.
+    signing_seed: ?[identity_mod.seed_len]u8 = null,
 
     /// Loads the store at `path`. A missing file is an empty store; a file
     /// that exists but does not parse is an error, never silently discarded.
-    pub fn load(allocator: std.mem.Allocator, path: []const u8) !Store {
+    pub fn load(allocator: std.mem.Allocator, path: []const u8, signing_seed: ?[identity_mod.seed_len]u8) !Store {
         var store: Store = .{
             .allocator = allocator,
             .path = try allocator.dupe(u8, path),
             .entries = .empty,
             .revocations = .empty,
+            .signing_seed = signing_seed,
         };
         errdefer store.deinit();
 
@@ -142,7 +176,11 @@ pub const Store = struct {
         defer allocator.free(content);
         if (try file.readPositionalAll(io, content, 0) != size) return Error.CorruptTrustStore;
 
-        try store.parse(content);
+        const body = if (signing_seed) |seed|
+            try stripSignature(content, seed)
+        else
+            content;
+        try store.parse(body);
         return store;
     }
 
@@ -168,15 +206,20 @@ pub const Store = struct {
         return null;
     }
 
-    /// Read-only lookup for verification paths that must not mutate.
-    pub fn lookup(self: *const Store, device_id: NodeID) ?*const Entry {
-        for (self.entries.items) |*entry| {
+    /// Read-only lookup for verification paths that must not mutate. Copies
+    /// the entry out, so the pointer into the store's array stays internal.
+    pub fn lookup(self: *Store, device_id: NodeID) ?Entry {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.entries.items) |entry| {
             if (entry.device_id.eql(device_id)) return entry;
         }
         return null;
     }
 
-    pub fn isTrusted(self: *const Store, device_id: NodeID) bool {
+    pub fn isTrusted(self: *Store, device_id: NodeID) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.entries.items) |entry| {
             if (entry.device_id.eql(device_id)) return true;
         }
@@ -232,15 +275,29 @@ pub const Store = struct {
         return false;
     }
 
-    pub fn isRevoked(self: *const Store, device_id: NodeID) bool {
+    pub fn isRevoked(self: *Store, device_id: NodeID) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         for (self.revocations.items) |r| {
             if (r.device_id.eql(device_id)) return true;
         }
         return false;
     }
 
-    pub fn revocationsSlice(self: *const Store) []const Revocation {
+    pub fn revocationsSlice(self: *Store) []const Revocation {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.revocations.items;
+    }
+
+    /// Copy for out-of-lock use, e.g. pushing tombstones over the network.
+    pub fn copyRevocationIds(self: *Store, allocator: std.mem.Allocator) ![]NodeID {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const ids = try allocator.alloc(NodeID, self.revocations.items.len);
+        for (self.revocations.items, 0..) |r, i| ids[i] = r.device_id;
+        return ids;
     }
 
     /// Removes a device and records who ordered the removal. Recorded even
@@ -248,6 +305,12 @@ pub const Store = struct {
     /// content not paired here yet, and the tombstone travels onward.
     /// `signer_id` must not equal `device_id`.
     pub fn revokeDevice(self: *Store, device_id: NodeID, signer_id: NodeID, at: u64) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.revokeDeviceLocked(device_id, signer_id, at);
+    }
+
+    fn revokeDeviceLocked(self: *Store, device_id: NodeID, signer_id: NodeID, at: u64) !bool {
         if (signer_id.eql(device_id)) return Error.InvalidDeviceQuery;
 
         const removed = self.revoke(device_id);
@@ -269,6 +332,9 @@ pub const Store = struct {
     /// Re-pairing is an explicit human decision on a fresh ticket, so it
     /// overrides a propagated revocation instead of being blocked by one.
     fn clearRevocation(self: *Store, device_id: NodeID) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         for (self.revocations.items, 0..) |r, index| {
             if (!r.device_id.eql(device_id)) continue;
             _ = self.revocations.orderedRemove(index);
@@ -303,6 +369,8 @@ pub const Store = struct {
     /// Writes the store atomically: temp file in the same directory, then a
     /// rename. The original file stays intact if anything fails.
     pub fn save(self: *Store) !void {
+        self.save_mutex.lock();
+        defer self.save_mutex.unlock();
         const io = std.Io.Threaded.global_single_threaded.io();
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.path});
         defer self.allocator.free(tmp_path);
@@ -315,6 +383,14 @@ pub const Store = struct {
         }
         for (self.revocations.items) |r| {
             try writeRevocation(&out.writer, r);
+        }
+
+        if (self.signing_seed) |seed| {
+            const identity = try identity_mod.Identity.fromSeed(seed);
+            const signature = try identity.sign(out.written());
+            var sig_hex: [2 * signature_len]u8 = undefined;
+            _ = std.fmt.bufPrint(&sig_hex, "{s}", .{std.fmt.bytesToHex(signature, .lower)}) catch unreachable;
+            try out.writer.print("SIG {s}\n", .{sig_hex});
         }
 
         {
@@ -470,7 +546,7 @@ fn testTicket(seed_byte: u8, nickname: []const u8) !pairing.Ticket {
 test "trust: missing file loads as an empty store" {
     const path = "test_trust_missing.store";
     cleanup(path);
-    var store = try Store.load(testing.allocator, path);
+    var store = try Store.load(testing.allocator, path, null);
     defer store.deinit();
 
     try testing.expectEqual(@as(usize, 0), store.count());
@@ -481,7 +557,7 @@ test "trust: pairing a ticket records and updates one entry" {
     cleanup(path);
     defer cleanup(path);
 
-    var store = try Store.load(testing.allocator, path);
+    var store = try Store.load(testing.allocator, path, null);
     defer store.deinit();
 
     const ticket = try testTicket(0x21, "phone");
@@ -506,7 +582,7 @@ test "trust: revoke removes only the requested device" {
     cleanup(path);
     defer cleanup(path);
 
-    var store = try Store.load(testing.allocator, path);
+    var store = try Store.load(testing.allocator, path, null);
     defer store.deinit();
 
     const first = try testTicket(0x31, "laptop");
@@ -526,7 +602,7 @@ test "trust: resolve accepts ids, fingerprints and pasted decoration" {
     cleanup(path);
     defer cleanup(path);
 
-    var store = try Store.load(testing.allocator, path);
+    var store = try Store.load(testing.allocator, path, null);
     defer store.deinit();
 
     const laptop = try testTicket(0x51, "laptop");
@@ -558,14 +634,14 @@ test "trust: save and load round-trip with private permissions" {
     const alpha_ticket = try testTicket(0x41, "alpha");
     const beta_ticket = try testTicket(0x42, "beta");
     {
-        var store = try Store.load(testing.allocator, path);
+        var store = try Store.load(testing.allocator, path, null);
         defer store.deinit();
         _ = try store.trustTicket(alpha_ticket, 1000);
         _ = try store.trustTicket(beta_ticket, 2000);
         try store.save();
     }
 
-    var store = try Store.load(testing.allocator, path);
+    var store = try Store.load(testing.allocator, path, null);
     defer store.deinit();
     try testing.expectEqual(@as(usize, 2), store.count());
 
@@ -585,7 +661,7 @@ test "trust: save and load round-trip with private permissions" {
     // Saving again replaces the file without stale entries.
     _ = store.revoke(alpha.device_id);
     try store.save();
-    var reloaded = try Store.load(testing.allocator, path);
+    var reloaded = try Store.load(testing.allocator, path, null);
     defer reloaded.deinit();
     try testing.expectEqual(@as(usize, 1), reloaded.count());
 }
@@ -595,7 +671,7 @@ test "trust: a re-pairing rotates the pinned transport key" {
     cleanup(path);
     defer cleanup(path);
 
-    var store = try Store.load(testing.allocator, path);
+    var store = try Store.load(testing.allocator, path, null);
     defer store.deinit();
 
     // The ticket's transport key is whatever node.key was at pairing time.
@@ -650,7 +726,7 @@ test "trust: entries without a transport key stay unpinned" {
         try file.writePositionalAll(io, content, 0);
     }
 
-    var store = try Store.load(testing.allocator, path);
+    var store = try Store.load(testing.allocator, path, null);
     defer store.deinit();
 
     try testing.expectEqual(@as(usize, 1), store.count());
@@ -682,7 +758,7 @@ test "trust: corrupt files are rejected rather than discarded" {
             defer file.close(io);
             try file.writePositionalAll(io, content, 0);
         }
-        try testing.expectError(Error.CorruptTrustStore, Store.load(testing.allocator, path));
+        try testing.expectError(Error.CorruptTrustStore, Store.load(testing.allocator, path, null));
     }
 }
 
@@ -691,7 +767,7 @@ test "trust: capacity is bounded" {
     cleanup(path);
     defer cleanup(path);
 
-    var store = try Store.load(testing.allocator, path);
+    var store = try Store.load(testing.allocator, path, null);
     defer store.deinit();
 
     for (0..max_entries) |i| {
@@ -713,7 +789,7 @@ test "trust: revocation tombstones persist and are overridden by re-pairing" {
     const operator = try testTicket(0x71, "admin");
     const phone = try testTicket(0x72, "phone");
     {
-        var store = try Store.load(testing.allocator, path);
+        var store = try Store.load(testing.allocator, path, null);
         defer store.deinit();
 
         _ = try store.trustTicket(operator, 1);
@@ -731,7 +807,7 @@ test "trust: revocation tombstones persist and are overridden by re-pairing" {
         try store.save();
     }
 
-    var reloaded = try Store.load(testing.allocator, path);
+    var reloaded = try Store.load(testing.allocator, path, null);
     defer reloaded.deinit();
     try testing.expect(reloaded.isRevoked(phone.deviceId()));
     try testing.expectEqual(@as(usize, 1), reloaded.revocationsSlice().len);
@@ -747,7 +823,7 @@ test "trust: applied revocations verify the signer and its trust" {
     cleanup(path);
     defer cleanup(path);
 
-    var store = try Store.load(testing.allocator, path);
+    var store = try Store.load(testing.allocator, path, null);
     defer store.deinit();
 
     const admin = try identity_mod.Identity.fromSeed([_]u8{0x73} ** identity_mod.seed_len);
@@ -784,4 +860,84 @@ test "trust: applied revocations verify the signer and its trust" {
     const self_signature = try phone_identity.sign(&self_message);
     try testing.expectError(Error.InvalidDeviceQuery, applyRevocation(&store, phone_ticket.deviceId(), phone_identity.publicKey(), self_signature, 44));
     try testing.expect(store.isTrusted(phone_ticket.deviceId()));
+}
+
+test "trust: a signed store rejects unauthorized edits" {
+    const path = "test_trust_signed.store";
+    cleanup(path);
+    defer cleanup(path);
+
+    const seed = [_]u8{0x91} ** identity_mod.seed_len;
+    {
+        var store = try Store.load(testing.allocator, path, seed);
+        defer store.deinit();
+        _ = try store.trustTicket(try testTicket(0x92, "alpha"), 1);
+        try store.save();
+
+        // Round-trip keeps working; the signature is verified on load.
+        var verify = try Store.load(testing.allocator, path, seed);
+        defer verify.deinit();
+        try testing.expect(verify.isTrusted((try testTicket(0x92, "alpha")).deviceId()));
+    }
+
+    // A hand edit to one byte of the body makes the load fail outright.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const size = blk: {
+        var f = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer f.close(io);
+        break :blk (try f.stat(io)).size;
+    };
+    const content = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(content);
+    {
+        var f = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer f.close(io);
+        _ = try f.readPositionalAll(io, content, 0);
+    }
+    // Labels are base64-encoded on disk; flip a byte inside the encoding.
+    const label_pos = std.mem.indexOf(u8, content, "YWxwaGE").?;
+    content[label_pos + 3] ^= 0x01;
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer f.close(io);
+        try f.writePositionalAll(io, content, 0);
+    }
+
+    try testing.expectError(Error.BadStoreSignature, Store.load(testing.allocator, path, seed));
+
+    // Removing the signature line fundamentally is not a workaround either:
+    // a signed-load config refuses an unsigned file.
+    const body_end = std.mem.lastIndexOf(u8, content, "\nSIG ").?;
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer f.close(io);
+        try f.writePositionalAll(io, content[0 .. body_end + 1], 0);
+    }
+    try testing.expectError(Error.UnsignedTrustStore, Store.load(testing.allocator, path, seed));
+}
+
+test "trust: unsigned stores stay usable without a signing seed" {
+    const path = "test_trust_unsigned.store";
+    cleanup(path);
+    defer cleanup(path);
+
+    {
+        var store = try Store.load(testing.allocator, path, null);
+        defer store.deinit();
+        _ = try store.trustTicket(try testTicket(0x93, "alpha"), 1);
+        try store.save(); // no signing seed, so no SIG line is written
+    }
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const size = (try file.stat(io)).size;
+    const content = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(content);
+    _ = try file.readPositionalAll(io, content, 0);
+    try testing.expect(std.mem.lastIndexOf(u8, content, "\nSIG ") == null);
+
+    var verify = try Store.load(testing.allocator, path, null);
+    defer verify.deinit();
+    try testing.expectEqual(@as(usize, 1), verify.count());
 }

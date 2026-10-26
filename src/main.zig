@@ -197,7 +197,8 @@ fn trustCommand(allocator: std.mem.Allocator, config: config_mod.Config, uri: []
     var paths = try DevicePaths.resolve(allocator, config.node.key_path);
     defer paths.deinit(allocator);
 
-    var store = try TrustStore.load(allocator, paths.trust);
+    const identity = try Identity.loadOrCreate(paths.identity);
+    var store = try TrustStore.load(allocator, paths.trust, identity.seed());
     defer store.deinit();
 
     const now = nowSeconds();
@@ -223,7 +224,8 @@ fn devicesCommand(allocator: std.mem.Allocator, config: config_mod.Config) !void
     var paths = try DevicePaths.resolve(allocator, config.node.key_path);
     defer paths.deinit(allocator);
 
-    var store = try TrustStore.load(allocator, paths.trust);
+    const identity = try Identity.loadOrCreate(paths.identity);
+    var store = try TrustStore.load(allocator, paths.trust, identity.seed());
     defer store.deinit();
 
     const entries = store.list();
@@ -254,7 +256,7 @@ fn revokeCommand(allocator: std.mem.Allocator, config: config_mod.Config, query:
     // wire.
     const identity = try Identity.loadOrCreate(paths.identity);
 
-    var store = try TrustStore.load(allocator, paths.trust);
+    var store = try TrustStore.load(allocator, paths.trust, identity.seed());
     defer store.deinit();
 
     const device_id = store.resolve(query) catch |err| switch (err) {

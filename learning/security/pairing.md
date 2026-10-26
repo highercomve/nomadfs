@@ -115,7 +115,12 @@ Trusted devices in /home/me/.nomadfs/trust.store:
 
 ## 5. Trust Store
 
-`trust.store` is a versioned text file:
+`trust.store` is a versioned text file signed by the owning device's Ed25519
+identity. The final line is `SIG <hex>` over everything above it; a store
+loaded with the device seed refuses files the device did not write
+(`error.BadStoreSignature`) and refuses unsigned files outright
+(`error.UnsignedTrustStore`, so stripping the signature cannot smuggle in
+edits). CLI invocations and running nodes sign with the same `device.key`.
 
 ```
 NMDFSTR1
@@ -135,8 +140,10 @@ NMDFSTR1
   `error.TrustStoreFull` rather than growing without limit.
 - **Atomic**: the store is written to `<path>.tmp` with mode `0600` and then
   renamed over the original. A failed write leaves the old file intact.
-- **Strict**: a missing file is an empty store; an unparsable file is an error.
-  Silently discarding trust decisions is worse than refusing to start.
+- **Strict**: a missing file is an empty store; an unparsable, unsigned or
+  wrongly signed file is an error. Silently discarding trust decisions is
+  worse than refusing to start. (Files written before signatures existed
+  must be re-created once.)
 
 ## 6. Handshake Binding
 
@@ -255,11 +262,10 @@ anti-entropy sweep for revocations is future work.
 | Replay of an old ticket | 24-hour expiry, plus handshake identity check | Revocation propagation is opportunistic; offline peers learn tombstones on the next dial |
 | Stolen ticket | Bearer until expiry | Fingerprint check is manual |
 | Rotated or stolen `node.key` | Trust store pins the ticket's X25519 key and the handshake re-checks it | Re-pairing required after a rotation |
-| Malicious trust file edit | ID/public-key cross-check, `0600` | No signature over the store itself |
+| Malicious trust file edit | Whole-file Ed25519 signature from the owning device; `0600`; ID/public-key cross-check | - |
 
-Next slices: sign the trust store so a local edit cannot add an entry
-silently, and add a periodic sweep so propagation no longer relies on one
-side dialing the other first.
+Next slice: a periodic sweep so revocation propagation no longer relies on
+one side dialing the other first.
 
 ## 9. Source Map
 

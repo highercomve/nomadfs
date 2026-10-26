@@ -90,7 +90,7 @@ pub const Node = struct {
         // Node value is copied out of init().
         const trust_store = try allocator.create(device.trust.Store);
         errdefer allocator.destroy(trust_store);
-        trust_store.* = try device.trust.Store.load(allocator, device_paths.trust);
+        trust_store.* = try device.trust.Store.load(allocator, device_paths.trust, device_identity.seed());
         errdefer trust_store.deinit();
 
         // Revocations are signed with the device identity and recorded in

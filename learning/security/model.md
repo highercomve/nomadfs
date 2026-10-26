@@ -39,8 +39,6 @@ The security of the entire network relies on the **Swarm Key**. This is a 32-byt
 - **Revocation Propagation**: Signed revocations already spread with the
   `REVOKE` RPC; a periodic anti-entropy sweep and receiver-side thresholds
   ("K trusted peers must agree") are still missing.
-- **Signed Trust Store**: Entries are cross-checked but the file itself is not
-  signed, so a local edit can still add a device.
 - **Capability-Based Access Control**: Granular read/write permissions.
 - **Connection Rate Limiting**: Defense against DoS.
 - **Peer Reputation System**: Mitigation for Sybil/Eclipse attacks.

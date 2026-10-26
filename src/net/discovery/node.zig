@@ -908,6 +908,11 @@ pub const Node = struct {
         var honored = false;
         if (self.trust_store) |trust| {
             honored = device_trust.applyRevocation(trust, device_id, signer_key, signature, @intCast(sync.timestamp())) catch false;
+            // Accepted tombstones must survive a restart, or every re-dial
+            // replays the whole revocation.
+            if (honored) trust.save() catch |err| {
+                std.debug.print("Failed to persist accepted revocation: {any}\n", .{err});
+            };
         }
         const response = rpc.Message{
             .sender_id = self.manager.node_id,

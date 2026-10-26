@@ -159,7 +159,7 @@ test "device auth: trust policy rejects unknown devices" {
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    var store = try trust_mod.Store.load(testing.allocator, path);
+    var store = try trust_mod.Store.load(testing.allocator, path, null);
     defer store.deinit();
 
     const known = try identityWith(0x67);

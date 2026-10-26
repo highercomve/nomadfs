@@ -28,7 +28,7 @@ test "cluster: revocations require a verified signature from a trusted device" {
     std.Io.Dir.cwd().deleteFile(io, store_path) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, store_path) catch {};
 
-    var receiver_store = try TrustStore.load(allocator, store_path);
+    var receiver_store = try TrustStore.load(allocator, store_path, null);
     defer receiver_store.deinit();
     _ = try receiver_store.trustTicket(try ticketFor(admin, "admin"), 1);
     _ = try receiver_store.trustTicket(try ticketFor(phone, "phone"), 2);
