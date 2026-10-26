@@ -5,3 +5,6 @@ build
 0.15.2
 .config
 .serena
+src/mobile/.build/
+src/mobile/android/obj/
+src/mobile/android/libs/
