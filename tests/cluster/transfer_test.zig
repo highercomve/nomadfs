@@ -332,3 +332,96 @@ test "cluster: replicated blocks are verified against their CID" {
     try std.testing.expect(try dht1.putBlock(conn, cid, data));
     try std.testing.expect(engine.has(&cid));
 }
+
+test "cluster: get retrieves from a replica without holder records" {
+    std.debug.print("\n=== Running Test: cluster: get from closest replica ===\n", .{});
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const walk = nomadfs.storage.dag.walk;
+
+    const dirs = [_][]const u8{
+        "test_replica_read_store_1",
+        "test_replica_read_store_2",
+        "test_replica_read_store_3",
+    };
+    for (dirs) |d| std.Io.Dir.cwd().deleteTree(io, d) catch {};
+    defer for (dirs) |d| std.Io.Dir.cwd().deleteTree(io, d) catch {};
+    var engines: [3]StorageEngine = undefined;
+    for (&engines, dirs) |*e, d| e.* = try StorageEngine.init(allocator, d);
+    defer for (&engines) |*e| e.deinit();
+    // engines[0] = putter, [1] and [2] = replication targets, engine 4 = reader.
+
+    const reader_dir = "test_replica_read_store_4";
+    std.Io.Dir.cwd().deleteTree(io, reader_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, reader_dir) catch {};
+    var engine4 = try StorageEngine.init(allocator, reader_dir);
+    defer engine4.deinit();
+
+    var peers: [4]TestPeer = undefined;
+    for (&peers, 0..) |*p, i| p.* = try TestPeer.init(allocator, @intCast(13116 + i));
+    defer for (&peers) |*p| p.deinit();
+
+    var dhts: [4]DhtNode = undefined;
+    for (&dhts, &peers, 0..) |*d, *p, i| {
+        d.* = DhtNode.init(allocator, p.manager, p.config.node.swarm_key);
+        // Nodes 1 and 2 hold replicated blocks and must be able to serve them.
+        if (i == 1 or i == 2) d.block_store = &engines[i];
+        p.manager.setConnectionHandler(d, DhtNode.serve);
+    }
+    defer for (&dhts) |*d| d.deinit();
+    defer for (&peers) |*p| p.stop();
+
+    for (&peers) |*p| try p.start();
+    nomadfs.sync.sleep(100 * std.time.ns_per_ms);
+
+    // The putter meets its two replication targets before the put.
+    for ([_]usize{ 1, 2 }) |i| {
+        const conn = try peers[0].manager.connectToPeer(peers[i].listen_addr, peers[0].config.node.swarm_key, peers[i].manager.node_id);
+        defer conn.deinit();
+        try dhts[0].ping(conn);
+    }
+    nomadfs.sync.sleep(200 * std.time.ns_per_ms);
+
+    // W = 0 publishes no holder records; replication=2 pushes the DAG to
+    // the two targets instead.
+    const bm0 = try BlockManager.init(allocator, .{
+        .network = peers[0].manager,
+        .dht = &dhts[0],
+        .storage = &engines[0],
+        .quorum = .{ .W = 0 },
+        .replication = 2,
+    });
+    defer bm0.deinit();
+
+    const data_len = 3500 * 1024;
+    const data = try allocator.alloc(u8, data_len);
+    defer allocator.free(data);
+    var prng = std.Random.DefaultPrng.init(0x22334455);
+    prng.random().bytes(data);
+    var reader = SliceReader{ .buffer = data };
+    const root = try bm0.put(&reader);
+    defer allocator.free(root);
+
+    // The fourth node joined later: no holder record reaches it. Its only
+    // sources are plain DHT peers.
+    {
+        const conn = try peers[3].manager.connectToPeer(peers[1].listen_addr, peers[3].config.node.swarm_key, peers[1].manager.node_id);
+        defer conn.deinit();
+        try dhts[3].ping(conn);
+    }
+    nomadfs.sync.sleep(200 * std.time.ns_per_ms);
+
+    const bm3 = try BlockManager.init(allocator, .{
+        .network = peers[3].manager,
+        .dht = &dhts[3],
+        .storage = &engine4,
+    });
+    defer bm3.deinit();
+
+    var out = ListWriter{ .allocator = allocator };
+    defer out.list.deinit(allocator);
+    const size = try bm3.get(root, &out, .{});
+    try std.testing.expectEqual(@as(u64, data_len), size);
+    try std.testing.expectEqualSlices(u8, data, out.list.items);
+    try std.testing.expect(try walk.isComplete(allocator, &engine4, root));
+}

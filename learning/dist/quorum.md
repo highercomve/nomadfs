@@ -46,8 +46,12 @@ The write path pushes what it can without blocking availability:
     closest to the CID through the `PUT_BLOCK` RPC and counts how many peers
     took every block. Targets are the Kademlia closest set, the concrete
     form of the ring's preference list in practice.
-*   Background repair (the `R` queries of a read plus `RepairManager.sync`)
-    copies whatever a node is still missing after a re-pair.
+*   Reads try holder records first. When a record is missing (W=0 puts and
+    puts older than the record TTL produce nothing) or every named holder
+    fails, `fetch` falls back to the peers closest to the CID, where
+    `PUT_BLOCK` replicas live, before giving up.
+*   Background repair (`RepairManager.sync`) copies whatever a node is still
+    missing once it has found a source.
 
 Crash-consistency rule: a put is only "accepted" locally ($W=1$); pushing
 replicas improves durability but can never veto the write.

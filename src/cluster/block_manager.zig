@@ -13,8 +13,10 @@ const walk = storage.dag.walk;
 /// the root CID and, when `replication > 0`, pushes the whole DAG to that
 /// many peers closest to the CID (PUT_BLOCK, content-verified by the
 /// receiver). Reads: `get` collects holder records, finds their addresses
-/// through the DHT and copies the missing blocks from the first one that can
-/// serve them. Records expire after providers.default_ttl_s; call `announce`
+/// through the DHT and copies the missing blocks from the first one that
+/// can serve them; when no record exists or every holder fails, it falls
+/// back to the peers closest to the CID, where PUT_BLOCK replicas live.
+/// Records expire after providers.default_ttl_s; call `announce`
 /// periodically to keep them.
 pub const BlockManager = struct {
     allocator: std.mem.Allocator,
@@ -140,26 +142,56 @@ pub const BlockManager = struct {
         return walk.readFile(self.allocator, store, root, writer, options);
     }
 
-    /// Copies every block of `root` that is missing locally from the first
-    /// provider able to serve them. Unreachable or incomplete providers are
-    /// skipped; the last failure is returned if none succeeds.
+    /// Copies every block of `root` that is missing locally, from the first
+    /// source able to serve them. Sources are tried in order: nodes named by
+    /// holder records, then the peers the DHT holds closest to the CID, whose
+    /// replicated copies survive records that expired or were never
+    /// published. Unreachable or incomplete sources are skipped; the last
+    /// failure is returned if none succeeds.
     pub fn fetch(self: *BlockManager, root: []const u8) !void {
         const key = NodeID{ .bytes = try walk.cidFromSlice(root) };
 
+        var tried: std.ArrayList(NodeID) = .empty;
+        defer tried.deinit(self.allocator);
+        var last_err: anyerror = error.NoProvider;
+
         const providers = try self.dht_node.findProviders(key);
         defer self.allocator.free(providers);
-        if (providers.len == 0) return error.NoProvider;
-
-        var last_err: anyerror = error.NoProvider;
         for (providers) |provider| {
-            self.fetchFrom(provider, root) catch |err| {
-                std.debug.print("BlockManager: provider {x} failed: {any}\n", .{ provider.bytes[0..4], err });
-                last_err = err;
-                continue;
-            };
-            return;
+            try tried.append(self.allocator, provider);
+            if (self.syncFrom(provider, root, &last_err)) return;
+        }
+
+        // Holder records are only published by puts that write with W >= 1
+        // and expire with the record TTL. Replication also leaves plain DHT
+        // peers behind; either way the replica answers GET_BLOCK for its
+        // blocks without any record.
+        const closest = try self.dht_node.closestFor(key);
+        defer self.allocator.free(closest);
+        for (closest) |peer| {
+            if (alreadyTried(&tried, peer.id)) continue;
+            try tried.append(self.allocator, peer.id);
+            if (self.syncFrom(peer.id, root, &last_err)) return;
         }
         return last_err;
+    }
+
+    /// One retrieval attempt. Returns true when the peer served the whole
+    /// DAG; otherwise records the failure for fetch().
+    fn syncFrom(self: *BlockManager, source: NodeID, root: []const u8, last_err: *anyerror) bool {
+        self.fetchFrom(source, root) catch |err| {
+            std.debug.print("BlockManager: source {x} failed: {any}\n", .{ source.bytes[0..4], err });
+            last_err.* = err;
+            return false;
+        };
+        return true;
+    }
+
+    fn alreadyTried(list: *const std.ArrayList(NodeID), id: NodeID) bool {
+        for (list.items) |candidate| {
+            if (candidate.eql(id)) return true;
+        }
+        return false;
     }
 
     fn fetchFrom(self: *BlockManager, provider: NodeID, root: []const u8) !void {
