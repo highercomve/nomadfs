@@ -93,6 +93,11 @@ pub const Node = struct {
         trust_store.* = try device.trust.Store.load(allocator, device_paths.trust);
         errdefer trust_store.deinit();
 
+        // Revocations are signed with the device identity and recorded in
+        // the same trust store the handshake policy reads.
+        discovery_node.trust_store = trust_store;
+        discovery_node.device_identity = device_identity;
+
         connection_manager.setDeviceAuthenticator(.{
             .identity = device_identity,
             .trust = trust_store,

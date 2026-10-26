@@ -7,6 +7,8 @@ const network = @import("../transport/mod.zig");
 const lookup_mod = @import("lookup.zig");
 const StorageEngine = @import("../../storage/engine.zig").StorageEngine;
 const providers_mod = @import("providers.zig");
+const device_trust = @import("../../device/trust.zig");
+const identity_mod = @import("../../device/identity.zig");
 
 /// Bounds on values peers can STORE here. Without them any peer could fill
 /// our memory with arbitrary values.
@@ -32,6 +34,11 @@ pub const Node = struct {
     rpc_timeout_ms: u32 = 10_000,
     /// Blocks served to peers via GET_BLOCK. Null on nodes without storage.
     block_store: ?*StorageEngine = null,
+    /// Where revocations from peers are recorded. Without a store a node
+    /// refuses revocation messages instead of ignoring them silently.
+    trust_store: ?*device_trust.Store = null,
+    /// This node's Ed25519 identity, used to sign revocations it pushes.
+    device_identity: ?identity_mod.Identity = null,
     store_limits: StoreLimits = .{},
     /// Sum of value lengths in `storage`. Guarded by `mutex`.
     stored_bytes: usize = 0,
@@ -142,6 +149,15 @@ pub const Node = struct {
         };
         _ = info.addAddress(conn.getPeerAddress());
         _ = try self.routing_table.addPeer(info);
+
+        // Outbound connections are the natural propagation point: every
+        // PONG we just verified is an authenticated peer that can now hear
+        // which devices we stopped trusting.
+        if (self.trust_store) |trust| {
+            if (trust.revocationsSlice().len > 0) {
+                _ = self.pushRevocations(conn) catch {};
+            }
+        }
     }
 
     /// Stores `value` at the K closest peers to `key`. Fails unless at least
@@ -484,6 +500,50 @@ pub const Node = struct {
         }
     }
 
+    /// Signs and pushes `device`'s revocation to `conn`'s peer. Fails when
+    /// this node has no device identity to sign with.
+    pub fn sendRevoke(self: *Node, conn: network.Connection, device_id: id.NodeID) !bool {
+        const identity = self.device_identity orelse return error.NoDeviceIdentity;
+        const signed = device_trust.revocationMessage(device_id, identity.deviceId());
+        const stream = try conn.openStream();
+        defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
+
+        const signature = try identity.sign(&signed);
+
+        const msg = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .REVOKE = .{ .device_id = device_id, .signer_key = identity.publicKey(), .at = @intCast(sync.timestamp()), .signature = signature } },
+        };
+        try msg.serialize(stream.writer());
+
+        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
+        defer response.deinit(self.allocator);
+        switch (response.payload) {
+            .STORE_ACK => |ack| return ack.stored,
+            else => return error.InvalidResponse,
+        }
+    }
+
+    /// Sends every tombstone this node holds to `conn`'s peer, so a newly
+    /// connected peer learns which devices were removed elsewhere. Returns
+    /// how many peers honored them. No-op without tombstones or an identity.
+    pub fn pushRevocations(self: *Node, conn: network.Connection) !usize {
+        const trust = self.trust_store orelse return 0;
+        if (self.device_identity == null) return 0;
+        const tombstones = trust.revocationsSlice();
+
+        var honored: usize = 0;
+        for (tombstones) |r| {
+            const ok = self.sendRevoke(conn, r.device_id) catch |err| {
+                std.debug.print("Failed to push revocation of {x}: {any}\n", .{ r.device_id.bytes[0..4], err });
+                continue;
+            };
+            if (ok) honored += 1;
+        }
+        return honored;
+    }
+
     // Returns either the value (allocated) or closer peers (allocated)
     pub const FindValueResult = union(enum) {
         value: []u8,
@@ -698,6 +758,7 @@ pub const Node = struct {
             .STORE => |p| try self.handleStore(stream, p.key, p.value),
             .GET_BLOCK => |p| try self.handleGetBlock(stream, p.cid),
             .PUT_BLOCK => |p| try self.handlePutBlock(stream, p.cid, p.data),
+            .REVOKE => |p| try self.handleRevoke(stream, p.device_id, p.signer_key, p.signature),
             .ADD_PROVIDER => |p| try self.handleAddProvider(stream, conn, p.key),
             .GET_PROVIDERS => |p| try self.handleGetProviders(stream, p.key),
             .DIAL_BACK => |p| try self.handleDialBack(conn, p.port),
@@ -830,6 +891,27 @@ pub const Node = struct {
         const response = rpc.Message{
             .sender_id = self.manager.node_id,
             .payload = .{ .STORE_ACK = .{ .stored = stored } },
+        };
+        try response.serialize(stream.writer());
+    }
+
+    /// REVOKE: only honored when the signature verifies, the signer is not
+    /// the revoked device, and the signer's Ed25519 identity is in this
+    /// node's own trust store. Everything else is refused, never applied.
+    fn handleRevoke(
+        self: *Node,
+        stream: network.Stream,
+        device_id: id.NodeID,
+        signer_key: [32]u8,
+        signature: [64]u8,
+    ) !void {
+        var honored = false;
+        if (self.trust_store) |trust| {
+            honored = device_trust.applyRevocation(trust, device_id, signer_key, signature, @intCast(sync.timestamp())) catch false;
+        }
+        const response = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .STORE_ACK = .{ .stored = honored } },
         };
         try response.serialize(stream.writer());
     }

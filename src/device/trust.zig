@@ -16,6 +16,12 @@ pub const max_entries = 64;
 /// Header plus 64 worst-case entries of roughly 300 bytes.
 pub const max_file_bytes = 32 * 1024;
 pub const max_label_len = pairing.max_nickname_len;
+/// Bound on tombstones so a swarm-wide revocation storm cannot grow the
+/// store unbounded (roughly 32 KiB keeps the file cap honest).
+pub const max_revocations = 256;
+/// Signed revocations are bound to this domain; the payload names both the
+/// revoked device and the signer, so a signature cannot be transplanted.
+pub const revocation_domain = "nomadfs-revoke-v1";
 
 pub const Error = error{
     CorruptTrustStore,
@@ -66,10 +72,51 @@ fn normalizeHexQuery(query: []const u8, out: *[128]u8) ![]const u8 {
     return out[0..written];
 }
 
+const revocation_msg_len = revocation_domain.len + NodeID.len * 2;
+
+/// Bytes covered by a revocation signature: the domain, the revoked device
+/// and the signer's device ID, so a signature cannot be transplanted to
+/// another revoker or claim a different device.
+pub fn revocationMessage(device_id: NodeID, signer_id: NodeID) [revocation_msg_len]u8 {
+    var message: [revocation_msg_len]u8 = undefined;
+    @memcpy(message[0..revocation_domain.len], revocation_domain);
+    var offset = revocation_domain.len;
+    @memcpy(message[offset..][0..32], &device_id.bytes);
+    offset += 32;
+    @memcpy(message[offset..][0..32], &signer_id.bytes);
+    return message;
+}
+
+/// Verifies a revocation against `signer_key` and applies it: the signer
+/// must not revoke itself, and only signers whose own device is trusted
+/// locally are honored. Returns whether the revocation was accepted.
+pub fn applyRevocation(
+    store: *Store,
+    device_id: NodeID,
+    signer_key: [32]u8,
+    signature: [64]u8,
+    now: u64,
+) !bool {
+    const signer_id = NodeID.fromPublicKey(signer_key);
+    try identity_mod.Identity.verify(signer_key, &revocationMessage(device_id, signer_id), signature);
+    if (!store.isTrusted(signer_id)) return false;
+    return store.revokeDevice(device_id, signer_id, now);
+}
+
+/// Records that a device was ordered removed by a trusted signer. Kept so
+/// the removal can be propagated again to peers that were not connected
+/// when it happened; re-pairing clears it.
+pub const Revocation = struct {
+    device_id: NodeID,
+    signer_id: NodeID,
+    at: u64,
+};
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     path: []u8,
     entries: std.ArrayList(Entry),
+    revocations: std.ArrayList(Revocation),
 
     /// Loads the store at `path`. A missing file is an empty store; a file
     /// that exists but does not parse is an error, never silently discarded.
@@ -78,6 +125,7 @@ pub const Store = struct {
             .allocator = allocator,
             .path = try allocator.dupe(u8, path),
             .entries = .empty,
+            .revocations = .empty,
         };
         errdefer store.deinit();
 
@@ -100,6 +148,7 @@ pub const Store = struct {
 
     pub fn deinit(self: *Store) void {
         self.entries.deinit(self.allocator);
+        self.revocations.deinit(self.allocator);
         self.allocator.free(self.path);
         self.* = undefined;
     }
@@ -157,6 +206,7 @@ pub const Store = struct {
             return false;
         }
 
+        self.clearRevocation(device_id);
         if (self.entries.items.len >= max_entries) return Error.TrustStoreFull;
 
         var entry: Entry = .{
@@ -180,6 +230,50 @@ pub const Store = struct {
             return true;
         }
         return false;
+    }
+
+    pub fn isRevoked(self: *const Store, device_id: NodeID) bool {
+        for (self.revocations.items) |r| {
+            if (r.device_id.eql(device_id)) return true;
+        }
+        return false;
+    }
+
+    pub fn revocationsSlice(self: *const Store) []const Revocation {
+        return self.revocations.items;
+    }
+
+    /// Removes a device and records who ordered the removal. Recorded even
+    /// for devices without a local entry: peers propagate revocations for
+    /// content not paired here yet, and the tombstone travels onward.
+    /// `signer_id` must not equal `device_id`.
+    pub fn revokeDevice(self: *Store, device_id: NodeID, signer_id: NodeID, at: u64) !bool {
+        if (signer_id.eql(device_id)) return Error.InvalidDeviceQuery;
+
+        const removed = self.revoke(device_id);
+        for (self.revocations.items) |*r| {
+            if (!r.device_id.eql(device_id)) continue;
+            r.signer_id = signer_id;
+            r.at = at;
+            return removed;
+        }
+        if (self.revocations.items.len >= max_revocations) return Error.TrustStoreFull;
+        try self.revocations.append(self.allocator, .{
+            .device_id = device_id,
+            .signer_id = signer_id,
+            .at = at,
+        });
+        return removed;
+    }
+
+    /// Re-pairing is an explicit human decision on a fresh ticket, so it
+    /// overrides a propagated revocation instead of being blocked by one.
+    fn clearRevocation(self: *Store, device_id: NodeID) void {
+        for (self.revocations.items, 0..) |r, index| {
+            if (!r.device_id.eql(device_id)) continue;
+            _ = self.revocations.orderedRemove(index);
+            return;
+        }
     }
 
     /// Resolves a device ID (64 hex chars) or fingerprint (16 hex chars) as
@@ -219,6 +313,9 @@ pub const Store = struct {
         for (self.entries.items) |entry| {
             try writeEntry(&out.writer, entry);
         }
+        for (self.revocations.items) |r| {
+            try writeRevocation(&out.writer, r);
+        }
 
         {
             var file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{
@@ -249,9 +346,14 @@ pub const Store = struct {
 
         while (lines.next()) |line| {
             if (line.len == 0) continue;
-            if (self.entries.items.len >= max_entries) return Error.CorruptTrustStore;
-            const entry = try parseEntry(line);
-            try self.entries.append(self.allocator, entry);
+            if (line[0] == '@') {
+                const r = try parseRevocation(line[1..]);
+                try self.revocations.append(self.allocator, r);
+            } else {
+                if (self.entries.items.len >= max_entries) return Error.CorruptTrustStore;
+                const entry = try parseEntry(line);
+                try self.entries.append(self.allocator, entry);
+            }
         }
     }
 
@@ -318,6 +420,30 @@ fn parseEntry(line: []const u8) !Entry {
     entry.label_len = @intCast(label_size);
 
     return entry;
+}
+
+fn writeRevocation(writer: *std.Io.Writer, r: Revocation) !void {
+    try writer.print("@{s}\t{s}\t{d}\n", .{
+        std.fmt.bytesToHex(r.device_id.bytes, .lower),
+        std.fmt.bytesToHex(r.signer_id.bytes, .lower),
+        r.at,
+    });
+}
+
+fn parseRevocation(rest: []const u8) !Revocation {
+    var fields = std.mem.splitScalar(u8, rest, '\t');
+    const device_hex = fields.next() orelse return Error.CorruptTrustStore;
+    const signer_hex = fields.next() orelse return Error.CorruptTrustStore;
+    const at_text = fields.next() orelse return Error.CorruptTrustStore;
+    if (fields.next() != null) return Error.CorruptTrustStore;
+
+    var r: Revocation = .{ .device_id = undefined, .signer_id = undefined, .at = 0 };
+    if (device_hex.len != NodeID.len * 2 or signer_hex.len != NodeID.len * 2) return Error.CorruptTrustStore;
+    _ = std.fmt.hexToBytes(&r.device_id.bytes, device_hex) catch return Error.CorruptTrustStore;
+    _ = std.fmt.hexToBytes(&r.signer_id.bytes, signer_hex) catch return Error.CorruptTrustStore;
+    r.at = std.fmt.parseInt(u64, at_text, 10) catch return Error.CorruptTrustStore;
+    if (r.signer_id.eql(r.device_id)) return Error.CorruptTrustStore;
+    return r;
 }
 
 fn validateLabel(label: []const u8) !void {
@@ -577,4 +703,85 @@ test "trust: capacity is bounded" {
     const overflow = try testTicket(200, "overflow");
     try testing.expectError(Error.TrustStoreFull, store.trustTicket(overflow, 300));
     try testing.expectEqual(max_entries, store.count());
+}
+
+test "trust: revocation tombstones persist and are overridden by re-pairing" {
+    const path = "test_trust_revocations.store";
+    cleanup(path);
+    defer cleanup(path);
+
+    const operator = try testTicket(0x71, "admin");
+    const phone = try testTicket(0x72, "phone");
+    {
+        var store = try Store.load(testing.allocator, path);
+        defer store.deinit();
+
+        _ = try store.trustTicket(operator, 1);
+        _ = try store.trustTicket(phone, 2);
+
+        // Removing a locally known device records who ordered it.
+        try testing.expect(try store.revokeDevice(phone.deviceId(), operator.deviceId(), 1234));
+        try testing.expect(store.isRevoked(phone.deviceId()));
+        try testing.expect(!store.isTrusted(phone.deviceId()));
+        try testing.expectEqual(@as(usize, 1), store.revocationsSlice().len);
+
+        // A signer is never its own subject.
+        try testing.expectError(Error.InvalidDeviceQuery, store.revokeDevice(operator.deviceId(), operator.deviceId(), 5));
+
+        try store.save();
+    }
+
+    var reloaded = try Store.load(testing.allocator, path);
+    defer reloaded.deinit();
+    try testing.expect(reloaded.isRevoked(phone.deviceId()));
+    try testing.expectEqual(@as(usize, 1), reloaded.revocationsSlice().len);
+
+    // Pairing again with a fresh, human-scanned ticket clears the tombstone.
+    _ = try reloaded.trustTicket(phone, 9999);
+    try testing.expect(!reloaded.isRevoked(phone.deviceId()));
+    try testing.expect(reloaded.isTrusted(phone.deviceId()));
+}
+
+test "trust: applied revocations verify the signer and its trust" {
+    const path = "test_trust_apply_revoke.store";
+    cleanup(path);
+    defer cleanup(path);
+
+    var store = try Store.load(testing.allocator, path);
+    defer store.deinit();
+
+    const admin = try identity_mod.Identity.fromSeed([_]u8{0x73} ** identity_mod.seed_len);
+    const admin_ticket = try testTicket(0x73, "admin");
+    const phone_ticket = try testTicket(0x74, "phone");
+    const stranger = try identity_mod.Identity.fromSeed([_]u8{0x75} ** identity_mod.seed_len);
+    _ = try store.trustTicket(admin_ticket, 1);
+    _ = try store.trustTicket(phone_ticket, 2);
+
+    // An untrusted signer's revocation verifies cryptographically but is
+    // never applied.
+    const stranger_message = revocationMessage(phone_ticket.deviceId(), stranger.deviceId());
+    const stranger_signature = try stranger.sign(&stranger_message);
+    try testing.expect(!try applyRevocation(&store, phone_ticket.deviceId(), stranger.publicKey(), stranger_signature, 41));
+    try testing.expect(store.isTrusted(phone_ticket.deviceId()));
+
+    // A trusted signer's revocation is applied and tombstoned.
+    const message = revocationMessage(phone_ticket.deviceId(), admin.deviceId());
+    const signature = try admin.sign(&message);
+    try testing.expect(try applyRevocation(&store, phone_ticket.deviceId(), admin.publicKey(), signature, 42));
+    try testing.expect(store.isRevoked(phone_ticket.deviceId()));
+    try testing.expect(!store.isTrusted(phone_ticket.deviceId()));
+
+    // A corrupted signature is refused even from a trusted signer.
+    var bad = signature;
+    bad[0] ^= 0x01;
+    _ = try store.trustTicket(phone_ticket, 3);
+    try testing.expectError(error.SignatureVerificationFailed, applyRevocation(&store, phone_ticket.deviceId(), admin.publicKey(), bad, 43));
+    try testing.expect(store.isTrusted(phone_ticket.deviceId()));
+
+    // The revoked device cannot vouch for its own removal.
+    const phone_identity = try identity_mod.Identity.fromSeed([_]u8{0x74} ** identity_mod.seed_len);
+    const self_message = revocationMessage(phone_ticket.deviceId(), phone_ticket.deviceId());
+    const self_signature = try phone_identity.sign(&self_message);
+    try testing.expectError(Error.InvalidDeviceQuery, applyRevocation(&store, phone_ticket.deviceId(), phone_identity.publicKey(), self_signature, 44));
+    try testing.expect(store.isTrusted(phone_ticket.deviceId()));
 }

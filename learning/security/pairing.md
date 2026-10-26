@@ -220,20 +220,46 @@ Revocation currently affects only the local store. Every node keeps its own
 `trust.store`, so other peers continue to accept the removed device until
 revocation propagation exists.
 
+### Revocation Propagation
+
+`--revoke` records the removal as a signed tombstone in the trust store
+(`device_id`, `signer_id`, `at`). The signer is the device that ordered the
+removal, and every tombstone it holds is pushed to peers as the
+`REVOKE` RPC message, which each node sends opportunistically on connections
+it dials itself (bootstrap peers, discovered peers).
+
+A receiver applies a `REVOKE` only when:
+
+1. the Ed25519 signature covers `revocation domain || revoked device || signer`,
+   verified with the signer's key,
+2. the signer is not the revoked device, and
+3. the signer's device is itself in the receiver's trust store.
+
+Everything else is refused rather than softened: an unknown signer, a broken
+signature, or a self-revocation never touches entries. Honoring only locally
+trusted signers keeps a compromised node from unilaterally pruning other
+nodes' stores.
+
+Tombstones persist in `trust.store` (`@`-prefixed lines, capped at 256), and
+they do not block recovery: pairing again with a fresh, human-scanned ticket
+clears the tombstone. Propagation is eventual - peers that were offline get
+the tombstone the next time they dial a peer that still holds it; a periodic
+anti-entropy sweep for revocations is future work.
+
 ## 8. Threat Notes & Next Steps
 
 | Threat | Current mitigation | Gap |
 | :--- | :--- | :--- |
 | Unknown device joining | Handshake binds the Ed25519 identity; `require_trusted_devices` rejects unknown IDs | Policy defaults to off so fresh installs can pair |
 | Tampered ticket | Ed25519 signature over canonical URI | - |
-| Replay of an old ticket | 24-hour expiry, plus handshake identity check | Revocation is local and does not propagate yet |
+| Replay of an old ticket | 24-hour expiry, plus handshake identity check | Revocation propagation is opportunistic; offline peers learn tombstones on the next dial |
 | Stolen ticket | Bearer until expiry | Fingerprint check is manual |
 | Rotated or stolen `node.key` | Trust store pins the ticket's X25519 key and the handshake re-checks it | Re-pairing required after a rotation |
 | Malicious trust file edit | ID/public-key cross-check, `0600` | No signature over the store itself |
 
-Next slices: propagate revocations across the swarm so a removed device cannot
-keep connecting to peers that still have the old entry, and sign the trust
-store so a local edit cannot add an entry silently.
+Next slices: sign the trust store so a local edit cannot add an entry
+silently, and add a periodic sweep so propagation no longer relies on one
+side dialing the other first.
 
 ## 9. Source Map
 
@@ -242,7 +268,7 @@ store so a local edit cannot add an entry silently.
 | `src/device/identity.zig` | Ed25519 identity, seed file, fingerprint |
 | `src/device/pairing.zig` | Ticket construction, canonical form, parse/verify |
 | `src/device/qr.zig` | QR encoder and ASCII renderer |
-| `src/device/trust.zig` | Versioned trust store, atomic save, query resolution |
+| `src/device/trust.zig` | Trust store, tombstones, revocation signature payload |
 | `src/device/auth.zig` | Signed handshake hello, trust policy |
 | `src/net/transport/noise.zig` | Carries and verifies the hello in messages 2 and 3 |
 | `src/device/paths.zig` | Where `device.key` and `trust.store` live |

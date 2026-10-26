@@ -30,6 +30,9 @@ pub const MessageType = enum(u8) {
     /// Push a content-addressed block; the receiver verifies it against the
     /// CID before storing. Answered with STORE_ACK.
     PUT_BLOCK = 14,
+    /// Tell a peer that a device was revoked, signed by the revoking
+    /// device's Ed25519 identity. Answered with STORE_ACK.
+    REVOKE = 15,
 };
 
 pub const FindValueResult = union(enum) {
@@ -55,6 +58,16 @@ pub const MessagePayload = union(MessageType) {
     GET_PROVIDERS: struct { key: id.NodeID },
     PROVIDERS: struct { providers: []const id.NodeID },
     PUT_BLOCK: struct { cid: [32]u8, data: []const u8 },
+    REVOKE: struct {
+        /// The revoked device's NodeID (hash of its Ed25519 public key).
+        device_id: id.NodeID,
+        /// The revoking device's public key; the receiver checks that it is
+        /// locally trusted before honoring anything.
+        signer_key: [32]u8,
+        signature: [64]u8,
+        /// Informational timestamp; not part of the signature.
+        at: u64,
+    },
 };
 
 pub const Message = struct {
@@ -121,6 +134,12 @@ pub const Message = struct {
                 try writer.writeAll(&p.cid);
                 try writer.writeInt(u32, @intCast(p.data.len), .big);
                 try writer.writeAll(p.data);
+            },
+            .REVOKE => |p| {
+                try writer.writeAll(&p.device_id.bytes);
+                try writer.writeAll(&p.signer_key);
+                try writer.writeInt(u64, p.at, .big);
+                try writer.writeAll(&p.signature);
             },
         }
     }
@@ -191,6 +210,16 @@ pub const Message = struct {
                 var cid: [32]u8 = undefined;
                 try reader.readNoEof(&cid);
                 break :blk MessagePayload{ .PUT_BLOCK = .{ .cid = cid, .data = try readValue(allocator, reader) } };
+            },
+            .REVOKE => blk: {
+                var device: id.NodeID = undefined;
+                try reader.readNoEof(&device.bytes);
+                var signer_key: [32]u8 = undefined;
+                try reader.readNoEof(&signer_key);
+                const at = try reader.readInt(u64, .big);
+                var signature: [64]u8 = undefined;
+                try reader.readNoEof(&signature);
+                break :blk MessagePayload{ .REVOKE = .{ .device_id = device, .signer_key = signer_key, .at = at, .signature = signature } };
             },
         };
 
@@ -359,6 +388,7 @@ test "rpc: block exchange and store ack round trip" {
         .{ .sender_id = sender, .payload = .{ .BLOCK = .{ .data = "block bytes" } } },
         .{ .sender_id = sender, .payload = .{ .BLOCK = .{ .data = null } } },
         .{ .sender_id = sender, .payload = .{ .PUT_BLOCK = .{ .cid = [_]u8{7} ** 32, .data = "block bytes" } } },
+        .{ .sender_id = sender, .payload = .{ .REVOKE = .{ .device_id = sender, .signer_key = [_]u8{8} ** 32, .signature = [_]u8{9} ** 64, .at = 42 } } },
         .{ .sender_id = sender, .payload = .{ .PROVIDERS = .{ .providers = &.{ sender, sender } } } },
     };
     for (messages) |m| try m.serialize(buf.writer());
@@ -383,6 +413,12 @@ test "rpc: block exchange and store ack round trip" {
     defer pushed.deinit(allocator);
     try std.testing.expectEqual([_]u8{7} ** 32, pushed.payload.PUT_BLOCK.cid);
     try std.testing.expectEqualStrings("block bytes", pushed.payload.PUT_BLOCK.data);
+
+    const revoke = try Message.deserialize(allocator, buf.reader());
+    defer revoke.deinit(allocator);
+    try std.testing.expect(revoke.payload.REVOKE.device_id.eql(sender));
+    try std.testing.expectEqual([_]u8{8} ** 32, revoke.payload.REVOKE.signer_key);
+    try std.testing.expectEqual(@as(u64, 42), revoke.payload.REVOKE.at);
 
     const providers = try Message.deserialize(allocator, buf.reader());
     defer providers.deinit(allocator);

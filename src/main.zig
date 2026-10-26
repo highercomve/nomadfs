@@ -249,6 +249,11 @@ fn revokeCommand(allocator: std.mem.Allocator, config: config_mod.Config, query:
     var paths = try DevicePaths.resolve(allocator, config.node.key_path);
     defer paths.deinit(allocator);
 
+    // The revocation is signed with this device's identity so peers can
+    // verify it was issued by a trusted operator node, not forged on the
+    // wire.
+    const identity = try Identity.loadOrCreate(paths.identity);
+
     var store = try TrustStore.load(allocator, paths.trust);
     defer store.deinit();
 
@@ -267,9 +272,13 @@ fn revokeCommand(allocator: std.mem.Allocator, config: config_mod.Config, query:
         std.process.exit(1);
     };
 
-    _ = store.revoke(device_id);
+    const removed = try store.revokeDevice(device_id, identity.deviceId(), nowSeconds());
     try store.save();
-    std.debug.print("Revoked device '{s}' from {s}\n", .{ query, paths.trust });
+    std.debug.print("Revoked device '{s}' from {s}{s}\n", .{
+        query,
+        paths.trust,
+        if (removed) "" else " (tombstone recorded; no local entry)",
+    });
 }
 
 fn nowSeconds() u64 {
