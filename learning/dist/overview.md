@@ -13,8 +13,15 @@ NomadFS uses **Consistent Hashing** to decide which nodes store which data.
 
 To support offline writes, NomadFS uses a **Write Quorum of 1**. 
 *   When you save a file on your laptop, it is saved locally immediately. 
-*   If you have internet, the laptop tries to push it to the other 2 nodes in the replica set.
-*   If you are offline, the write is still successful. The system "remembers" to sync later.
+*   The laptop also announces itself as a provider of the root CID.
+*   When `replicas` is configured (the `[storage]` section of `nomadfs.conf`),
+    the put further **pushes** the DAG - every leaf and parent block - to that
+    many peers closest to the CID, using the `PUT_BLOCK` RPC. A receiver
+    verifies each block against its CID before storing it, so a compromised
+    sender cannot poison a replica with junk. A put never fails because
+    replication did: the local copy plus the provider record is already
+    durable.
+*   If you are offline, the write is still successful. The system "remembers" to sync later (see Anti-Entropy below).
 
 ## 3. Conflict Detection: Vector Clocks
 

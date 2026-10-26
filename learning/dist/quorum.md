@@ -22,7 +22,7 @@ The primary goal of NomadFS is to support **Roaming Devices** that are often off
 
 ## 4. Implementation
 
-The quorum logic is implemented in `src/dist/quorum.zig`:
+The quorum logic is implemented in `src/cluster/quorum.zig`:
 
 ```zig
 pub const QuorumConfig = struct {
@@ -36,7 +36,23 @@ pub fn isWriteSatisfied(config: QuorumConfig, successful_writes: u8) bool {
 }
 ```
 
-## 5. Availability during Partitions
+## 5. How $N$ is Applied Today
+
+The write path pushes what it can without blocking availability:
+
+*   `BlockManager.put` stores everything locally, then announces the root CID
+    to the DHT (`W` records must acknowledge, default 1).
+*   With `replicas = N` configured, the same put pushes the DAG to the peers
+    closest to the CID through the `PUT_BLOCK` RPC and counts how many peers
+    took every block. Targets are the Kademlia closest set, the concrete
+    form of the ring's preference list in practice.
+*   Background repair (the `R` queries of a read plus `RepairManager.sync`)
+    copies whatever a node is still missing after a re-pair.
+
+Crash-consistency rule: a put is only "accepted" locally ($W=1$); pushing
+replicas improves durability but can never veto the write.
+
+## 6. Availability during Partitions
 
 Because $W=1$, NomadFS can survive any number of node failures and network partitions. You can always write to your local partition. The trade-off is that you must handle **Conflicts** (via [Vector Clocks](./vectors.md)) when partitions merge.
 

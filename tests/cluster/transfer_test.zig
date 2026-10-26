@@ -221,3 +221,114 @@ test "cluster: get fails over to another provider when one is offline" {
     try std.testing.expectEqual(@as(u64, data.len), size);
     try std.testing.expectEqualStrings(data, out.list.items);
 }
+
+test "cluster: put replicates the DAG to the closest peers" {
+    std.debug.print("\n=== Running Test: cluster: put replicates to closest peers ===\n", .{});
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const walk = nomadfs.storage.dag.walk;
+
+    const dir1 = "test_replication_store_1";
+    const dir2 = "test_replication_store_2";
+    std.Io.Dir.cwd().deleteTree(io, dir1) catch {};
+    std.Io.Dir.cwd().deleteTree(io, dir2) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir1) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir2) catch {};
+    var engine1 = try StorageEngine.init(allocator, dir1);
+    defer engine1.deinit();
+    var engine2 = try StorageEngine.init(allocator, dir2);
+    defer engine2.deinit();
+
+    var peer1 = try TestPeer.init(allocator, 13112);
+    defer peer1.deinit();
+    var peer2 = try TestPeer.init(allocator, 13113);
+    defer peer2.deinit();
+
+    var dht1 = DhtNode.init(allocator, peer1.manager, peer1.config.node.swarm_key);
+    defer dht1.deinit();
+    var dht2 = DhtNode.init(allocator, peer2.manager, peer2.config.node.swarm_key);
+    defer dht2.deinit();
+    dht2.block_store = &engine2;
+    peer2.manager.setConnectionHandler(&dht2, DhtNode.serve);
+    defer peer1.stop();
+    defer peer2.stop();
+
+    try peer1.start();
+    try peer2.start();
+    nomadfs.sync.sleep(100 * std.time.ns_per_ms);
+
+    {
+        const conn = try peer1.manager.connectToPeer(peer2.listen_addr, peer1.config.node.swarm_key, peer2.manager.node_id);
+        defer conn.deinit();
+        try dht1.ping(conn);
+    }
+    nomadfs.sync.sleep(200 * std.time.ns_per_ms);
+
+    const bm1 = try BlockManager.init(allocator, .{
+        .network = peer1.manager,
+        .dht = &dht1,
+        .storage = &engine1,
+        .replication = 1,
+    });
+    defer bm1.deinit();
+
+    // The put itself forwards the DAG: peer 2 must not need to fetch.
+    const data_len = 3500 * 1024;
+    const data = try allocator.alloc(u8, data_len);
+    defer allocator.free(data);
+    var prng = std.Random.DefaultPrng.init(0x44556677);
+    prng.random().bytes(data);
+    var reader = SliceReader{ .buffer = data };
+    const root = try bm1.put(&reader);
+    defer allocator.free(root);
+
+    try std.testing.expect(try walk.isComplete(allocator, &engine2, root));
+    var out = ListWriter{ .allocator = allocator };
+    defer out.list.deinit(allocator);
+    const size = try walk.readFile(allocator, &engine2, root, &out, .{});
+    try std.testing.expectEqual(@as(u64, data_len), size);
+    try std.testing.expectEqualSlices(u8, data, out.list.items);
+}
+
+test "cluster: replicated blocks are verified against their CID" {
+    std.debug.print("\n=== Running Test: cluster: replicated blocks verify CIDs ===\n", .{});
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const dir = "test_replication_verify";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var engine = try StorageEngine.init(allocator, dir);
+    defer engine.deinit();
+
+    var peer1 = try TestPeer.init(allocator, 13114);
+    defer peer1.deinit();
+    var peer2 = try TestPeer.init(allocator, 13115);
+    defer peer2.deinit();
+
+    var dht1 = DhtNode.init(allocator, peer1.manager, peer1.config.node.swarm_key);
+    defer dht1.deinit();
+    var dht2 = DhtNode.init(allocator, peer2.manager, peer2.config.node.swarm_key);
+    defer dht2.deinit();
+    dht2.block_store = &engine;
+    peer2.manager.setConnectionHandler(&dht2, DhtNode.serve);
+    defer peer1.stop();
+    defer peer2.stop();
+
+    try peer1.start();
+    try peer2.start();
+    nomadfs.sync.sleep(100 * std.time.ns_per_ms);
+
+    // Sender claims an unrelated CID; the receiver must refuse and ack false.
+    const conn = try peer1.manager.connectToPeer(peer2.listen_addr, peer1.config.node.swarm_key, peer2.manager.node_id);
+    defer conn.deinit();
+
+    const data = "verified block content";
+    try std.testing.expect(!try dht1.putBlock(conn, [_]u8{0x42} ** 32, data));
+    try std.testing.expect(!engine.has(&[_]u8{0x42} ** 32));
+
+    var cid: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &cid, .{});
+    try std.testing.expect(try dht1.putBlock(conn, cid, data));
+    try std.testing.expect(engine.has(&cid));
+}

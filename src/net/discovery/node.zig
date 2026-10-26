@@ -217,6 +217,15 @@ pub const Node = struct {
         return acked;
     }
 
+    /// Refreshes the routing view for `key` and returns the K closest peers
+    /// (caller-owned). Used both to replicate values and to choose holders.
+    pub fn closestFor(self: *Node, key: id.NodeID) ![]kbucket.PeerInfo {
+        try self.lookup(key);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.routing_table.getClosestPeers(key, kbucket.K);
+    }
+
     /// Returns up to providers.max_per_key other nodes holding content for
     /// `key` (caller-owned): known locally plus those the K closest peers
     /// report.
@@ -454,6 +463,27 @@ pub const Node = struct {
         }
     }
 
+    /// Pushes a block to `conn`'s peer. The receiver verifies the bytes
+    /// against the CID before storing; returns whether it kept the block.
+    pub fn putBlock(self: *Node, conn: network.Connection, cid: [32]u8, data: []const u8) !bool {
+        const stream = try conn.openStream();
+        defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
+
+        const msg = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .PUT_BLOCK = .{ .cid = cid, .data = data } },
+        };
+        try msg.serialize(stream.writer());
+
+        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
+        defer response.deinit(self.allocator);
+        switch (response.payload) {
+            .STORE_ACK => |ack| return ack.stored,
+            else => return error.InvalidResponse,
+        }
+    }
+
     // Returns either the value (allocated) or closer peers (allocated)
     pub const FindValueResult = union(enum) {
         value: []u8,
@@ -667,6 +697,7 @@ pub const Node = struct {
             .FIND_VALUE => |p| try self.handleFindValue(stream, p.key),
             .STORE => |p| try self.handleStore(stream, p.key, p.value),
             .GET_BLOCK => |p| try self.handleGetBlock(stream, p.cid),
+            .PUT_BLOCK => |p| try self.handlePutBlock(stream, p.cid, p.data),
             .ADD_PROVIDER => |p| try self.handleAddProvider(stream, conn, p.key),
             .GET_PROVIDERS => |p| try self.handleGetProviders(stream, p.key),
             .DIAL_BACK => |p| try self.handleDialBack(conn, p.port),
@@ -779,6 +810,26 @@ pub const Node = struct {
         const response = rpc.Message{
             .sender_id = self.manager.node_id,
             .payload = .{ .BLOCK = .{ .data = data } },
+        };
+        try response.serialize(stream.writer());
+    }
+
+    /// PUT_BLOCK: verify the bytes against their CID, then keep the block.
+    /// A node with no block storage acknowledges nothing, so the sender does
+    /// not count it as a replica.
+    fn handlePutBlock(self: *Node, stream: network.Stream, cid: [32]u8, data: []const u8) !void {
+        var stored = false;
+        if (self.block_store) |block_store| {
+            // put() rejects bytes that do not hash to `cid`.
+            if (block_store.put(.{ .cid = cid, .data = data })) {
+                stored = true;
+            } else |err| {
+                std.debug.print("PUT_BLOCK rejected: {any}\n", .{err});
+            }
+        }
+        const response = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .STORE_ACK = .{ .stored = stored } },
         };
         try response.serialize(stream.writer());
     }

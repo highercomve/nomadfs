@@ -27,6 +27,9 @@ pub const MessageType = enum(u8) {
     GET_PROVIDERS = 12,
     /// Reply to GET_PROVIDERS.
     PROVIDERS = 13,
+    /// Push a content-addressed block; the receiver verifies it against the
+    /// CID before storing. Answered with STORE_ACK.
+    PUT_BLOCK = 14,
 };
 
 pub const FindValueResult = union(enum) {
@@ -51,6 +54,7 @@ pub const MessagePayload = union(MessageType) {
     ADD_PROVIDER: struct { key: id.NodeID },
     GET_PROVIDERS: struct { key: id.NodeID },
     PROVIDERS: struct { providers: []const id.NodeID },
+    PUT_BLOCK: struct { cid: [32]u8, data: []const u8 },
 };
 
 pub const Message = struct {
@@ -112,6 +116,11 @@ pub const Message = struct {
                 try writer.writeByte(1);
                 try writer.writeInt(u32, @intCast(data.len), .big);
                 try writer.writeAll(data);
+            },
+            .PUT_BLOCK => |p| {
+                try writer.writeAll(&p.cid);
+                try writer.writeInt(u32, @intCast(p.data.len), .big);
+                try writer.writeAll(p.data);
             },
         }
     }
@@ -178,6 +187,11 @@ pub const Message = struct {
             .BLOCK => MessagePayload{ .BLOCK = .{
                 .data = if (try readBool(reader)) try readValue(allocator, reader) else null,
             } },
+            .PUT_BLOCK => blk: {
+                var cid: [32]u8 = undefined;
+                try reader.readNoEof(&cid);
+                break :blk MessagePayload{ .PUT_BLOCK = .{ .cid = cid, .data = try readValue(allocator, reader) } };
+            },
         };
 
         return Message{
@@ -263,6 +277,7 @@ pub const Message = struct {
             },
             .STORE => |p| allocator.free(p.value),
             .BLOCK => |p| if (p.data) |d| allocator.free(d),
+            .PUT_BLOCK => |p| allocator.free(p.data),
             .PROVIDERS => |p| allocator.free(p.providers),
             else => {},
         }
@@ -343,6 +358,7 @@ test "rpc: block exchange and store ack round trip" {
         .{ .sender_id = sender, .payload = .{ .GET_BLOCK = .{ .cid = [_]u8{9} ** 32 } } },
         .{ .sender_id = sender, .payload = .{ .BLOCK = .{ .data = "block bytes" } } },
         .{ .sender_id = sender, .payload = .{ .BLOCK = .{ .data = null } } },
+        .{ .sender_id = sender, .payload = .{ .PUT_BLOCK = .{ .cid = [_]u8{7} ** 32, .data = "block bytes" } } },
         .{ .sender_id = sender, .payload = .{ .PROVIDERS = .{ .providers = &.{ sender, sender } } } },
     };
     for (messages) |m| try m.serialize(buf.writer());
@@ -362,6 +378,11 @@ test "rpc: block exchange and store ack round trip" {
     const missing = try Message.deserialize(allocator, buf.reader());
     defer missing.deinit(allocator);
     try std.testing.expect(missing.payload.BLOCK.data == null);
+
+    const pushed = try Message.deserialize(allocator, buf.reader());
+    defer pushed.deinit(allocator);
+    try std.testing.expectEqual([_]u8{7} ** 32, pushed.payload.PUT_BLOCK.cid);
+    try std.testing.expectEqualStrings("block bytes", pushed.payload.PUT_BLOCK.data);
 
     const providers = try Message.deserialize(allocator, buf.reader());
     defer providers.deinit(allocator);

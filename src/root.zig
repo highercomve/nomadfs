@@ -67,6 +67,7 @@ pub const Node = struct {
             .network = connection_manager,
             .dht = discovery_node,
             .storage = store,
+            .replication = cfg.storage.replicas,
         });
         errdefer block_manager.deinit();
 

@@ -44,6 +44,34 @@ pub const RepairManager = struct {
         return fetched;
     }
 
+    /// Sends every locally held block of the DAG rooted at `root_cid` to
+    /// `peer`, which verifies each block against its CID before storing it.
+    /// Blocks the receiver already has are simply acknowledged. A locally
+    /// incomplete DAG aborts the push instead of replicating partial content.
+    /// Returns the number of blocks transferred.
+    pub fn push(
+        allocator: std.mem.Allocator,
+        node: *dht.Node,
+        store: *storage.engine.StorageEngine,
+        peer: network.Connection,
+        root_cid: []const u8,
+    ) !usize {
+        std.debug.assert(peer.ptr != null);
+
+        var cids = try walk.collectReachable(allocator, store, root_cid);
+        defer cids.deinit(allocator);
+
+        var sent: usize = 0;
+        var it = cids.keyIterator();
+        while (it.next()) |cid| {
+            const block = (try store.get(cid, allocator)) orelse return error.IncompleteDag;
+            defer allocator.free(block.data);
+            const stored = try node.putBlock(peer, block.cid, block.data);
+            if (stored) sent += 1;
+        }
+        return sent;
+    }
+
     /// Returns the block's bytes (caller-owned), fetching and storing it
     /// first if it is not held locally.
     fn loadOrFetch(

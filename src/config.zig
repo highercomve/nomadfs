@@ -49,6 +49,9 @@ pub const Config = struct {
     pub const StorageConfig = struct {
         enabled: bool,
         storage_path: []const u8,
+        /// Closest peers the DAG of every new file is pushed to. 0 keeps
+        /// puts local (provider records only).
+        replicas: u8 = 0,
     };
 
     pub const SecurityConfig = struct {
@@ -163,6 +166,10 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
 
 /// Replaces an owned string, freeing the previous value. A repeated key in
 /// the file therefore does not leak the earlier value.
+/// Upper bound on storage.replicas: mirrors the routing-table width
+/// (kbucket.K), which is the widest replica set the DHT can address.
+pub const max_replicas: u8 = 20;
+
 fn replaceString(allocator: std.mem.Allocator, field: *[]const u8, new_value: []const u8) void {
     if (field.len > 0) allocator.free(field.*);
     field.* = new_value;
@@ -187,6 +194,12 @@ fn applyConfigEntry(
         config.storage.enabled = std.mem.eql(u8, val, "true");
     } else if (std.mem.eql(u8, key, "storage_path")) {
         replaceString(allocator, &config.storage.storage_path, try allocator.dupe(u8, val));
+    } else if (std.mem.eql(u8, key, "replicas")) {
+        // Bounded by the routing-table width (kbucket.K): replicating wider
+        // than the DHT can name targets is pointless.
+        const n = try std.fmt.parseInt(u8, val, 10);
+        if (n > max_replicas) return error.ReplicasOutOfRange;
+        config.storage.replicas = n;
     } else if (std.mem.eql(u8, key, "port")) {
         config.network.port = try std.fmt.parseInt(u16, val, 10);
     } else if (std.mem.eql(u8, key, "upnp_enabled")) {
@@ -264,6 +277,7 @@ test "parseConfigText parses all fields" {
         \\swarm_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         \\[storage]
         \\storage_path = "/tmp/nomad"
+        \\replicas = 2
         \\[network]
         \\port = 9100
         \\transport = "tcp"
@@ -278,6 +292,7 @@ test "parseConfigText parses all fields" {
     try std.testing.expectEqual(Config.TransportType.tcp, cfg.network.transport);
     try std.testing.expectEqual(@as(usize, 2), cfg.network.bootstrap_peers.len);
     try std.testing.expect(cfg.security.require_trusted_devices);
+    try std.testing.expectEqual(@as(u8, 2), cfg.storage.replicas);
 }
 
 test "parseConfigText releases everything on failure" {
