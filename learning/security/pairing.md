@@ -15,10 +15,11 @@ rendered as a QR code (GUI) or ASCII art (headless CLI). The peer stores the
 identity in a trust store and can later require that identity during the
 handshake.
 
-The first implementation slice is deliberately additive: identities, tickets,
-QR output and the trust store exist and are tested, while the Noise handshake
-still authenticates with `XXpsk3` alone. Binding the identity into the
-handshake is the next slice.
+The identity is now bound into the Noise handshake: both sides sign the
+handshake transcript with their Ed25519 key, so a session is tied to the
+device that opened it. Pairing and trust are still separate concerns - a
+signature proves *which* identity is on the wire, while the trust store and
+`require_trusted_devices` decide whether that identity is allowed.
 
 ## 2. Key Hierarchy
 
@@ -130,7 +131,47 @@ NMDFSTR1
 - **Strict**: a missing file is an empty store; an unparsable file is an error.
   Silently discarding trust decisions is worse than refusing to start.
 
-## 6. QR Output
+## 6. Handshake Binding
+
+The Noise pattern stays `XXpsk3`. The Ed25519 identity travels inside the
+existing encrypted handshake payloads rather than adding a new message:
+
+| Message | Direction | Plaintext payload |
+| :--- | :--- | :--- |
+| 2 | responder -> initiator | `version(1) \|\| identity_pub(32) \|\| signature(64)` |
+| 3 | initiator -> responder | `version(1) \|\| identity_pub(32) \|\| signature(64)` |
+
+The signature covers `"nomadfs-device-auth-v1" || handshake_hash`, where the
+handshake hash is captured immediately before the payload is encrypted. That
+hash already commits to the ephemeral keys, both static X25519 keys, the PSK
+and every previous message, so:
+
+- a hello cannot be replayed into another session or moved to the other
+  message;
+- substituting the public key breaks the signature;
+- a peer without the Swarm Key cannot produce a payload that decrypts at all.
+
+Verification is unconditional: the payload length must be exact, the version
+must be `1`, and the signature must verify. Afterwards
+`NoiseStream.remote_device_id` holds the peer's device ID, derived from the
+verified public key rather than trusted from the wire.
+
+Trust is an additional policy:
+
+```toml
+[security]
+require_trusted_devices = true
+```
+
+When enabled, a peer whose device ID is absent from `trust.store` is rejected
+during the handshake with `error.UntrustedDevice`. It defaults to `false`
+because a fresh install has an empty store and must still pair; the signature
+check runs either way.
+
+This is wire-incompatible: message 2 grew from 80 to 193 bytes and message 3
+from 64 to 161, so both peers must run this version.
+
+## 7. QR Output
 
 Tickets are small enough for a medium-error-correction symbol. A typical ticket
 (one address, 13-character nickname) fits in version 9-12, comfortably below
@@ -150,29 +191,44 @@ Use `--address` to publish a reachable LAN address, since the default
 nomadfs --pair --address 192.168.1.5:9000
 nomadfs --trust 'nomadfs://pair?v=1&p=...'
 nomadfs --devices
+nomadfs --revoke f712-ae38-4f35-7778
+nomadfs --revoke f712ae384f357778...   # full device ID also works
 ```
 
-## 7. Threat Notes & Next Steps
+`--revoke` accepts a device ID or fingerprint, case-insensitively, with or
+without `0x` and with `-`, `:` or spaces ignored. A query that matches nothing
+(or, in the unlikely case of a fingerprint collision, more than one entry) is
+rejected instead of guessing. Removal is saved atomically like any other
+trust-store write.
+
+Revocation currently affects only the local store. Every node keeps its own
+`trust.store`, so other peers continue to accept the removed device until
+revocation propagation exists.
+
+## 8. Threat Notes & Next Steps
 
 | Threat | Current mitigation | Gap |
 | :--- | :--- | :--- |
-| Unknown device joining | Identity ticket + fingerprint comparison | Handshake does not yet require a trusted identity |
+| Unknown device joining | Handshake binds the Ed25519 identity; `require_trusted_devices` rejects unknown IDs | Policy defaults to off so fresh installs can pair |
 | Tampered ticket | Ed25519 signature over canonical URI | - |
-| Replay of an old ticket | 24-hour expiry | No revocation list beyond deleting the entry |
+| Replay of an old ticket | 24-hour expiry, plus handshake identity check | Revocation is local and does not propagate yet |
 | Stolen ticket | Bearer until expiry | Fingerprint check is manual |
 | Malicious trust file edit | ID/public-key cross-check, `0600` | No signature over the store itself |
 
-Next slice: require a trusted Ed25519 identity during the Noise handshake,
-bind the device ID to the transport key used in the ticket, and support
-revocation propagation so a removed device cannot re-pair with its old ticket.
+Next slices: propagate revocations across the swarm so a removed device cannot
+keep connecting to peers that still have the old entry, sign the trust store so
+a local edit cannot add an entry silently, and bind the transport key in the
+ticket to the identity that presents it.
 
-## 8. Source Map
+## 9. Source Map
 
 | Path | Responsibility |
 | :--- | :--- |
 | `src/device/identity.zig` | Ed25519 identity, seed file, fingerprint |
 | `src/device/pairing.zig` | Ticket construction, canonical form, parse/verify |
 | `src/device/qr.zig` | QR encoder and ASCII renderer |
-| `src/device/trust.zig` | Versioned trust store, atomic save |
+| `src/device/trust.zig` | Versioned trust store, atomic save, query resolution |
+| `src/device/auth.zig` | Signed handshake hello, trust policy |
+| `src/net/transport/noise.zig` | Carries and verifies the hello in messages 2 and 3 |
 | `src/device/paths.zig` | Where `device.key` and `trust.store` live |
-| `src/main.zig` | `--pair`, `--trust`, `--devices` commands |
+| `src/main.zig` | `--pair`, `--trust`, `--devices`, `--revoke` commands |

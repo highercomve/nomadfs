@@ -1,6 +1,7 @@
 const std = @import("std");
 const network = @import("mod.zig");
 const noise = @import("noise.zig");
+const device_auth = @import("../../device/auth.zig");
 const YamuxSession = @import("yamux.zig").Session;
 
 const id = @import("../id.zig");
@@ -163,6 +164,7 @@ pub const ListenConfig = struct {
     static_key: noise.KeyPair,
     running: ?*std.atomic.Value(bool) = null,
     manager: ?*network.manager.ConnectionManager = null,
+    device_auth: ?*const device_auth.Authenticator = null,
 };
 
 pub fn listen(_: std.mem.Allocator, cfg: ListenConfig) !network.Server {
@@ -203,6 +205,7 @@ fn acceptLoop(allocator: std.mem.Allocator, mut_server: network.Server, cfg: Lis
             cfg.static_key,
             cfg.handshake_timeout_ms,
             cfg.manager,
+            cfg.device_auth,
         }) catch |err| {
             std.debug.print("Failed to spawn connection handler thread: {any}\n", .{err});
             conn.stream.close();
@@ -224,13 +227,14 @@ fn handleIncomingConnection(
     static_key: noise.KeyPair,
     handshake_timeout_ms: u32,
     manager: ?*network.manager.ConnectionManager,
+    device_auth_opt: ?*const device_auth.Authenticator,
 ) void {
     defer if (manager) |m| {
         m.handshake_wg.finish();
         m.deinit();
     };
 
-    const connection = establish(allocator, conn.stream, conn.address, swarm_key, static_key, false, handshake_timeout_ms) catch |err| {
+    const connection = establish(allocator, conn.stream, conn.address, swarm_key, static_key, false, handshake_timeout_ms, device_auth_opt) catch |err| {
         std.debug.print("Connection handler error for {f}: {}\n", .{ conn.address, err });
         return;
     };
@@ -252,10 +256,11 @@ pub fn connect(
     swarm_key: []const u8,
     static_key: noise.KeyPair,
     handshake_timeout_ms: u32,
+    device_auth_opt: ?*const device_auth.Authenticator,
 ) !network.Connection {
     // The handshake bound doubles as the connect bound.
     const stream = try network.compat.tcpConnectToAddressTimeout(address, handshake_timeout_ms);
-    return establish(allocator, stream, address, swarm_key, static_key, true, handshake_timeout_ms);
+    return establish(allocator, stream, address, swarm_key, static_key, true, handshake_timeout_ms, device_auth_opt);
 }
 
 /// Runs the Noise handshake and starts Yamux over `net_stream`, returning a
@@ -269,6 +274,7 @@ fn establish(
     static_key: noise.KeyPair,
     initiator: bool,
     handshake_timeout_ms: u32,
+    device_auth_opt: ?*const device_auth.Authenticator,
 ) !network.Connection {
     std.debug.assert(handshake_timeout_ms > 0);
     const impl = allocator.create(TcpConnectionImpl) catch |err| {
@@ -290,7 +296,7 @@ fn establish(
     errdefer TcpStream.close(&impl.tcp_stream);
 
     try net_stream.setTimeout(handshake_timeout_ms);
-    impl.noise_stream = try noise.NoiseStream.handshake(allocator, impl.tcp_stream.stream(), swarm_key, static_key, initiator);
+    impl.noise_stream = try noise.NoiseStream.handshake(allocator, impl.tcp_stream.stream(), swarm_key, static_key, initiator, device_auth_opt);
     errdefer impl.noise_stream.deinit();
     // Established connections idle legitimately; Yamux reads block forever.
     try net_stream.setTimeout(0);

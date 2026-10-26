@@ -8,6 +8,7 @@ const nat = @import("nat.zig");
 const id = @import("../id.zig");
 const sync = @import("../../sync.zig");
 const env_mod = @import("../../env.zig");
+const device_auth = @import("../../device/auth.zig");
 
 pub const ConnectionManager = struct {
     const ManagedConnection = struct {
@@ -42,6 +43,7 @@ pub const ConnectionManager = struct {
     stopping: bool = false,
     tcp_server: ?network.Server = null,
     heap_allocated: bool = false,
+    device_auth: ?device_auth.Authenticator = null,
 
     pub fn init(allocator: std.mem.Allocator, transport_type: config.Config.TransportType, key_path: ?[]const u8) !ConnectionManager {
         const keypair = try loadOrGenerateKey(allocator, key_path);
@@ -83,6 +85,16 @@ pub const ConnectionManager = struct {
             .tcp_server = null,
             .heap_allocated = false,
         };
+    }
+
+    /// Enables device identity verification for every new connection.
+    pub fn setDeviceAuthenticator(self: *ConnectionManager, auth: device_auth.Authenticator) void {
+        self.device_auth = auth;
+    }
+
+    fn deviceAuthPtr(self: *ConnectionManager) ?*const device_auth.Authenticator {
+        if (self.device_auth) |*auth| return auth;
+        return null;
     }
 
     pub fn ref(self: *ConnectionManager) void {
@@ -434,6 +446,7 @@ pub const ConnectionManager = struct {
                     .static_key = self.identity_key,
                     .running = running,
                     .manager = self,
+                    .device_auth = self.deviceAuthPtr(),
                 });
 
                 self.accept_thread = try std.Thread.spawn(.{}, tcp.runAcceptLoop, .{
@@ -446,6 +459,7 @@ pub const ConnectionManager = struct {
                         .static_key = self.identity_key,
                         .running = running,
                         .manager = self,
+                        .device_auth = self.deviceAuthPtr(),
                     },
                 });
             },
@@ -498,7 +512,7 @@ pub const ConnectionManager = struct {
 
         switch (self.transport_type) {
             .tcp => {
-                const conn = try tcp.connect(self.allocator, address, swarm_key, self.identity_key, self.handshake_timeout_ms);
+                const conn = try tcp.connect(self.allocator, address, swarm_key, self.identity_key, self.handshake_timeout_ms, self.deviceAuthPtr());
                 errdefer conn.deinit();
 
                 // The Noise handshake authenticated the remote key; make sure

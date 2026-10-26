@@ -109,7 +109,7 @@ test "security: connection drop during handshake" {
     defer mem_stream.deinit();
 
     // Case 1: Stream is empty (Immediate EOF)
-    const err1 = noise.NoiseStream.handshake(allocator, mem_stream.stream(), swarm_key, noise.KeyPair.generate(), false);
+    const err1 = noise.NoiseStream.handshake(allocator, mem_stream.stream(), swarm_key, noise.KeyPair.generate(), false, null);
     try std.testing.expectError(error.EndOfStream, err1);
 
     // Case 2: Partial Header (EOF in header)
@@ -117,7 +117,7 @@ test "security: connection drop during handshake" {
     // We need to reset read_pos because write didn't advance it (same stream instance)
     // But wait, MemoryStream append doesn't move read_pos.
     // So if we read now, we read what we wrote.
-    const err2 = noise.NoiseStream.handshake(allocator, mem_stream.stream(), swarm_key, noise.KeyPair.generate(), false);
+    const err2 = noise.NoiseStream.handshake(allocator, mem_stream.stream(), swarm_key, noise.KeyPair.generate(), false, null);
     // Depending on readFull impl, could be EndOfStream or similar.
     try std.testing.expectError(error.EndOfStream, err2);
 }
@@ -129,7 +129,7 @@ const Context = struct {
     allocator: std.mem.Allocator,
 
     fn runClient(ctx: @This()) !void {
-        var ns = try noise.NoiseStream.handshake(ctx.allocator, ctx.pipe.client(), ctx.key, noise.KeyPair.generate(), true);
+        var ns = try noise.NoiseStream.handshake(ctx.allocator, ctx.pipe.client(), ctx.key, noise.KeyPair.generate(), true, null);
         defer ns.deinit();
 
         const msg = "Super Secret Plaintext";
@@ -142,7 +142,7 @@ const Context = struct {
     }
 
     fn runServer(ctx: @This()) !void {
-        var ns = try noise.NoiseStream.handshake(ctx.allocator, ctx.pipe.server(), ctx.key, noise.KeyPair.generate(), false);
+        var ns = try noise.NoiseStream.handshake(ctx.allocator, ctx.pipe.server(), ctx.key, noise.KeyPair.generate(), false, null);
         defer ns.deinit();
 
         // Read client message
@@ -216,4 +216,120 @@ test "security: silent peer cannot stall the handshake or shutdown" {
     peer1.stop();
     const elapsed = nomadfs.sync.milliTimestamp() - started;
     try std.testing.expect(elapsed < 2000);
+}
+
+const DeviceContext = struct {
+    pipe: *Pipe,
+    key: []const u8,
+    allocator: std.mem.Allocator,
+    auth: *const nomadfs.device.auth.Authenticator,
+    initiator: bool,
+    remote: ?nomadfs.net.id.NodeID = null,
+    failure: ?anyerror = null,
+
+    fn run(ctx: *DeviceContext) void {
+        ctx.runInner() catch |err| {
+            ctx.failure = err;
+        };
+    }
+
+    fn runInner(ctx: *DeviceContext) !void {
+        const stream = if (ctx.initiator) ctx.pipe.client() else ctx.pipe.server();
+        var ns = try noise.NoiseStream.handshake(
+            ctx.allocator,
+            stream,
+            ctx.key,
+            noise.KeyPair.generate(),
+            ctx.initiator,
+            ctx.auth,
+        );
+        defer ns.deinit();
+        ctx.remote = ns.remote_device_id;
+    }
+};
+
+test "security: handshake binds the session to both device identities" {
+    std.debug.print("\n=== Running Test: security: handshake binds the session to both device identities ===\n", .{});
+    const allocator = std.testing.allocator;
+    const swarm_key = "correct_swarm_key_32_bytes_long_";
+    const identity_mod = nomadfs.device.identity;
+
+    const client_identity = try identity_mod.Identity.fromSeed([_]u8{0x21} ** identity_mod.seed_len);
+    const server_identity = try identity_mod.Identity.fromSeed([_]u8{0x22} ** identity_mod.seed_len);
+    const client_auth: nomadfs.device.auth.Authenticator = .{ .identity = client_identity };
+    const server_auth: nomadfs.device.auth.Authenticator = .{ .identity = server_identity };
+
+    var pipe = Pipe.init(allocator);
+    defer pipe.deinit();
+
+    var client_ctx = DeviceContext{
+        .pipe = &pipe,
+        .key = swarm_key,
+        .allocator = allocator,
+        .auth = &client_auth,
+        .initiator = true,
+    };
+    var server_ctx = DeviceContext{
+        .pipe = &pipe,
+        .key = swarm_key,
+        .allocator = allocator,
+        .auth = &server_auth,
+        .initiator = false,
+    };
+
+    const client_thread = try std.Thread.spawn(.{}, DeviceContext.run, .{&client_ctx});
+    server_ctx.run();
+    client_thread.join();
+
+    try std.testing.expect(server_ctx.failure == null);
+    try std.testing.expect(client_ctx.failure == null);
+    try std.testing.expect(server_ctx.remote.?.eql(client_identity.deviceId()));
+    try std.testing.expect(client_ctx.remote.?.eql(server_identity.deviceId()));
+}
+
+test "security: handshake rejects an untrusted device under strict policy" {
+    std.debug.print("\n=== Running Test: security: handshake rejects an untrusted device under strict policy ===\n", .{});
+    const allocator = std.testing.allocator;
+    const swarm_key = "correct_swarm_key_32_bytes_long_";
+    const identity_mod = nomadfs.device.identity;
+
+    const strict_auth: nomadfs.device.auth.Authenticator = .{
+        .identity = try identity_mod.Identity.fromSeed([_]u8{0x23} ** identity_mod.seed_len),
+        // No trust store attached, so every peer is unknown and must be rejected.
+        .require_trusted = true,
+    };
+    const peer_auth: nomadfs.device.auth.Authenticator = .{
+        .identity = try identity_mod.Identity.fromSeed([_]u8{0x24} ** identity_mod.seed_len),
+    };
+
+    var pipe = Pipe.init(allocator);
+    defer pipe.deinit();
+
+    var initiator_ctx = DeviceContext{
+        .pipe = &pipe,
+        .key = swarm_key,
+        .allocator = allocator,
+        .auth = &strict_auth,
+        .initiator = true,
+    };
+    var responder_ctx = DeviceContext{
+        .pipe = &pipe,
+        .key = swarm_key,
+        .allocator = allocator,
+        .auth = &peer_auth,
+        .initiator = false,
+    };
+
+    const responder_thread = try std.Thread.spawn(.{}, DeviceContext.run, .{&responder_ctx});
+    initiator_ctx.run();
+    // The initiator aborts before message 3; unblock the responder.
+    pipe.stop();
+    responder_thread.join();
+
+    try std.testing.expectEqual(
+        @as(?anyerror, nomadfs.device.auth.Error.UntrustedDevice),
+        initiator_ctx.failure,
+    );
+    try std.testing.expectEqual(@as(?anyerror, error.EndOfStream), responder_ctx.failure);
+    try std.testing.expect(initiator_ctx.remote == null);
 }

@@ -38,6 +38,7 @@ pub const Config = struct {
     node: NodeConfig,
     storage: StorageConfig,
     network: NetworkConfig,
+    security: SecurityConfig = .{},
 
     pub const NodeConfig = struct {
         nickname: []const u8,
@@ -48,6 +49,11 @@ pub const Config = struct {
     pub const StorageConfig = struct {
         enabled: bool,
         storage_path: []const u8,
+    };
+
+    pub const SecurityConfig = struct {
+        /// Reject peers whose Ed25519 identity is not in the trust store.
+        require_trusted_devices: bool = false,
     };
 
     pub const NetworkConfig = struct {
@@ -114,6 +120,7 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
         .node = .{ .nickname = "", .swarm_key = "", .key_path = null },
         .storage = .{ .enabled = true, .storage_path = "" },
         .network = .{ .port = 9000, .bootstrap_peers = &.{}, .transport = .tcp },
+        .security = .{},
     };
     errdefer config.deinit(allocator);
 
@@ -186,6 +193,8 @@ fn applyConfigEntry(
         config.network.upnp_enabled = std.mem.eql(u8, val, "true");
     } else if (std.mem.eql(u8, key, "enable_mdns")) {
         config.network.enable_mdns = std.mem.eql(u8, val, "true");
+    } else if (std.mem.eql(u8, key, "require_trusted_devices")) {
+        config.security.require_trusted_devices = std.mem.eql(u8, val, "true");
     } else if (std.mem.eql(u8, key, "transport")) {
         // Reject at startup rather than failing on first connect, and never
         // silently fall back to TCP on a typo.
@@ -259,6 +268,7 @@ test "parseConfigText parses all fields" {
         \\port = 9100
         \\transport = "tcp"
         \\bootstrap_peers = ["tcp://10.0.0.1:9000", "tcp://10.0.0.2:9000"]
+        \\require_trusted_devices = true
     );
     defer cfg.deinit(allocator);
 
@@ -267,6 +277,7 @@ test "parseConfigText parses all fields" {
     try std.testing.expectEqual(@as(u16, 9100), cfg.network.port);
     try std.testing.expectEqual(Config.TransportType.tcp, cfg.network.transport);
     try std.testing.expectEqual(@as(usize, 2), cfg.network.bootstrap_peers.len);
+    try std.testing.expect(cfg.security.require_trusted_devices);
 }
 
 test "parseConfigText releases everything on failure" {

@@ -20,6 +20,8 @@ pub const max_label_len = pairing.max_nickname_len;
 pub const Error = error{
     CorruptTrustStore,
     TrustStoreFull,
+    InvalidDeviceQuery,
+    AmbiguousDeviceQuery,
 };
 
 pub const Entry = struct {
@@ -37,6 +39,25 @@ pub const Entry = struct {
         return identity_mod.Identity.fingerprintOf(self.public_key);
     }
 };
+
+/// Lowercases a hex query and drops the decoration a user may paste from the
+/// `--devices` listing: an `0x` prefix and `-`, `:` or whitespace separators.
+fn normalizeHexQuery(query: []const u8, out: *[128]u8) ![]const u8 {
+    var start: usize = 0;
+    if (query.len >= 2 and query[0] == '0' and (query[1] == 'x' or query[1] == 'X')) start = 2;
+
+    var written: usize = 0;
+    for (query[start..]) |byte| {
+        switch (byte) {
+            '-', ':', ' ', '\t' => continue,
+            else => {},
+        }
+        if (!std.ascii.isHex(byte) or written >= out.len) return Error.InvalidDeviceQuery;
+        out[written] = std.ascii.toLower(byte);
+        written += 1;
+    }
+    return out[0..written];
+}
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
@@ -91,8 +112,11 @@ pub const Store = struct {
         return null;
     }
 
-    pub fn isTrusted(self: *Store, device_id: NodeID) bool {
-        return self.find(device_id) != null;
+    pub fn isTrusted(self: *const Store, device_id: NodeID) bool {
+        for (self.entries.items) |entry| {
+            if (entry.device_id.eql(device_id)) return true;
+        }
+        return false;
     }
 
     /// Records a self-verified pairing ticket. Returns true when the device was
@@ -135,6 +159,30 @@ pub const Store = struct {
             return true;
         }
         return false;
+    }
+
+    /// Resolves a device ID (64 hex chars) or fingerprint (16 hex chars) as
+    /// typed by a human: case-insensitive, `0x` prefix and `-`, `:` or space
+    /// separators allowed. Returns null when nothing matches.
+    pub fn resolve(self: *const Store, query: []const u8) !?NodeID {
+        var query_buf: [128]u8 = undefined;
+        const normalized = try normalizeHexQuery(query, &query_buf);
+        if (normalized.len == 0) return null;
+
+        var found: ?NodeID = null;
+        for (self.entries.items) |entry| {
+            var id_buf: [64]u8 = undefined;
+            var fingerprint_buf: [identity_mod.Identity.fingerprint_len * 2]u8 = undefined;
+            const id_hex = std.fmt.bufPrint(&id_buf, "{x}", .{entry.device_id.bytes}) catch unreachable;
+            const fingerprint_hex = std.fmt.bufPrint(&fingerprint_buf, "{x}", .{entry.fingerprint()}) catch unreachable;
+            if (!std.mem.eql(u8, normalized, id_hex) and !std.mem.eql(u8, normalized, fingerprint_hex)) continue;
+
+            // A full ID is unique; two devices could in principle share a
+            // truncated fingerprint, so never guess between them.
+            if (found != null) return Error.AmbiguousDeviceQuery;
+            found = entry.device_id;
+        }
+        return found;
     }
 
     /// Writes the store atomically: temp file in the same directory, then a
@@ -315,6 +363,35 @@ test "trust: revoke removes only the requested device" {
     try testing.expectEqual(@as(usize, 1), store.count());
     try testing.expect(!store.isTrusted(first.deviceId()));
     try testing.expect(store.isTrusted(second.deviceId()));
+}
+
+test "trust: resolve accepts ids, fingerprints and pasted decoration" {
+    const path = "test_trust_resolve.store";
+    cleanup(path);
+    defer cleanup(path);
+
+    var store = try Store.load(testing.allocator, path);
+    defer store.deinit();
+
+    const laptop = try testTicket(0x51, "laptop");
+    const phone = try testTicket(0x52, "phone");
+    _ = try store.trustTicket(laptop, 1);
+    _ = try store.trustTicket(phone, 2);
+
+    var id_buf: [64]u8 = undefined;
+    const id_hex = std.fmt.bufPrint(&id_buf, "{x}", .{laptop.deviceId().bytes}) catch unreachable;
+    try testing.expect((try store.resolve(id_hex)).?.eql(laptop.deviceId()));
+
+    // Uppercase, 0x prefix and the dashed fingerprint rendering all work.
+    var fp_buf: [19]u8 = undefined;
+    const fingerprint = identity_mod.Identity.formatFingerprint(phone.fingerprint(), &fp_buf);
+    try testing.expect((try store.resolve(fingerprint)).?.eql(phone.deviceId()));
+    var decorated_buf: [66]u8 = undefined;
+    const decorated = std.fmt.bufPrint(&decorated_buf, "0x{s}", .{id_hex}) catch unreachable;
+    try testing.expect((try store.resolve(decorated)).?.eql(laptop.deviceId()));
+
+    try testing.expect((try store.resolve("00112233445566778899aabbccddeeff")) == null);
+    try testing.expectError(Error.InvalidDeviceQuery, store.resolve("not-a-device"));
 }
 
 test "trust: save and load round-trip with private permissions" {

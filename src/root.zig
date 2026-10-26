@@ -22,7 +22,7 @@ pub const Node = struct {
     ring: *HashRight,
     device_paths: device.paths.Paths,
     device_identity: device.identity.Identity,
-    trust_store: device.trust.Store,
+    trust_store: *device.trust.Store,
     bootstrap_thread: ?std.Thread = null,
     bootstrap_running: *std.atomic.Value(bool),
 
@@ -85,8 +85,18 @@ pub const Node = struct {
         var device_paths = try device.paths.Paths.resolve(allocator, cfg.node.key_path);
         errdefer device_paths.deinit(allocator);
         const device_identity = try device.identity.Identity.loadOrCreate(device_paths.identity);
-        var trust_store = try device.trust.Store.load(allocator, device_paths.trust);
+        // Heap allocated so the authenticator's pointer stays valid after the
+        // Node value is copied out of init().
+        const trust_store = try allocator.create(device.trust.Store);
+        errdefer allocator.destroy(trust_store);
+        trust_store.* = try device.trust.Store.load(allocator, device_paths.trust);
         errdefer trust_store.deinit();
+
+        connection_manager.setDeviceAuthenticator(.{
+            .identity = device_identity,
+            .trust = trust_store,
+            .require_trusted = cfg.security.require_trusted_devices,
+        });
 
         const bootstrap_running = try allocator.create(std.atomic.Value(bool));
         bootstrap_running.* = std.atomic.Value(bool).init(true);
@@ -117,6 +127,7 @@ pub const Node = struct {
         self.connection_manager.stop();
 
         self.trust_store.deinit();
+        self.allocator.destroy(self.trust_store);
         self.device_paths.deinit(self.allocator);
 
         self.ring.deinit();
@@ -262,6 +273,7 @@ test {
         @import("cluster/ring.zig"),
         @import("cluster/vectors.zig"),
         @import("config.zig"),
+        @import("device/auth.zig"),
         @import("device/identity.zig"),
         @import("device/pairing.zig"),
         @import("device/paths.zig"),

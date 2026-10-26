@@ -1,6 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const network = @import("mod.zig");
+const device_auth = @import("../../device/auth.zig");
+const identity_mod = @import("../../device/identity.zig");
+const NodeID = @import("../id.zig").NodeID;
 
 const Hash = std.crypto.hash.blake2.Blake2s256;
 const Hmac = std.crypto.auth.hmac.Hmac(Hash);
@@ -200,8 +203,10 @@ pub const HandshakeState = struct {
     re: ?[32]u8, // Remote party's ephemeral public key (received during handshake)
     psk: [32]u8, // Pre-shared key
     initiator: bool,
+    auth: *const device_auth.Authenticator,
+    remote_device_id: ?NodeID = null,
 
-    pub fn init(initiator: bool, static_key: KeyPair, swarm_key: [32]u8) HandshakeState {
+    pub fn init(initiator: bool, static_key: KeyPair, swarm_key: [32]u8, auth: *const device_auth.Authenticator) HandshakeState {
         return .{
             .symmetric = SymmetricState.init("Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s"),
             .s = static_key,
@@ -210,6 +215,7 @@ pub const HandshakeState = struct {
             .re = null,
             .psk = swarm_key,
             .initiator = initiator,
+            .auth = auth,
         };
     }
 };
@@ -219,12 +225,20 @@ pub const NoiseStream = struct {
     send_cipher: CipherState,
     recv_cipher: CipherState,
     remote_static: [32]u8,
+    remote_device_id: NodeID,
     read_buffer: []u8,
     read_pos: usize = 0,
     read_end: usize = 0,
     allocator: std.mem.Allocator,
 
-    pub fn handshake(allocator: std.mem.Allocator, inner: network.Stream, swarm_key_bytes: []const u8, static_key: KeyPair, initiator: bool) !NoiseStream {
+    pub fn handshake(
+        allocator: std.mem.Allocator,
+        inner: network.Stream,
+        swarm_key_bytes: []const u8,
+        static_key: KeyPair,
+        initiator: bool,
+        auth: ?*const device_auth.Authenticator,
+    ) !NoiseStream {
         const role = if (initiator) "Initiator" else "Responder";
         std.debug.print("* Noise_XXpsk3 handshake start ({s})\n", .{role});
 
@@ -232,7 +246,15 @@ pub const NoiseStream = struct {
         var swarm_key: [32]u8 = undefined;
         @memcpy(&swarm_key, swarm_key_bytes);
 
-        var hs = HandshakeState.init(initiator, static_key, swarm_key);
+        // Callers that have no device identity yet (tests, embedded use) still
+        // take part in the identity exchange with an in-memory key.
+        var fallback_auth: device_auth.Authenticator = undefined;
+        const auth_ptr = auth orelse blk: {
+            fallback_auth = .{ .identity = identity_mod.Identity.generate() };
+            break :blk &fallback_auth;
+        };
+
+        var hs = HandshakeState.init(initiator, static_key, swarm_key, auth_ptr);
 
         const result = runHandshakeSteps(allocator, inner, &hs, initiator);
         if (result) |ns| {
@@ -264,6 +286,7 @@ pub const NoiseStream = struct {
             .send_cipher = if (initiator) ciphers[0] else ciphers[1],
             .recv_cipher = if (initiator) ciphers[1] else ciphers[0],
             .remote_static = hs.rs.?,
+            .remote_device_id = hs.remote_device_id.?,
             .read_buffer = read_buf,
             .read_pos = 0,
             .read_end = 0,
@@ -306,15 +329,20 @@ pub const NoiseStream = struct {
         const es = X25519.scalarmult(hs.s.private_key, hs.re.?) catch |err| return logError("Message 2 DH (es)", err);
         hs.symmetric.mixKey(&es);
 
-        var msg2: [32 + 48]u8 = undefined;
+        const hello = try hs.auth.createHello(hs.symmetric.h);
+        var payload_ct: [device_auth.hello_len + 16]u8 = undefined;
+        try hs.symmetric.encryptAndHash(&hello, &payload_ct);
+
+        var msg2: [32 + 48 + device_auth.hello_len + 16]u8 = undefined;
         @memcpy(msg2[0..32], &hs.e.?.public_key);
         @memcpy(msg2[32..80], &s_ct);
+        @memcpy(msg2[80..], &payload_ct);
         writeHandshakeMessage(inner, &msg2) catch |err| return logError("Message 2 write", err);
     }
 
     /// Message 2 (initiator): <- e, ee, s, es
     fn readMessage2(inner: network.Stream, hs: *HandshakeState) !void {
-        var buf: [32 + 48]u8 = undefined; // re, rs (encrypted)
+        var buf: [32 + 48 + device_auth.hello_len + 16]u8 = undefined; // re, rs (encrypted), device hello
         readHandshakeMessage(inner, &buf) catch |err| return logError("Message 2 read", err);
         std.debug.print("* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)\n", .{});
 
@@ -334,6 +362,13 @@ pub const NoiseStream = struct {
         // es
         const es = X25519.scalarmult(hs.e.?.private_key, hs.rs.?) catch |err| return logError("Message 2 DH (es)", err);
         hs.symmetric.mixKey(&es);
+
+        // Device identity, signed over the handshake hash that also
+        // authenticates this payload.
+        const transcript = hs.symmetric.h;
+        var hello: [device_auth.hello_len]u8 = undefined;
+        hs.symmetric.decryptAndHash(buf[80..], &hello) catch |err| return logError("Message 2 Decrypt (device hello)", err);
+        hs.remote_device_id = hs.auth.verifyHello(&hello, transcript) catch |err| return logError("Message 2 device identity", err);
     }
 
     /// Message 3 (initiator): -> s, se, psk
@@ -350,19 +385,20 @@ pub const NoiseStream = struct {
         // psk
         hs.symmetric.mixKeyAndHash(&hs.psk);
 
-        // Final message has s_ct and an empty payload encrypted (just a tag)
-        var payload_ct: [16]u8 = undefined;
-        try hs.symmetric.encryptAndHash(&[_]u8{}, &payload_ct);
+        // Payload: device identity, signed over the psk-mixed handshake hash.
+        const hello = try hs.auth.createHello(hs.symmetric.h);
+        var payload_ct: [device_auth.hello_len + 16]u8 = undefined;
+        try hs.symmetric.encryptAndHash(&hello, &payload_ct);
 
-        var msg3: [48 + 16]u8 = undefined;
+        var msg3: [48 + device_auth.hello_len + 16]u8 = undefined;
         @memcpy(msg3[0..48], &s_ct);
-        @memcpy(msg3[48..64], &payload_ct);
+        @memcpy(msg3[48..], &payload_ct);
         writeHandshakeMessage(inner, &msg3) catch |err| return logError("Message 3 write", err);
     }
 
     /// Message 3 (responder): -> s, se, psk
     fn readMessage3(inner: network.Stream, hs: *HandshakeState) !void {
-        var buf: [48 + 16]u8 = undefined;
+        var buf: [48 + device_auth.hello_len + 16]u8 = undefined;
         readHandshakeMessage(inner, &buf) catch |err| return logError("Message 3 read", err);
         std.debug.print("* Noise (IN):  Message 3 <- received static key (s) and PSK authentication\n", .{});
 
@@ -378,9 +414,11 @@ pub const NoiseStream = struct {
         // psk
         hs.symmetric.mixKeyAndHash(&hs.psk);
 
-        // payload
-        var payload: [0]u8 = undefined;
-        hs.symmetric.decryptAndHash(buf[48..64], &payload) catch |err| return logError("Message 3 Decrypt (payload/psk verify)", err);
+        // payload: device identity (also verifies the PSK-derived key)
+        const transcript = hs.symmetric.h;
+        var hello: [device_auth.hello_len]u8 = undefined;
+        hs.symmetric.decryptAndHash(buf[48..], &hello) catch |err| return logError("Message 3 Decrypt (payload/psk verify)", err);
+        hs.remote_device_id = hs.auth.verifyHello(&hello, transcript) catch |err| return logError("Message 3 device identity", err);
     }
 
     fn logError(step: []const u8, err: anyerror) anyerror {

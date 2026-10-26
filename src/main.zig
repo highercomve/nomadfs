@@ -12,13 +12,14 @@ const DevicePaths = device.paths.Paths;
 /// rotates, and an old QR code should not grant access forever.
 const ticket_lifetime_seconds = 24 * 60 * 60;
 
-const Command = enum { run, pair, trust, devices };
+const Command = enum { run, pair, trust, devices, revoke };
 
 const Options = struct {
     command: Command = .run,
     config_path: ?[]const u8 = null,
     address: ?[]const u8 = null,
     trust_uri: ?[]const u8 = null,
+    revoke_query: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -38,6 +39,7 @@ pub fn main(init: std.process.Init) !void {
         .pair => try pairCommand(allocator, config, options.address),
         .trust => try trustCommand(allocator, config, options.trust_uri.?),
         .devices => try devicesCommand(allocator, config),
+        .revoke => try revokeCommand(allocator, config, options.revoke_query.?),
         .run => try runNode(allocator, config),
     }
 }
@@ -59,6 +61,9 @@ fn parseArgs(args: []const []const u8, options: *Options) !bool {
             options.trust_uri = try nextValue(args, &i, "--trust");
         } else if (std.mem.eql(u8, arg, "--devices")) {
             try selectCommand(options, .devices);
+        } else if (std.mem.eql(u8, arg, "--revoke")) {
+            try selectCommand(options, .revoke);
+            options.revoke_query = try nextValue(args, &i, "--revoke");
         } else if (std.mem.eql(u8, arg, "--address")) {
             options.address = try nextValue(args, &i, "--address");
         } else if (std.mem.startsWith(u8, arg, "-")) {
@@ -91,7 +96,7 @@ fn nextValue(args: []const []const u8, index: *usize, flag: []const u8) ![]const
 
 fn selectCommand(options: *Options, command: Command) !void {
     if (options.command != .run) {
-        std.debug.print("Error: only one of --pair, --trust or --devices may be used\n", .{});
+        std.debug.print("Error: only one of --pair, --trust, --devices or --revoke may be used\n", .{});
         std.process.exit(1);
     }
     options.command = command;
@@ -106,6 +111,7 @@ fn printHelp() void {
         \\  nomadfs --pair [--address host:port] [config_path]
         \\  nomadfs --trust <nomadfs://pair?...> [config_path]
         \\  nomadfs --devices [config_path]
+        \\  nomadfs --revoke <device-id-or-fingerprint> [config_path]
         \\
         \\Options:
         \\  --config <path>    Path to the configuration file
@@ -113,6 +119,7 @@ fn printHelp() void {
         \\  --address <addr>   Address(es) to publish in the ticket, comma separated
         \\  --trust <uri>      Verify and add a pairing ticket to the trust store
         \\  --devices          List trusted devices
+        \\  --revoke <id>      Remove a trusted device by ID or fingerprint
         \\  --help, -h         Show this help message
         \\
     , .{});
@@ -236,6 +243,33 @@ fn devicesCommand(allocator: std.mem.Allocator, config: config_mod.Config) !void
             entry.device_id.bytes[0..4],
         });
     }
+}
+
+fn revokeCommand(allocator: std.mem.Allocator, config: config_mod.Config, query: []const u8) !void {
+    var paths = try DevicePaths.resolve(allocator, config.node.key_path);
+    defer paths.deinit(allocator);
+
+    var store = try TrustStore.load(allocator, paths.trust);
+    defer store.deinit();
+
+    const device_id = store.resolve(query) catch |err| switch (err) {
+        error.InvalidDeviceQuery => {
+            std.debug.print("Error: '{s}' is not a hex device ID or fingerprint\n", .{query});
+            std.process.exit(1);
+        },
+        error.AmbiguousDeviceQuery => {
+            std.debug.print("Error: '{s}' matches more than one device; use the full device ID\n", .{query});
+            std.process.exit(1);
+        },
+        else => return err,
+    } orelse {
+        std.debug.print("No trusted device matches '{s}' in {s}\n", .{ query, paths.trust });
+        std.process.exit(1);
+    };
+
+    _ = store.revoke(device_id);
+    try store.save();
+    std.debug.print("Revoked device '{s}' from {s}\n", .{ query, paths.trust });
 }
 
 fn nowSeconds() u64 {
