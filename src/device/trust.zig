@@ -103,7 +103,10 @@ pub fn applyRevocation(
     const signer_id = NodeID.fromPublicKey(signer_key);
     try identity_mod.Identity.verify(signer_key, &revocationMessage(device_id, signer_id), signature);
     if (!store.isTrusted(signer_id)) return false;
-    return store.revokeDevice(device_id, signer_id, now);
+    // The ack reports absorption, not entry removal: replaying a tombstone
+    // the store already holds still counts as honored.
+    _ = try store.revokeDevice(device_id, signer_id, now);
+    return true;
 }
 
 /// Format marker of the trailing integrity line.

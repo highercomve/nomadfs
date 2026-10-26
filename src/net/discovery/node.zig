@@ -544,6 +544,50 @@ pub const Node = struct {
         return honored;
     }
 
+    /// Anti-entropy for revocations: connects to a sample of known peers
+    /// and replays every tombstone we hold, so peers that never dialed us
+    /// still learn which devices were removed. Returns how many peers
+    /// accepted at least one revocation.
+    pub fn sweepRevocations(self: *Node, sample: usize) !usize {
+        const trust = self.trust_store orelse return 0;
+        const ids = try trust.copyRevocationIds(self.allocator);
+        defer self.allocator.free(ids);
+        if (ids.len == 0 or self.device_identity == null) return 0;
+
+        self.mutex.lock();
+        const maybe_peers = self.routing_table.getClosestPeers(self.manager.node_id, sample) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
+        const peers = maybe_peers;
+        defer self.allocator.free(peers);
+
+        var accepted: usize = 0;
+        for (peers) |peer| {
+            const conn = self.manager.connectToPeerMulti(
+                peer.addresses[0..peer.addrs_count],
+                self.swarm_key,
+                peer.id,
+            ) catch |err| {
+                std.debug.print("Revocation sweep: {x} unreachable: {any}\n", .{ peer.id.bytes[0..4], err });
+                continue;
+            };
+            defer conn.deinit();
+
+            var any_honored = false;
+            for (ids) |device_id| {
+                const ok = self.sendRevoke(conn, device_id) catch |err| {
+                    std.debug.print("Revocation sweep: push to {x} failed: {any}\n", .{ peer.id.bytes[0..4], err });
+                    continue;
+                };
+                if (ok) any_honored = true;
+            }
+            if (any_honored) accepted += 1;
+        }
+        return accepted;
+    }
+
     // Returns either the value (allocated) or closer peers (allocated)
     pub const FindValueResult = union(enum) {
         value: []u8,

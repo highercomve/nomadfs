@@ -36,9 +36,9 @@ The security of the entire network relies on the **Swarm Key**. This is a 32-byt
 
 ## 5. Future Work
 
-- **Revocation Propagation**: Signed revocations already spread with the
-  `REVOKE` RPC; a periodic anti-entropy sweep and receiver-side thresholds
-  ("K trusted peers must agree") are still missing.
+- **Revocation Propagation**: Spread over dial-time pushes and the periodic
+  sweep; receiver-side thresholds ("K trusted peers must agree") remain an
+  option for detecting a compromised signer.
 - **Capability-Based Access Control**: Granular read/write permissions.
 - **Connection Rate Limiting**: Defense against DoS.
 - **Peer Reputation System**: Mitigation for Sybil/Eclipse attacks.

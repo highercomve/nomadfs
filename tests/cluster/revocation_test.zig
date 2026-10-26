@@ -98,3 +98,71 @@ test "cluster: revocations require a verified signature from a trusted device" {
         try std.testing.expect(receiver_store.isRevoked(phone.deviceId()));
     }
 }
+
+test "cluster: the revocation sweep reaches peers that never dialed out" {
+    std.debug.print("\n=== Running Test: cluster: revocation anti-entropy sweep ===\n", .{});
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const admin = try identityWith(0x86);
+    const phone = try identityWith(0x87);
+
+    const a_path = "test_sweep_a.store";
+    const b_path = "test_sweep_b.store";
+    std.Io.Dir.cwd().deleteFile(io, a_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, b_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, a_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, b_path) catch {};
+
+    var store_a = try TrustStore.load(allocator, a_path, null);
+    defer store_a.deinit();
+    var store_b = try TrustStore.load(allocator, b_path, null);
+    defer store_b.deinit();
+
+    // A holds a tombstone; B never met A and still holds the phone.
+    _ = try store_b.trustTicket(try ticketFor(admin, "admin"), 1);
+    _ = try store_b.trustTicket(try ticketFor(phone, "phone"), 2);
+    _ = try store_a.revokeDevice(phone.deviceId(), admin.deviceId(), 77);
+
+    var peer_a = try TestPeer.init(allocator, 13122);
+    defer peer_a.deinit();
+    var peer_b = try TestPeer.init(allocator, 13123);
+    defer peer_b.deinit();
+    defer peer_a.stop();
+    defer peer_b.stop();
+
+    var dht_a = DhtNode.init(allocator, peer_a.manager, peer_a.config.node.swarm_key);
+    defer dht_a.deinit();
+    var dht_b = DhtNode.init(allocator, peer_b.manager, peer_b.config.node.swarm_key);
+    defer dht_b.deinit();
+    dht_a.device_identity = admin;
+    dht_a.trust_store = &store_a;
+    dht_b.trust_store = &store_b;
+    peer_a.manager.setConnectionHandler(&dht_a, DhtNode.serve);
+    peer_b.manager.setConnectionHandler(&dht_b, DhtNode.serve);
+
+    try peer_a.start();
+    try peer_b.start();
+    nomadfs.sync.sleep(100 * std.time.ns_per_ms);
+
+    // A pings B once so the routing tables know each other (both sides get
+    // the peer via the verified PONG path).
+    {
+        const conn = try peer_a.manager.connectToPeer(peer_b.listen_addr, peer_a.config.node.swarm_key, peer_b.manager.node_id);
+        defer conn.deinit();
+        try dht_a.ping(conn);
+    }
+    nomadfs.sync.sleep(200 * std.time.ns_per_ms);
+
+    const accepted = try dht_a.sweepRevocations(4);
+    try std.testing.expectEqual(@as(usize, 1), accepted);
+
+    try std.testing.expect(store_b.isRevoked(phone.deviceId()));
+    try std.testing.expect(!store_b.isTrusted(phone.deviceId()));
+    // The admin device itself stays trusted.
+    try std.testing.expect(store_b.isTrusted(admin.deviceId()));
+
+    // A second sweep is a no-op beyond reaching the peer again.
+    const accepted_again = try dht_a.sweepRevocations(4);
+    try std.testing.expectEqual(@as(usize, 1), accepted_again);
+}

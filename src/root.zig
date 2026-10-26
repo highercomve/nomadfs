@@ -204,6 +204,11 @@ pub const Node = struct {
             discovery_node.refreshBuckets() catch |err| {
                 std.debug.print("Bucket refresh error: {any}\n", .{err});
             };
+            // Revocation anti-entropy: the push-on-connect path misses peers
+            // that never dial us until they do.
+            _ = discovery_node.sweepRevocations(4) catch |err| {
+                std.debug.print("Revocation sweep error: {any}\n", .{err});
+            };
         }
     }
 

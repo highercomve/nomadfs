@@ -249,9 +249,11 @@ nodes' stores.
 
 Tombstones persist in `trust.store` (`@`-prefixed lines, capped at 256), and
 they do not block recovery: pairing again with a fresh, human-scanned ticket
-clears the tombstone. Propagation is eventual - peers that were offline get
-the tombstone the next time they dial a peer that still holds it; a periodic
-anti-entropy sweep for revocations is future work.
+clears the tombstone. Propagation happens on both paths: out of band, every
+connection we dial hears our tombstones right after its PING; and the
+periodic maintenance loop every minute replays them to a sample of known
+peers even if they never dial us. A missing peer eventually gets the
+tombstones as long as either side can reach the fleet.
 
 ## 8. Threat Notes & Next Steps
 
