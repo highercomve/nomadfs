@@ -55,6 +55,7 @@ laptop pair through the same QR ticket flow.
 | Linux (this machine) | `zig build` | `zig-out/lib/libnomadfs.so` |
 | Mac (any arch) | `zig build -Dtarget=aarch64-macos` | `libnomadfs.dylib` |
 | Windows | `zig build -Dtarget=x86_64-windows-gnu` | `nomadfs.dll` (via `nomadfs.lib`) |
+| Android (per ABI) | `gen-libc.sh lib -p zig-out/android/<abi>` | `zig-out/android/<abi>/lib-android/` |
 
 ### Android
 
@@ -106,7 +107,41 @@ activity's lifetime (`open` in `onCreate`, `close` in `onDestroy`); the
 listener and bootstrap threads are joined by the same calls, so no native
 threads outlive the object.
 
-## 5. Swift (committed sources)
+## 5. Chromebooks & Googlebook
+
+Googlebook devices run Android apps through the ChromeOS Android runtime
+(ARC VM), and so do their Chromebook predecessors. Two things matter for
+NomadFS:
+
+1. **ABI coverage.** ARC hosts are `x86_64` (Intel Core Ultra) or
+   `arm64-v8a` (Snapdragon X Elite). The repo therefore builds both ABIs
+   (`gen-libc.sh` honors `NOMADFS_ANDROID_ABI=` and `Android.mk` links a
+   per-ABI prebuilt), and the harness APK packages them into both
+   `lib/x86_64` and `lib/arm64-v8a` so one APK installs anywhere. Desktop
+   mode and Googlebook windowing do not change the ABI: a headless binding
+   sees the same sandbox, storage paths and ` INTERNET` permission.
+
+2. **Bionic seccomp.** Android (including ARC VM) blocks the raw `poll`
+   syscall; the connect-timeout code waits via `ppoll`, which matches what
+   bionic uses everywhere. This is verified on-device (see below).
+
+## 6. On-device harness (emulator verdict)
+
+`src/mobile/android/emulator/harness.sh` assembles a debug APK from the
+SDK build tools (aapt2 + d8 + apksigner, no Gradle), boots or reuses a
+headless AVD (KVM), installs it, and runs a real end-to-end flow inside
+ART's app namespace through the Java binding:
+
+- two nodes with distinct device ids open, run and stop cleanly;
+- B bootstraps against A, then a 200 KB payload passes B -> A (A fetches
+  every missing block from B, verifying each CID), byte-identical;
+
+The script prints `NOMADFS-HARNESS: PASS`; `--keep` leaves the APK
+installed for manual poking with `adb shell`. It has been verified against
+the api-35 x86_64 system image (ARC VM architecture, the Googlebook ABI)
+plus the arm64-v8a binary is cross-built every run.
+
+## 7. Swift (committed sources)
 
 `src/mobile/swift/` is a SwiftPM package rooted at `src/mobile` that wraps
 the same header:

@@ -120,6 +120,14 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
+    // Per-ABI installs for Android packaging: zig build lib -Dtarget=... -p
+    // <out-dir> drops only libnomadfs.so into <out-dir>/lib-android.
+    const lib_install = b.addInstallArtifact(lib, .{
+        .dest_dir = .{ .override = .{ .custom = "lib-android" } },
+    });
+    const lib_step = b.step("lib", "Install only the mobile C ABI library");
+    lib_step.dependOn(&lib_install.step);
+
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden

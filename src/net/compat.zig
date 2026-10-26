@@ -254,7 +254,13 @@ pub fn tcpConnectToAddressTimeout(address: Address, timeout_ms: u32) !Stream {
 fn awaitConnect(fd: i32, timeout_ms: u32) !void {
     const linux = std.os.linux;
     var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
-    const ready = linux.poll(&fds, 1, @intCast(@min(timeout_ms, std.math.maxInt(i32))));
+    // Android's seccomp profile forbids the raw `poll` syscall (bionic only
+    // uses ppoll), so wait on ppoll even on desktop Linux.
+    const timeout: linux.timespec = .{
+        .sec = @intCast(timeout_ms / std.time.ms_per_s),
+        .nsec = @intCast((timeout_ms % std.time.ms_per_s) * std.time.ns_per_ms),
+    };
+    const ready = linux.ppoll(&fds, 1, @constCast(&timeout), null);
     switch (linux.errno(ready)) {
         .SUCCESS => {},
         .INTR => return error.ConnectionTimedOut,

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Bare harness package: no UI, just an instrumentation that exercises the
+     NomadFs JNI binding on a real Android runtime. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="net.nomadfs.harness">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application android:hasCode="true" android:debuggable="true" android:label="NomadFsHarness">
+        <activity
+            android:name="net.nomadfs.harness.HarnessActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+    </application>
+    <instrumentation
+        android:name="net.nomadfs.harness.NomadFsInstrumentation"
+        android:targetPackage="net.nomadfs.harness" />
+</manifest>
