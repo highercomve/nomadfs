@@ -87,8 +87,9 @@ To fully understand NomadFS, familiarity with these concepts is helpful. We have
     *   [6.4: Performance Targets](./ops/performance.md)
 10. **[Chapter 7: Security & API](./security/model.md)**
     *   [7.1: Security Model](./security/model.md)
-    *   [7.2: API Reference](./api/reference.md)
-    *   [7.3: Testing Strategy](./testing.md)
+    *   [7.2: Device Identity & Pairing](./security/pairing.md)
+    *   [7.3: API Reference](./api/reference.md)
+    *   [7.4: Testing Strategy](./testing.md)
 
 ## 5. Getting Started with the Code
 

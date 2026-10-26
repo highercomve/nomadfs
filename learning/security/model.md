@@ -14,12 +14,14 @@
 | **Eavesdropping** | **ChaCha20-Poly1305** encryption on all streams. | ✅ Implemented |
 | **Man-in-the-Middle** | **Noise_XXpsk3** handshake enforces mutual auth. | ✅ Implemented |
 | **Tampering** | **Merkle DAGs** ensure content integrity by hash. | ✅ Implemented |
+| **Unknown Device** | **Pairing tickets** carry a self-signed Ed25519 identity; fingerprints are compared out of band. | ⚠️ Partial: handshake binding pending |
 | **Sybil Attack** | **None currently**. A malicious actor with the Swarm Key can flood the DHT. | ⚠️ Risk |
 | **Eclipse Attack** | **K-Buckets** prefer long-lived peers, but still vulnerable. | ⚠️ Risk |
 | **DoS** | Basic **Yamux** flow control, but no strict rate limiting yet. | ⚠️ Risk |
 
 ## 3. Cryptography Standards
 
+- **Device Identity**: Ed25519 signatures (tickets, trust store)
 - **Key Exchange**: X25519 (Elliptic Curve Diffie-Hellman)
 - **Encryption**: ChaCha20-Poly1305 (Authenticated Encryption)
 - **Hash Function**: BLAKE2s (for Noise state), SHA-256 (for Content Addressing)
@@ -34,6 +36,8 @@ The security of the entire network relies on the **Swarm Key**. This is a 32-byt
 
 ## 5. Future Work
 
+- **Handshake-Bound Identity**: Require a trusted Ed25519 device identity during
+  the Noise handshake instead of relying on the Swarm Key alone.
 - **Capability-Based Access Control**: Granular read/write permissions.
 - **Connection Rate Limiting**: Defense against DoS.
 - **Peer Reputation System**: Mitigation for Sybil/Eclipse attacks.

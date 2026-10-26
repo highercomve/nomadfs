@@ -122,6 +122,12 @@ pub const ConnectionManager = struct {
         }
     }
 
+    /// Public wrapper for callers that need the node transport key without
+    /// constructing a manager, such as device pairing.
+    pub fn loadOrCreateKey(allocator: std.mem.Allocator, explicit_path: ?[]const u8) !noise.KeyPair {
+        return loadOrGenerateKey(allocator, explicit_path);
+    }
+
     /// Loads the node key, generating one only where none exists yet. An
     /// existing but unreadable or corrupt key is an error: replacing it
     /// would silently change the node's identity.

@@ -4,6 +4,7 @@ const std = @import("std");
 pub const config = @import("config.zig");
 pub const net = @import("net/mod.zig");
 pub const storage = @import("storage/mod.zig");
+pub const device = @import("device/mod.zig");
 pub const cluster = @import("cluster/mod.zig");
 pub const sync = @import("sync.zig");
 pub const env = @import("env.zig");
@@ -19,6 +20,9 @@ pub const Node = struct {
     discovery_node: *DiscoveryNode,
     block_manager: *cluster.BlockManager,
     ring: *HashRight,
+    device_paths: device.paths.Paths,
+    device_identity: device.identity.Identity,
+    trust_store: device.trust.Store,
     bootstrap_thread: ?std.Thread = null,
     bootstrap_running: *std.atomic.Value(bool),
 
@@ -78,6 +82,12 @@ pub const Node = struct {
             try ring.addNode(connection_manager.node_id, 10);
         }
 
+        var device_paths = try device.paths.Paths.resolve(allocator, cfg.node.key_path);
+        errdefer device_paths.deinit(allocator);
+        const device_identity = try device.identity.Identity.loadOrCreate(device_paths.identity);
+        var trust_store = try device.trust.Store.load(allocator, device_paths.trust);
+        errdefer trust_store.deinit();
+
         const bootstrap_running = try allocator.create(std.atomic.Value(bool));
         bootstrap_running.* = std.atomic.Value(bool).init(true);
 
@@ -88,6 +98,9 @@ pub const Node = struct {
             .discovery_node = discovery_node,
             .block_manager = block_manager,
             .ring = ring,
+            .device_paths = device_paths,
+            .device_identity = device_identity,
+            .trust_store = trust_store,
             .bootstrap_running = bootstrap_running,
             .bootstrap_thread = null,
         };
@@ -102,6 +115,9 @@ pub const Node = struct {
 
         // Stop network traffic and callbacks BEFORE destroying handlers
         self.connection_manager.stop();
+
+        self.trust_store.deinit();
+        self.device_paths.deinit(self.allocator);
 
         self.ring.deinit();
         self.allocator.destroy(self.ring);
@@ -246,6 +262,11 @@ test {
         @import("cluster/ring.zig"),
         @import("cluster/vectors.zig"),
         @import("config.zig"),
+        @import("device/identity.zig"),
+        @import("device/pairing.zig"),
+        @import("device/paths.zig"),
+        @import("device/qr.zig"),
+        @import("device/trust.zig"),
         @import("env.zig"),
         @import("errors.zig"),
         @import("metrics.zig"),
