@@ -6,9 +6,9 @@ const StorageEngine = @import("../engine.zig").StorageEngine;
 const block_mod = @import("../block.zig");
 const Block = block_mod.Block;
 const codec = @import("codec.zig");
+const chunker = @import("../chunker.zig");
 
-// IPFS default chunk size is 256KB
-pub const CHUNK_SIZE = 256 * 1024;
+pub const chunk_params = chunker.Params{};
 const MAX_LINKS = 174;
 
 pub const Layout = enum {
@@ -28,23 +28,24 @@ pub const DagBuilder = struct {
         var leaf_metadata: std.ArrayList(DagLink) = .empty;
         defer self.freeLinks(&leaf_metadata);
 
-        // Buffer for reading chunks (Zero-Copy Strategy: Reuse this buffer).
-        // Byte 0 holds the leaf tag, so each chunk is read directly into an
-        // encoded leaf block.
-        const buffer = try self.allocator.alloc(u8, 1 + CHUNK_SIZE);
-        defer self.allocator.free(buffer);
-        buffer[0] = @intFromEnum(codec.Tag.leaf);
+        var chk = try chunker.Chunker.init(self.allocator, chunk_params);
+        defer chk.deinit();
 
-        while (true) {
-            const bytes_read = try reader.read(buffer[1..]);
-            if (bytes_read == 0) break;
+        // Reused encoding buffer: byte 0 holds the leaf tag, so a chunk is
+        // copied once into place and persisted straight from there. Chunk
+        // slices returned by the chunker alias its own buffer, which is why
+        // the copy is needed.
+        const leaf_buf = try self.allocator.alloc(u8, 1 + chunk_params.max_size);
+        defer self.allocator.free(leaf_buf);
+        leaf_buf[0] = @intFromEnum(codec.Tag.leaf);
 
-            // Persist the leaf before the buffer is reused by the next read.
-            const leaf_cid = try self.persistBytes(buffer[0 .. 1 + bytes_read]);
+        while (try chk.next(reader)) |chunk| {
+            @memcpy(leaf_buf[1 .. 1 + chunk.len], chunk);
+            const leaf_cid = try self.persistBytes(leaf_buf[0 .. 1 + chunk.len]);
             defer self.allocator.free(leaf_cid);
 
             // Empty name for leaves in list
-            try self.appendLink(&leaf_metadata, "", leaf_cid, bytes_read);
+            try self.appendLink(&leaf_metadata, "", leaf_cid, chunk.len);
         }
 
         // Step B & C: Linking
@@ -269,10 +270,11 @@ test "DagBuilder does not leak when allocation fails" {
     var engine = try StorageEngine.init(testing.allocator, test_path);
     defer engine.deinit();
 
-    // Three leaves, so both layouts build at least one internal node.
-    const data = try testing.allocator.alloc(u8, CHUNK_SIZE * 2 + 17);
+    // Sized to produce several leaves so both layouts build at least one internal node.
+    const data = try testing.allocator.alloc(u8, chunk_params.max_size * 3);
     defer testing.allocator.free(data);
-    for (data, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var prng = std.Random.DefaultPrng.init(0x1234abcd);
+    prng.random().bytes(data);
 
     for ([_]Layout{ .Balanced, .Linear }) |layout| {
         try testing.checkAllAllocationFailures(testing.allocator, buildOnce, .{ &engine, layout, data });

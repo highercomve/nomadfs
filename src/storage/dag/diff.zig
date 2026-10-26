@@ -54,7 +54,6 @@ pub fn freeDiff(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) 
 }
 
 const DagBuilder = @import("builder.zig").DagBuilder;
-const CHUNK_SIZE = @import("builder.zig").CHUNK_SIZE;
 
 const SliceReader = struct {
     buffer: []const u8,
@@ -94,13 +93,15 @@ test "DiffService: calculateDiff detects changes" {
     defer engine.deinit();
     var diff_service = DiffService{ .store = &engine, .allocator = allocator };
 
-    // Two three-chunk files that differ only in the middle chunk.
-    const old_data = try allocator.alloc(u8, CHUNK_SIZE * 3);
+    const data_size = 3 * 1024 * 1024;
+    const old_data = try allocator.alloc(u8, data_size);
     defer allocator.free(old_data);
-    @memset(old_data, 'a');
+    var prng = std.Random.DefaultPrng.init(0x11223344);
+    prng.random().bytes(old_data);
+
     const new_data = try allocator.dupe(u8, old_data);
     defer allocator.free(new_data);
-    new_data[CHUNK_SIZE + 5] = 'b';
+    new_data[data_size / 2] ^= 0xff;
 
     const old_root = try buildFile(&engine, old_data);
     defer allocator.free(old_root);
@@ -112,17 +113,86 @@ test "DiffService: calculateDiff detects changes" {
     defer freeDiff(allocator, &same);
     try testing.expectEqual(@as(usize, 0), same.items.len);
 
-    // Changed middle chunk: only the new root and the new leaf differ. The
-    // unchanged first/last chunks ('a' * CHUNK_SIZE) are shared.
+    // Changed middle chunk: CDC limits the diff to the changed leaf,
+    // possibly a neighbor, plus parent/root.
     var diff = try diff_service.calculateDiff(old_root, new_root);
     defer freeDiff(allocator, &diff);
-    try testing.expectEqual(@as(usize, 2), diff.items.len);
+    try testing.expect(diff.items.len >= 2 and diff.items.len <= 4);
     try testing.expect(containsCid(diff.items, new_root));
     try testing.expect(!containsCid(diff.items, old_root));
 
     // A missing block is reported, not skipped.
     const unknown = [_]u8{0x42} ** codec.cid_len;
     try testing.expectError(error.BlockNotFound, diff_service.calculateDiff(&unknown, new_root));
+}
+
+test "DiffService: shift resistance with FastCDC" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const test_path = "test_storage_diff_shift";
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+
+    var engine = try StorageEngine.init(allocator, test_path);
+    defer engine.deinit();
+    var diff_service = DiffService{ .store = &engine, .allocator = allocator };
+
+    const data_len = 4 * 1024 * 1024;
+    const data_a = try allocator.alloc(u8, data_len);
+    defer allocator.free(data_a);
+    var prng = std.Random.DefaultPrng.init(0x55667788);
+    prng.random().bytes(data_a);
+
+    // Insert one byte at offset 100
+    const data_b = try allocator.alloc(u8, data_len + 1);
+    defer allocator.free(data_b);
+    @memcpy(data_b[0..100], data_a[0..100]);
+    data_b[100] = 0xAA;
+    @memcpy(data_b[101..], data_a[100..]);
+
+    const root_a = try buildFile(&engine, data_a);
+    defer allocator.free(root_a);
+    const root_b = try buildFile(&engine, data_b);
+    defer allocator.free(root_b);
+
+    var diff = try diff_service.calculateDiff(root_a, root_b);
+    defer freeDiff(allocator, &diff);
+
+    // CDC preserves boundaries: diff must be small (<= 4 blocks)
+    try testing.expect(diff.items.len <= 4);
+
+    // Count leaves in DAG A and check how many are shared with DAG B
+    var reachable_a = try walk.collectReachable(allocator, &engine, root_a);
+    defer reachable_a.deinit(allocator);
+    var reachable_b = try walk.collectReachable(allocator, &engine, root_b);
+    defer reachable_b.deinit(allocator);
+
+    var leaf_count_a: usize = 0;
+    var shared_leaves: usize = 0;
+    var it = reachable_a.keyIterator();
+    while (it.next()) |cid| {
+        {
+            const block = (try engine.get(cid, allocator)).?;
+            defer allocator.free(block.data);
+            switch (try codec.decode(block.data)) {
+                .leaf => {
+                    leaf_count_a += 1;
+                    if (reachable_b.contains(cid.*)) shared_leaves += 1;
+                },
+                .parent => {},
+            }
+        }
+    }
+
+    std.debug.print("\nShift resistance: diff size = {d}, shared leaves = {d}/{d}\n", .{
+        diff.items.len,
+        shared_leaves,
+        leaf_count_a,
+    });
+
+    try testing.expect(shared_leaves >= leaf_count_a - 2);
 }
 
 test "DiffService: no leaks when allocation fails" {

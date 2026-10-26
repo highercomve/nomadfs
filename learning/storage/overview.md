@@ -12,7 +12,7 @@ In a traditional file system, you find a file by its path (e.g., `/home/user/pho
 
 ## 2. Chunking & Blocks
 
-Large files are split into smaller **Chunks** (typically 256 KB). Each chunk is hashed and stored as an immutable **Block**.
+Large files are split into smaller **Chunks** by content-defined chunking (FastCDC: 64 KiB minimum, 256 KiB average, 1 MiB maximum). Each chunk is hashed and stored as an immutable **Block**.
 
 ```mermaid
 graph BT

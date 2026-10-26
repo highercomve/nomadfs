@@ -19,45 +19,42 @@ pub const Block = struct {
 
 The CID is derived directly from the data. This means:
 *   **Integrity**: If a single bit of the data changes, the CID changes.
-*   **Deduplication**: If two different files contain the same 256KB chunk of data, that chunk is only stored once in the system, as they both share the same CID.
+*   **Deduplication**: If two files contain the same chunk of data (same content-defined boundary and bytes), that chunk is only stored once, as both share the same CID.
 
-## 3. Chunking Strategies
+## 3. Chunking Strategy: FastCDC
 
-A large file must be split into multiple blocks. The component responsible for this is the `Chunker`.
+A large file must be split into multiple blocks. The component responsible for this is the `Chunker` in `src/storage/chunker.zig`, which implements **FastCDC** (Xia et al., USENIX ATC 2016): content-defined chunking driven by a gear hash over a 256-entry table that is generated at compile time from a fixed seed.
 
-### Fixed-Size Chunking
-Currently, NomadFS implements a simple fixed-size chunking strategy. The file is sliced into 256 KB segments (the default size).
+Chunk boundaries are chosen by the content itself:
 
 ```zig
-pub fn chunk(data: []const u8, chunk_size: usize, allocator: std.mem.Allocator) ![]Block {
-    var blocks = std.ArrayList(Block).init(allocator);
-    var i: usize = 0;
-    while (i < data.len) {
-        const end = @min(i + chunk_size, data.len);
-        const slice = data[i..end];
-        try blocks.append(Block.new(slice));
-        i = end;
-    }
-    return blocks.toOwnedSlice();
-}
+// A rolling hash skips ahead; a boundary is where the mask matches.
+hash = (hash << 1) +% gear[data[i]];
+if (hash & mask == 0) return i + 1;
 ```
 
-### Content-Defined Chunking (Future)
-In the future, NomadFS plans to implement **Content-Defined Chunking (CDC)** using algorithms like Rabin Fingerprinting. CDC allows for better deduplication when bytes are inserted or deleted in the middle of a file, as the chunk boundaries "shift" with the content.
+Sizes are bounded: 64 KiB minimum, 256 KiB average, 1 MiB maximum. The mask is stricter before the average size and looser after it, which keeps chunks near 256 KiB instead of bunching at the minimum.
 
-## 4. Why 256 KB?
+### Why not fixed-size?
+With fixed 256 KiB chunks, inserting one byte near the start of a file shifts every later boundary. Every chunk after the edit gets a new CID, so the DAG diff and the repair path re-transfer the whole file. Content-defined boundaries resynchronise within one or two chunks, so an insertion changes only a couple of blocks and the rest of the DAG is shared.
 
-We chose 256 KB as the default chunk size to balance two competing needs:
+The trade-off is that a chunker must look at the content to find boundaries, so blocks are no longer aligned to offsets in the file. That is why links in the DAG carry explicit sizes instead of assuming a fixed chunk size.
+
+## 4. Why 64 KiB / 256 KiB / 1 MiB?
+
+The bounds balance three competing needs:
 1.  **Deduplication Efficiency**: Smaller chunks increase the chance of finding duplicate data but increase the overhead of managing the Merkle DAG.
 2.  **Network Performance**: Larger chunks are more efficient to transfer over high-latency links but make the system less responsive when resuming interrupted downloads.
+3.  **Bounded memory**: The chunker holds at most one maximum-size chunk in memory, so the limit doubles as the streaming buffer size.
 
-## 5. Memory Efficiency (The Zero-Copy Rule)
+Because the gear table and seed are part of the on-disk format, changing either changes every CID. Treat them as frozen.
 
-A core mandate of NomadFS is to avoid unnecessary memory copying.
+## 5. Memory Efficiency
 
-*   **Slices over Allocations**: The `Block` struct and `Chunker` logic rely on **slices** (`[]const u8`) rather than owning buffers whenever possible.
-*   **Streaming**: When processing large files, we read data into a fixed-size buffer (e.g., 256 KB), hash it, persist it, and discard it *immediately*. We do **not** load the entire file into memory.
+*   **Slices over Allocations**: The `Block` struct relies on **slices** (`[]const u8`) rather than owning buffers whenever possible.
+*   **Streaming**: The chunker reads into one `max_size` buffer (1 MiB), compacts the unconsumed tail to the front, and returns a slice into that buffer. The `DagBuilder` copies each chunk once into a reused tag-prefixed block buffer, hashes it, persists it, and drops it. The whole file is never in memory.
 *   **Lifetimes**: A `Block` or `MerkleNode` created during the build process is transient. It exists only long enough to generate its CID and be written to the `StorageEngine`. Only the lightweight CIDs are kept in memory to build the upper layers of the DAG.
+*   **Determinism**: Boundaries depend only on file content, not on how the reader delivers bytes, so two nodes chunking the same file produce the same CIDs.
 
 ---
 

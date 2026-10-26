@@ -263,6 +263,7 @@ test {
         @import("net/transport/tcp.zig"),
         @import("net/transport/yamux.zig"),
         @import("storage/block.zig"),
+        @import("storage/chunker.zig"),
         @import("storage/dag/builder.zig"),
         @import("storage/dag/codec.zig"),
         @import("storage/dag/diff.zig"),

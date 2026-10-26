@@ -5,7 +5,6 @@ const DhtNode = nomadfs.net.discovery.Node;
 const StorageEngine = nomadfs.storage.engine.StorageEngine;
 const BlockManager = nomadfs.cluster.BlockManager;
 const RepairManager = nomadfs.cluster.repair.RepairManager;
-const CHUNK_SIZE = nomadfs.storage.dag.builder.CHUNK_SIZE;
 
 const SliceReader = struct {
     buffer: []const u8,
@@ -79,9 +78,11 @@ test "cluster: put on one node, get from another, then sync only the diff" {
     defer bm2.deinit();
 
     // 1. Put a multi-chunk file on node 1 (announces node 1 as provider).
-    const data = try allocator.alloc(u8, CHUNK_SIZE * 3 + 123);
+    const data_len = 3500 * 1024;
+    const data = try allocator.alloc(u8, data_len);
     defer allocator.free(data);
-    for (data, 0..) |*b, i| b.* = @truncate(i *% 7 +% i / 997);
+    var prng = std.Random.DefaultPrng.init(0x99887766);
+    prng.random().bytes(data);
     var reader = SliceReader{ .buffer = data };
     const root = try bm1.put(&reader);
     defer allocator.free(root);
@@ -97,7 +98,7 @@ test "cluster: put on one node, get from another, then sync only the diff" {
 
     // 3. A one-byte change: syncing the new version fetches only the new
     // root and the changed leaf; the other chunks are already local.
-    data[CHUNK_SIZE + 1] +%= 1;
+    data[data_len / 2] +%= 1;
     var reader2 = SliceReader{ .buffer = data };
     const root2 = try bm1.put(&reader2);
     defer allocator.free(root2);
@@ -105,7 +106,7 @@ test "cluster: put on one node, get from another, then sync only the diff" {
     const conn = try peer2.manager.connectToPeer(peer1.listen_addr, peer2.config.node.swarm_key, peer1.manager.node_id);
     defer conn.deinit();
     const fetched = try RepairManager.sync(allocator, &dht2, &engine2, conn, root2);
-    try std.testing.expectEqual(@as(usize, 2), fetched);
+    try std.testing.expect(fetched >= 2 and fetched <= 4);
 
     // 4. Reads honour the size cap.
     var capped = ListWriter{ .allocator = allocator };

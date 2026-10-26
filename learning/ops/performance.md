@@ -12,7 +12,7 @@ NomadFS is optimized for:
 | Resource | Limit | Constraint |
 | :--- | :--- | :--- |
 | **Max File Size** | ~4 PB | Merkle DAG depth limit (effectively infinite for practical use). |
-| **Max Block Size** | 256 KB | Fixed chunk size for deduplication efficiency. |
+| **Max Block Size** | 1 MiB | FastCDC maximum; 256 KiB average target. |
 | **Max Peers** | ~1000 | Current limitation of linear vector clock scans (to be optimized). |
 | **Max DHT Depth** | 160 bits | SHA-1 / XOR metric space. |
 
