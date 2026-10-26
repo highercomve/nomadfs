@@ -104,6 +104,22 @@ pub fn build(b: *std.Build) void {
         exe.root_module.link_libc = true;
     }
 
+    // Dynamic C ABI library for mobile bindings (JNI via Android NDK, or any
+    // FFI host). Exports live in `src/mobile/api.zig`, referenced from root.
+    // Own module so only the library carries the libc dependency.
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const lib = b.addLibrary(.{
+        .name = "nomadfs",
+        .root_module = lib_mod,
+        .linkage = .dynamic,
+    });
+    b.installArtifact(lib);
+
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden

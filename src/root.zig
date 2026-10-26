@@ -5,6 +5,15 @@ pub const config = @import("config.zig");
 pub const net = @import("net/mod.zig");
 pub const storage = @import("storage/mod.zig");
 pub const device = @import("device/mod.zig");
+
+/// C ABI bindings for mobile hosts; the shared library target points here.
+pub const mobile_api = @import("mobile/api.zig");
+
+// Force the C ABI surface into every artifact of this module, so the shared
+// library keeps its exports even though nothing below references it.
+comptime {
+    _ = mobile_api;
+}
 pub const cluster = @import("cluster/mod.zig");
 pub const sync = @import("sync.zig");
 pub const env = @import("env.zig");
@@ -274,6 +283,7 @@ test {
     // nothing imports yet, so broken code and tests cannot hide.
     inline for (.{
         @import("cluster/block_manager.zig"),
+        @import("mobile/api.zig"),
         @import("cluster/quorum.zig"),
         @import("cluster/repair.zig"),
         @import("cluster/ring.zig"),

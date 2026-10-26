@@ -94,7 +94,7 @@ pub const Stream = struct {
         if (builtin.os.tag == .linux) {
             const rc = std.posix.system.read(@intCast(self.inner.socket.handle), buffer.ptr, buffer.len);
             return switch (std.posix.errno(rc)) {
-                .SUCCESS => rc,
+                .SUCCESS => @intCast(rc),
                 .BADF => 0,
                 .AGAIN => error.WouldBlock,
                 .CONNRESET => error.ConnectionResetByPeer,
@@ -112,7 +112,7 @@ pub const Stream = struct {
         if (builtin.os.tag == .linux) {
             const rc = std.posix.system.write(@intCast(self.inner.socket.handle), buffer.ptr, buffer.len);
             return switch (std.posix.errno(rc)) {
-                .SUCCESS => rc,
+                .SUCCESS => @intCast(rc),
                 .BADF, .PIPE => error.BrokenPipe,
                 .AGAIN => error.WouldBlock,
                 .CONNRESET => error.ConnectionResetByPeer,
