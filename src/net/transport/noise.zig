@@ -368,7 +368,7 @@ pub const NoiseStream = struct {
         const transcript = hs.symmetric.h;
         var hello: [device_auth.hello_len]u8 = undefined;
         hs.symmetric.decryptAndHash(buf[80..], &hello) catch |err| return logError("Message 2 Decrypt (device hello)", err);
-        hs.remote_device_id = hs.auth.verifyHello(&hello, transcript) catch |err| return logError("Message 2 device identity", err);
+        hs.remote_device_id = hs.auth.verifyHello(&hello, transcript, hs.rs.?) catch |err| return logError("Message 2 device identity", err);
     }
 
     /// Message 3 (initiator): -> s, se, psk
@@ -418,7 +418,7 @@ pub const NoiseStream = struct {
         const transcript = hs.symmetric.h;
         var hello: [device_auth.hello_len]u8 = undefined;
         hs.symmetric.decryptAndHash(buf[48..], &hello) catch |err| return logError("Message 3 Decrypt (payload/psk verify)", err);
-        hs.remote_device_id = hs.auth.verifyHello(&hello, transcript) catch |err| return logError("Message 3 device identity", err);
+        hs.remote_device_id = hs.auth.verifyHello(&hello, transcript, hs.rs.?) catch |err| return logError("Message 3 device identity", err);
     }
 
     fn logError(step: []const u8, err: anyerror) anyerror {

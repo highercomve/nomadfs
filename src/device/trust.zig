@@ -24,9 +24,16 @@ pub const Error = error{
     AmbiguousDeviceQuery,
 };
 
+/// Sentinel written when an entry has no recorded transport key (files saved
+/// before transport-key pinning existed). An all-zero X25519 key is not a
+/// real key, so it can never collide.
+pub const no_transport_key: [32]u8 = [_]u8{0} ** 32;
+
 pub const Entry = struct {
     device_id: NodeID,
     public_key: [32]u8,
+    /// The X25519 transport key the pair presented when it was admitted.
+    transport_key: [32]u8 = no_transport_key,
     label: [max_label_len]u8,
     label_len: u8,
     added_at: u64,
@@ -112,6 +119,14 @@ pub const Store = struct {
         return null;
     }
 
+    /// Read-only lookup for verification paths that must not mutate.
+    pub fn lookup(self: *const Store, device_id: NodeID) ?*const Entry {
+        for (self.entries.items) |*entry| {
+            if (entry.device_id.eql(device_id)) return entry;
+        }
+        return null;
+    }
+
     pub fn isTrusted(self: *const Store, device_id: NodeID) bool {
         for (self.entries.items) |entry| {
             if (entry.device_id.eql(device_id)) return true;
@@ -122,18 +137,23 @@ pub const Store = struct {
     /// Records a self-verified pairing ticket. Returns true when the device was
     /// not known before; an update keeps the original `added_at`.
     pub fn trustTicket(self: *Store, ticket: pairing.Ticket, now: u64) !bool {
-        return self.upsertKey(ticket.identity_public_key, ticket.nicknameSlice(), now);
+        return self.upsert(ticket.identity_public_key, ticket.transport_public_key, ticket.nicknameSlice(), now);
     }
 
-    pub fn upsertKey(self: *Store, public_key: [32]u8, label: []const u8, now: u64) !bool {
+    /// Records a paired identity together with the transport key its ticket
+    /// vouched for. A re-pairing updates both the label and the pinned
+    /// transport key, letting a device rotate `node.key`.
+    pub fn upsert(self: *Store, public_key: [32]u8, transport_key: [32]u8, label: []const u8, now: u64) !bool {
         if (label.len == 0 or label.len > max_label_len) return pairing.Error.InvalidTicket;
         try validateLabel(label);
+        if (std.mem.eql(u8, &transport_key, &no_transport_key)) return pairing.Error.InvalidTicket;
 
         const device_id = NodeID.fromPublicKey(public_key);
         if (self.find(device_id)) |entry| {
             @memset(&entry.label, 0);
             @memcpy(entry.label[0..label.len], label);
             entry.label_len = @intCast(label.len);
+            entry.transport_key = transport_key;
             return false;
         }
 
@@ -142,6 +162,7 @@ pub const Store = struct {
         var entry: Entry = .{
             .device_id = device_id,
             .public_key = public_key,
+            .transport_key = transport_key,
             .label = undefined,
             .label_len = @intCast(label.len),
             .added_at = now,
@@ -248,16 +269,18 @@ fn writeEntry(writer: *std.Io.Writer, entry: Entry) !void {
 
     var label_buf: [128]u8 = undefined;
     try writer.writeAll(std.base64.url_safe_no_pad.Encoder.encode(&label_buf, entry.labelSlice()));
-    try writer.writeByte('\n');
+
+    var transport_buf: [64]u8 = undefined;
+    try writer.print("\t{s}\n", .{std.base64.url_safe_no_pad.Encoder.encode(&transport_buf, &entry.transport_key)});
 }
 
 fn parseEntry(line: []const u8) !Entry {
     var fields = std.mem.splitScalar(u8, line, '\t');
+    const decoder = std.base64.url_safe_no_pad.Decoder;
     const id_hex = fields.next() orelse return Error.CorruptTrustStore;
     const key_b64 = fields.next() orelse return Error.CorruptTrustStore;
     const added_text = fields.next() orelse return Error.CorruptTrustStore;
     const label_b64 = fields.next() orelse return Error.CorruptTrustStore;
-    if (fields.next() != null) return Error.CorruptTrustStore;
 
     var entry: Entry = .{
         .device_id = undefined,
@@ -266,11 +289,19 @@ fn parseEntry(line: []const u8) !Entry {
         .label_len = 0,
         .added_at = 0,
     };
+    // Files saved before transport-key pinning store four fields; such an
+    // entry stays in the store but is not pinned until it re-pairs.
+    if (fields.peek()) |transport_b64| {
+        _ = fields.next();
+        if (fields.next() != null) return Error.CorruptTrustStore;
+        const transport_size = decoder.calcSizeForSlice(transport_b64) catch return Error.CorruptTrustStore;
+        if (transport_size != entry.transport_key.len) return Error.CorruptTrustStore;
+        decoder.decode(&entry.transport_key, transport_b64) catch return Error.CorruptTrustStore;
+    }
 
     if (id_hex.len != NodeID.len * 2) return Error.CorruptTrustStore;
     _ = std.fmt.hexToBytes(&entry.device_id.bytes, id_hex) catch return Error.CorruptTrustStore;
 
-    const decoder = std.base64.url_safe_no_pad.Decoder;
     const key_size = decoder.calcSizeForSlice(key_b64) catch return Error.CorruptTrustStore;
     if (key_size != entry.public_key.len) return Error.CorruptTrustStore;
     decoder.decode(&entry.public_key, key_b64) catch return Error.CorruptTrustStore;
@@ -278,7 +309,6 @@ fn parseEntry(line: []const u8) !Entry {
     // The identifier must match the key; anything else means the file was
     // edited or written by an incompatible version.
     if (!NodeID.fromPublicKey(entry.public_key).eql(entry.device_id)) return Error.CorruptTrustStore;
-
     entry.added_at = std.fmt.parseInt(u64, added_text, 10) catch return Error.CorruptTrustStore;
 
     const label_size = decoder.calcSizeForSlice(label_b64) catch return Error.CorruptTrustStore;
@@ -399,11 +429,13 @@ test "trust: save and load round-trip with private permissions" {
     cleanup(path);
     defer cleanup(path);
 
+    const alpha_ticket = try testTicket(0x41, "alpha");
+    const beta_ticket = try testTicket(0x42, "beta");
     {
         var store = try Store.load(testing.allocator, path);
         defer store.deinit();
-        _ = try store.trustTicket(try testTicket(0x41, "alpha"), 1000);
-        _ = try store.trustTicket(try testTicket(0x42, "beta"), 2000);
+        _ = try store.trustTicket(alpha_ticket, 1000);
+        _ = try store.trustTicket(beta_ticket, 2000);
         try store.save();
     }
 
@@ -411,9 +443,10 @@ test "trust: save and load round-trip with private permissions" {
     defer store.deinit();
     try testing.expectEqual(@as(usize, 2), store.count());
 
-    const alpha = store.find((try testTicket(0x41, "alpha")).deviceId()).?;
+    const alpha = store.find(alpha_ticket.deviceId()).?;
     try testing.expectEqualStrings("alpha", alpha.labelSlice());
     try testing.expectEqual(@as(u64, 1000), alpha.added_at);
+    try testing.expectEqualSlices(u8, &alpha_ticket.transport_public_key, &alpha.transport_key);
 
     if (builtin.os.tag != .windows) {
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -429,6 +462,80 @@ test "trust: save and load round-trip with private permissions" {
     var reloaded = try Store.load(testing.allocator, path);
     defer reloaded.deinit();
     try testing.expectEqual(@as(usize, 1), reloaded.count());
+}
+
+test "trust: a re-pairing rotates the pinned transport key" {
+    const path = "test_trust_rotate.store";
+    cleanup(path);
+    defer cleanup(path);
+
+    var store = try Store.load(testing.allocator, path);
+    defer store.deinit();
+
+    // The ticket's transport key is whatever node.key was at pairing time.
+    const fresh = try pairing.Ticket.init(
+        try identity_mod.Identity.fromSeed([_]u8{0x61} ** identity_mod.seed_len),
+        [_]u8{0x11} ** 32,
+        "laptop",
+        "192.168.1.5:4001",
+        1_800_000_000,
+    );
+    _ = try store.trustTicket(fresh, 1);
+
+    const rotated = try pairing.Ticket.init(
+        try identity_mod.Identity.fromSeed([_]u8{0x61} ** identity_mod.seed_len),
+        [_]u8{0x22} ** 32,
+        "laptop",
+        "192.168.1.5:4001",
+        1_800_000_000,
+    );
+    try testing.expect(!try store.trustTicket(rotated, 2));
+    try testing.expectEqual(@as(usize, 1), store.count());
+
+    const entry = store.find(fresh.deviceId()).?;
+    try testing.expectEqual(@as(u64, 1), entry.added_at);
+    try testing.expectEqualSlices(u8, &rotated.transport_public_key, &entry.transport_key);
+}
+
+test "trust: entries without a transport key stay unpinned" {
+    // A file saved before transport-key pinning only has four fields; it must
+    // still load, with no pinned key until the device re-pairs.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "test_trust_legacy.store";
+    cleanup(path);
+    defer cleanup(path);
+
+    const identity = try identity_mod.Identity.fromSeed([_]u8{0x63} ** identity_mod.seed_len);
+    const device_id = identity.deviceId();
+    var line_buf: [512]u8 = undefined;
+    var key_buf: [64]u8 = undefined;
+    var label_buf: [8]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "{s}\t{s}\t{d}\t{s}", .{
+        std.fmt.bytesToHex(device_id.bytes, .lower),
+        std.base64.url_safe_no_pad.Encoder.encode(&key_buf, &identity.publicKey()),
+        1234,
+        std.base64.url_safe_no_pad.Encoder.encode(&label_buf, "legacy"),
+    });
+    const content = try std.fmt.allocPrint(testing.allocator, "{s}\n{s}\n", .{ magic, line });
+    defer testing.allocator.free(content);
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, content, 0);
+    }
+
+    var store = try Store.load(testing.allocator, path);
+    defer store.deinit();
+
+    try testing.expectEqual(@as(usize, 1), store.count());
+    const entry = store.lookup(device_id).?;
+    try testing.expectEqualStrings("legacy", entry.labelSlice());
+    try testing.expectEqualSlices(u8, &no_transport_key, &entry.transport_key);
+
+    // Re-pairing pins the key the new ticket carries.
+    const ticket = try pairing.Ticket.init(identity, [_]u8{0x44} ** 32, "legacy", "192.168.1.5:4001", 1_800_000_000);
+    try testing.expect(!try store.trustTicket(ticket, 2));
+    try testing.expectEqualSlices(u8, &ticket.transport_public_key, &store.lookup(device_id).?.transport_key);
 }
 
 test "trust: corrupt files are rejected rather than discarded" {

@@ -21,7 +21,7 @@
 
 ## 3. Cryptography Standards
 
-- **Device Identity**: Ed25519 signatures (tickets, trust store, handshake transcript)
+- **Device Identity**: Ed25519 signatures (tickets, trust store, handshake transcript); the trust store pins each device's X25519 transport key
 - **Key Exchange**: X25519 (Elliptic Curve Diffie-Hellman)
 - **Encryption**: ChaCha20-Poly1305 (Authenticated Encryption)
 - **Hash Function**: BLAKE2s (for Noise state), SHA-256 (for Content Addressing)
@@ -40,8 +40,6 @@ The security of the entire network relies on the **Swarm Key**. This is a 32-byt
   swarm-wide signed revocation list is still missing.
 - **Signed Trust Store**: Entries are cross-checked but the file itself is not
   signed, so a local edit can still add a device.
-- **Transport-Key Binding**: The ticket's X25519 key is not yet bound to the
-  identity that presents it in the handshake.
 - **Capability-Based Access Control**: Granular read/write permissions.
 - **Connection Rate Limiting**: Defense against DoS.
 - **Peer Reputation System**: Mitigation for Sybil/Eclipse attacks.

@@ -4,6 +4,7 @@ const noise = nomadfs.net.transport.noise;
 const TestPeer = @import("test_helpers").TestPeer;
 const MemoryStream = @import("memory_stream.zig").MemoryStream;
 const Pipe = @import("memory_stream.zig").Pipe;
+const identity_mod = nomadfs.device.identity;
 
 test "security: noise handshake and data transfer" {
     std.debug.print("\n=== Running Test: security: noise handshake and data transfer ===\n", .{});
@@ -226,6 +227,8 @@ const DeviceContext = struct {
     initiator: bool,
     remote: ?nomadfs.net.id.NodeID = null,
     failure: ?anyerror = null,
+    /// Present when the test wants to check transport-key pinning.
+    static_key: ?noise.KeyPair = null,
 
     fn run(ctx: *DeviceContext) void {
         ctx.runInner() catch |err| {
@@ -239,7 +242,7 @@ const DeviceContext = struct {
             ctx.allocator,
             stream,
             ctx.key,
-            noise.KeyPair.generate(),
+            ctx.static_key orelse noise.KeyPair.generate(),
             ctx.initiator,
             ctx.auth,
         );
@@ -248,11 +251,35 @@ const DeviceContext = struct {
     }
 };
 
+const test_swarm_key = "correct_swarm_key_32_bytes_long_";
+
+fn pairedStore(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    identity: nomadfs.device.identity.Identity,
+    transport: [32]u8,
+) !nomadfs.device.trust.Store {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var store = try nomadfs.device.trust.Store.load(allocator, path);
+    errdefer store.deinit();
+
+    const ticket = try nomadfs.device.pairing.Ticket.init(
+        identity,
+        transport,
+        "peer",
+        "192.168.1.5:4001",
+        1_800_000_000,
+    );
+    _ = try store.trustTicket(ticket, 1);
+    return store;
+}
+
 test "security: handshake binds the session to both device identities" {
     std.debug.print("\n=== Running Test: security: handshake binds the session to both device identities ===\n", .{});
     const allocator = std.testing.allocator;
     const swarm_key = "correct_swarm_key_32_bytes_long_";
-    const identity_mod = nomadfs.device.identity;
 
     const client_identity = try identity_mod.Identity.fromSeed([_]u8{0x21} ** identity_mod.seed_len);
     const server_identity = try identity_mod.Identity.fromSeed([_]u8{0x22} ** identity_mod.seed_len);
@@ -291,7 +318,6 @@ test "security: handshake rejects an untrusted device under strict policy" {
     std.debug.print("\n=== Running Test: security: handshake rejects an untrusted device under strict policy ===\n", .{});
     const allocator = std.testing.allocator;
     const swarm_key = "correct_swarm_key_32_bytes_long_";
-    const identity_mod = nomadfs.device.identity;
 
     const strict_auth: nomadfs.device.auth.Authenticator = .{
         .identity = try identity_mod.Identity.fromSeed([_]u8{0x23} ** identity_mod.seed_len),
@@ -332,4 +358,102 @@ test "security: handshake rejects an untrusted device under strict policy" {
     );
     try std.testing.expectEqual(@as(?anyerror, error.EndOfStream), responder_ctx.failure);
     try std.testing.expect(initiator_ctx.remote == null);
+}
+
+test "security: a paired transport key is accepted when it matches" {
+    std.debug.print("\n=== Running Test: security: a paired transport key is accepted when it matches ===\n", .{});
+    const allocator = std.testing.allocator;
+    const auth_mod = nomadfs.device.auth;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const store_path = "test_security_pin.store";
+    defer std.Io.Dir.cwd().deleteFile(io, store_path) catch {};
+
+    const client_identity = try identity_mod.Identity.fromSeed([_]u8{0x25} ** identity_mod.seed_len);
+    const server_identity = try identity_mod.Identity.fromSeed([_]u8{0x26} ** identity_mod.seed_len);
+    const server_static = noise.KeyPair.generate();
+
+    var store = try pairedStore(allocator, store_path, server_identity, server_static.public_key);
+    defer store.deinit();
+
+    const client_auth: auth_mod.Authenticator = .{ .identity = client_identity, .trust = &store };
+    const server_auth: auth_mod.Authenticator = .{ .identity = server_identity };
+
+    var pipe = Pipe.init(allocator);
+    defer pipe.deinit();
+
+    var client_ctx = DeviceContext{
+        .pipe = &pipe,
+        .key = test_swarm_key,
+        .allocator = allocator,
+        .auth = &client_auth,
+        .initiator = true,
+        .static_key = noise.KeyPair.generate(),
+    };
+    var server_ctx = DeviceContext{
+        .pipe = &pipe,
+        .key = test_swarm_key,
+        .allocator = allocator,
+        .auth = &server_auth,
+        .initiator = false,
+        .static_key = server_static,
+    };
+
+    const client_thread = try std.Thread.spawn(.{}, DeviceContext.run, .{&client_ctx});
+    server_ctx.run();
+    client_thread.join();
+
+    try std.testing.expect(server_ctx.failure == null);
+    try std.testing.expect(client_ctx.failure == null);
+    try std.testing.expect(server_ctx.remote.?.eql(client_identity.deviceId()));
+    try std.testing.expect(client_ctx.remote.?.eql(server_identity.deviceId()));
+}
+
+test "security: a paired device cannot swap its transport key" {
+    std.debug.print("\n=== Running Test: security: a paired device cannot swap its transport key ===\n", .{});
+    const allocator = std.testing.allocator;
+    const auth_mod = nomadfs.device.auth;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const store_path = "test_security_pin_mismatch.store";
+    defer std.Io.Dir.cwd().deleteFile(io, store_path) catch {};
+
+    const client_identity = try identity_mod.Identity.fromSeed([_]u8{0x27} ** identity_mod.seed_len);
+    const server_identity = try identity_mod.Identity.fromSeed([_]u8{0x28} ** identity_mod.seed_len);
+
+    // The store pins the server to a transport key it no longer presents.
+    var store = try pairedStore(allocator, store_path, server_identity, [_]u8{0x99} ** 32);
+    defer store.deinit();
+
+    const client_auth: auth_mod.Authenticator = .{ .identity = client_identity, .trust = &store };
+    const server_auth: auth_mod.Authenticator = .{ .identity = server_identity };
+
+    var pipe = Pipe.init(allocator);
+    defer pipe.deinit();
+
+    var client_ctx = DeviceContext{
+        .pipe = &pipe,
+        .key = test_swarm_key,
+        .allocator = allocator,
+        .auth = &client_auth,
+        .initiator = true,
+    };
+    var server_ctx = DeviceContext{
+        .pipe = &pipe,
+        .key = test_swarm_key,
+        .allocator = allocator,
+        .auth = &server_auth,
+        .initiator = false,
+    };
+
+    const server_thread = try std.Thread.spawn(.{}, DeviceContext.run, .{&server_ctx});
+    client_ctx.run();
+    // The initiator aborts before message 3; unblock the responder.
+    pipe.stop();
+    server_thread.join();
+
+    try std.testing.expectEqual(
+        @as(?anyerror, auth_mod.Error.TransportKeyMismatch),
+        client_ctx.failure,
+    );
+    try std.testing.expectEqual(@as(?anyerror, error.EndOfStream), server_ctx.failure);
+    try std.testing.expect(client_ctx.remote == null);
 }

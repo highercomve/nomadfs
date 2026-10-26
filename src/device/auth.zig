@@ -22,6 +22,7 @@ pub const hello_len = 1 + 32 + 64;
 pub const Error = error{
     InvalidDeviceHello,
     UntrustedDevice,
+    TransportKeyMismatch,
 };
 
 pub const Authenticator = struct {
@@ -45,10 +46,19 @@ pub const Authenticator = struct {
         return hello;
     }
 
-    /// Verifies the peer's hello and returns its device ID. The transcript must
-    /// be the handshake hash captured before the payload was decrypted, i.e.
-    /// the AD that authenticated it.
-    pub fn verifyHello(self: *const Authenticator, hello: []const u8, transcript: [32]u8) !NodeID {
+    /// Verifies the peer's hello and returns its device ID.
+    ///
+    /// `transcript` must be the handshake hash captured before the payload was
+    /// decrypted, i.e. the AD that authenticated it. `transport_key` is the
+    /// X25519 static key occurring in the same handshake; when the device is
+    /// already paired, its pinned transport key must match, so a stolen or
+    /// rotated `node.key` cannot ride on the device's Ed25519 identity.
+    pub fn verifyHello(
+        self: *const Authenticator,
+        hello: []const u8,
+        transcript: [32]u8,
+        transport_key: [32]u8,
+    ) !NodeID {
         if (hello.len != hello_len or hello[0] != version) return Error.InvalidDeviceHello;
 
         var public_key: [32]u8 = undefined;
@@ -62,6 +72,15 @@ pub const Authenticator = struct {
         try identity_mod.Identity.verify(public_key, &message, signature);
 
         const device_id = NodeID.fromPublicKey(public_key);
+        if (self.trust) |store| {
+            if (store.lookup(device_id)) |entry| {
+                if (!std.mem.eql(u8, &entry.transport_key, &transport_key) and
+                    !std.mem.eql(u8, &entry.transport_key, &trust_mod.no_transport_key))
+                {
+                    return Error.TransportKeyMismatch;
+                }
+            }
+        }
         if (self.require_trusted) {
             const store = self.trust orelse return Error.UntrustedDevice;
             if (!store.isTrusted(device_id)) return Error.UntrustedDevice;
@@ -76,6 +95,9 @@ fn identityWith(seed_byte: u8) !identity_mod.Identity {
     return identity_mod.Identity.fromSeed([_]u8{seed_byte} ** identity_mod.seed_len);
 }
 
+const test_transport: [32]u8 = [_]u8{0x11} ** 32;
+const other_transport: [32]u8 = [_]u8{0x22} ** 32;
+
 test "device auth: hello round-trips and identifies the sender" {
     const local = try identityWith(0x61);
     const remote = try identityWith(0x62);
@@ -85,7 +107,7 @@ test "device auth: hello round-trips and identifies the sender" {
 
     const transcript = [_]u8{0x5c} ** 32;
     const hello = try local_auth.createHello(transcript);
-    const peer_id = try remote_auth.verifyHello(&hello, transcript);
+    const peer_id = try remote_auth.verifyHello(&hello, transcript, test_transport);
 
     try testing.expect(peer_id.eql(local.deviceId()));
     try testing.expectEqual(hello_len, hello.len);
@@ -100,7 +122,7 @@ test "device auth: hello is bound to the handshake transcript" {
     const hello = try auth.createHello([_]u8{0x11} ** 32);
     try testing.expectError(
         error.SignatureVerificationFailed,
-        verifier.verifyHello(&hello, [_]u8{0x12} ** 32),
+        verifier.verifyHello(&hello, [_]u8{0x12} ** 32, test_transport),
     );
 }
 
@@ -116,19 +138,19 @@ test "device auth: hello rejection cases" {
     // Wrong version byte.
     var bad_version = hello;
     bad_version[0] = 2;
-    try testing.expectError(Error.InvalidDeviceHello, verifier.verifyHello(&bad_version, transcript));
+    try testing.expectError(Error.InvalidDeviceHello, verifier.verifyHello(&bad_version, transcript, test_transport));
 
     // Truncated payload.
-    try testing.expectError(Error.InvalidDeviceHello, verifier.verifyHello(hello[0 .. hello.len - 1], transcript));
+    try testing.expectError(Error.InvalidDeviceHello, verifier.verifyHello(hello[0 .. hello.len - 1], transcript, test_transport));
 
     // Substituted public key can no longer match the signature.
     var swapped = hello;
     swapped[1] ^= 0x01;
-    try testing.expectError(error.SignatureVerificationFailed, verifier.verifyHello(&swapped, transcript));
+    try testing.expectError(error.SignatureVerificationFailed, verifier.verifyHello(&swapped, transcript, test_transport));
 
     // Flipped signature bit.
     hello[33] ^= 0x01;
-    try testing.expectError(error.SignatureVerificationFailed, verifier.verifyHello(&hello, transcript));
+    try testing.expectError(error.SignatureVerificationFailed, verifier.verifyHello(&hello, transcript, test_transport));
 }
 
 test "device auth: trust policy rejects unknown devices" {
@@ -157,25 +179,25 @@ test "device auth: trust policy rejects unknown devices" {
     };
     const known_auth: Authenticator = .{ .identity = known };
     const known_hello = try known_auth.createHello(transcript);
-    try testing.expectError(Error.UntrustedDevice, no_store.verifyHello(&known_hello, transcript));
+    try testing.expectError(Error.UntrustedDevice, no_store.verifyHello(&known_hello, transcript, test_transport));
 
     // Unknown peer is rejected while the store is empty.
-    try testing.expectError(Error.UntrustedDevice, auth.verifyHello(&known_hello, transcript));
+    try testing.expectError(Error.UntrustedDevice, auth.verifyHello(&known_hello, transcript, test_transport));
 
     // Trusting the device key admits it.
     const ticket = try @import("pairing.zig").Ticket.init(
         known,
-        [_]u8{0x11} ** 32,
+        test_transport,
         "known",
         "192.168.1.5:4001",
         1_800_000_000,
     );
     _ = try store.trustTicket(ticket, 1);
-    const peer_id = try auth.verifyHello(&known_hello, transcript);
+    const peer_id = try auth.verifyHello(&known_hello, transcript, test_transport);
     try testing.expect(peer_id.eql(known.deviceId()));
 
     // A different identity is still rejected.
     const unknown_auth: Authenticator = .{ .identity = unknown };
     const unknown_hello = try unknown_auth.createHello(transcript);
-    try testing.expectError(Error.UntrustedDevice, auth.verifyHello(&unknown_hello, transcript));
+    try testing.expectError(Error.UntrustedDevice, auth.verifyHello(&unknown_hello, transcript, test_transport));
 }

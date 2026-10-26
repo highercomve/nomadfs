@@ -56,7 +56,7 @@ nomadfs://pair?v=1&p=<identity>&k=<transport>&n=<nickname>&a=<addresses>&e=<expi
 | :--- | :--- | :--- |
 | `v` | decimal | must be `1` |
 | `p` | base64url, no padding | 32-byte Ed25519 public key |
-| `k` | base64url, no padding | 32-byte X25519 public key |
+| `k` | base64url, no padding | 32-byte X25519 transport key, pinned in the trust store |
 | `n` | percent-encoded | 1-64 printable ASCII bytes |
 | `a` | percent-encoded, comma separated | 1-8 `host:port` entries, 512 bytes total |
 | `e` | decimal | Unix seconds, non-zero |
@@ -98,7 +98,10 @@ Device A                          Device B
 ```
 
 `--trust` rejects expired tickets with `error.ExpiredTicket`; a ticket is valid
-while `now <= e`. Default lifetime is 24 hours. The ticket is a bearer object
+while `now <= e`. The `k` transport key is recorded with the entry and pinned:
+the paired device must present the same X25519 key in every later handshake
+(see section 6), so a leaked or rotated `node.key` cannot take over a paired
+identity without an explicit re-pairing. Default lifetime is 24 hours. The ticket is a bearer object
 until it expires: anyone who photographs the QR code can present it. That is
 acceptable for first contact on a trusted channel, and is why the fingerprint
 is printed alongside the QR - compare it with the other device's screen.
@@ -116,11 +119,15 @@ Trusted devices in /home/me/.nomadfs/trust.store:
 
 ```
 NMDFSTR1
-<device_id_hex>\t<public_key_b64>\t<added_at>\t<label_b64>
+<device_id_hex>\t<public_key_b64>\t<added_at>\t<label_b64>\t<transport_key_b64>
 ```
 
 - **Keyed by device ID**: re-pairing the same identity updates the label and
-  keeps the original `added_at` instead of creating a second entry.
+  the pinned transport key, and keeps the original `added_at` instead of
+  creating a second entry. This is how a device rotates `node.key`.
+- **Pinned transport key**: the fifth column records the X25519 key from the
+  pairing ticket. Handshakes verify it again (section 6). Entries saved by
+  older versions have four columns and stay unpinned until they re-pair.
 - **Cross-checked on load**: the device ID must equal the hash of the stored
   public key. A mismatch means the file was edited or written by an
   incompatible version, and loading fails with `error.CorruptTrustStore`.
@@ -155,6 +162,14 @@ Verification is unconditional: the payload length must be exact, the version
 must be `1`, and the signature must verify. Afterwards
 `NoiseStream.remote_device_id` holds the peer's device ID, derived from the
 verified public key rather than trusted from the wire.
+
+The signature proves *which* identity is speaking, and the trust store pins
+which transport key belongs to it. Every `verifyHello` call also receives the
+X25519 static key from the same handshake; a paired device whose Noise key
+differs from the one in its ticket is rejected with
+`error.TransportKeyMismatch` - even when `require_trusted_devices` is off,
+because the pair was explicitly vouched for with that key. Only unpinned
+entries (legacy files, never-paired devices) skip this check.
 
 Trust is an additional policy:
 
@@ -213,12 +228,12 @@ revocation propagation exists.
 | Tampered ticket | Ed25519 signature over canonical URI | - |
 | Replay of an old ticket | 24-hour expiry, plus handshake identity check | Revocation is local and does not propagate yet |
 | Stolen ticket | Bearer until expiry | Fingerprint check is manual |
+| Rotated or stolen `node.key` | Trust store pins the ticket's X25519 key and the handshake re-checks it | Re-pairing required after a rotation |
 | Malicious trust file edit | ID/public-key cross-check, `0600` | No signature over the store itself |
 
 Next slices: propagate revocations across the swarm so a removed device cannot
-keep connecting to peers that still have the old entry, sign the trust store so
-a local edit cannot add an entry silently, and bind the transport key in the
-ticket to the identity that presents it.
+keep connecting to peers that still have the old entry, and sign the trust
+store so a local edit cannot add an entry silently.
 
 ## 9. Source Map
 
