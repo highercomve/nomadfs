@@ -99,6 +99,18 @@ fn liveStreamCount(session: *yamux.Session) usize {
     return session.streams.count();
 }
 
+/// The reader thread frees a closed stream only after the peer's FIN
+/// arrives. Await (bounded) that drain so a round that is safe by protocol
+/// does not fail on timing.
+fn awaitFreeSlot(session: *yamux.Session) !void {
+    var retries: usize = 0;
+    while (liveStreamCount(session) >= yamux.MaxStreams) {
+        if (retries >= 200) return error.TestTimeout;
+        nomadfs.sync.sleep(5 * std.time.ns_per_ms);
+        retries += 1;
+    }
+}
+
 test "yamux: invalid frame type closes the session instead of panicking" {
     const allocator = std.testing.allocator;
     var pipe = Pipe.init(allocator);
@@ -191,6 +203,7 @@ test "yamux: streams are freed once both sides close" {
 
     var round: usize = 0;
     while (round < 3 * yamux.MaxStreams) : (round += 1) {
+        try awaitFreeSlot(client_session);
         const client_stream = try client_session.newStream();
         _ = try yamux.Session.streamWrite(client_stream, "ping");
         const server_stream = try server_session.acceptStream();

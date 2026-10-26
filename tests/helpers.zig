@@ -48,6 +48,19 @@ pub const TestPeer = struct {
 
     pub fn deinit(self: *TestPeer) void {
         self.stop();
+        // Handshake threads are detached and drop the manager's reference in
+        // their last statement. Wait (bounded) until only our own reference
+        // remains, so the test allocator's leak detection cannot race a
+        // thread that is one instruction away from destroying the manager.
+        var waited: usize = 0;
+        while (self.manager.ref_count.load(.acquire) != 1) {
+            if (waited >= 200) {
+                std.debug.print("TestPeer: manager reference did not drain in time\n", .{});
+                break;
+            }
+            nomadfs.sync.sleep(5 * std.time.ns_per_ms);
+            waited += 1;
+        }
         self.manager.deinit();
     }
 
