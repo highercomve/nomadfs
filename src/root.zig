@@ -77,6 +77,7 @@ pub const Node = struct {
             .dht = discovery_node,
             .storage = store,
             .replication = cfg.storage.replicas,
+            .quorum = .{ .W = cfg.storage.write_quorum },
         });
         errdefer block_manager.deinit();
 

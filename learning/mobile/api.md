@@ -174,10 +174,21 @@ ART's app namespace through the Java binding:
 - B bootstraps against A, then a 200 KB payload passes B -> A (A fetches
   every missing block from B, verifying each CID), byte-identical;
 
-The script prints `NOMADFS-HARNESS: PASS`; `--keep` leaves the APK
-installed for manual poking with `adb shell`. It has been verified against
-the api-35 x86_64 system image (ARC VM architecture, the Googlebook ABI)
-plus the arm64-v8a binary is cross-built every run.
+Verified outcomes so far:
+
+- `api-35 x86_64` AVD: `NOMADFS-HARNESS: PASS` (ARC VM/Googlebook ABI).
+- A real arm64 phone (Android 12 / MIUI): `NOMADFS-HARNESS: PASS` after
+  MIUI's "Install via USB" switch was enabled.
+- **Cross-architecture**: a 2 MB transfer where the phone (arm64) filled its
+  local DAG and a host (x86_64, `src/mobile/testing/host-probe.c`) fetched
+  the file over the LAN and byte-compared it. arm64 server serving x86_64
+  client through the same C ABI, plus both sides hitting the `ppoll`
+  seccomp profile.
+
+`./harness.sh cross-device` automates the emulator x phone transfer (needs
+both devices; adb reverse/forward picks up whatever is attached). Standalone
+single-device puts use `write_quorum = 0` (a config knob: a device with no
+peers can still store locally and announce its content).
 
 ## 7. Swift (committed sources)
 

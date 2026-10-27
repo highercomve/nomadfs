@@ -39,7 +39,8 @@ echo "==> compile Java against the platform"
 javac --release 17 -classpath "$PLATFORM" -d "$OUT/build/obj" \
     src/mobile/android/java/net/nomadfs/NomadFs.java \
     src/mobile/android/emulator/src/net/nomadfs/harness/NomadFsInstrumentation.java \
-    src/mobile/android/emulator/src/net/nomadfs/harness/HarnessActivity.java
+    src/mobile/android/emulator/src/net/nomadfs/harness/HarnessActivity.java \
+    src/mobile/android/emulator/src/net/nomadfs/harness/RemoteNodeActivity.java
 
 echo "==> dex"
 "$TOOLS/d8" --release --min-api "$API" --lib "$PLATFORM" \
@@ -76,8 +77,10 @@ echo "==> sign"
     --out harness.apk aligned.apk
 
 echo "==> boot emulator (KVM)"
-# Reuse a running emulator if one exists.
-if ! "$ADB" get-state >/dev/null 2>&1; then
+# Reuse a running emulator if one exists. A phone may be attached too, so
+# every ADB command targets the emulator by serial.
+EMU_SERIAL="$( $ADB devices | awk '/^emulator-.*\tdevice$/ {print $1; exit}' )"
+if [[ -z "$EMU_SERIAL" ]]; then
     CLI="$SDK/cmdline-tools/latest/bin"
     "$CLI/avdmanager" list avd 2>/dev/null | grep -q "Name: $AVD_NAME" || \
         echo no | "$CLI/avdmanager" create avd \
@@ -88,25 +91,82 @@ if ! "$ADB" get-state >/dev/null 2>&1; then
     EMU_PID=$!
     trap 'kill "$EMU_PID" 2>/dev/null || true' EXIT
 fi
-until "$ADB" get-state >/dev/null 2>&1; do sleep 1; done
-"$ADB" wait-for-device
-while [[ "$("$ADB" shell getprop sys.boot_completed | tr -d '\r')" != "1" ]]; do
+while [[ -z "$EMU_SERIAL" ]]; do
+    EMU_SERIAL="$( $ADB devices | awk '/^emulator-.*\tdevice$/ {print $1; exit}' )"
+    sleep 1
+done
+"$ADB" -s "$EMU_SERIAL" wait-for-device
+while [[ "$("$ADB" -s "$EMU_SERIAL" shell getprop sys.boot_completed | tr -d '\r')" != "1" ]]; do
     sleep 2
 done
 
 echo "==> install"
-"$ADB" install -r harness.apk >/dev/null
+"$ADB" -s "$EMU_SERIAL" install -r harness.apk >/dev/null
 
 echo "==> run the binding harness on-device"
-"$ADB" shell am start -W -n net.nomadfs.harness/net.nomadfs.harness.HarnessActivity | tee activity.log
+"$ADB" -s "$EMU_SERIAL" shell am start -W -n net.nomadfs.harness/net.nomadfs.harness.HarnessActivity | tee activity.log
 for _ in $(seq 1 60); do
-    if "$ADB" shell "logcat -d | grep -c 'NOMADFS-HARNESS'" | grep -q '[1-9]'; then break; fi
+    if "$ADB" -s "$EMU_SERIAL" shell "logcat -d | grep -c 'NOMADFS-HARNESS'" | grep -q '[1-9]'; then break; fi
     sleep 2
 done
-"$ADB" shell "logcat -d" | grep "NOMADFS-HARNESS" | tail -3 | tee instrument.log
+"$ADB" -s "$EMU_SERIAL" shell "logcat -d" | grep "NOMADFS-HARNESS" | tail -3 | tee instrument.log
 grep -q "NOMADFS-HARNESS: PASS" instrument.log
 echo "HARNESS PASSED ON EMULATOR"
 
 if [[ "$KEEP" != "--keep" ]]; then
-    "$ADB" uninstall net.nomadfs.harness >/dev/null || true
+    "$ADB" -s "$EMU_SERIAL" uninstall net.nomadfs.harness >/dev/null || true
 fi
+
+cross_device() {
+    # Cross-device transfer: emulator (x86_64, ARC ABI) x real phone
+    # (arm64-v8a). Payload is deterministic, so both ends regenerate and
+    # byte-compare on-device. Requires both devices attached.
+    set -u
+    EMU="${EMU_SERIAL:-$( $ADB devices | awk '/^emulator-.*\tdevice$/ {print $1; exit}' )}"
+    PHONE="${PHONE_SERIAL:-$( $ADB devices | awk '$2=="device" && $1 !~ /^emulator-/ {print $1; exit}' )}"
+    LEN="${PAYLOAD_LEN:-2000000}"
+    "$ADB" -s "$EMU" shell am force-stop net.nomadfs.harness 2>/dev/null || true
+    "$ADB" -s "$PHONE" shell am force-stop net.nomadfs.harness 2>/dev/null || true
+
+    echo "==> emulator node (serve)"
+    "$ADB" -s "$EMU" shell am start -W \
+        -e mode serve -e port 13500 \
+        -n net.nomadfs.harness/.RemoteNodeActivity | tail -1
+    echo "==> phone reverse tunnel to the emulator"
+    "$ADB" -s "$PHONE" reverse --remove-all >/dev/null 2>&1 || true
+    "$ADB" -s "$PHONE" reverse tcp:13500 tcp:13500
+
+    echo "==> phone node (put)"
+    "$ADB" -s "$PHONE" shell am start -W \
+        -e mode put -e port 13500 -e peer tcp://127.0.0.1:13500 \
+        -e payloadLen $LEN \
+        -n net.nomadfs.harness/.RemoteNodeActivity | tail -1
+    CID=""
+    for _ in $(seq 1 60); do
+        L="$("$ADB" -s "$PHONE" shell logcat -d | grep 'NOMADFS-REMOTE CID' | tail -1 | sed 's/.*CID: //')"
+        [[ -n "$L" ]] && CID="$L" && break
+        sleep 2
+    done
+    [[ -n "$CID" ]] || { echo "cross-device: no CID" >&2; exit 1; }
+    echo "cid=$CID"
+
+    echo "==> emulator node (get from the phone)"
+    "$ADB" -s "$EMU" shell am start -W \
+        -e mode get -e port 13500 -e peer tcp://127.0.0.1:13500 \
+        -e cid "$CID" -e payloadLen $LEN \
+        -n net.nomadfs.harness/.RemoteNodeActivity | tail -1
+    for _ in $(seq 1 30); do
+        if "$ADB" -s "$EMU" shell logcat -d | grep -c "NOMADFS-REMOTE: DONE" | grep -qv 0; then break; fi
+        sleep 2
+    done
+    LINE="$("$ADB" -s "$EMU" shell logcat -d | grep 'NOMADFS-REMOTE: DONE' | tail -1)"
+    echo "$LINE"
+    echo "$LINE" | grep -qv "status=0" && { echo "cross-device: FAILED - $LINE" >&2; exit 1; }
+    "$ADB" -s "$EMU" shell am force-stop net.nomadfs.harness
+    "$ADB" -s "$PHONE" shell am force-stop net.nomadfs.harness
+    "$ADB" -s "$PHONE" reverse --remove-all >/dev/null 2>&1 || true
+    echo "CROSS-DEVICE PASS (emulator x86_64 fetched ${LEN} bytes from the arm64 phone through the C ABI)"
+    
+}
+
+[[ "${1:-}" == "cross-device" ]] && { cross_device; exit $?; }

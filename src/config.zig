@@ -52,6 +52,9 @@ pub const Config = struct {
         /// Closest peers the DAG of every new file is pushed to. 0 keeps
         /// puts local (provider records only).
         replicas: u8 = 0,
+        /// Provider-record acknowledgements a put requires. 0 lets a
+        /// device with no peers adopt content offline.
+        write_quorum: u8 = 1,
     };
 
     pub const SecurityConfig = struct {
@@ -194,6 +197,8 @@ fn applyConfigEntry(
         config.storage.enabled = std.mem.eql(u8, val, "true");
     } else if (std.mem.eql(u8, key, "storage_path")) {
         replaceString(allocator, &config.storage.storage_path, try allocator.dupe(u8, val));
+    } else if (std.mem.eql(u8, key, "write_quorum")) {
+        config.storage.write_quorum = try std.fmt.parseInt(u8, val, 10);
     } else if (std.mem.eql(u8, key, "replicas")) {
         // Bounded by the routing-table width (kbucket.K): replicating wider
         // than the DHT can name targets is pointless.

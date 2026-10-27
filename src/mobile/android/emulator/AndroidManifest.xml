@@ -9,6 +9,10 @@
             android:name="net.nomadfs.harness.HarnessActivity"
             android:exported="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <activity
+            android:name="net.nomadfs.harness.RemoteNodeActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
     </application>
     <instrumentation
         android:name="net.nomadfs.harness.NomadFsInstrumentation"
