@@ -42,6 +42,7 @@ const ICONS = {
   image: "M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z",
   video: "M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z",
   download: "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z",
+  copy: "M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z",
   remove: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z",
 };
 
@@ -122,7 +123,6 @@ function setView(view) {
     item.classList.toggle("active", item.dataset.view === view);
   }
   window.scrollTo(0, 0);
-  if (view === "text") $("text-drop").open = true;
   try { localStorage.setItem("view", view); } catch {}
   renderNavDevices();
 }
@@ -888,55 +888,150 @@ $("nick-form").addEventListener("submit", async (e) => {
 
 // ---- Text drop ----
 
+const NOTES_KEY = "notes";
+const MAX_NOTES = 30;
+
+function shortCid(cid) {
+  return cid.length > 16 ? `${cid.slice(0, 8)}…${cid.slice(-6)}` : cid;
+}
+
+function timeAgo(ms) {
+  const s = Math.max(1, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} h ago`;
+  return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+/** Recent notes live on this device only: code, a preview and when. */
+function loadNotes() {
+  try { return JSON.parse(localStorage.getItem(NOTES_KEY) || "[]"); } catch { return []; }
+}
+
+function rememberNote(cid, text, kind) {
+  const notes = loadNotes().filter((n) => n.cid !== cid);
+  notes.unshift({ cid, preview: text.slice(0, 140), size: new TextEncoder().encode(text).length, at: Date.now(), kind });
+  try { localStorage.setItem(NOTES_KEY, JSON.stringify(notes.slice(0, MAX_NOTES))); } catch {}
+  renderNotes();
+}
+
+function renderNotes() {
+  const notes = loadNotes();
+  const list = $("notes-list");
+  list.replaceChildren();
+  $("notes-empty").hidden = notes.length > 0;
+  $("notes-clear").hidden = notes.length === 0;
+  for (const n of notes) {
+    const firstLine = n.preview.split("\n").find((l) => l.trim()) || "(empty note)";
+    list.appendChild(row({
+      icon: "file",
+      headline: firstLine,
+      meta: `${n.kind === "stored" ? "Stored" : "Opened"} ${timeAgo(n.at)} · ${formatSize(n.size)} · ${shortCid(n.cid)}`,
+      onClick: () => { $("cid-in").value = n.cid; openNote(n.cid); },
+      action: { icon: "copy", label: "Copy code", run: () => copyText(n.cid, "Code copied") },
+    }));
+  }
+}
+
+async function copyText(text, done) {
+  try {
+    await navigator.clipboard.writeText(text);
+    snack(done);
+  } catch {
+    snack("Clipboard unavailable");
+  }
+}
+
+function updateComposer() {
+  const t = $("text-in");
+  t.style.height = "auto";
+  t.style.height = `${t.scrollHeight}px`;
+  const n = t.value.length;
+  $("text-count").textContent = `${n.toLocaleString()} character${n === 1 ? "" : "s"}`;
+  $("put-submit").disabled = n === 0;
+}
+
+$("text-in").addEventListener("input", updateComposer);
+$("text-in").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    $("put-form").requestSubmit();
+  }
+});
+
 $("put-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const text = $("text-in").value;
   if (!text) return;
-  const box = $("cid-box");
-  try {
-    const cid = await invoke("put_text", { text });
-    box.classList.remove("error");
-    $("cid-output").textContent = cid;
-    $("cid-use").hidden = false;
-    $("cid-copy").hidden = false;
-    $("cid-use").onclick = () => {
-      $("cid-in").value = cid;
-      $("cid-in").scrollIntoView({ behavior: "smooth", block: "center" });
-    };
-    $("cid-copy").onclick = async () => {
-      try {
-        await navigator.clipboard.writeText(cid);
-        snack("CID copied");
-      } catch {
-        snack("Clipboard unavailable");
-      }
-    };
-    snack(`Stored ${new TextEncoder().encode(text).length} bytes`);
-  } catch (err) {
-    box.classList.add("error");
-    $("cid-output").textContent = `Store failed: ${err}`;
-    $("cid-use").hidden = true;
-    $("cid-copy").hidden = true;
-  }
-  box.hidden = false;
-});
-
-$("fetch").addEventListener("click", async () => {
-  const cid = $("cid-in").value.trim();
-  if (cid.length !== 64) {
-    snack("A CID is 64 hex characters");
+  if (!running) {
+    snack("Start the node first");
     return;
   }
-  const out = $("text-out");
+  $("put-submit").disabled = true;
   try {
-    out.textContent = await invoke("get_text", { cid });
-    out.classList.remove("error");
+    const cid = await invoke("put_text", { text });
+    $("cid-output").textContent = shortCid(cid);
+    $("cid-output").title = cid;
+    $("cid-copy").onclick = () => copyText(cid, "Code copied: open it on another device");
+    $("cid-box").hidden = false;
+    rememberNote(cid, text, "stored");
+    $("text-in").value = "";
   } catch (err) {
-    out.textContent = `Fetch failed: ${err}`;
-    out.classList.add("error");
+    snack(`Store failed: ${err}`);
   }
-  out.hidden = false;
+  updateComposer();
 });
+
+async function openNote(cid) {
+  if (!/^[0-9a-fA-F]{64}$/.test(cid)) {
+    snack("A note code is 64 hex characters");
+    return;
+  }
+  const view = $("note-view");
+  view.hidden = false;
+  view.classList.remove("error");
+  $("note-meta").textContent = `Opening ${shortCid(cid)}…`;
+  $("text-out").textContent = "";
+  $("note-copy").hidden = true;
+  try {
+    const text = await invoke("get_text", { cid: cid.toLowerCase() });
+    $("text-out").textContent = text;
+    $("note-meta").textContent = `${formatSize(new TextEncoder().encode(text).length)} · ${shortCid(cid)}`;
+    $("note-copy").hidden = false;
+    $("note-copy").onclick = () => copyText(text, "Text copied");
+    rememberNote(cid.toLowerCase(), text, "opened");
+  } catch (err) {
+    view.classList.add("error");
+    $("note-meta").textContent = shortCid(cid);
+    $("text-out").textContent = `Couldn't open this note: ${err}. The device that stored it may be offline.`;
+  }
+}
+
+$("fetch-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  openNote($("cid-in").value.trim());
+});
+
+$("cid-paste").addEventListener("click", async () => {
+  try {
+    const text = (await navigator.clipboard.readText()).trim();
+    $("cid-in").value = text;
+    if (/^[0-9a-fA-F]{64}$/.test(text)) openNote(text);
+  } catch {
+    snack("Clipboard unavailable: paste with Ctrl+V");
+    $("cid-in").focus();
+  }
+});
+
+$("notes-clear").addEventListener("click", () => {
+  try { localStorage.removeItem(NOTES_KEY); } catch {}
+  renderNotes();
+});
+
+renderNotes();
+updateComposer();
 
 // ---- Trusted devices ----
 

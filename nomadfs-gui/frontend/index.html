@@ -217,41 +217,60 @@
         </form>
       </section>
 
-      <!-- Text drop (CID demo) -->
-      <details class="card" id="text-drop" data-view="text">
-        <summary class="card-head">
-          <svg class="icon" viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>
+      <!-- Text drop: notes stored in the swarm, opened anywhere by code -->
+      <section class="card" id="text-drop" data-view="text">
+        <div class="card-head">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
           <div>
             <h2>Text drop</h2>
-            <p class="supporting">Store a note in the swarm and fetch it by CID.</p>
-          </div>
-        </summary>
-        <form id="put-form" class="stack">
-          <label class="field">
-            <textarea id="text-in" rows="3" placeholder=" "></textarea>
-            <span class="field-label">Text to store</span>
-          </label>
-          <div class="actions">
-            <button type="submit" class="btn filled">Store</button>
-          </div>
-        </form>
-        <div id="cid-box" class="result" hidden>
-          <span class="result-label">CID</span>
-          <code id="cid-output" class="cid"></code>
-          <div class="actions">
-            <button id="cid-copy" class="btn text" type="button">Copy</button>
-            <button id="cid-use" class="btn tonal" type="button">Fetch it below</button>
+            <p class="supporting">Store a note in the swarm and open it on any of your devices with its code.</p>
           </div>
         </div>
-        <label class="field">
-          <input id="cid-in" class="mono" placeholder=" " spellcheck="false" autocomplete="off" />
-          <span class="field-label">CID (64 hex chars)</span>
-        </label>
-        <div class="actions">
-          <button id="fetch" class="btn filled">Fetch</button>
+
+        <div class="notes">
+          <h3 class="sub-heading">Write a note</h3>
+          <form id="put-form" class="composer">
+            <textarea id="text-in" rows="4" placeholder="Paste a link, an address, a snippet…"></textarea>
+            <div class="composer-bar">
+              <span id="text-count" class="meta">0 characters</span>
+              <span class="meta hint-keys">Ctrl+Enter</span>
+              <button type="submit" class="btn filled" id="put-submit" disabled>Store note</button>
+            </div>
+          </form>
+          <div id="cid-box" class="saved" hidden>
+            <svg viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
+            <div class="saved-text">
+              <span class="headline">Saved</span>
+              <code id="cid-output" class="meta mono" title=""></code>
+            </div>
+            <button id="cid-copy" class="btn text" type="button">Copy code</button>
+          </div>
+
+          <h3 class="sub-heading">Open a note</h3>
+          <form id="fetch-form" class="open-row">
+            <label class="field grow">
+              <input id="cid-in" class="mono" placeholder=" " spellcheck="false" autocomplete="off" />
+              <span class="field-label">Note code (CID)</span>
+            </label>
+            <button id="cid-paste" type="button" class="btn outlined">Paste</button>
+            <button id="fetch" type="submit" class="btn filled">Open</button>
+          </form>
+          <article id="note-view" class="note-card" hidden>
+            <header>
+              <span id="note-meta" class="meta"></span>
+              <button id="note-copy" type="button" class="btn text">Copy text</button>
+            </header>
+            <pre id="text-out"></pre>
+          </article>
+
+          <div class="recent-head">
+            <h3 class="sub-heading">Recent notes</h3>
+            <button id="notes-clear" type="button" class="btn text" hidden>Clear</button>
+          </div>
+          <ul id="notes-list" class="list rows"></ul>
+          <p id="notes-empty" class="empty-state">Notes you store or open on this device show up here.</p>
         </div>
-        <pre id="text-out" class="result-text" hidden></pre>
-      </details>
+      </section>
 
       <!-- Trusted devices -->
       <section class="card" id="devices-section" data-view="settings">
