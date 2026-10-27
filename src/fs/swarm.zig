@@ -152,23 +152,72 @@ pub const SwarmFolder = struct {
         const parent = if (slash) |s| path[0..s] else "";
         const new_path = try join(self.allocator, parent, new_name);
         defer self.allocator.free(new_path);
-        if (!manifest_mod.validPath(new_path)) return error.InvalidPath;
+        return self.move(path, new_path, .{});
+    }
+
+    pub const MoveOptions = struct {
+        /// Replace whatever is at `new_path` (POSIX rename). Otherwise an
+        /// existing target is an error.
+        replace: bool = false,
+    };
+
+    /// Moves a file or folder to `new_path`, anywhere in the swarm folder.
+    pub fn move(self: *SwarmFolder, path: []const u8, new_path: []const u8, options: MoveOptions) !void {
+        if (!manifest_mod.validPath(new_path) or !manifest_mod.validPath(path)) return error.InvalidPath;
         if (std.mem.eql(u8, new_path, path)) return;
+        // A folder can't move inside itself.
+        if (std.mem.startsWith(u8, new_path, path) and new_path.len > path.len and new_path[path.len] == '/') return error.InvalidPath;
 
         self.mutex.lock();
         defer self.mutex.unlock();
         const moving = try self.liveUnderLocked(path);
         defer freePaths(self.allocator, moving);
         if (moving.len == 0) return error.FileNotFound;
+
+        const in_the_way = try self.liveUnderLocked(new_path);
+        defer freePaths(self.allocator, in_the_way);
+        if (in_the_way.len > 0) {
+            if (!options.replace) return error.PathAlreadyExists;
+            for (in_the_way) |p| _ = try self.manifest.edit(p, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+        }
         for (moving) |old| {
             const e = self.manifest.get(old).?;
             const dest = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ new_path, old[path.len..] });
             defer self.allocator.free(dest);
-            if (self.manifest.get(dest)) |existing| if (!existing.deleted) return error.PathAlreadyExists;
             _ = try self.manifest.edit(dest, .{ .kind = e.kind, .cid = e.cid, .size = e.size, .mtime = e.mtime }, self.self_id.bytes, self.self_name);
             _ = try self.manifest.edit(old, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
         }
         try self.saveLocked();
+    }
+
+    pub const Info = struct { cid: [32]u8, size: u64, mtime: u64, author: [32]u8 };
+
+    /// A live file's content and author, or null.
+    pub fn fileInfo(self: *SwarmFolder, path: []const u8) ?Info {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const e = self.manifest.get(path) orelse return null;
+        if (e.deleted or e.kind != .file) return null;
+        return .{ .cid = e.cid, .size = e.size, .mtime = e.mtime, .author = e.version.device };
+    }
+
+    /// Whether `path` is a folder with nothing live in it.
+    pub fn isEmptyDir(self: *SwarmFolder, path: []const u8) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const under = try self.liveUnderLocked(path);
+        defer freePaths(self.allocator, under);
+        for (under) |p| if (!std.mem.eql(u8, p, path)) return false;
+        return true;
+    }
+
+    /// A folder for files being written through the mount before they are
+    /// added (next to the manifest). Created on demand; caller frees.
+    pub fn stagingDir(self: *SwarmFolder, allocator: std.mem.Allocator) ![]u8 {
+        const dir = try std.fmt.allocPrint(allocator, "{s}.staging", .{self.file_path});
+        errdefer allocator.free(dir);
+        try std.Io.Dir.cwd().createDirPath(self.io, dir);
+        return dir;
     }
 
     /// Live entries at `path` or below it (owned copies). Caller holds mutex.

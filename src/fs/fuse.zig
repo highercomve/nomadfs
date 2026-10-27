@@ -19,6 +19,7 @@ const storage = @import("../storage/mod.zig");
 const tree = @import("tree.zig");
 const remote_mod = @import("remote.zig");
 const swarm_mod = @import("swarm.zig");
+const manifest_mod = @import("manifest.zig");
 const Remote = remote_mod.Remote;
 
 // ---- Kernel protocol (include/uapi/linux/fuse.h) ----
@@ -31,10 +32,17 @@ const Opcode = enum(u32) {
     lookup = 1,
     forget = 2,
     getattr = 3,
+    setattr = 4,
+    mkdir = 9,
+    unlink = 10,
+    rmdir = 11,
+    rename = 12,
     open = 14,
     read = 15,
+    write = 16,
     statfs = 17,
     release = 18,
+    fsync = 20,
     getxattr = 22,
     listxattr = 23,
     flush = 25,
@@ -43,11 +51,47 @@ const Opcode = enum(u32) {
     readdir = 28,
     releasedir = 29,
     access = 34,
+    create = 35,
     interrupt = 36,
     destroy = 38,
     batch_forget = 42,
+    rename2 = 45,
     _,
 };
+
+// Write side (only the swarm folder is writable).
+const CreateIn = extern struct { flags: u32, mode: u32, umask: u32, open_flags: u32 };
+const WriteIn = extern struct { fh: u64, offset: u64, size: u32, write_flags: u32, lock_owner: u64, flags: u32, padding: u32 };
+const WriteOut = extern struct { size: u32, padding: u32 = 0 };
+const SetattrIn = extern struct {
+    valid: u32,
+    padding: u32,
+    fh: u64,
+    size: u64,
+    lock_owner: u64,
+    atime: u64,
+    mtime: u64,
+    ctime: u64,
+    atimensec: u32,
+    mtimensec: u32,
+    ctimensec: u32,
+    mode: u32,
+    unused4: u32,
+    uid: u32,
+    gid: u32,
+    unused5: u32,
+};
+const MkdirIn = extern struct { mode: u32, umask: u32 };
+const RenameIn = extern struct { newdir: u64 };
+const Rename2In = extern struct { newdir: u64, flags: u32, padding: u32 };
+const ReleaseIn = extern struct { fh: u64, flags: u32, release_flags: u32, lock_owner: u64 };
+
+const FATTR_SIZE = 1 << 3;
+const FATTR_FH = 1 << 6;
+const O_TRUNC = 0o1000;
+const FUSE_ATOMIC_O_TRUNC = 1 << 3;
+const FUSE_BIG_WRITES = 1 << 5;
+const max_write = 128 * 1024;
 
 const InHeader = extern struct {
     len: u32,
@@ -177,6 +221,10 @@ comptime {
     std.debug.assert(@sizeOf(EntryOut) == 128);
     std.debug.assert(@sizeOf(InitOut) == 64);
     std.debug.assert(@sizeOf(StatfsOut) == 80);
+    std.debug.assert(@sizeOf(CreateIn) == 16);
+    std.debug.assert(@sizeOf(WriteIn) == 40);
+    std.debug.assert(@sizeOf(SetattrIn) == 88);
+    std.debug.assert(@sizeOf(ReleaseIn) == 24);
 }
 
 const S_IFDIR = 0o040000;
@@ -189,11 +237,18 @@ const O_ACCMODE = 3;
 const Errno = enum(i32) {
     NOENT = 2,
     IO = 5,
+    BADF = 9,
     ACCES = 13,
     NOTDIR = 20,
     ISDIR = 21,
+    BUSY = 16,
+    EXIST = 17,
+    XDEV = 18,
+    INVAL = 22,
     ROFS = 30,
+    NAMETOOLONG = 36,
     NOSYS = 38,
+    NOTEMPTY = 39,
 };
 
 /// Seconds the kernel may cache names and attributes. Short, because a
@@ -233,6 +288,18 @@ const Inode = struct {
     author: [32]u8 = [_]u8{0} ** 32,
 };
 
+/// A swarm file open for writing: bytes go to a staging file and are added
+/// to the swarm folder on release.
+const Handle = struct {
+    ino: u64,
+    /// Path inside the swarm folder (owned).
+    path: []u8,
+    /// Staging file (owned, NUL-terminated for open(2)).
+    staging: [:0]u8,
+    fd: i32,
+    dirty: bool,
+};
+
 const Device = struct {
     name: []u8,
     remote: *Remote,
@@ -260,6 +327,11 @@ pub const Mount = struct {
     swarm: ?*swarm_mod.SwarmFolder = null,
     /// Swarm paths held by inodes.
     path_arena: std.heap.ArenaAllocator,
+    /// Open write handles on swarm files: fh -> handle.
+    handles: std.AutoHashMapUnmanaged(u64, Handle) = .empty,
+    /// Inode -> the fh writing it, so reads see unsaved bytes.
+    writing: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    next_fh: u64 = 1,
     reply: std.ArrayList(u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, block_manager: *cluster.BlockManager, store: *storage.engine.StorageEngine) !Mount {
@@ -280,6 +352,10 @@ pub const Mount = struct {
 
     pub fn deinit(self: *Mount) void {
         if (self.fd >= 0) _ = linux.close(self.fd);
+        var hit = self.handles.valueIterator();
+        while (hit.next()) |h| self.dropHandle(h.*);
+        self.handles.deinit(self.allocator);
+        self.writing.deinit(self.allocator);
         self.path_arena.deinit();
         var it = self.children.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
@@ -336,7 +412,16 @@ pub const Mount = struct {
             .read => try self.opRead(header, body),
             .statfs => try self.replyStruct(header, StatfsOut{}),
             .access => try self.opAccess(header, body),
-            .release, .releasedir, .flush => try self.replyEmpty(header),
+            .release => try self.opRelease(header, body),
+            .releasedir, .flush, .fsync => try self.replyEmpty(header),
+            .create => try self.opCreate(header, body),
+            .write => try self.opWrite(header, body),
+            .setattr => try self.opSetattr(header, body),
+            .mkdir => try self.opMkdir(header, body),
+            .unlink => try self.opRemove(header, std.mem.sliceTo(body, 0), .file),
+            .rmdir => try self.opRemove(header, std.mem.sliceTo(body, 0), .dir),
+            .rename => try self.opRename(header, body, false),
+            .rename2 => try self.opRename(header, body, true),
             // No reply expected.
             .forget, .batch_forget, .interrupt => {},
             .destroy => {
@@ -358,14 +443,16 @@ pub const Mount = struct {
             .major = kernel_major,
             .minor = @min(in.minor, kernel_minor),
             .max_readahead = in.max_readahead,
-            .flags = 0,
-            .max_write = 4096,
+            .flags = in.flags & (FUSE_ATOMIC_O_TRUNC | FUSE_BIG_WRITES),
+            .max_write = max_write,
         });
     }
 
     fn opAccess(self: *Mount, header: *const InHeader, body: []const u8) !void {
         const in = readStruct(AccessIn, body) orelse return self.replyError(header, .IO);
-        if (in.mask & W_OK != 0) return self.replyError(header, .ROFS);
+        const node = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
+        const writable = node.kind == .swarm_dir or node.kind == .swarm_file;
+        if (in.mask & W_OK != 0 and !writable) return self.replyError(header, .ROFS);
         try self.replyEmpty(header);
     }
 
@@ -392,7 +479,11 @@ pub const Mount = struct {
         if (want == .dir and is_file) return self.replyError(header, .NOTDIR);
         if (want == .file) {
             const in = readStruct(OpenIn, body) orelse return self.replyError(header, .IO);
-            if (in.flags & O_ACCMODE != 0) return self.replyError(header, .ROFS);
+            if (in.flags & O_ACCMODE != 0) {
+                if (node.kind != .swarm_file) return self.replyError(header, .ROFS);
+                const fh = self.openForWrite(header.nodeid, node, in.flags & O_TRUNC != 0) catch |err| return self.replyError(header, errnoFor(err));
+                return self.replyStruct(header, OpenOut{ .fh = fh });
+            }
         }
         try self.replyStruct(header, OpenOut{});
     }
@@ -414,6 +505,12 @@ pub const Mount = struct {
     }
 
     fn readFile(self: *Mount, node: Inode, offset: u64, dest: []u8) !usize {
+        // A file being written reads from its staging copy.
+        if (self.writingHandle(node)) |h| {
+            const rc = linux.pread(h.fd, dest.ptr, dest.len, @intCast(offset));
+            if (linux.errno(rc) != .SUCCESS) return error.InputOutput;
+            return rc;
+        }
         if (node.kind == .swarm_file) {
             const folder = self.swarm orelse return error.FileNotFound;
             return folder.readAt(self.allocator, node.cid, node.author, offset, dest);
@@ -452,6 +549,291 @@ pub const Mount = struct {
         try self.sendPrepared(header, self.reply.items.len - @sizeOf(OutHeader));
     }
 
+    // ---- Writing (swarm folder only) ----
+
+    fn swarmChildPath(self: *Mount, arena: std.mem.Allocator, parent: Inode, name: []const u8) ![]u8 {
+        _ = self;
+        if (parent.kind != .swarm_dir) return error.ReadOnly;
+        if (name.len > 255) return error.NameTooLong;
+        const path = if (parent.swarm_path.len == 0)
+            try arena.dupe(u8, name)
+        else
+            try std.fmt.allocPrint(arena, "{s}/{s}", .{ parent.swarm_path, name });
+        if (!manifest_mod.validPath(path)) return error.InvalidPath;
+        return path;
+    }
+
+    fn nowSeconds() u64 {
+        const t = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .real).nanoseconds;
+        return @intCast(@max(0, @divFloor(t, std.time.ns_per_s)));
+    }
+
+    fn writingHandle(self: *Mount, node: Inode) ?*Handle {
+        if (node.kind != .swarm_file) return null;
+        // Find the inode number for this node via the handle table.
+        var it = self.handles.valueIterator();
+        while (it.next()) |h| {
+            if (std.mem.eql(u8, self.inodes.items[h.ino - 1].swarm_path, node.swarm_path)) return h;
+        }
+        return null;
+    }
+
+    /// A staging file and handle for `path`; when `copy_from` is set its
+    /// current bytes are copied in first.
+    fn newHandle(self: *Mount, ino: u64, path: []const u8, copy_from: ?Inode) !u64 {
+        const folder = self.swarm orelse return error.ReadOnly;
+        const dir = try folder.stagingDir(self.allocator);
+        defer self.allocator.free(dir);
+        const fh = self.next_fh;
+        self.next_fh += 1;
+        const staging = try std.fmt.allocPrintSentinel(self.allocator, "{s}/{d}.part", .{ dir, fh }, 0);
+        errdefer self.allocator.free(staging);
+        const rc = linux.open(staging.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
+        if (linux.errno(rc) != .SUCCESS) return error.InputOutput;
+        const fd: i32 = @intCast(rc);
+        errdefer {
+            _ = linux.close(fd);
+            _ = linux.unlink(staging.ptr);
+        }
+        if (copy_from) |src| {
+            const buf = try self.allocator.alloc(u8, 1024 * 1024);
+            defer self.allocator.free(buf);
+            var offset: u64 = 0;
+            while (offset < src.size) {
+                const n = try folder.readAt(self.allocator, src.cid, src.author, offset, buf);
+                if (n == 0) break;
+                if (linux.errno(linux.pwrite(fd, buf.ptr, n, @intCast(offset))) != .SUCCESS) return error.InputOutput;
+                offset += n;
+            }
+        }
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        try self.handles.put(self.allocator, fh, .{ .ino = ino, .path = owned_path, .staging = staging, .fd = fd, .dirty = copy_from == null });
+        try self.writing.put(self.allocator, ino, fh);
+        return fh;
+    }
+
+    fn dropHandle(self: *Mount, h: Handle) void {
+        _ = linux.close(h.fd);
+        _ = linux.unlink(h.staging.ptr);
+        if (self.writing.get(h.ino)) |fh| {
+            if (self.handles.get(fh)) |cur| if (cur.fd == h.fd) {
+                _ = self.writing.remove(h.ino);
+            };
+        }
+        self.allocator.free(h.path);
+        self.allocator.free(h.staging);
+    }
+
+    fn openForWrite(self: *Mount, ino: u64, node: Inode, truncate: bool) !u64 {
+        const fh = try self.newHandle(ino, node.swarm_path, if (truncate) null else node);
+        if (truncate) self.inodes.items[ino - 1].size = 0;
+        return fh;
+    }
+
+    /// Adds a handle's bytes to the swarm folder (when changed).
+    fn commit(self: *Mount, h: *Handle) !void {
+        if (!h.dirty) return;
+        const folder = self.swarm orelse return error.ReadOnly;
+        const slash = std.mem.lastIndexOfScalar(u8, h.path, '/');
+        const dir = if (slash) |sl| h.path[0..sl] else "";
+        const name = h.path[if (slash) |sl| sl + 1 else 0..];
+        try folder.addFile(dir, name, h.staging);
+        h.dirty = false;
+        if (folder.fileInfo(h.path)) |info| {
+            const node = &self.inodes.items[h.ino - 1];
+            node.cid = info.cid;
+            node.size = info.size;
+            node.mtime = info.mtime;
+            node.author = info.author;
+        }
+    }
+
+    fn opCreate(self: *Mount, header: *const InHeader, body: []const u8) !void {
+        if (body.len <= @sizeOf(CreateIn)) return self.replyError(header, .INVAL);
+        const name = std.mem.sliceTo(body[@sizeOf(CreateIn)..], 0);
+        const parent = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const path = self.swarmChildPath(arena_state.allocator(), parent, name) catch |err| return self.replyError(header, errnoFor(err));
+
+        const ino = try self.upsert(header.nodeid, name, .{
+            .kind = .swarm_file,
+            .size = 0,
+            .mtime = nowSeconds(),
+            .swarm_path = path,
+            .author = (self.swarm.?.self_id).bytes,
+        });
+        const fh = self.newHandle(ino, path, null) catch |err| return self.replyError(header, errnoFor(err));
+        const Reply = extern struct { entry: EntryOut, open: OpenOut };
+        try self.replyStruct(header, Reply{
+            .entry = .{ .nodeid = ino, .entry_valid = cache_seconds, .attr_valid = cache_seconds, .attr = self.attr(ino) },
+            .open = .{ .fh = fh },
+        });
+    }
+
+    fn opWrite(self: *Mount, header: *const InHeader, body: []const u8) !void {
+        const in = readStruct(WriteIn, body) orelse return self.replyError(header, .INVAL);
+        const data = body[@sizeOf(WriteIn)..];
+        if (data.len < in.size) return self.replyError(header, .INVAL);
+        const h = self.handles.getPtr(in.fh) orelse return self.replyError(header, .BADF);
+        var done: usize = 0;
+        while (done < in.size) {
+            const rc = linux.pwrite(h.fd, data[done..].ptr, in.size - done, @intCast(in.offset + done));
+            if (linux.errno(rc) != .SUCCESS) return self.replyError(header, .IO);
+            done += rc;
+        }
+        h.dirty = true;
+        const node = &self.inodes.items[h.ino - 1];
+        node.size = @max(node.size, in.offset + in.size);
+        node.mtime = nowSeconds();
+        try self.replyStruct(header, WriteOut{ .size = in.size });
+    }
+
+    fn opSetattr(self: *Mount, header: *const InHeader, body: []const u8) !void {
+        const in = readStruct(SetattrIn, body) orelse return self.replyError(header, .INVAL);
+        const node = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
+        if (in.valid & FATTR_SIZE != 0) {
+            if (node.kind != .swarm_file) return self.replyError(header, if (node.kind == .file) .ROFS else .ISDIR);
+            const fh = if (in.valid & FATTR_FH != 0 and self.handles.contains(in.fh)) in.fh else self.writing.get(header.nodeid);
+            if (fh) |f| {
+                const h = self.handles.getPtr(f).?;
+                if (linux.errno(linux.ftruncate(h.fd, @intCast(in.size))) != .SUCCESS) return self.replyError(header, .IO);
+                h.dirty = true;
+                self.inodes.items[header.nodeid - 1].size = in.size;
+            } else {
+                // Truncate without an open file: stage, cut, add at once.
+                const f = self.newHandle(header.nodeid, node.swarm_path, if (in.size == 0) null else node) catch |err| return self.replyError(header, errnoFor(err));
+                const h = self.handles.getPtr(f).?;
+                _ = linux.ftruncate(h.fd, @intCast(in.size));
+                h.dirty = true;
+                self.commit(h) catch |err| {
+                    std.debug.print("fuse: truncate of {s} failed: {any}\n", .{ h.path, err });
+                };
+                const removed = self.handles.fetchRemove(f).?;
+                self.dropHandle(removed.value);
+            }
+        } else if (node.kind != .swarm_file and node.kind != .swarm_dir and in.valid != 0) {
+            // Times and modes on read-only parts are accepted and ignored,
+            // so cp -p and touch don't fail; nothing is stored for them.
+        }
+        try self.replyStruct(header, AttrOut{ .attr_valid = cache_seconds, .attr = self.attr(header.nodeid) });
+    }
+
+    fn opRelease(self: *Mount, header: *const InHeader, body: []const u8) !void {
+        const in = readStruct(ReleaseIn, body) orelse return self.replyEmpty(header);
+        if (self.handles.getPtr(in.fh)) |h| {
+            self.commit(h) catch |err| std.debug.print("fuse: saving {s} to the swarm folder failed: {any}\n", .{ h.path, err });
+            const removed = self.handles.fetchRemove(in.fh).?;
+            self.dropHandle(removed.value);
+        }
+        try self.replyEmpty(header);
+    }
+
+    fn opMkdir(self: *Mount, header: *const InHeader, body: []const u8) !void {
+        if (body.len <= @sizeOf(MkdirIn)) return self.replyError(header, .INVAL);
+        const name = std.mem.sliceTo(body[@sizeOf(MkdirIn)..], 0);
+        const parent = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        _ = self.swarmChildPath(arena_state.allocator(), parent, name) catch |err| return self.replyError(header, errnoFor(err));
+        if (try self.child(header.nodeid, name) != null) return self.replyError(header, .EXIST);
+        self.swarm.?.makeDir(parent.swarm_path, name) catch |err| return self.replyError(header, errnoFor(err));
+        const ino = (try self.child(header.nodeid, name)) orelse return self.replyError(header, .IO);
+        try self.replyStruct(header, EntryOut{ .nodeid = ino, .entry_valid = cache_seconds, .attr_valid = cache_seconds, .attr = self.attr(ino) });
+    }
+
+    fn opRemove(self: *Mount, header: *const InHeader, name: []const u8, want: enum { file, dir }) !void {
+        const parent = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const path = self.swarmChildPath(arena_state.allocator(), parent, name) catch |err| return self.replyError(header, errnoFor(err));
+        const ino = (try self.child(header.nodeid, name)) orelse return self.replyError(header, .NOENT);
+        const node = self.inodes.items[ino - 1];
+        const folder = self.swarm.?;
+        switch (want) {
+            .file => if (node.kind != .swarm_file) return self.replyError(header, .ISDIR),
+            .dir => {
+                if (node.kind != .swarm_dir) return self.replyError(header, .NOTDIR);
+                if (!(try folder.isEmptyDir(path))) return self.replyError(header, .NOTEMPTY);
+            },
+        }
+        folder.remove(path) catch |err| switch (err) {
+            // An empty folder only implied by a pending file, or already gone.
+            error.FileNotFound => {},
+            else => return self.replyError(header, errnoFor(err)),
+        };
+        try self.replyEmpty(header);
+    }
+
+    fn opRename(self: *Mount, header: *const InHeader, body: []const u8, v2: bool) !void {
+        const head_len: usize = if (v2) @sizeOf(Rename2In) else @sizeOf(RenameIn);
+        if (body.len <= head_len) return self.replyError(header, .INVAL);
+        const newdir = std.mem.readInt(u64, body[0..8], .little);
+        var replace = true;
+        if (v2) {
+            const flags = std.mem.readInt(u32, body[8..12], .little);
+            if (flags & ~@as(u32, 1) != 0) return self.replyError(header, .INVAL); // only NOREPLACE
+            replace = flags & 1 == 0;
+        }
+        const names = body[head_len..];
+        const old_name = std.mem.sliceTo(names, 0);
+        if (old_name.len + 1 >= names.len) return self.replyError(header, .INVAL);
+        const new_name = std.mem.sliceTo(names[old_name.len + 1 ..], 0);
+
+        const old_parent = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
+        const new_parent = self.inode(newdir) orelse return self.replyError(header, .NOENT);
+        if (old_parent.kind != .swarm_dir or new_parent.kind != .swarm_dir) {
+            const either_swarm = old_parent.kind == .swarm_dir or new_parent.kind == .swarm_dir;
+            return self.replyError(header, if (either_swarm) .XDEV else .ROFS);
+        }
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const from = self.swarmChildPath(arena, old_parent, old_name) catch |err| return self.replyError(header, errnoFor(err));
+        const to = self.swarmChildPath(arena, new_parent, new_name) catch |err| return self.replyError(header, errnoFor(err));
+        const moved_ino = try self.child(header.nodeid, old_name);
+        // A file still open for writing is saved before it moves.
+        if (moved_ino) |ino| {
+            if (self.writing.get(ino)) |fh| {
+                if (self.handles.getPtr(fh)) |h| self.commit(h) catch {};
+            }
+        }
+        self.swarm.?.move(from, to, .{ .replace = replace }) catch |err| return self.replyError(header, errnoFor(err));
+        // The kernel keeps the moved inode under its new name: point it at
+        // the new path (its children refresh from it on their next lookup).
+        if (moved_ino) |ino| try self.rekey(header.nodeid, old_name, newdir, new_name, ino, to);
+        try self.repath(from, to);
+        try self.replyEmpty(header);
+    }
+
+    /// Cached swarm inodes below a moved folder take its new path.
+    fn repath(self: *Mount, from: []const u8, to: []const u8) !void {
+        for (self.inodes.items) |*node| {
+            if (node.kind != .swarm_dir and node.kind != .swarm_file) continue;
+            const p = node.swarm_path;
+            if (!(p.len > from.len and std.mem.startsWith(u8, p, from) and p[from.len] == '/')) continue;
+            node.swarm_path = try std.fmt.allocPrint(self.path_arena.allocator(), "{s}{s}", .{ to, p[from.len..] });
+        }
+    }
+
+    fn childKey(buf: *[8 + 256]u8, parent_ino: u64, name: []const u8) []const u8 {
+        std.mem.writeInt(u64, buf[0..8], parent_ino, .little);
+        @memcpy(buf[8..][0..name.len], name);
+        return buf[0 .. 8 + name.len];
+    }
+
+    fn rekey(self: *Mount, old_parent: u64, old_name: []const u8, new_parent: u64, new_name: []const u8, ino: u64, new_path: []const u8) !void {
+        var buf: [8 + 256]u8 = undefined;
+        if (self.children.fetchRemove(childKey(&buf, old_parent, old_name))) |kv| self.allocator.free(kv.key);
+        const key = try self.allocator.dupe(u8, childKey(&buf, new_parent, new_name));
+        errdefer self.allocator.free(key);
+        const gop = try self.children.getOrPut(self.allocator, key);
+        if (gop.found_existing) self.allocator.free(key) else gop.key_ptr.* = key;
+        gop.value_ptr.* = ino;
+        self.inodes.items[ino - 1].swarm_path = try self.path_arena.allocator().dupe(u8, new_path);
+    }
+
     // ---- Tree navigation ----
 
     fn inode(self: *Mount, ino: u64) ?Inode {
@@ -469,7 +851,11 @@ pub const Mount = struct {
             .atime = node.mtime,
             .mtime = node.mtime,
             .ctime = node.mtime,
-            .mode = if (is_file) S_IFREG | 0o444 else S_IFDIR | 0o555,
+            .mode = switch (node.kind) {
+                .swarm_file => S_IFREG | 0o644,
+                .swarm_dir => S_IFDIR | 0o755,
+                else => if (is_file) S_IFREG | 0o444 else S_IFDIR | 0o555,
+            },
             .nlink = if (is_file) 1 else 2,
             .uid = self.uid,
             .gid = self.gid,
@@ -512,6 +898,19 @@ pub const Mount = struct {
             .swarm_dir => {
                 const folder = self.swarm orelse return out.items;
                 const items = try folder.list(arena, parent.swarm_path);
+                // Files still being written aren't in the manifest yet.
+                var hit = self.handles.valueIterator();
+                while (hit.next()) |h| {
+                    const slash = std.mem.lastIndexOfScalar(u8, h.path, '/');
+                    const dir = if (slash) |sl| h.path[0..sl] else "";
+                    if (!std.mem.eql(u8, dir, parent.swarm_path)) continue;
+                    const name = h.path[if (slash) |sl| sl + 1 else 0..];
+                    const listed = for (items) |it| {
+                        if (std.mem.eql(u8, it.name, name)) break true;
+                    } else false;
+                    if (listed) continue;
+                    try out.append(arena, .{ .name = name, .node = self.inodes.items[h.ino - 1] });
+                }
                 for (items) |it| {
                     try out.append(arena, .{ .name = it.name, .node = .{
                         .kind = if (it.dir) .swarm_dir else .swarm_file,
@@ -698,6 +1097,10 @@ fn errnoFor(err: anyerror) Errno {
         error.NotADirectory => .NOTDIR,
         error.IsDirectory => .ISDIR,
         error.FileNotFound => .NOENT,
+        error.PathAlreadyExists => .EXIST,
+        error.ReadOnly => .ROFS,
+        error.InvalidPath, error.InvalidName => .INVAL,
+        error.NameTooLong => .NAMETOOLONG,
         else => .IO,
     };
 }
@@ -756,7 +1159,7 @@ fn mountWithFusermount(allocator: std.mem.Allocator, mountpoint: []const u8) !i3
 
     var env_buf: [32]u8 = undefined;
     const env = try std.fmt.bufPrintZ(&env_buf, "_FUSE_COMMFD={d}", .{fds[1]});
-    const status = try runFusermount(allocator, &.{ "-o", "ro,nosuid,nodev,fsname=nomadfs,subtype=nomadfs", "--" }, mountpoint, env);
+    const status = try runFusermount(allocator, &.{ "-o", "rw,nosuid,nodev,default_permissions,fsname=nomadfs,subtype=nomadfs", "--" }, mountpoint, env);
     _ = linux.close(fds[1]);
     child_open = false;
     if (status != 0) return error.MountFailed;
