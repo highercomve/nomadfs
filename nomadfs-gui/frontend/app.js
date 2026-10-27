@@ -707,19 +707,80 @@ document.addEventListener("visibilitychange", async () => {
 async function loadJoinInfo() {
   try {
     const info = await invoke("join_info", { config_path: await ensureConfig() });
-    $("join-code").textContent = info.code;
     $("device-name").textContent = info.nickname;
     $("nick-in").value = info.nickname;
     return info;
   } catch (err) {
-    $("join-code").textContent = `Unavailable: ${err}`;
+    snack(`Couldn't read this device's settings: ${err}`);
   }
 }
 
-$("join-copy").addEventListener("click", async () => {
+// One-time invites: the code carries a throwaway token, never the swarm key.
+let inviteTimer = null;
+
+function renderInvite(info) {
+  const active = info.state !== "none";
+  $("invite-idle").hidden = active && info.state === "waiting";
+  $("invite-active").hidden = !active;
+  if (!active) return;
+  const status = $("invite-active").querySelector(".invite-status");
+  status.dataset.state = info.state;
+  $("invite-code").textContent = info.state === "waiting" ? info.code : "";
+  $("invite-copy").hidden = info.state !== "waiting";
+  $("invite-cancel").textContent = info.state === "waiting" ? "Cancel" : "Done";
+  if (info.state === "waiting") {
+    $("invite-label").textContent = "Waiting for the other device…";
+    const m = Math.floor(info.expires_in / 60), sec = String(info.expires_in % 60).padStart(2, "0");
+    $("invite-timer").textContent = `${m}:${sec}`;
+  } else if (info.state === "joined") {
+    $("invite-label").textContent = `${info.peer || "A device"} joined`;
+    $("invite-timer").textContent = "";
+  } else {
+    $("invite-label").textContent = "Invite expired";
+    $("invite-timer").textContent = "";
+  }
+}
+
+async function pollInvite() {
+  let info;
+  try { info = await invoke("invite_status", { config_path: await ensureConfig() }); } catch { return; }
+  renderInvite(info);
+  if (info.state !== "waiting") {
+    clearInterval(inviteTimer);
+    inviteTimer = null;
+    if (info.state === "joined") {
+      snack(`${info.peer || "A device"} joined your devices`);
+      setTimeout(showDevices, 1500);
+    }
+  }
+}
+
+$("invite-create").addEventListener("click", async () => {
+  if (!running) {
+    snack("Start the node first");
+    return;
+  }
   try {
-    await navigator.clipboard.writeText($("join-code").textContent);
-    snack("Code copied");
+    renderInvite(await invoke("invite_create", { config_path: await ensureConfig() }));
+    clearInterval(inviteTimer);
+    inviteTimer = setInterval(pollInvite, 1000);
+  } catch (err) {
+    snack(`Couldn't create an invite: ${err}`);
+  }
+});
+
+$("invite-cancel").addEventListener("click", async () => {
+  try { await invoke("invite_cancel", null); } catch {}
+  clearInterval(inviteTimer);
+  inviteTimer = null;
+  renderInvite({ state: "none" });
+  $("invite-idle").hidden = false;
+});
+
+$("invite-copy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("invite-code").textContent);
+    snack("Invite copied");
   } catch {
     snack("Clipboard unavailable");
   }
@@ -729,16 +790,22 @@ $("join-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const code = $("join-in").value.trim();
   if (!code) return;
+  const btn = e.submitter;
+  if (btn) btn.disabled = true;
+  snack("Joining…", 30000);
   try {
-    await invoke("join", { config_path: await ensureConfig(), code });
+    const name = await invoke("invite_accept", { config_path: await ensureConfig(), code });
     $("join-in").value = "";
-    snack("Joined. Looking for devices…");
+    snack(`Joined ${name || "the device"}. Looking for devices…`);
     await nodeState();
     await loadJoinInfo();
     setTimeout(showDevices, 1500);
   } catch (err) {
-    snack(`Join failed: ${err}`);
+    snack(`${err}`.includes("InviteRejected")
+      ? "That invite didn't work: it may have expired or already been used. Ask for a new one."
+      : `Join failed: ${err}`);
   }
+  if (btn) btn.disabled = false;
 });
 
 $("nick-form").addEventListener("submit", async (e) => {

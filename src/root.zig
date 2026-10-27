@@ -328,6 +328,7 @@ test {
         @import("config.zig"),
         @import("device/auth.zig"),
         @import("device/identity.zig"),
+        @import("device/invite.zig"),
         @import("device/pairing.zig"),
         @import("device/paths.zig"),
         @import("device/qr.zig"),

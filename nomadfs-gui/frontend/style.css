@@ -673,3 +673,12 @@ main { padding-bottom: calc(104px + env(safe-area-inset-bottom)); }
   #pv-download span { display: inline; }
   #pv-download { width: auto; padding: 0 20px 0 16px; }
 }
+
+/* ---- Invites ---- */
+.sub-heading { margin: 4px 0 -4px; font-size: 14px; font-weight: 500; color: var(--md-on-surface-variant); letter-spacing: .1px; }
+.invite-status { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 500; }
+.invite-status .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--md-primary); animation: pulse 1s infinite alternate; }
+.invite-status[data-state="joined"] .dot { background: var(--md-tertiary); animation: none; }
+.invite-status[data-state="expired"] .dot { background: var(--md-outline); animation: none; }
+.invite-status .timer { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--md-on-surface-variant); font-weight: 400; }
+#invite-active[hidden], #invite-idle[hidden] { display: none; }

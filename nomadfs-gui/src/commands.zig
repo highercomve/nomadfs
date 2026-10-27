@@ -840,62 +840,197 @@ pub fn openPath(gpa: std.mem.Allocator, args: OpenPathArgs) !void {
 
 // ---- Joining devices ----
 
-pub const JoinInfo = struct { code: []const u8, nickname: []const u8, addresses: []const u8 };
+pub const JoinInfo = struct { nickname: []const u8, addresses: []const u8 };
 
-/// `invoke("join_info", { config_path })`: the code another device enters
-/// to join this one's swarm. It carries the swarm key: share it only with
-/// your own devices.
+/// `invoke("join_info", { config_path })`: this device's name and the
+/// address other devices reach it at. (Never the swarm key: devices join
+/// through one-time invites.)
 pub fn joinInfo(gpa: std.mem.Allocator, args: ListArgs) !JoinInfo {
     var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
     defer config.deinit(gpa);
-    const key = std.fmt.bytesToHex(config.node.swarm_key[0..32].*, .lower);
     var ip_buf: [16]u8 = undefined;
     const ip = primaryIp(&ip_buf) orelse "127.0.0.1";
-    const addresses = try std.fmt.allocPrint(gpa, "{s}:{d}", .{ ip, config.network.port });
     return .{
-        .code = try std.fmt.allocPrint(gpa, "nomadfs://join?key={s}&addr={s}", .{ &key, addresses }),
         .nickname = try gpa.dupe(u8, config.node.nickname),
-        .addresses = addresses,
+        .addresses = try std.fmt.allocPrint(gpa, "{s}:{d}", .{ ip, config.network.port }),
     };
 }
 
-pub const JoinArgs = struct { config_path: []const u8, code: []const u8 };
+// ---- Invites: join a device without showing the swarm key ----
 
-/// `invoke("join", { config_path, code })`: adopts the swarm key in
-/// another device's join code and bootstraps to its addresses. A running
-/// node restarts to pick them up.
-pub fn join(gpa: std.mem.Allocator, args: JoinArgs) !void {
-    const code = std.mem.trim(u8, args.code, " \t\r\n");
-    const prefix = "nomadfs://join?";
-    if (!std.mem.startsWith(u8, code, prefix)) return error.InvalidJoinCode;
-    var key: ?[]const u8 = null;
-    var addr: ?[]const u8 = null;
-    var params = std.mem.splitScalar(u8, code[prefix.len..], '&');
-    while (params.next()) |param| {
-        if (std.mem.startsWith(u8, param, "key=")) key = param[4..];
-        if (std.mem.startsWith(u8, param, "addr=")) addr = param[5..];
-    }
-    const swarm_key = key orelse return error.InvalidJoinCode;
-    _ = try parseHex32(swarm_key);
-    const addresses = addr orelse return error.InvalidJoinCode;
+const invite = nomadfs.device.invite;
 
-    var peers: std.ArrayList(u8) = .empty;
-    defer peers.deinit(gpa);
-    var it = std.mem.splitScalar(u8, addresses, ',');
-    while (it.next()) |a| {
-        if (a.len == 0 or std.mem.indexOfAny(u8, a, "\"[] ") != null) return error.InvalidJoinCode;
-        if (peers.items.len > 0) try peers.append(gpa, ',');
-        try peers.print(gpa, "\"tcp://{s}\"", .{a});
+var g_invite: ?*invite.Host = null;
+var g_invite_code: ?[]u8 = null;
+var g_invite_handled = false;
+var g_invite_mutex: nomadfs.sync.Mutex = .{};
+
+pub const InviteInfo = struct {
+    /// "none", "waiting", "joined" or "expired".
+    state: []const u8,
+    code: []const u8,
+    expires_in: u64,
+    /// Who joined, once state is "joined".
+    peer: []const u8,
+};
+
+/// `invite_create { config_path }`: opens a one-time invite (10 minutes,
+/// one join) on the node port + 1 and returns its code. The code holds a
+/// throwaway token, never the swarm key.
+pub fn inviteCreate(gpa: std.mem.Allocator, args: ListArgs) !InviteInfo {
+    var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
+    defer config.deinit(gpa);
+    var ip_buf: [16]u8 = undefined;
+    const ip = primaryIp(&ip_buf) orelse return error.NoNetwork;
+    const my_addr = try std.fmt.allocPrint(gpa, "{s}:{d}", .{ ip, config.network.port });
+    defer gpa.free(my_addr);
+    const ticket = try pairTicket(gpa, .{ .config_path = args.config_path, .address = my_addr });
+
+    g_invite_mutex.lock();
+    defer g_invite_mutex.unlock();
+    cancelInviteLocked();
+    const host = try invite.Host.start(std.heap.page_allocator, .{
+        .swarm_key = config.node.swarm_key[0..32].*,
+        .node_port = config.network.port,
+        .ticket_uri = ticket.uri,
+    }, config.network.port +% 1, invite.default_lifetime_s, nomadfs.nowSeconds());
+    var buf: [160]u8 = undefined;
+    g_invite_code = try std.heap.page_allocator.dupe(u8, try host.code(ip, &buf));
+    g_invite = host;
+    g_invite_handled = false;
+    return inviteInfoLocked(gpa, args.config_path);
+}
+
+/// `invite_status { config_path }`. When the invite has been used, the
+/// joiner is trusted and remembered as a peer (once).
+pub fn inviteStatus(gpa: std.mem.Allocator, args: ListArgs) !InviteInfo {
+    g_invite_mutex.lock();
+    defer g_invite_mutex.unlock();
+    return inviteInfoLocked(gpa, args.config_path);
+}
+
+pub fn inviteCancel() void {
+    g_invite_mutex.lock();
+    defer g_invite_mutex.unlock();
+    cancelInviteLocked();
+}
+
+fn cancelInviteLocked() void {
+    if (g_invite) |host| host.destroy();
+    g_invite = null;
+    if (g_invite_code) |c| std.heap.page_allocator.free(c);
+    g_invite_code = null;
+}
+
+fn inviteInfoLocked(gpa: std.mem.Allocator, config_path: []const u8) !InviteInfo {
+    const host = g_invite orelse return .{ .state = "none", .code = "", .expires_in = 0, .peer = "" };
+    const now = nomadfs.nowSeconds();
+    const state = host.status(now);
+    var peer: []const u8 = "";
+    if (state == .joined) {
+        if (try host.joinedTicket(gpa)) |uri| {
+            const ticket = Ticket.parseAt(uri, now) catch null;
+            if (ticket) |t| peer = try gpa.dupe(u8, t.nicknameSlice());
+            if (!g_invite_handled) {
+                g_invite_handled = true;
+                adoptPeer(gpa, config_path, uri) catch |err| std.debug.print("invite: adopting the joiner failed: {any}\n", .{err});
+            }
+        }
     }
-    const key_line = try std.fmt.allocPrint(gpa, "swarm_key = \"{s}\"", .{swarm_key});
-    defer gpa.free(key_line);
-    const peers_line = try std.fmt.allocPrint(gpa, "bootstrap_peers = [{s}]", .{peers.items});
-    defer gpa.free(peers_line);
+    return .{
+        .state = @tagName(state),
+        .code = if (state == .waiting) try gpa.dupe(u8, g_invite_code orelse "") else "",
+        .expires_in = if (host.expires_at > now) host.expires_at - now else 0,
+        .peer = peer,
+    };
+}
+
+/// Trusts a device's pairing ticket and remembers its addresses as
+/// bootstrap peers, dialing them now if the node is running.
+fn adoptPeer(gpa: std.mem.Allocator, config_path: []const u8, ticket_uri: []const u8) !void {
+    try trustDevice(gpa, .{ .config_path = config_path, .uri = ticket_uri });
+    const ticket = try Ticket.parseAt(ticket_uri, nomadfs.nowSeconds());
+    var urls: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (urls.items) |u| gpa.free(u);
+        urls.deinit(gpa);
+    }
+    var it = std.mem.splitScalar(u8, ticket.addressesSlice(), ',');
+    while (it.next()) |addr| {
+        const a = std.mem.trim(u8, addr, " ");
+        if (a.len == 0 or std.mem.startsWith(u8, a, "127.")) continue;
+        try urls.append(gpa, try std.fmt.allocPrint(gpa, "tcp://{s}", .{a}));
+    }
+    if (urls.items.len == 0) return;
+    try addBootstrapPeers(gpa, config_path, urls.items);
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    if (g_node) |node| {
+        const csv = try std.mem.joinZ(gpa, ",", urls.items);
+        defer gpa.free(csv);
+        _ = mobile.nomadfs_node_bootstrap(node, csv.ptr);
+    }
+}
+
+/// Merges `urls` into the config's bootstrap_peers (no duplicates).
+fn addBootstrapPeers(gpa: std.mem.Allocator, config_path: []const u8, urls: []const []const u8) !void {
+    var config = config_mod.parseConfig(gpa, config_path) catch return error.ConfigInvalid;
+    defer config.deinit(gpa);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(gpa);
+    try line.appendSlice(gpa, "bootstrap_peers = [");
+    var first = true;
+    for (config.network.bootstrap_peers) |p| {
+        try line.print(gpa, "{s}\"{s}\"", .{ if (first) "" else ",", p });
+        first = false;
+    }
+    for (urls) |u| {
+        const dup = for (config.network.bootstrap_peers) |p| {
+            if (std.mem.eql(u8, p, u)) break true;
+        } else false;
+        if (dup) continue;
+        if (std.mem.indexOfAny(u8, u, "\"[]\n") != null) continue;
+        try line.print(gpa, "{s}\"{s}\"", .{ if (first) "" else ",", u });
+        first = false;
+    }
+    try line.append(gpa, ']');
+    try editConfig(gpa, config_path, .{ .drop_keys = &.{"bootstrap_peers"}, .append = &.{line.items} });
+}
+
+pub const InviteAcceptArgs = struct { config_path: []const u8, code: []const u8 };
+
+/// `invite_accept { config_path, code }`: joins the inviting device's
+/// swarm through the one-time exchange, trusts it, remembers its address
+/// and restarts the node with the new swarm key.
+pub fn inviteAccept(gpa: std.mem.Allocator, args: InviteAcceptArgs) ![]const u8 {
+    var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
+    const port = config.network.port;
+    config.deinit(gpa);
+
+    var ip_buf: [16]u8 = undefined;
+    const ip = primaryIp(&ip_buf) orelse "127.0.0.1";
+    const my_addr = try std.fmt.allocPrint(gpa, "{s}:{d}", .{ ip, port });
+    defer gpa.free(my_addr);
+    const mine = try pairTicket(gpa, .{ .config_path = args.config_path, .address = my_addr });
+
+    var joined = try invite.join(gpa, args.code, mine.uri);
+    defer joined.deinit(gpa);
 
     const was_running = isRunning();
     if (was_running) nodeClose();
-    try editConfig(gpa, args.config_path, .{ .drop_keys = &.{ "swarm_key", "bootstrap_peers" }, .append = &.{ key_line, peers_line } });
+    const key_hex = std.fmt.bytesToHex(joined.swarm_key, .lower);
+    const key_line = try std.fmt.allocPrint(gpa, "swarm_key = \"{s}\"", .{&key_hex});
+    defer gpa.free(key_line);
+    try editConfig(gpa, args.config_path, .{ .drop_keys = &.{"swarm_key"}, .append = &.{key_line} });
+    const url = try std.fmt.allocPrint(gpa, "tcp://{s}:{d}", .{ joined.host_ip, joined.node_port });
+    defer gpa.free(url);
+    try addBootstrapPeers(gpa, args.config_path, &.{url});
+    trustDevice(gpa, .{ .config_path = args.config_path, .uri = joined.ticket_uri }) catch |err|
+        std.debug.print("invite: trusting the inviter failed: {any}\n", .{err});
     if (was_running) try nodeOpen(gpa, .{ .config_path = args.config_path });
+
+    const ticket = Ticket.parseAt(joined.ticket_uri, nomadfs.nowSeconds()) catch return gpa.dupe(u8, "");
+    return gpa.dupe(u8, ticket.nicknameSlice());
 }
 
 pub const NicknameArgs = struct { config_path: []const u8, nickname: []const u8 };
@@ -910,22 +1045,8 @@ pub fn setNickname(gpa: std.mem.Allocator, args: NicknameArgs) !void {
     try editConfig(gpa, args.config_path, .{ .drop_keys = &.{"nickname"}, .append = &.{line} });
 }
 
-/// The address this device uses to reach the LAN: the source address the
-/// kernel picks for an outbound UDP "connection" (nothing is sent).
 fn primaryIp(buf: *[16]u8) ?[]const u8 {
-    if (builtin.os.tag != .linux) return null;
-    const linux = std.os.linux;
-    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
-    if (linux.errno(rc) != .SUCCESS) return null;
-    const fd: i32 = @intCast(rc);
-    defer _ = linux.close(fd);
-    var target = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, 9), .addr = std.mem.nativeToBig(u32, 0xC0000201) }; // 192.0.2.1 (TEST-NET-1)
-    if (linux.errno(linux.connect(fd, @ptrCast(&target), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return null;
-    var local: linux.sockaddr.in = undefined;
-    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
-    if (linux.errno(linux.getsockname(fd, @ptrCast(&local), &len)) != .SUCCESS) return null;
-    const a: [4]u8 = @bitCast(local.addr);
-    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ a[0], a[1], a[2], a[3] }) catch null;
+    return nomadfs.device.invite.lanAddress(buf);
 }
 
 const ConfigEdit = struct {

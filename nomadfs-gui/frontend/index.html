@@ -163,25 +163,39 @@
           <svg class="icon" viewBox="0 0 24 24"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>
           <div>
             <h2>Connect devices</h2>
-            <p class="supporting">Enter this code on your other device, or paste its code here. It holds your swarm key: keep it to your own devices.</p>
+            <p class="supporting">Invite your other devices with a one-time code. The code only opens an encrypted exchange for a few minutes; your swarm key is never shown.</p>
           </div>
         </div>
-        <div class="result">
-          <span class="result-label">This device</span>
-          <code id="join-code" class="cid">—</code>
+
+        <h3 class="sub-heading">Invite a device</h3>
+        <div id="invite-idle" class="actions start">
+          <button id="invite-create" type="button" class="btn filled">Create invite</button>
+        </div>
+        <div id="invite-active" class="result" hidden>
+          <div class="invite-status">
+            <span class="dot"></span>
+            <span id="invite-label">Waiting for the other device…</span>
+            <span id="invite-timer" class="timer"></span>
+          </div>
+          <code id="invite-code" class="cid"></code>
           <div class="actions">
-            <button id="join-copy" class="btn text" type="button">Copy code</button>
+            <button id="invite-cancel" class="btn text" type="button">Cancel</button>
+            <button id="invite-copy" class="btn tonal" type="button">Copy code</button>
           </div>
         </div>
+
+        <h3 class="sub-heading">Join with an invite</h3>
         <form id="join-form" class="stack">
           <label class="field">
             <input id="join-in" class="mono" placeholder=" " autocomplete="off" spellcheck="false" />
-            <span class="field-label">Other device's code</span>
+            <span class="field-label">Invite code from your other device</span>
           </label>
           <div class="actions">
             <button type="submit" class="btn filled">Join</button>
           </div>
         </form>
+
+        <h3 class="sub-heading">This device</h3>
         <form id="nick-form" class="stack">
           <label class="field">
             <input id="nick-in" placeholder=" " autocomplete="off" />

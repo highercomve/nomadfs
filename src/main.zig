@@ -12,7 +12,7 @@ const DevicePaths = device.paths.Paths;
 /// rotates, and an old QR code should not grant access forever.
 const ticket_lifetime_seconds = 24 * 60 * 60;
 
-const Command = enum { run, pair, trust, devices, revoke, mount };
+const Command = enum { run, pair, trust, devices, revoke, mount, invite };
 
 const Options = struct {
     command: Command = .run,
@@ -52,6 +52,7 @@ pub fn main(init: std.process.Init) !void {
         .revoke => try revokeCommand(allocator, config, options.revoke_query.?),
         .run => try runNode(allocator, config),
         .mount => try mountCommand(allocator, config, options.mountpoint.?),
+        .invite => try inviteCommand(allocator, config, options.address),
     }
 }
 
@@ -75,6 +76,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Optio
         } else if (std.mem.eql(u8, arg, "--revoke")) {
             try selectCommand(options, .revoke);
             options.revoke_query = try nextValue(args, &i, "--revoke");
+        } else if (std.mem.eql(u8, arg, "--invite")) {
+            try selectCommand(options, .invite);
         } else if (std.mem.eql(u8, arg, "--mount")) {
             try selectCommand(options, .mount);
             options.mountpoint = try nextValue(args, &i, "--mount");
@@ -94,8 +97,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Optio
         }
     }
 
-    if (options.address != null and options.command != .pair) {
-        std.debug.print("Error: --address is only valid with --pair\n", .{});
+    if (options.address != null and options.command != .pair and options.command != .invite) {
+        std.debug.print("Error: --address is only valid with --pair or --invite\n", .{});
         std.process.exit(1);
     }
     return true;
@@ -129,6 +132,7 @@ fn printHelp() void {
         \\  nomadfs --devices [config_path]
         \\  nomadfs --revoke <device-id-or-fingerprint> [config_path]
         \\  nomadfs --mount <dir> [config_path]
+        \\  nomadfs --invite [--address ip] [config_path]
         \\
         \\Options:
         \\  --config <path>    Path to the configuration file
@@ -139,6 +143,9 @@ fn printHelp() void {
         \\  --revoke <id>      Remove a trusted device by ID or fingerprint
         \\  --share Name:/path Share a folder with the swarm (repeatable; also
         \\                     `share = "Name:/path"` in the config)
+        \\  --invite           Print a one-time invite code (10 min, one use) that
+        \\                     lets another device join this swarm; the swarm key
+        \\                     travels encrypted and is never shown
         \\  --mount <dir>      Run the node and mount every device's shares at
         \\                     <dir>/<device>/<share>, read-only; files download
         \\                     on demand (Linux, needs fusermount3)
@@ -240,6 +247,61 @@ fn runUntilStopped(node: *nomadfs.Node, running: *std.atomic.Value(bool), config
     node.run(running, config) catch |err| {
         std.debug.print("Node stopped: {any}\n", .{err});
     };
+}
+
+fn inviteCommand(allocator: std.mem.Allocator, config: config_mod.Config, address: ?[]const u8) !void {
+    const invite = device.invite;
+    var ip_buf: [16]u8 = undefined;
+    const ip = address orelse invite.lanAddress(&ip_buf) orelse "127.0.0.1";
+
+    var paths = try DevicePaths.resolve(allocator, config.node.key_path);
+    defer paths.deinit(allocator);
+    const identity = try Identity.loadOrCreate(paths.identity);
+    const transport = try nomadfs.net.transport.manager.ConnectionManager.loadOrCreateKey(allocator, config.node.key_path);
+    var addr_buf: [64]u8 = undefined;
+    const node_addr = try std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ ip, config.network.port });
+    const now = nowSeconds();
+    const ticket = try Ticket.init(identity, transport.public_key, config.node.nickname, node_addr, now + ticket_lifetime_seconds);
+    var uri_buf: [device.pairing.max_uri_len]u8 = undefined;
+    const uri = try ticket.toUri(&uri_buf);
+
+    const host = try invite.Host.start(allocator, .{
+        .swarm_key = config.node.swarm_key[0..32].*,
+        .node_port = config.network.port,
+        .ticket_uri = uri,
+    }, config.network.port +% 1, invite.default_lifetime_s, now);
+    defer host.destroy();
+
+    var code_buf: [160]u8 = undefined;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print("Invite (one use, expires in {d} minutes):\n\n{s}\n\nWaiting for the other device...\n", .{ invite.default_lifetime_s / 60, try host.code(ip, &code_buf) });
+    try writeStdout(out.written());
+
+    while (true) {
+        nomadfs.sync.sleep(500 * std.time.ns_per_ms);
+        switch (host.status(nowSeconds())) {
+            .waiting => continue,
+            .expired => {
+                std.debug.print("Invite expired.\n", .{});
+                return;
+            },
+            .joined => break,
+        }
+    }
+    const joined_uri = (try host.joinedTicket(allocator)).?;
+    defer allocator.free(joined_uri);
+    const joiner = try Ticket.parseAt(joined_uri, nowSeconds());
+    var store = try TrustStore.load(allocator, paths.trust, identity.seed());
+    defer store.deinit();
+    _ = try store.trustTicket(joiner, nowSeconds());
+    try store.save();
+    var fp_buf: [19]u8 = undefined;
+    std.debug.print("{s} joined ({s}, {s}) and is now trusted.\n", .{
+        joiner.nicknameSlice(),
+        Identity.formatFingerprint(joiner.fingerprint(), &fp_buf),
+        joiner.addressesSlice(),
+    });
 }
 
 fn pairCommand(allocator: std.mem.Allocator, config: config_mod.Config, address: ?[]const u8) !void {

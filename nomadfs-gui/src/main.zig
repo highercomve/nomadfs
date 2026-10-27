@@ -35,7 +35,28 @@ pub const Commands = struct {
     /// Slow or waiting commands run on a worker thread so the window stays
     /// responsive: the folder picker waits for the user, sharing scans a
     /// folder, and the rest talk to other devices.
-    pub const async_commands = .{ "pick_folder", "share_add", "remote_devices", "browse", "download", "join", "read_range", "mount_start", "mount_stop" };
+    pub const async_commands = .{ "pick_folder", "share_add", "remote_devices", "browse", "download", "read_range", "mount_start", "mount_stop", "invite_create", "invite_accept" };
+
+    /// `invoke("invite_create", { config_path })`: one-time invite code.
+    pub fn invite_create(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.InviteInfo {
+        return commands.inviteCreate(gpa, args);
+    }
+
+    /// `invoke("invite_status", { config_path })`.
+    pub fn invite_status(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.InviteInfo {
+        return commands.inviteStatus(gpa, args);
+    }
+
+    /// `invoke("invite_cancel")`.
+    pub fn invite_cancel() void {
+        commands.inviteCancel();
+    }
+
+    /// `invoke("invite_accept", { config_path, code })`: join with a code;
+    /// returns the inviting device's name.
+    pub fn invite_accept(gpa: std.mem.Allocator, args: commands.InviteAcceptArgs) ![]const u8 {
+        return commands.inviteAccept(gpa, args);
+    }
 
     /// `invoke("read_range", { peer, cid, offset, len })`: base64 bytes of
     /// a remote file, for previews.
@@ -173,14 +194,9 @@ pub const Commands = struct {
         return commands.download(gpa, args);
     }
 
-    /// `invoke("join_info", { config_path })`: this device's join code.
+    /// `invoke("join_info", { config_path })`: this device's name and address.
     pub fn join_info(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.JoinInfo {
         return commands.joinInfo(gpa, args);
-    }
-
-    /// `invoke("join", { config_path, code })`: join another device's swarm.
-    pub fn join(gpa: std.mem.Allocator, args: commands.JoinArgs) !void {
-        return commands.join(gpa, args);
     }
 
     /// `invoke("set_nickname", { config_path, nickname })`.
