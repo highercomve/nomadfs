@@ -1137,3 +1137,11 @@ body[data-view] main > [data-view] + [data-view] { animation-delay: .07s; }
 /* Names are words, codes are readouts. */
 .field input { font-family: var(--font); font-size: 15px; }
 .field input.mono { font-family: var(--mono) !important; font-size: 13px !important; }
+
+/* Buttons stay flat: a faint top highlight, no halo. The focus ring is
+   for keyboard focus only, and quiet. */
+.btn.filled,
+.btn.filled:hover { box-shadow: 0 1px 0 rgb(255 255 255 / .22) inset; }
+.btn.filled:hover { filter: brightness(1.06); }
+.btn:focus { outline: none; }
+.btn:focus-visible { outline: 1.5px solid rgb(246 176 66 / .5); outline-offset: 2px; }
