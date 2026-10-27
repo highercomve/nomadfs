@@ -64,6 +64,8 @@ pub fn build(b: *std.Build) void {
             .summary = "Share folders across your devices; files download on demand",
             .version = "0.1.0",
         },
+        // The page's camera scans invite QR codes (getUserMedia).
+        .permissions = .{ .camera = "Scan invite QR codes from your other devices" },
         .android = .{
             // Sharing folders like DCIM/Camera and saving to Download/:
             // "All files access", granted from the system settings page the

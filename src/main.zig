@@ -275,7 +275,12 @@ fn inviteCommand(allocator: std.mem.Allocator, config: config_mod.Config, addres
     var code_buf: [160]u8 = undefined;
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try out.writer.print("Invite (one use, expires in {d} minutes):\n\n{s}\n\nWaiting for the other device...\n", .{ invite.default_lifetime_s / 60, try host.code(ip, &code_buf) });
+    const code = try host.code(ip, &code_buf);
+    try out.writer.print("Invite (one use, expires in {d} minutes). Scan it with the NomadFS app\n(Connect devices > Scan QR code) or enter the code:\n\n", .{invite.default_lifetime_s / 60});
+    var matrix = try device.qr.encode(allocator, code, .medium);
+    defer matrix.deinit();
+    try device.qr.renderAscii(matrix, &out.writer, .{});
+    try out.writer.print("\n{s}\n\nWaiting for the other device...\n", .{code});
     try writeStdout(out.written());
 
     while (true) {

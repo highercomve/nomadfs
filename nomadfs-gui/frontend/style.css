@@ -682,3 +682,41 @@ main { padding-bottom: calc(104px + env(safe-area-inset-bottom)); }
 .invite-status[data-state="expired"] .dot { background: var(--md-outline); animation: none; }
 .invite-status .timer { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--md-on-surface-variant); font-weight: 400; }
 #invite-active[hidden], #invite-idle[hidden] { display: none; }
+
+/* ---- Invite QR and scanner ---- */
+.invite-body { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
+.qr { flex: none; width: 200px; height: 200px; border-radius: 12px; overflow: hidden; background: #fff; }
+.qr svg { width: 100%; height: 100%; display: block; }
+.qr:empty { display: none; }
+.invite-text { flex: 1; min-width: 200px; display: flex; flex-direction: column; gap: 8px; }
+.invite-text .supporting { margin: 0; }
+@media (max-width: 839px) { .invite-body { justify-content: center; } .qr { width: 240px; height: 240px; } }
+
+.scanner { position: fixed; inset: 0; z-index: 20; background: #000; }
+.scanner[hidden] { display: none; }
+.scanner video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.scan-frame {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: min(70vw, 70vh, 320px);
+  aspect-ratio: 1;
+  transform: translate(-50%, -50%);
+  border-radius: 24px;
+  box-shadow: 0 0 0 100vmax rgb(0 0 0 / .45);
+  outline: 3px solid var(--md-primary);
+}
+.scan-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: calc(12px + env(safe-area-inset-top)) 12px 12px;
+  color: #fff;
+  font-weight: 500;
+  background: linear-gradient(rgb(0 0 0 / .6), transparent);
+}
+.scan-bar .icon-btn { color: #fff; }

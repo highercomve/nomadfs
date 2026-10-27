@@ -177,7 +177,13 @@
             <span id="invite-label">Waiting for the other device…</span>
             <span id="invite-timer" class="timer"></span>
           </div>
-          <code id="invite-code" class="cid"></code>
+          <div class="invite-body">
+            <div id="invite-qr" class="qr" aria-label="Invite QR code"></div>
+            <div class="invite-text">
+              <p class="supporting">Scan this with your other device, or copy the code.</p>
+              <code id="invite-code" class="cid"></code>
+            </div>
+          </div>
           <div class="actions">
             <button id="invite-cancel" class="btn text" type="button">Cancel</button>
             <button id="invite-copy" class="btn tonal" type="button">Copy code</button>
@@ -191,6 +197,10 @@
             <span class="field-label">Invite code from your other device</span>
           </label>
           <div class="actions">
+            <button id="scan-open" type="button" class="btn tonal with-icon" hidden>
+              <svg viewBox="0 0 24 24"><path d="M4 4h6v2H6v4H4V4zm10 0h6v6h-2V6h-4V4zM4 14h2v4h4v2H4v-6zm14 4h-4v2h6v-6h-2v4zM7 11h10v2H7z"/></svg>
+              Scan QR code
+            </button>
             <button type="submit" class="btn filled">Join</button>
           </div>
         </form>
@@ -294,6 +304,18 @@
           </button>
         </div>
         <div id="pv-body" class="preview-body"></div>
+      </div>
+    </div>
+
+    <!-- QR scanner (devices whose web view has BarcodeDetector) -->
+    <div id="scanner" class="scanner" hidden role="dialog" aria-modal="true" aria-label="Scan invite">
+      <video id="scan-video" playsinline muted></video>
+      <div class="scan-frame"></div>
+      <div class="scan-bar">
+        <button id="scan-close" class="icon-btn" aria-label="Close">
+          <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+        <span>Point the camera at the invite QR code</span>
       </div>
     </div>
 

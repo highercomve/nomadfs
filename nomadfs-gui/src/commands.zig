@@ -872,6 +872,9 @@ pub const InviteInfo = struct {
     expires_in: u64,
     /// Who joined, once state is "joined".
     peer: []const u8,
+    /// The code as a QR (SVG markup) while the invite is waiting, for
+    /// another device's camera.
+    qr_svg: []const u8,
 };
 
 /// `invite_create { config_path }`: opens a one-time invite (10 minutes,
@@ -923,7 +926,7 @@ fn cancelInviteLocked() void {
 }
 
 fn inviteInfoLocked(gpa: std.mem.Allocator, config_path: []const u8) !InviteInfo {
-    const host = g_invite orelse return .{ .state = "none", .code = "", .expires_in = 0, .peer = "" };
+    const host = g_invite orelse return .{ .state = "none", .code = "", .expires_in = 0, .peer = "", .qr_svg = "" };
     const now = nomadfs.nowSeconds();
     const state = host.status(now);
     var peer: []const u8 = "";
@@ -937,11 +940,18 @@ fn inviteInfoLocked(gpa: std.mem.Allocator, config_path: []const u8) !InviteInfo
             }
         }
     }
+    var qr_svg: []const u8 = "";
+    if (state == .waiting) {
+        var matrix = try nomadfs.device.qr.encode(gpa, g_invite_code orelse "", .medium);
+        defer matrix.deinit();
+        qr_svg = try nomadfs.device.qr.renderSvg(gpa, matrix, 4);
+    }
     return .{
         .state = @tagName(state),
         .code = if (state == .waiting) try gpa.dupe(u8, g_invite_code orelse "") else "",
         .expires_in = if (host.expires_at > now) host.expires_at - now else 0,
         .peer = peer,
+        .qr_svg = qr_svg,
     };
 }
 

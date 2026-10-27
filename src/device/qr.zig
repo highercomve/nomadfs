@@ -705,3 +705,56 @@ test "QR: rendering has the expected shape" {
     const lines = std.mem.count(u8, text, "\n");
     try testing.expectEqual((matrix.size + 1) / 2 + 4, lines);
 }
+
+/// Renders `matrix` as a standalone SVG (black modules on white, with a
+/// `quiet`-module margin), for pages and other vector consumers. Runs of
+/// dark modules in a row become one rectangle in a single path. Caller
+/// frees the result.
+pub fn renderSvg(allocator: std.mem.Allocator, matrix: Matrix, quiet: usize) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    const dim = matrix.size + 2 * quiet;
+    try w.print(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {d} {d}\" shape-rendering=\"crispEdges\">" ++
+            "<rect width=\"{d}\" height=\"{d}\" fill=\"#fff\"/><path fill=\"#000\" d=\"",
+        .{ dim, dim, dim, dim },
+    );
+    for (0..matrix.size) |y| {
+        var x: usize = 0;
+        while (x < matrix.size) {
+            if (!matrix.get(x, y)) {
+                x += 1;
+                continue;
+            }
+            const start = x;
+            while (x < matrix.size and matrix.get(x, y)) x += 1;
+            try w.print("M{d} {d}h{d}v1h-{d}z", .{ start + quiet, y + quiet, x - start, x - start });
+        }
+    }
+    try w.writeAll("\"/></svg>");
+    return out.toOwnedSlice();
+}
+
+test "qr: svg rendering covers every dark module" {
+    const allocator = std.testing.allocator;
+    var matrix = try encode(allocator, "nomadfs://invite?addr=192.168.1.20:14701&token=00112233445566778899aabbccddeeff", .medium);
+    defer matrix.deinit();
+    const svg = try renderSvg(allocator, matrix, 4);
+    defer allocator.free(svg);
+    try std.testing.expect(std.mem.startsWith(u8, svg, "<svg "));
+    try std.testing.expect(std.mem.endsWith(u8, svg, "</svg>"));
+    // Count dark modules via the h<run> segments.
+    var dark: usize = 0;
+    for (0..matrix.size) |y| for (0..matrix.size) |x| {
+        if (matrix.get(x, y)) dark += 1;
+    };
+    var drawn: usize = 0;
+    var it = std.mem.tokenizeAny(u8, svg, "Mz\"");
+    while (it.next()) |seg| {
+        const h = std.mem.indexOfScalar(u8, seg, 'h') orelse continue;
+        const v = std.mem.indexOfScalarPos(u8, seg, h, 'v') orelse continue;
+        drawn += std.fmt.parseInt(usize, seg[h + 1 .. v], 10) catch continue;
+    }
+    try std.testing.expectEqual(dark, drawn);
+}

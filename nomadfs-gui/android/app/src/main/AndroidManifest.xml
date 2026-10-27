@@ -7,11 +7,13 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- oriel:permissions begin -->
+    <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <!-- oriel:permissions end -->
     <!-- oriel:features begin -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <!-- oriel:features end -->
     <!-- oriel:queries begin -->
     <!-- oriel.dictation's and oriel.tts's system engines: Android 11+ only
@@ -92,6 +94,13 @@
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|locale" />
 
         <!-- oriel:components begin -->
+        <provider
+            android:name="dev.oriel.OrielCaptureProvider"
+            android:authorities="${applicationId}.oriel.capture"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="dev.oriel.camera.transcode" android:value="true" />
+        </provider>
         <!-- oriel:components end -->
 
         <receiver
