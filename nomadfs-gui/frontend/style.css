@@ -1145,3 +1145,12 @@ body[data-view] main > [data-view] + [data-view] { animation-delay: .07s; }
 .btn.filled:hover { filter: brightness(1.06); }
 .btn:focus { outline: none; }
 .btn:focus-visible { outline: 1.5px solid rgb(246 176 66 / .5); outline-offset: 2px; }
+
+/* Snappy: switching sections and lists is instant. Only the live
+   signal pulse animates; nothing makes a click wait. */
+body[data-view] main > [data-view],
+body[data-view] main > [data-view] + [data-view],
+.list.rows li { animation: none !important; }
+.top-app-bar, .nav-bar, .nav-drawer, #snackbar { backdrop-filter: none; -webkit-backdrop-filter: none; }
+.nav-item:focus, .bar-item:focus, .icon-btn:focus, .list.rows li:focus { outline: none; }
+.nav-item:focus-visible, .bar-item:focus-visible, .icon-btn:focus-visible { outline: 1.5px solid rgb(246 176 66 / .5); outline-offset: -2px; }

@@ -575,7 +575,7 @@ $("mount-toggle").addEventListener("click", async () => {
 $("mount-change").addEventListener("click", async () => {
   try {
     const picked = await invoke("pick_folder", null);
-    if (picked) { mountPath = picked.path; $("mount-path").textContent = mountPath; }
+    if (picked && typeof picked.path === "string" && picked.path) { mountPath = picked.path; $("mount-path").textContent = mountPath; }
   } catch (err) {
     snack(`Folder picker failed: ${err}`);
   }
@@ -623,6 +623,7 @@ async function removeShare(name) {
 
 /** Shows the share form for `path`, with the name pre-filled. */
 function stageShare(path, name) {
+  path = String(path || "");
   $("share-path").textContent = path;
   $("share-name").value = name || path.split("/").filter(Boolean).pop() || "";
   $("share-form").hidden = false;
@@ -635,7 +636,13 @@ async function pickFolder() {
   }
   try {
     const picked = await invoke("pick_folder", null);
-    if (picked) stageShare(picked.path, picked.name);
+    if (picked == null) return; // cancelled
+    if (typeof picked.path !== "string" || !picked.path) {
+      console.warn("pick_folder returned", picked);
+      snack("The folder picker didn't return a folder. Try again.");
+      return;
+    }
+    stageShare(picked.path, picked.name);
   } catch (err) {
     snack(`${err}`.includes("UnsupportedFolder")
       ? "That folder isn't on this device's storage. Pick one from internal storage or an SD card."

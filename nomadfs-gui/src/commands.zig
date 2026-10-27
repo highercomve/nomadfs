@@ -730,6 +730,20 @@ pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
     if (g_mount != null) return error.AlreadyMounted;
     const handle = g_node orelse return error.NotRunning;
     const store = handle.node.store orelse return error.StorageDisabled;
+    // A NomadFS mount left behind by a process that died ("transport
+    // endpoint is not connected"): detach it before mounting again.
+    if (can_mount and isMounted(gpa, args.path)) {
+        const z = try gpa.dupeZ(u8, args.path);
+        defer gpa.free(z);
+        fs.fuse.unmount(z);
+        // fusermount3 may be reaped by the toolkit before we wait on it:
+        // trust the mount table, not the exit status.
+        var tries: u32 = 0;
+        while (tries < 30 and isMounted(gpa, args.path)) : (tries += 1) {
+            nomadfs.sync.sleep(100 * std.time.ns_per_ms);
+        }
+        if (isMounted(gpa, args.path)) return error.StaleMountBusy;
+    }
     try std.Io.Dir.cwd().createDirPath(io, args.path);
 
     const job = try std.heap.page_allocator.create(MountJob);
@@ -763,6 +777,14 @@ fn serveMount(job: *MountJob) void {
         };
     }
     job.done.store(true, .release);
+}
+
+/// Unmounts without taking any lock, for a signal handler about to end
+/// the process: the kernel would otherwise keep a dead mount behind.
+pub fn emergencyUnmount() void {
+    if (!can_mount) return;
+    const job = @atomicLoad(?*MountJob, &g_mount, .acquire) orelse return;
+    if (!job.done.load(.acquire)) fs.fuse.unmount(job.path);
 }
 
 /// `invoke("mount_stop")`.
@@ -805,12 +827,8 @@ fn isMounted(gpa: std.mem.Allocator, path: []const u8) bool {
     defer file.close(io);
     const buf = gpa.alloc(u8, 1024 * 1024) catch return false;
     defer gpa.free(buf);
-    var len: usize = 0;
-    while (len < buf.len) {
-        const n = file.readStreaming(io, &.{buf[len..]}) catch return false;
-        if (n == 0) break;
-        len += n;
-    }
+    // One positional read: readStreaming ends /proc files with an error.
+    const len = file.readPositionalAll(io, buf, 0) catch return false;
     var lines = std.mem.splitScalar(u8, buf[0..len], '\n');
     while (lines.next()) |line| {
         if (std.mem.indexOf(u8, line, "fuse.nomadfs") == null) continue;

@@ -92,6 +92,7 @@ pub const Commands = struct {
     /// user cancels.
     pub fn pick_folder(gpa: std.mem.Allocator) !?commands.PickedFolder {
         const folder = try oriel.dialog.openFolder(gpa, .{ .title = "Choose a folder to share" }) orelse return null;
+        std.log.info("pick_folder: \"{s}\"", .{folder.id});
         return try commands.pickedFolder(gpa, folder.id, folder.name);
     }
 
@@ -215,7 +216,25 @@ fn refreshTray(_: ?*anyopaque) void {
     tray.refresh();
 }
 
+/// SIGTERM/SIGINT/SIGHUP (kill, logout, Ctrl-C): unmount first so no
+/// dead mount stays behind, then end the process.
+fn onTerminate(sig: std.os.linux.SIG) callconv(.c) void {
+    commands.emergencyUnmount();
+    std.os.linux.exit_group(128 + @as(i32, @intCast(@intFromEnum(sig))));
+}
+
+fn installExitHandlers() void {
+    if (builtin.os.tag != .linux or builtin.abi.isAndroid()) return;
+    const action = std.os.linux.Sigaction{
+        .handler = .{ .handler = onTerminate },
+        .mask = std.os.linux.sigemptyset(),
+        .flags = 0,
+    };
+    for ([_]std.os.linux.SIG{ .TERM, .INT, .HUP }) |sig| _ = std.os.linux.sigaction(sig, &action, null);
+}
+
 fn setup() !void {
+    installExitHandlers();
     // Desktop: a tray icon keeps NomadFS (and its mount) running with the
     // window closed.
     tray.setup() catch |err| std.log.warn("tray unavailable: {any}", .{err});
