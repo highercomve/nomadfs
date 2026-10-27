@@ -41,6 +41,9 @@ pub const Node = struct {
     trust_store: *device.trust.Store,
     /// Folders this device shares; null without block storage.
     shares: ?*fs.ShareIndex,
+    /// The swarm-wide folder every device reads and writes; null without
+    /// block storage.
+    swarm: ?*fs.SwarmFolder,
     bootstrap_thread: ?std.Thread = null,
     bootstrap_running: *std.atomic.Value(bool),
 
@@ -110,6 +113,17 @@ pub const Node = struct {
         });
         errdefer block_manager.deinit();
 
+        var swarm: ?*fs.SwarmFolder = null;
+        if (store) |s| {
+            const manifest_path = try std.fmt.allocPrint(allocator, "{s}.swarm.json", .{cfg.storage.storage_path});
+            defer allocator.free(manifest_path);
+            const folder = try fs.SwarmFolder.create(allocator, std.Io.Threaded.global_single_threaded.io(), s, connection_manager.node_id, cfg.node.nickname, manifest_path);
+            discovery_node.swarm_source = folder.source();
+            folder.start(block_manager) catch |err| std.debug.print("swarm: sync thread not started: {any}\n", .{err});
+            swarm = folder;
+        }
+        errdefer if (swarm) |f| f.destroy();
+
         const ring = try allocator.create(HashRight);
         ring.* = HashRight.init(allocator);
         errdefer {
@@ -157,6 +171,7 @@ pub const Node = struct {
             .device_identity = device_identity,
             .trust_store = trust_store,
             .shares = shares,
+            .swarm = swarm,
             .bootstrap_running = bootstrap_running,
             .bootstrap_thread = null,
         };
@@ -172,6 +187,7 @@ pub const Node = struct {
         // Stop network traffic and callbacks BEFORE destroying handlers
         self.connection_manager.stop();
         if (self.shares) |index| index.destroy();
+        if (self.swarm) |folder| folder.destroy();
 
         self.trust_store.deinit();
         self.allocator.destroy(self.trust_store);
@@ -336,6 +352,8 @@ test {
         @import("env.zig"),
         @import("errors.zig"),
         @import("fs/filestore.zig"),
+        @import("fs/manifest.zig"),
+        @import("fs/swarm.zig"),
         @import("fs/remote.zig"),
         @import("fs/scan.zig"),
         @import("fs/shares.zig"),

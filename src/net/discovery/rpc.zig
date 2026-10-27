@@ -38,6 +38,10 @@ pub const MessageType = enum(u8) {
     /// Reply to GET_SHARES: a dir block (storage/dag/codec.zig) whose
     /// entries map each share name to its current root CID.
     SHARES = 17,
+    /// Ask a device for its swarm folder manifest. Answered with SWARM.
+    GET_SWARM = 18,
+    /// Reply to GET_SWARM: the encoded manifest (fs/manifest.zig).
+    SWARM = 19,
 };
 
 pub const FindValueResult = union(enum) {
@@ -75,6 +79,8 @@ pub const MessagePayload = union(MessageType) {
     },
     GET_SHARES: void,
     SHARES: struct { nickname: []const u8, listing: []const u8 },
+    GET_SWARM: void,
+    SWARM: struct { manifest: []const u8 },
 };
 
 pub const Message = struct {
@@ -155,6 +161,11 @@ pub const Message = struct {
                 try writer.writeAll(nick);
                 try writer.writeInt(u32, @intCast(p.listing.len), .big);
                 try writer.writeAll(p.listing);
+            },
+            .GET_SWARM => {},
+            .SWARM => |p| {
+                try writer.writeInt(u32, @intCast(p.manifest.len), .big);
+                try writer.writeAll(p.manifest);
             },
         }
     }
@@ -244,6 +255,8 @@ pub const Message = struct {
                 try reader.readNoEof(nickname);
                 break :blk MessagePayload{ .SHARES = .{ .nickname = nickname, .listing = try readValue(allocator, reader) } };
             },
+            .GET_SWARM => MessagePayload{ .GET_SWARM = {} },
+            .SWARM => MessagePayload{ .SWARM = .{ .manifest = try readValue(allocator, reader) } },
         };
 
         return Message{
@@ -338,6 +351,7 @@ pub const Message = struct {
                 allocator.free(p.nickname);
                 allocator.free(p.listing);
             },
+            .SWARM => |p| allocator.free(p.manifest),
             else => {},
         }
     }

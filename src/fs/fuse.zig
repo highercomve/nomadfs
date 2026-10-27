@@ -18,6 +18,7 @@ const cluster = @import("../cluster/mod.zig");
 const storage = @import("../storage/mod.zig");
 const tree = @import("tree.zig");
 const remote_mod = @import("remote.zig");
+const swarm_mod = @import("swarm.zig");
 const Remote = remote_mod.Remote;
 
 // ---- Kernel protocol (include/uapi/linux/fuse.h) ----
@@ -205,7 +206,19 @@ const request_buffer_len = 1024 * 1024 + 4096;
 
 // ---- Filesystem state ----
 
-const Kind = enum { root, device, dir, file };
+const Kind = enum {
+    root,
+    device,
+    dir,
+    file,
+    /// The swarm folder (Swarm/ and folders inside it) and its files.
+    swarm_dir,
+    swarm_file,
+
+    fn isFile(k: Kind) bool {
+        return k == .file or k == .swarm_file;
+    }
+};
 
 const Inode = struct {
     kind: Kind,
@@ -214,6 +227,10 @@ const Inode = struct {
     cid: tree.Cid = undefined,
     size: u64 = 0,
     mtime: u64 = 0,
+    /// Swarm inodes: path inside the swarm folder (owned by path_arena)
+    /// and the device that added the file.
+    swarm_path: []const u8 = "",
+    author: [32]u8 = [_]u8{0} ** 32,
 };
 
 const Device = struct {
@@ -239,10 +256,15 @@ pub const Mount = struct {
     request: []align(8) u8 = &.{},
     /// Shown as the mtime of the root and device folders.
     mounted_at: u64 = 0,
+    /// The swarm folder, shown as <mount>/Swarm when set.
+    swarm: ?*swarm_mod.SwarmFolder = null,
+    /// Swarm paths held by inodes.
+    path_arena: std.heap.ArenaAllocator,
     reply: std.ArrayList(u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, block_manager: *cluster.BlockManager, store: *storage.engine.StorageEngine) !Mount {
         var self = Mount{
+            .path_arena = std.heap.ArenaAllocator.init(allocator),
             .allocator = allocator,
             .block_manager = block_manager,
             .store = store,
@@ -258,6 +280,7 @@ pub const Mount = struct {
 
     pub fn deinit(self: *Mount) void {
         if (self.fd >= 0) _ = linux.close(self.fd);
+        self.path_arena.deinit();
         var it = self.children.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.children.deinit(self.allocator);
@@ -364,7 +387,7 @@ pub const Mount = struct {
 
     fn opOpen(self: *Mount, header: *const InHeader, want: enum { dir, file }, body: []const u8) !void {
         const node = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
-        const is_file = node.kind == .file;
+        const is_file = node.kind.isFile();
         if (want == .file and !is_file) return self.replyError(header, .ISDIR);
         if (want == .dir and is_file) return self.replyError(header, .NOTDIR);
         if (want == .file) {
@@ -377,18 +400,26 @@ pub const Mount = struct {
     fn opRead(self: *Mount, header: *const InHeader, body: []const u8) !void {
         const in = readStruct(ReadIn, body) orelse return self.replyError(header, .IO);
         const node = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
-        if (node.kind != .file) return self.replyError(header, .ISDIR);
+        if (!node.kind.isFile()) return self.replyError(header, .ISDIR);
         if (in.offset >= node.size) return self.replyBytes(header, &.{});
 
         const want: usize = @intCast(@min(in.size, node.size - in.offset));
         try self.reply.resize(self.allocator, @sizeOf(OutHeader) + want);
         const dest = self.reply.items[@sizeOf(OutHeader)..];
-        const remote = self.devices.items[node.device].remote;
-        const n = tree.readAt(self.allocator, remote.loader(), node.cid, in.offset, dest) catch |err| {
+        const n = self.readFile(node, in.offset, dest) catch |err| {
             std.debug.print("fuse: read of {x} failed: {any}\n", .{ node.cid[0..4], err });
             return self.replyError(header, .IO);
         };
         try self.sendPrepared(header, n);
+    }
+
+    fn readFile(self: *Mount, node: Inode, offset: u64, dest: []u8) !usize {
+        if (node.kind == .swarm_file) {
+            const folder = self.swarm orelse return error.FileNotFound;
+            return folder.readAt(self.allocator, node.cid, node.author, offset, dest);
+        }
+        const remote = self.devices.items[node.device].remote;
+        return tree.readAt(self.allocator, remote.loader(), node.cid, offset, dest);
     }
 
     fn opReaddir(self: *Mount, header: *const InHeader, body: []const u8) !void {
@@ -412,7 +443,7 @@ pub const Mount = struct {
                 .ino = ino,
                 .off = index + 1,
                 .namelen = @intCast(entry.name.len),
-                .type = if (entry.node.kind == .file) DT_REG else DT_DIR,
+                .type = if (entry.node.kind.isFile()) DT_REG else DT_DIR,
             };
             try self.reply.appendSlice(self.allocator, std.mem.asBytes(&dirent));
             try self.reply.appendSlice(self.allocator, entry.name);
@@ -430,7 +461,7 @@ pub const Mount = struct {
 
     fn attr(self: *Mount, ino: u64) Attr {
         const node = self.inodes.items[ino - 1];
-        const is_file = node.kind == .file;
+        const is_file = node.kind.isFile();
         return .{
             .ino = ino,
             .size = node.size,
@@ -451,8 +482,11 @@ pub const Mount = struct {
     fn childrenOf(self: *Mount, arena: std.mem.Allocator, parent: Inode) ![]Child {
         var out: std.ArrayList(Child) = .empty;
         switch (parent.kind) {
-            .file => return error.NotADirectory,
+            .file, .swarm_file => return error.NotADirectory,
             .root => {
+                if (self.swarm != null) {
+                    try out.append(arena, .{ .name = "Swarm", .node = .{ .kind = .swarm_dir, .mtime = self.mounted_at } });
+                }
                 self.refreshDevices();
                 for (self.devices.items, 0..) |d, i| {
                     if (!d.online) continue;
@@ -472,6 +506,20 @@ pub const Mount = struct {
                         .cid = e.cid,
                         .size = e.size,
                         .mtime = e.mtime,
+                    } });
+                }
+            },
+            .swarm_dir => {
+                const folder = self.swarm orelse return out.items;
+                const items = try folder.list(arena, parent.swarm_path);
+                for (items) |it| {
+                    try out.append(arena, .{ .name = it.name, .node = .{
+                        .kind = if (it.dir) .swarm_dir else .swarm_file,
+                        .cid = it.cid orelse [_]u8{0} ** 32,
+                        .size = it.size,
+                        .mtime = it.mtime,
+                        .swarm_path = it.path,
+                        .author = it.author_id orelse [_]u8{0} ** 32,
                     } });
                 }
             },
@@ -515,11 +563,18 @@ pub const Mount = struct {
         @memcpy(key_buf[8..][0..name.len], name);
         const key = key_buf[0 .. 8 + name.len];
 
+        // A swarm path comes from a temporary listing: keep a lasting copy,
+        // reusing the inode's own when it hasn't changed.
+        var stored = node;
+        if (node.swarm_path.len > 0) {
+            const old = if (self.children.get(key)) |ino| self.inodes.items[ino - 1].swarm_path else "";
+            stored.swarm_path = if (std.mem.eql(u8, old, node.swarm_path)) old else try self.path_arena.allocator().dupe(u8, node.swarm_path);
+        }
         if (self.children.get(key)) |ino| {
-            self.inodes.items[ino - 1] = node;
+            self.inodes.items[ino - 1] = stored;
             return ino;
         }
-        try self.inodes.append(self.allocator, node);
+        try self.inodes.append(self.allocator, stored);
         const ino: u64 = self.inodes.items.len;
         const owned = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned);

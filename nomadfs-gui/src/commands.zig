@@ -662,6 +662,143 @@ pub fn readRange(gpa: std.mem.Allocator, args: ReadRangeArgs) ![]const u8 {
     return encoder.encode(out, buf[0..n]);
 }
 
+// ---- Swarm folder: one folder every device reads and writes ----
+
+pub const SwarmItem = struct {
+    name: []const u8,
+    path: []const u8,
+    dir: bool,
+    size: u64,
+    mtime: u64,
+    cid: []const u8,
+    author: []const u8,
+    author_id: []const u8,
+};
+pub const SwarmListing = struct { items: []SwarmItem, entries: usize, peers_synced: u32, last_sync: u64 };
+pub const SwarmDirArgs = struct { dir: []const u8 };
+
+/// Caller holds g_mutex.
+fn swarmFolder() !*fs.SwarmFolder {
+    const handle = g_node orelse return error.NotRunning;
+    return handle.node.swarm orelse error.StorageDisabled;
+}
+
+/// `swarm_list { dir }`: a folder of the swarm folder ("" = top).
+pub fn swarmList(gpa: std.mem.Allocator, args: SwarmDirArgs) !SwarmListing {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const folder = try swarmFolder();
+    const items = try folder.list(gpa, args.dir);
+    const out = try gpa.alloc(SwarmItem, items.len);
+    for (items, out) |it, *o| {
+        o.* = .{
+            .name = it.name,
+            .path = it.path,
+            .dir = it.dir,
+            .size = it.size,
+            .mtime = it.mtime,
+            .cid = if (it.cid) |c| try hexAlloc(gpa, &c) else "",
+            .author = it.author,
+            .author_id = if (it.author_id) |a| try hexAlloc(gpa, &a) else "",
+        };
+    }
+    const st = folder.status();
+    return .{ .items = out, .entries = st.entries, .peers_synced = st.peers_synced, .last_sync = st.last_sync };
+}
+
+/// `swarm_sync`: pull every reachable device's changes now.
+pub fn swarmSync() !usize {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    return (try swarmFolder()).syncNow();
+}
+
+/// `swarm_add_file { dir }`: the system file picker, then the picked
+/// file is added to `dir`. Returns its name, or null when cancelled.
+pub fn swarmAddFile(gpa: std.mem.Allocator, dir: []const u8, picked_path: []const u8) ![]const u8 {
+    const name = std.fs.path.basename(picked_path);
+    if (!nomadfs.storage.dag.codec.isValidName(name)) return error.InvalidName;
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    try (try swarmFolder()).addFile(dir, name, picked_path);
+    return gpa.dupe(u8, name);
+}
+
+pub const SwarmNameArgs = struct { dir: []const u8, name: []const u8 };
+
+/// `swarm_mkdir { dir, name }`.
+pub fn swarmMkdir(args: SwarmNameArgs) !void {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    try (try swarmFolder()).makeDir(args.dir, std.mem.trim(u8, args.name, " \t"));
+}
+
+pub const SwarmPathArgs = struct { path: []const u8 };
+
+/// `swarm_delete { path }`: a file, or a folder and everything in it.
+pub fn swarmDelete(args: SwarmPathArgs) !void {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    try (try swarmFolder()).remove(args.path);
+}
+
+pub const SwarmRenameArgs = struct { path: []const u8, name: []const u8 };
+
+/// `swarm_rename { path, name }`: in place, same parent folder.
+pub fn swarmRename(args: SwarmRenameArgs) !void {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    try (try swarmFolder()).rename(args.path, std.mem.trim(u8, args.name, " \t"));
+}
+
+pub const SwarmRangeArgs = struct { cid: []const u8, author_id: []const u8, offset: u64, len: u32 };
+
+/// `swarm_read_range`: base64 bytes of a swarm file, for previews.
+pub fn swarmReadRange(gpa: std.mem.Allocator, args: SwarmRangeArgs) ![]const u8 {
+    if (args.len == 0 or args.len > max_range_len) return error.InvalidArgument;
+    const cid = try parseHex32(args.cid);
+    const author = try parseHex32(args.author_id);
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const buf = try gpa.alloc(u8, args.len);
+    defer gpa.free(buf);
+    const n = try (try swarmFolder()).readAt(gpa, cid, author, args.offset, buf);
+    const encoder = std.base64.standard.Encoder;
+    const out = try gpa.alloc(u8, encoder.calcSize(n));
+    return encoder.encode(out, buf[0..n]);
+}
+
+pub const SwarmDownloadArgs = struct { cid: []const u8, author_id: []const u8, name: []const u8 };
+
+/// `swarm_download`: copies a swarm file into Downloads/NomadFS.
+pub fn swarmDownload(gpa: std.mem.Allocator, args: SwarmDownloadArgs) !DownloadResult {
+    if (!nomadfs.storage.dag.codec.isValidName(args.name)) return error.InvalidName;
+    const cid = try parseHex32(args.cid);
+    const author = try parseHex32(args.author_id);
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const folder = try swarmFolder();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try downloadsDir(gpa);
+    defer gpa.free(dir);
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const path = try uniquePath(gpa, dir, args.name);
+    errdefer gpa.free(path);
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
+    defer file.close(io);
+    errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const chunk = try gpa.alloc(u8, 1024 * 1024);
+    defer gpa.free(chunk);
+    var offset: u64 = 0;
+    while (true) {
+        const n = try folder.readAt(gpa, cid, author, offset, chunk);
+        if (n == 0) break;
+        try file.writePositionalAll(io, chunk[0..n], offset);
+        offset += n;
+    }
+    return .{ .path = path, .size = offset };
+}
+
 // ---- Mounting (desktop Linux) ----
 
 const can_mount = builtin.os.tag == .linux and !builtin.abi.isAndroid();
@@ -753,6 +890,7 @@ pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
         .thread = undefined,
         .path = try std.heap.page_allocator.dupeZ(u8, args.path),
     };
+    if (can_mount) job.mount.swarm = handle.node.swarm;
     job.thread = try std.Thread.spawn(.{}, serveMount, .{job});
     g_mount = job;
 
@@ -1152,8 +1290,6 @@ fn editConfig(gpa: std.mem.Allocator, path: []const u8, edit: ConfigEdit) !void 
 const testing = std.testing;
 
 test "commands: node put/get text round trip" {
-    // Keep the prebuilt fixture from /tmp/nomadfs-gui-test if present, so
-    // repeated runs do not re-pair; the conf carries `write_quorum = 0`.
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = "/tmp/nomadfs-gui-test";
     std.Io.Dir.cwd().deleteTree(io, dir) catch {};
@@ -1164,18 +1300,26 @@ test "commands: node put/get text round trip" {
 
     var conf_buf: [512]u8 = undefined;
     const conf_path = try std.fmt.bufPrint(&conf_buf, "{s}/nomadfs.conf", .{dir});
-    // Copy the canonical fixture (written on the host once, matching
-    // nothing: enough for the round trip: it never leaves this box).
-    var fixture: [640]u8 = undefined;
-    var fixture_file = std.Io.Dir.cwd().openFile(io, "/tmp/opencode/gui-test-fixture", .{}) catch |err| {
-        std.debug.print("fixture missing: {any}\n", .{err});
-        return err;
-    };
-    defer fixture_file.close(io);
-    const read_fix = try fixture_file.readPositionalAll(io, &fixture, 0);
+    // A self-contained config: no peers, writes stay local.
     var file = try std.Io.Dir.cwd().createFile(io, conf_path, .{ .truncate = true });
     defer file.close(io);
-    try file.writePositionalAll(io, fixture[0..read_fix], 0);
+    var text_buf: [512]u8 = undefined;
+    const conf = try std.fmt.bufPrint(&text_buf,
+        \\[node]
+        \\nickname = "gui-test"
+        \\swarm_key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+        \\key_path = "{s}/keys/node.key"
+        \\[storage]
+        \\enabled = true
+        \\storage_path = "{s}/data"
+        \\write_quorum = 0
+        \\[network]
+        \\port = 14799
+        \\upnp_enabled = false
+        \\enable_mdns = false
+        \\
+    , .{ dir, dir });
+    try file.writePositionalAll(io, conf, 0);
 
     var gpa = try testing.allocator.create(std.heap.DebugAllocator(.{}));
     defer testing.allocator.destroy(gpa);

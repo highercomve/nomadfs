@@ -932,12 +932,13 @@ h2 { font-size: 19px; font-weight: 650; letter-spacing: -.25px; font-variation-s
   color: var(--dust);
 }
 #remote-section h2::before { content: "01 · browse"; }
-#shares-section h2::before { content: "02 · shared folders"; }
-#mount-section h2::before { content: "03 · mount"; }
-#join-section h2::before { content: "04 · connect"; }
-#text-drop h2::before { content: "05 · text drop"; }
-#node-section h2::before { content: "06 · node"; }
-#devices-section h2::before { content: "07 · trust"; }
+#swarm-section h2::before { content: "02 · swarm"; }
+#shares-section h2::before { content: "03 · shared folders"; }
+#mount-section h2::before { content: "04 · mount"; }
+#join-section h2::before { content: "05 · connect"; }
+#text-drop h2::before { content: "06 · text drop"; }
+#node-section h2::before { content: "07 · node"; }
+#devices-section h2::before { content: "08 · trust"; }
 
 .card-head .icon {
   border-radius: 6px;
@@ -1154,3 +1155,55 @@ body[data-view] main > [data-view] + [data-view],
 .top-app-bar, .nav-bar, .nav-drawer, #snackbar { backdrop-filter: none; -webkit-backdrop-filter: none; }
 .nav-item:focus, .bar-item:focus, .icon-btn:focus, .list.rows li:focus { outline: none; }
 .nav-item:focus-visible, .bar-item:focus-visible, .icon-btn:focus-visible { outline: 1.5px solid rgb(246 176 66 / .5); outline-offset: -2px; }
+
+/* ---- Swarm folder ---- */
+body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
+.swarm-status { margin: 6px 0 0; font-size: 10.5px; letter-spacing: .3px; color: var(--oasis-hi); }
+.swarm-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.swarm-toolbar .crumbs { flex: 1; min-width: 0; }
+.row-actions { display: flex; gap: 2px; flex: none; }
+.list.rows li .col-by { display: none; }
+.table-head.swarm-head .th-by { width: 150px; }
+.table-head.swarm-head .th-act { width: 120px; }
+#swarm-scroll .table-head { display: none; }
+
+/* Phones: Text drop lives under Settings (its bar slot is Swarm). */
+@media (max-width: 839px) {
+  body[data-view="settings"] main > #text-drop { display: flex; }
+}
+
+@media (min-width: 840px) {
+  body[data-view="swarm"] main { overflow: hidden; }
+  body[data-view="swarm"] #swarm-section { flex: 1; min-height: 0; max-width: none; }
+  #swarm-scroll { flex: 1; min-height: 0; overflow-y: auto; margin: 0 -8px; padding: 0 8px; }
+  #swarm-scroll .table-head {
+    display: flex; gap: 16px; position: sticky; top: 0; z-index: 1;
+    padding: 10px 4px 8px 56px; background: var(--plate);
+    border-bottom: 1px solid var(--rule);
+    font: 500 10px/1.4 var(--mono); letter-spacing: 1.4px; text-transform: uppercase; color: var(--dust);
+  }
+  #swarm-scroll .table-head .th-name { flex: 1; }
+  #swarm-scroll .table-head .th-size { width: 110px; text-align: right; }
+  #swarm-scroll .table-head .th-date { width: 140px; }
+  .list.rows li.has-cols .col-by { display: block; width: 150px; overflow: hidden; text-overflow: ellipsis; }
+  .list.rows li.has-cols .row-actions { width: 120px; justify-content: flex-end; opacity: 0; }
+  .list.rows li.has-cols:hover .row-actions, .list.rows li.has-cols .row-actions:focus-within { opacity: 1; }
+  #remote-list li.has-cols .row-actions { width: 48px; }
+}
+
+/* ---- Ask dialog ---- */
+.ask { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; background: rgb(0 0 0 / .55); padding: 16px; }
+.ask[hidden] { display: none; }
+.ask-panel {
+  width: min(420px, 100%);
+  display: flex; flex-direction: column; gap: 14px;
+  padding: 20px 20px 14px;
+  background: var(--plate);
+  border: 1px solid var(--rule-strong);
+  border-radius: 8px;
+  box-shadow: 0 30px 60px -20px rgb(0 0 0 / .8);
+}
+.ask-panel h3 { margin: 0; font-size: 18px; font-weight: 650; }
+.ask-panel .supporting { margin: 0; }
+.ask-panel .field[hidden], .ask-panel p[hidden] { display: none; }
+.btn.filled.danger { background: linear-gradient(180deg, #ff8a7a, #e0533f); color: #1d0905; }

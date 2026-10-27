@@ -59,6 +59,33 @@ pub const Remote = struct {
     }
 };
 
+/// A Loader over several devices: the local store first, then each peer
+/// in order until one serves the block (the device that added a swarm
+/// file, then anyone who may have cached it).
+pub const MultiRemote = struct {
+    block_manager: *cluster.BlockManager,
+    store: *storage.engine.StorageEngine,
+    peers: []const NodeID,
+
+    pub fn loader(self: *MultiRemote) tree.Loader {
+        return .{ .ctx = self, .loadFn = load };
+    }
+
+    fn load(ctx: *anyopaque, cid: *const tree.Cid, allocator: std.mem.Allocator) anyerror![]u8 {
+        const self: *MultiRemote = @ptrCast(@alignCast(ctx));
+        if (try self.store.get(cid, allocator)) |block| return @constCast(block.data);
+        var last: anyerror = error.BlockNotFound;
+        for (self.peers) |peer| {
+            var one = Remote{ .block_manager = self.block_manager, .store = self.store, .peer = peer };
+            return Remote.load(&one, cid, allocator) catch |err| {
+                last = err;
+                continue;
+            };
+        }
+        return last;
+    }
+};
+
 /// Every peer the routing table knows (caller frees).
 pub fn knownPeers(block_manager: *cluster.BlockManager, allocator: std.mem.Allocator) ![]NodeID {
     const dht_node = block_manager.dht_node;

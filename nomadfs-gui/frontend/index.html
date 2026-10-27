@@ -30,6 +30,10 @@
         <svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
         <span>Browse</span>
       </button>
+      <button class="nav-item" data-view="swarm">
+        <svg viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-1 5.83V10H7.83A3 3 0 1 0 6 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 0 0 9.83 12h4.34A3 3 0 0 0 16 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 1 0 16.17 10H13V7.83A3 3 0 0 0 12 2z"/></svg>
+        <span>Swarm folder</span>
+      </button>
       <button class="nav-item" data-view="shares">
         <svg viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-5 3c1.1 0 2 .9 2 2s-.9 2-2 2-2-.9-2-2 .9-2 2-2zm4 8h-8v-1c0-1.33 2.67-2 4-2s4 .67 4 2v1z"/></svg>
         <span>Shared folders</span>
@@ -92,6 +96,38 @@
           </div>
           <ul id="remote-list" class="list rows"></ul>
         </div>
+      </section>
+
+      <!-- Swarm folder: one folder every device reads and writes -->
+      <section class="card" id="swarm-section" data-view="swarm">
+        <div class="card-head">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-1 5.83V10H7.83A3 3 0 1 0 6 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 0 0 9.83 12h4.34A3 3 0 0 0 16 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 1 0 16.17 10H13V7.83A3 3 0 0 0 12 2z"/></svg>
+          <div class="grow">
+            <h2>Swarm folder</h2>
+            <p class="supporting">One folder all your devices share. Anyone can add, rename and delete; files download only when opened.</p>
+            <p id="swarm-status" class="meta swarm-status">…</p>
+          </div>
+          <button id="swarm-sync" class="icon-btn" title="Sync now" aria-label="Sync now">
+            <svg viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+          </button>
+        </div>
+        <div class="swarm-toolbar">
+          <nav id="swarm-crumbs" class="crumbs"></nav>
+          <div class="actions">
+            <button id="swarm-mkdir" type="button" class="btn outlined">New folder</button>
+            <button id="swarm-add" type="button" class="btn filled with-icon">
+              <svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+              Add file…
+            </button>
+          </div>
+        </div>
+        <div class="table-scroll" id="swarm-scroll">
+          <div class="table-head swarm-head">
+            <span class="th-name">Name</span><span class="th-size">Size</span><span class="th-date">Modified</span><span class="th-by">Added by</span><span class="th-act"></span>
+          </div>
+          <ul id="swarm-list" class="list rows"></ul>
+        </div>
+        <p id="swarm-empty" class="empty-state" hidden></p>
       </section>
 
       <!-- Shared folders -->
@@ -296,7 +332,7 @@
       <button class="bar-item" data-view="browse"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg></span><span>Browse</span></button>
       <button class="bar-item" data-view="shares"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-5 3c1.1 0 2 .9 2 2s-.9 2-2 2-2-.9-2-2 .9-2 2-2zm4 8h-8v-1c0-1.33 2.67-2 4-2s4 .67 4 2v1z"/></svg></span><span>Shared</span></button>
       <button class="bar-item" data-view="connect"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg></span><span>Connect</span></button>
-      <button class="bar-item" data-view="text"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg></span><span>Text</span></button>
+      <button class="bar-item" data-view="swarm"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-1 5.83V10H7.83A3 3 0 1 0 6 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 0 0 9.83 12h4.34A3 3 0 0 0 16 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 1 0 16.17 10H13V7.83A3 3 0 0 0 12 2z"/></svg></span><span>Swarm</span></button>
       <button class="bar-item" data-view="settings"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg></span><span>Settings</span></button>
     </nav>
 
@@ -336,6 +372,22 @@
         </button>
         <span>Point the camera at the invite QR code</span>
       </div>
+    </div>
+
+    <!-- Ask: a name or a confirmation -->
+    <div id="ask" class="ask" hidden role="dialog" aria-modal="true" aria-labelledby="ask-title">
+      <form id="ask-form" class="ask-panel">
+        <h3 id="ask-title"></h3>
+        <p id="ask-text" class="supporting"></p>
+        <label id="ask-field" class="field">
+          <input id="ask-input" placeholder=" " autocomplete="off" spellcheck="false" />
+          <span class="field-label">Name</span>
+        </label>
+        <div class="actions">
+          <button id="ask-cancel" type="button" class="btn text">Cancel</button>
+          <button id="ask-ok" type="submit" class="btn filled">OK</button>
+        </div>
+      </form>
     </div>
 
     <div id="snackbar" role="status" aria-live="polite"></div>

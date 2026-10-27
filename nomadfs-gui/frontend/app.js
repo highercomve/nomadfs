@@ -42,6 +42,9 @@ const ICONS = {
   image: "M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z",
   video: "M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z",
   download: "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z",
+  edit: "M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z",
+  trash: "M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z",
+  swarm: "M12 2a3 3 0 0 0-1 5.83V10H7.83A3 3 0 1 0 6 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 0 0 9.83 12h4.34A3 3 0 0 0 16 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 1 0 16.17 10H13V7.83A3 3 0 0 0 12 2z",
   copy: "M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z",
   remove: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z",
 };
@@ -65,7 +68,8 @@ function iconFor(name, dir) {
 }
 
 /** A Material list row: leading icon, headline + meta, optional trailing button. */
-function row({ icon, iconClass = "", headline, meta, monoMeta = false, onClick, action, cols }) {
+function row({ icon, iconClass = "", headline, meta, monoMeta = false, onClick, action, actions, cols }) {
+  if (action && !actions) actions = [action];
   const li = document.createElement("li");
   const lead = document.createElement("span");
   lead.className = `row-icon ${iconClass}`;
@@ -87,26 +91,33 @@ function row({ icon, iconClass = "", headline, meta, monoMeta = false, onClick, 
   // Wide layout: Size and Modified columns (CSS hides them on phones).
   if (cols) {
     li.classList.add("has-cols");
-    for (const [cls, value] of [["col-size", cols.size], ["col-date", cols.date]]) {
+    const colList = [["col-size", cols.size], ["col-date", cols.date]];
+    if (cols.by !== undefined) colList.push(["col-by", cols.by]);
+    for (const [cls, value] of colList) {
       const c = document.createElement("span");
       c.className = `col ${cls}`;
       c.textContent = value || "";
       li.appendChild(c);
     }
-    if (!action) {
+    if (!actions) {
       const pad = document.createElement("span");
       pad.className = "col act-spacer";
       li.appendChild(pad);
     }
   }
-  if (action) {
-    const b = document.createElement("button");
-    b.className = "icon-btn";
-    b.title = action.label;
-    b.setAttribute("aria-label", action.label);
-    b.appendChild(svg(ICONS[action.icon]));
-    b.addEventListener("click", (e) => { e.stopPropagation(); action.run(b); });
-    li.appendChild(b);
+  if (actions) {
+    const box = document.createElement("span");
+    box.className = "row-actions";
+    for (const a of actions) {
+      const b = document.createElement("button");
+      b.className = "icon-btn";
+      b.title = a.label;
+      b.setAttribute("aria-label", a.label);
+      b.appendChild(svg(ICONS[a.icon]));
+      b.addEventListener("click", (e) => { e.stopPropagation(); a.run(b); });
+      box.appendChild(b);
+    }
+    li.appendChild(box);
   }
   if (onClick) {
     li.classList.add("clickable");
@@ -125,6 +136,7 @@ function setView(view) {
   window.scrollTo(0, 0);
   try { localStorage.setItem("view", view); } catch {}
   if (view === "settings") $("devices-refresh").click();
+  if (view === "swarm") loadSwarm();
   renderNavDevices();
 }
 
@@ -358,7 +370,7 @@ async function showLocation() {
         headline: e.name,
         meta: `${formatSize(e.size)} · ${formatDate(e.mtime)}`,
         cols: { size: formatSize(e.size), date: formatDate(e.mtime) },
-        onClick: () => openPreview(device, files, files.indexOf(e)),
+        onClick: () => openPreview(deviceSource(device), files, files.indexOf(e)),
         action: { icon: "download", label: "Download", run: fetchIt },
       }));
     }
@@ -405,7 +417,20 @@ function kindOf(name) {
   return { kind: null, ext };
 }
 
-let pv = null; // { device, files, index, token, url }
+let pv = null; // { source, files, index, token, url }
+
+/** Where a preview reads from: a device's share... */
+function deviceSource(device) {
+  return {
+    read: (e, offset, len) => invoke("read_range", { peer: device.peer, cid: e.cid, offset, len }),
+    download: (e, btn) => downloadFile(device, e, btn),
+  };
+}
+/** ...or the swarm folder (the device that added it, then anyone). */
+const swarmSource = {
+  read: (e, offset, len) => invoke("swarm_read_range", { cid: e.cid, author_id: e.author_id, offset, len }),
+  download: (e, btn) => swarmDownload(e, btn),
+};
 
 function previewMessage(icon, text, extra) {
   const box = document.createElement("div");
@@ -426,8 +451,8 @@ function decodeBase64(b64) {
   return bytes;
 }
 
-function openPreview(device, files, index) {
-  pv = { device, files, index, token: 0, url: null };
+function openPreview(source, files, index) {
+  pv = { source, files, index, token: 0, url: null };
   $("preview").hidden = false;
   showPreview();
 }
@@ -466,7 +491,7 @@ async function showPreview() {
   try {
     while (offset < total) {
       const len = Math.min(RANGE, total - offset);
-      const b64 = await invoke("read_range", { peer: pv.device.peer, cid: entry.cid, offset, len });
+      const b64 = await pv.source.read(entry, offset, len);
       if (!pv || token !== pv.token) return; // closed or moved on
       const bytes = decodeBase64(b64);
       if (bytes.length === 0) break;
@@ -515,7 +540,7 @@ $("pv-close").addEventListener("click", closePreview);
 $("preview").addEventListener("click", (e) => { if (e.target === $("preview")) closePreview(); });
 $("pv-prev").addEventListener("click", () => { if (pv && pv.index > 0) { pv.index--; showPreview(); } });
 $("pv-next").addEventListener("click", () => { if (pv && pv.index < pv.files.length - 1) { pv.index++; showPreview(); } });
-$("pv-download").addEventListener("click", () => { if (pv) downloadFile(pv.device, pv.files[pv.index], null); });
+$("pv-download").addEventListener("click", () => { if (pv) pv.source.download(pv.files[pv.index], null); });
 document.addEventListener("keydown", (e) => {
   if (!pv) return;
   if (e.key === "Escape") closePreview();
@@ -586,6 +611,200 @@ $("mount-open").addEventListener("click", async () => {
 });
 
 $("remote-refresh").addEventListener("click", () => (path.length ? showLocation() : showDevices()));
+
+// ---- Swarm folder: one folder all devices read and write ----
+
+let swarmDir = ""; // "" = top; "a/b" below
+
+function swarmCrumbs() {
+  const nav = $("swarm-crumbs");
+  nav.replaceChildren();
+  const parts = swarmDir ? swarmDir.split("/") : [];
+  const all = [{ label: "Swarm", dir: "" }, ...parts.map((p, i) => ({ label: p, dir: parts.slice(0, i + 1).join("/") }))];
+  all.forEach((c, i) => {
+    if (i > 0) {
+      const sep = document.createElement("span");
+      sep.className = "sep";
+      sep.textContent = "›";
+      nav.appendChild(sep);
+    }
+    const b = document.createElement("button");
+    b.textContent = c.label;
+    if (i < all.length - 1) b.addEventListener("click", () => { swarmDir = c.dir; loadSwarm(); });
+    nav.appendChild(b);
+  });
+}
+
+function swarmStatusText(st) {
+  if (!running) return "Node stopped";
+  const devices = st.peers_synced === 1 ? "1 device" : `${st.peers_synced} devices`;
+  const when = st.last_sync ? timeAgo(st.last_sync * 1000) : "not yet";
+  return `${st.entries} item${st.entries === 1 ? "" : "s"} · synced with ${devices} · ${when}`;
+}
+
+async function loadSwarm() {
+  swarmCrumbs();
+  const list = $("swarm-list");
+  if (!running) {
+    list.replaceChildren();
+    $("swarm-empty").hidden = false;
+    $("swarm-empty").textContent = "Start the node to see the swarm folder.";
+    $("swarm-status").textContent = "Node stopped";
+    return;
+  }
+  let res;
+  try {
+    res = await invoke("swarm_list", { dir: swarmDir });
+  } catch (err) {
+    snack(`Swarm folder: ${err}`);
+    return;
+  }
+  $("swarm-status").textContent = swarmStatusText(res);
+  const items = res.items.sort((a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
+  if (!items.length && swarmDir) { // folder vanished (deleted elsewhere): go up
+    swarmDir = swarmDir.split("/").slice(0, -1).join("/");
+    return loadSwarm();
+  }
+  const files = items.filter((x) => !x.dir);
+  list.replaceChildren();
+  $("swarm-empty").hidden = items.length > 0;
+  $("swarm-empty").textContent = "Empty. Add a file, or create a folder; every device sees it.";
+  for (const it of items) {
+    const by = it.author || "";
+    const actions = [
+      { icon: "edit", label: `Rename ${it.name}`, run: () => swarmRenamePrompt(it) },
+      { icon: "trash", label: `Delete ${it.name}`, run: () => swarmDeleteConfirm(it) },
+    ];
+    if (!it.dir) actions.unshift({ icon: "download", label: "Download", run: (btn) => swarmDownload(it, btn) });
+    list.appendChild(row({
+      icon: it.dir ? "folder" : iconFor(it.name, false),
+      iconClass: it.dir ? "folder" : "",
+      headline: it.name,
+      meta: it.dir ? formatSize(it.size) : `${formatSize(it.size)} · ${formatDate(it.mtime)}${by ? ` · ${by}` : ""}`,
+      cols: { size: formatSize(it.size), date: formatDate(it.mtime), by },
+      onClick: it.dir
+        ? () => { swarmDir = it.path; loadSwarm(); }
+        : () => openPreview(swarmSource, files, files.indexOf(it)),
+      actions,
+    }));
+  }
+}
+
+async function swarmDownload(it, btn) {
+  if (downloading.has(it.cid)) return;
+  downloading.add(it.cid);
+  if (btn) btn.classList.add("spin");
+  snack(`Downloading ${it.name} (${formatSize(it.size)})…`, 60000);
+  try {
+    const res = await invoke("swarm_download", { cid: it.cid, author_id: it.author_id, name: it.name });
+    snack(`Saved to ${res.path}`, 5000);
+  } catch (err) {
+    snack(`${err}`.includes("BlockNotFound") || `${err}`.includes("AllAddressesFailed")
+      ? `${it.name} isn't reachable: the device that added it is offline.`
+      : `Download failed: ${err}`);
+  }
+  downloading.delete(it.cid);
+  if (btn) btn.classList.remove("spin");
+}
+
+/** A small dialog: ask for a name, or confirm. Resolves null on cancel. */
+function askDialog({ title, text = "", value = null, confirm = "OK", danger = false }) {
+  return new Promise((resolve) => {
+    const dlg = $("ask");
+    $("ask-title").textContent = title;
+    $("ask-text").textContent = text;
+    $("ask-text").hidden = !text;
+    const field = $("ask-field");
+    field.hidden = value === null;
+    $("ask-input").value = value ?? "";
+    const ok = $("ask-ok");
+    ok.textContent = confirm;
+    ok.classList.toggle("danger", danger);
+    dlg.hidden = false;
+    if (value !== null) {
+      const input = $("ask-input");
+      input.focus();
+      const dot = input.value.lastIndexOf(".");
+      input.setSelectionRange(0, dot > 0 ? dot : input.value.length);
+    } else ok.focus();
+    const done = (result) => {
+      dlg.hidden = true;
+      $("ask-form").onsubmit = null;
+      $("ask-cancel").onclick = null;
+      resolve(result);
+    };
+    $("ask-form").onsubmit = (e) => { e.preventDefault(); done(value === null ? true : $("ask-input").value.trim()); };
+    $("ask-cancel").onclick = () => done(null);
+  });
+}
+
+async function swarmRenamePrompt(it) {
+  const name = await askDialog({ title: `Rename ${it.dir ? "folder" : "file"}`, value: it.name, confirm: "Rename" });
+  if (!name || name === it.name) return;
+  try {
+    await invoke("swarm_rename", { path: it.path, name });
+    snack(`Renamed to ${name}`);
+  } catch (err) {
+    snack(`${err}`.includes("PathAlreadyExists") ? `"${name}" already exists here.` : `Rename failed: ${err}`);
+  }
+  loadSwarm();
+}
+
+async function swarmDeleteConfirm(it) {
+  const ok = await askDialog({
+    title: `Delete ${it.name}?`,
+    text: it.dir ? "The folder and everything in it disappear from every device." : "It disappears from every device.",
+    confirm: "Delete",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await invoke("swarm_delete", { path: it.path });
+    snack(`Deleted ${it.name}`);
+  } catch (err) {
+    snack(`Delete failed: ${err}`);
+  }
+  loadSwarm();
+}
+
+$("swarm-add").addEventListener("click", async () => {
+  if (!running) return snack("Start the node first");
+  try {
+    const name = await invoke("swarm_add_file", { dir: swarmDir });
+    if (name) snack(`Added ${name}: every device can see it now`);
+  } catch (err) {
+    snack(`Add failed: ${err}`);
+  }
+  loadSwarm();
+});
+
+$("swarm-mkdir").addEventListener("click", async () => {
+  if (!running) return snack("Start the node first");
+  const name = await askDialog({ title: "New folder", value: "New folder", confirm: "Create" });
+  if (!name) return;
+  try {
+    await invoke("swarm_mkdir", { dir: swarmDir, name });
+  } catch (err) {
+    snack(`Couldn't create it: ${err}`);
+  }
+  loadSwarm();
+});
+
+$("swarm-sync").addEventListener("click", async () => {
+  const btn = $("swarm-sync");
+  btn.classList.add("spin");
+  try {
+    const changed = await invoke("swarm_sync", null);
+    snack(changed ? `${changed} change${changed === 1 ? "" : "s"} from your devices` : "Up to date");
+  } catch (err) {
+    snack(`Sync failed: ${err}`);
+  }
+  btn.classList.remove("spin");
+  loadSwarm();
+});
+
+// While the view is open, pick up other devices' changes.
+setInterval(() => { if (document.body.dataset.view === "swarm" && !document.hidden && running) loadSwarm(); }, 10000);
 
 // ---- Shared folders ----
 

@@ -40,6 +40,9 @@ pub const Node = struct {
     /// Answers GET_SHARES. Null on nodes that share nothing: they reply
     /// with an empty listing.
     share_source: ?ShareSource = null,
+    /// Answers GET_SWARM with the swarm folder's manifest. Null: an empty
+    /// manifest.
+    swarm_source: ?ShareSource = null,
     /// Human name sent with SHARES (config node.nickname).
     nickname: []const u8 = "",
     /// This node's Ed25519 identity, used to sign revocations it pushes.
@@ -521,6 +524,24 @@ pub const Node = struct {
         }
     }
 
+    /// Asks `conn`'s peer for its swarm folder manifest (caller-owned,
+    /// allocated with the node's allocator; validate by merging it).
+    pub fn fetchSwarm(self: *Node, conn: network.Connection) ![]u8 {
+        const stream = try conn.openStream();
+        defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
+        const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .GET_SWARM = {} } };
+        try msg.serialize(stream.writer());
+        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
+        switch (response.payload) {
+            .SWARM => |p| return @constCast(p.manifest),
+            else => {
+                response.deinit(self.allocator);
+                return error.InvalidResponse;
+            },
+        }
+    }
+
     /// Pushes a block to `conn`'s peer. The receiver verifies the bytes
     /// against the CID before storing; returns whether it kept the block.
     pub fn putBlock(self: *Node, conn: network.Connection, cid: [32]u8, data: []const u8) !bool {
@@ -844,6 +865,7 @@ pub const Node = struct {
             .STORE => |p| try self.handleStore(stream, p.key, p.value),
             .GET_BLOCK => |p| try self.handleGetBlock(stream, p.cid),
             .GET_SHARES => try self.handleGetShares(stream),
+            .GET_SWARM => try self.handleGetSwarm(stream),
             .PUT_BLOCK => |p| try self.handlePutBlock(stream, p.cid, p.data),
             .REVOKE => |p| try self.handleRevoke(stream, p.device_id, p.signer_key, p.signature),
             .ADD_PROVIDER => |p| try self.handleAddProvider(stream, conn, p.key),
@@ -973,6 +995,16 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .SHARES = .{ .nickname = self.nickname, .listing = listing } },
         };
+        try response.serialize(stream.writer());
+    }
+
+    fn handleGetSwarm(self: *Node, stream: network.Stream) !void {
+        const manifest: []u8 = if (self.swarm_source) |source|
+            try source.listFn(source.ctx, self.allocator)
+        else
+            try self.allocator.dupe(u8, "[]");
+        defer self.allocator.free(manifest);
+        const response = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .SWARM = .{ .manifest = manifest } } };
         try response.serialize(stream.writer());
     }
 

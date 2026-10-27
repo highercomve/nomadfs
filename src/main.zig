@@ -234,6 +234,7 @@ fn mountLinux(allocator: std.mem.Allocator, config: config_mod.Config, mountpoin
 
     var mount = try nomadfs.fs.fuse.Mount.init(allocator, node.block_manager, node.store.?);
     defer mount.deinit();
+    mount.swarm = node.swarm;
     std.debug.print("Mounted at {s} (Ctrl-C to unmount)\n", .{mountpoint});
     mount.serve(mountpoint) catch |err| {
         std.debug.print("Error: mount failed: {any}\n", .{err});

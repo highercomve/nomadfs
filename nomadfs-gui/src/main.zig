@@ -37,7 +37,7 @@ pub const Commands = struct {
     /// worker thread: they share one lock, and a command waiting on it on
     /// the UI thread would freeze the window (node_open behind a share scan
     /// did, for 20 s on a phone). Only quick config-file reads stay inline.
-    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download" };
+    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_read_range", "swarm_download" };
 
     /// `invoke("invite_create", { config_path })`: one-time invite code.
     pub fn invite_create(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.InviteInfo {
@@ -58,6 +58,48 @@ pub const Commands = struct {
     /// returns the inviting device's name.
     pub fn invite_accept(gpa: std.mem.Allocator, args: commands.InviteAcceptArgs) ![]const u8 {
         return commands.inviteAccept(gpa, args);
+    }
+
+    /// `invoke("swarm_list", { dir })`: a folder of the swarm folder.
+    pub fn swarm_list(gpa: std.mem.Allocator, args: commands.SwarmDirArgs) !commands.SwarmListing {
+        return commands.swarmList(gpa, args);
+    }
+
+    /// `invoke("swarm_sync")`: pull changes from every device now.
+    pub fn swarm_sync() !usize {
+        return commands.swarmSync();
+    }
+
+    /// `invoke("swarm_add_file", { dir })`: pick a file and add it.
+    /// Returns its name, or null when the picker was cancelled.
+    pub fn swarm_add_file(gpa: std.mem.Allocator, args: commands.SwarmDirArgs) !?[]const u8 {
+        const path = try oriel.dialog.openFile(gpa, .{ .title = "Add a file to the swarm folder" }) orelse return null;
+        return try commands.swarmAddFile(gpa, args.dir, path);
+    }
+
+    /// `invoke("swarm_mkdir", { dir, name })`.
+    pub fn swarm_mkdir(args: commands.SwarmNameArgs) !void {
+        return commands.swarmMkdir(args);
+    }
+
+    /// `invoke("swarm_delete", { path })`.
+    pub fn swarm_delete(args: commands.SwarmPathArgs) !void {
+        return commands.swarmDelete(args);
+    }
+
+    /// `invoke("swarm_rename", { path, name })`.
+    pub fn swarm_rename(args: commands.SwarmRenameArgs) !void {
+        return commands.swarmRename(args);
+    }
+
+    /// `invoke("swarm_read_range", { cid, author_id, offset, len })`.
+    pub fn swarm_read_range(gpa: std.mem.Allocator, args: commands.SwarmRangeArgs) ![]const u8 {
+        return commands.swarmReadRange(gpa, args);
+    }
+
+    /// `invoke("swarm_download", { cid, author_id, name })`.
+    pub fn swarm_download(gpa: std.mem.Allocator, args: commands.SwarmDownloadArgs) !commands.DownloadResult {
+        return commands.swarmDownload(gpa, args);
     }
 
     /// `invoke("read_range", { peer, cid, offset, len })`: base64 bytes of
