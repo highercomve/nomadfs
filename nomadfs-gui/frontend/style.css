@@ -1234,3 +1234,50 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 
 .credit { cursor: pointer; }
 .credit:hover { color: var(--amber); }
+
+/* "Saved to …" opens its folder on the desktop. */
+#snackbar.clickable { cursor: pointer; }
+#snackbar.clickable.show { pointer-events: auto; }
+#snackbar.clickable:hover { border-left-color: var(--amber-hi, var(--amber)); filter: brightness(1.08); }
+
+/* ---- Background (Android): a switch row ---- */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 0;
+  font-size: 15px;
+  cursor: pointer;
+}
+.toggle-row input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: none;
+  position: relative;
+  width: 44px;
+  height: 24px;
+  margin: 0;
+  border-radius: 12px;
+  border: 1px solid var(--rule-strong);
+  background: var(--plate-2);
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.toggle-row input[type="checkbox"]::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--sand);
+  transition: transform .15s;
+}
+.toggle-row input[type="checkbox"]:checked { background: var(--amber); border-color: var(--amber); }
+.toggle-row input[type="checkbox"]:checked::after { transform: translateX(20px); background: #1d1a16; }
+.toggle-row input[type="checkbox"]:focus-visible { outline: 1.5px solid rgb(246 176 66 / .5); outline-offset: 2px; }
+.supporting.small { font-size: 13px; margin: 0; }
+.supporting.small:empty { display: none; }
+#background-section[hidden] { display: none; }

@@ -5,7 +5,12 @@
     .fingerprint = 0x5f521d4994d41c7c,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        .oriel = .{ .path = "../../oriel" },
+        // Oriel v0.19.6. To build against a local checkout instead:
+        // zig build --fork=../../oriel
+        .oriel = .{
+            .url = "https://github.com/highercomve/Oriel/archive/refs/tags/v0.19.6.tar.gz",
+            .hash = "oriel-0.19.6-K1NO5fd8_ABoktMGqIkIkHYzj9k2Xw7-5G7fB8nupKgk",
+        },
         // The NomadFS core: same sources the CLI, the C ABI and the mobile
         // bindings build from.
         .nomadfs = .{ .path = "../src" },

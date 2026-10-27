@@ -8,9 +8,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- oriel:permissions begin -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- oriel:permissions end -->
     <!-- oriel:features begin -->
     <uses-feature android:name="android.hardware.camera" android:required="false" />
@@ -94,6 +97,12 @@
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|locale" />
 
         <!-- oriel:components begin -->
+        <service
+            android:name="dev.oriel.OrielKeepRunningService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Serves this device's shared folders and swarm folder to the user's other devices while the app isn't open" />
+        </service>
         <provider
             android:name="dev.oriel.OrielCaptureProvider"
             android:authorities="${applicationId}.oriel.capture"

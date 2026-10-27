@@ -76,6 +76,25 @@
         </div>
       </section>
 
+      <!-- Android: keep running in the background -->
+      <section class="card" id="background-section" data-view="settings" hidden>
+        <div class="card-head">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M15.67 4H14V2h-4v2H8.33C7.6 4 7 4.6 7 5.33v15.33C7 21.4 7.6 22 8.33 22h7.33c.74 0 1.34-.6 1.34-1.33V5.33C17 4.6 16.4 4 15.67 4zM11 20v-5.5H9L13 7v5.5h2L11 20z"/></svg>
+          <div>
+            <h2>Background</h2>
+            <p class="supporting">Keep NomadFS running when you leave the app, so your other devices can still reach this phone and the swarm folder keeps syncing. A notification shows while it runs.</p>
+          </div>
+        </div>
+        <label class="toggle-row">
+          <span>Keep running in the background</span>
+          <input type="checkbox" id="keep-running" role="switch">
+        </label>
+        <p id="battery-state" class="supporting small"></p>
+        <div class="actions">
+          <button id="battery-settings" class="btn text">Battery &amp; autostart settings</button>
+        </div>
+      </section>
+
       <!-- Devices: browse what other devices share -->
       <section class="card" id="remote-section" data-view="browse">
         <div class="card-head">

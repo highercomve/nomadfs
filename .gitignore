@@ -16,3 +16,6 @@ src/mobile/android/library/.gradle/
 nomadfs-gui/.zig-cache/
 nomadfs-gui/zig-out/
 nomadfs-gui/zig-pkg/
+
+# Local screenshots and logs from driving the app
+.playwright-mcp/

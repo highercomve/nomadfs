@@ -375,9 +375,16 @@ pub fn revokeDevice(gpa: std.mem.Allocator, args: RevokeDeviceArgs) !void {
     var store = try TrustStore.load(gpa, paths.trust, identity.seed());
     defer store.deinit();
 
-    const id = try store.resolve(args.query) orelse return error.DeviceNotFound;
-    _ = try store.revokeDevice(id, identity.deviceId(), @intCast(nomadfs.nowSeconds()));
-    try store.save();
+    // A running node holds its own copy of the store: revoke there, so it
+    // stops trusting the device now (and the file isn't overwritten by an
+    // older copy on its next save).
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const target: *TrustStore = if (g_node) |handle| handle.node.trust_store else &store;
+
+    const id = try target.resolve(args.query) orelse return error.DeviceNotFound;
+    _ = try target.revokeDevice(id, identity.deviceId(), @intCast(nomadfs.nowSeconds()));
+    try target.save();
 }
 
 // ---- Shared folders ----

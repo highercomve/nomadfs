@@ -11,6 +11,7 @@ const oriel = @import("oriel");
 const app = @import("oriel_app");
 const commands = @import("commands.zig");
 const tray = @import("tray.zig");
+const background = @import("background.zig");
 
 pub const std_options: std.Options = .{ .logFn = oriel.log.logFn };
 
@@ -37,7 +38,7 @@ pub const Commands = struct {
     /// worker thread: they share one lock, and a command waiting on it on
     /// the UI thread would freeze the window (node_open behind a share scan
     /// did, for 20 s on a phone). Only quick config-file reads stay inline.
-    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_read_range", "swarm_download", "swarm_rotate_key" };
+    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_read_range", "swarm_download", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings" };
 
     /// `invoke("invite_create", { config_path })`: one-time invite code.
     pub fn invite_create(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.InviteInfo {
@@ -134,6 +135,25 @@ pub const Commands = struct {
     /// `invoke("open_path", { path })`: open in the file manager.
     pub fn open_path(gpa: std.mem.Allocator, args: commands.OpenPathArgs) !void {
         return commands.openPath(gpa, args);
+    }
+
+    /// `invoke("keep_running_status")`: Android's background mode.
+    pub fn keep_running_status(gpa: std.mem.Allocator) !background.Status {
+        _ = gpa;
+        return background.status();
+    }
+
+    /// `invoke("keep_running_set", { on })`: start or stop running in the
+    /// background (Android).
+    pub fn keep_running_set(gpa: std.mem.Allocator, args: background.SetArgs) !background.Status {
+        _ = gpa;
+        return background.set(args);
+    }
+
+    /// `invoke("open_app_settings")`: the app's system settings page (Android).
+    pub fn open_app_settings(gpa: std.mem.Allocator) !bool {
+        _ = gpa;
+        return background.openSettings();
     }
 
     /// `invoke("pick_folder")`: the system folder picker. Null when the
@@ -286,6 +306,8 @@ fn setup() !void {
     // Desktop: a tray icon keeps NomadFS (and its mount) running with the
     // window closed.
     tray.setup() catch |err| std.log.warn("tray unavailable: {any}", .{err});
+    // Android: the notification's Stop button.
+    background.setup();
     if (oriel.extensions.get("nomadfs.storage").available())
         oriel.extensions.expose("nomadfs.storage", .{ .methods = &.{ "status", "request", "info" } });
 }
@@ -313,7 +335,9 @@ pub fn main(init: std.process.Init) !u8 {
     return oriel.main(init, .{ .commands = Commands, .events = Events }, .{
         .app = app.build,
         // With a tray, closing the window hides it; Quit is in the tray.
-        .window = .{ .title = "NomadFS", .width = 1200, .height = 800, .hide_on_close = tray.available },
+        // Android: swiping it away from Recents hides it too, so running
+        // in the background (background.zig) outlives the window.
+        .window = .{ .title = "NomadFS", .width = 1200, .height = 800, .hide_on_close = tray.available or background.supported },
         .setup = setup,
     });
 }

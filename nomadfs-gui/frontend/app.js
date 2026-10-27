@@ -8,9 +8,14 @@ let configPath = null;
 let storageExt = false; // Android: all-files access extension present
 
 let snackTimer;
-function snack(msg, ms = 3000) {
+// The desktop can open folders in the file manager (the same check as mounting).
+let canOpenPaths = false;
+function snack(msg, ms = 3000, onClick = null) {
   const bar = $("snackbar");
   bar.textContent = msg;
+  bar.classList.toggle("clickable", !!onClick);
+  bar.title = onClick ? "Open the folder" : "";
+  bar.onclick = onClick ? () => { bar.classList.remove("show"); onClick(); } : null;
   bar.classList.add("show");
   clearTimeout(snackTimer);
   snackTimer = setTimeout(() => bar.classList.remove("show"), ms);
@@ -81,7 +86,9 @@ function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = false, on
   h.className = "headline";
   h.textContent = headline;
   text.appendChild(h);
-  for (const [line, mono] of [[meta, monoMeta], [meta2, true]]) {
+  // `meta` may be several lines (an array), each on its own row.
+  const metaLines = (Array.isArray(meta) ? meta : [meta]).map((m) => [m, monoMeta]);
+  for (const [line, mono] of [...metaLines, [meta2, true]]) {
     if (!line) continue;
     const m = document.createElement("span");
     m.className = mono ? "meta mono" : "meta";
@@ -400,6 +407,15 @@ async function showLocation() {
 
 const downloading = new Set();
 
+/** "Saved to …"; on the desktop a click opens the folder it landed in. */
+function savedSnack(file) {
+  if (!canOpenPaths) return snack(`Saved to ${file}`, 5000);
+  const dir = file.slice(0, file.lastIndexOf("/")) || "/";
+  snack(`Saved to ${file} · click to open the folder`, 8000, () => {
+    invoke("open_path", { path: dir }).catch((err) => snack(`Couldn't open the folder: ${err}`));
+  });
+}
+
 async function downloadFile(device, entry, btn) {
   if (downloading.has(entry.cid)) return;
   downloading.add(entry.cid);
@@ -407,7 +423,7 @@ async function downloadFile(device, entry, btn) {
   snack(`Downloading ${entry.name} (${formatSize(entry.size)})…`, 60000);
   try {
     const res = await invoke("download", { peer: device.peer, cid: entry.cid, name: entry.name });
-    snack(`Saved to ${res.path}`, 5000);
+    savedSnack(res.path);
   } catch (err) {
     snack(`Download failed: ${err}`);
   }
@@ -589,6 +605,7 @@ function renderMount(status) {
 async function loadMount() {
   let status;
   try { status = await invoke("mount_status", null); } catch { return; }
+  canOpenPaths = status.supported;
   $("nav-mount").hidden = !status.supported;
   if (!status.supported && document.body.dataset.view === "mount") setView("browse");
   renderMount(status);
@@ -718,7 +735,7 @@ async function swarmDownload(it, btn) {
   snack(`Downloading ${it.name} (${formatSize(it.size)})…`, 60000);
   try {
     const res = await invoke("swarm_download", { cid: it.cid, author_id: it.author_id, name: it.name });
-    snack(`Saved to ${res.path}`, 5000);
+    savedSnack(res.path);
   } catch (err) {
     snack(`${err}`.includes("BlockNotFound") || `${err}`.includes("AllAddressesFailed")
       ? `${it.name} isn't reachable: the device that added it is offline.`
@@ -826,6 +843,22 @@ $("swarm-sync").addEventListener("click", async () => {
 
 // While the view is open, pick up other devices' changes.
 setInterval(() => { if (document.body.dataset.view === "swarm" && !document.hidden && running) loadSwarm(); }, 10000);
+
+// Devices come and go (a phone wakes, a laptop rejoins): keep the drawer's
+// list current, and the Browse list when it shows the devices.
+const deviceKey = (list) => list.map((d) => d.peer).sort().join(",");
+setInterval(async () => {
+  if (!running || document.hidden) return;
+  let now;
+  try { now = await invoke("remote_devices", null); } catch { return; }
+  if (deviceKey(now) === deviceKey(devices)) return;
+  if (document.body.dataset.view === "browse" && path.length === 0) {
+    showDevices();
+  } else {
+    devices = now;
+    renderNavDevices();
+  }
+}, 10000);
 
 // ---- Shared folders ----
 
@@ -1281,7 +1314,74 @@ $("notes-clear").addEventListener("click", () => {
 renderNotes();
 updateComposer();
 
+// ---- Background (Android) ----
+
+async function renderBackground(status) {
+  $("background-section").hidden = !status.supported;
+  if (!status.supported) return;
+  $("keep-running").checked = status.on;
+  $("battery-state").textContent = status.battery_unrestricted
+    ? "Battery: unrestricted."
+    : "Battery: optimized. Android may still stop NomadFS in the background: open the settings, set Battery to No restrictions (Unrestricted), and on Xiaomi phones turn on Autostart.";
+}
+
+async function loadBackground() {
+  let status;
+  try { status = await invoke("keep_running_status", null); } catch { return; }
+  // Turned on before: start again with the app (the switch is remembered).
+  if (status.supported && !status.on && localStorage.getItem("keepRunning") === "1") {
+    try { status = await invoke("keep_running_set", { on: true }); } catch {}
+  }
+  renderBackground(status);
+}
+
+$("keep-running").addEventListener("change", async (e) => {
+  const on = e.target.checked;
+  try {
+    renderBackground(await invoke("keep_running_set", { on }));
+    try { localStorage.setItem("keepRunning", on ? "1" : "0"); } catch {}
+    snack(on ? "NomadFS keeps running in the background" : "NomadFS stops when you leave it");
+  } catch (err) {
+    e.target.checked = !on;
+    snack(`Couldn't change it: ${err}`);
+  }
+});
+
+$("battery-settings").addEventListener("click", () => invoke("open_app_settings", null).catch(() => {}));
+
+// The notification's Stop button (Zig has stopped the service already).
+window.oriel.listen?.("android:event", ({ name, data }) => {
+  if (name !== "action" || data !== "stop") return;
+  try { localStorage.setItem("keepRunning", "0"); } catch {}
+  $("keep-running").checked = false;
+});
+
+// Coming back from the system settings: show the battery state again.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) invoke("keep_running_status", null).then(renderBackground).catch(() => {});
+});
+
+loadBackground();
+
 // ---- Trusted devices ----
+
+async function revokeTrusted(d) {
+  const name = d.label || "this device";
+  const ok = await askDialog({
+    title: `Remove ${name}?`,
+    text: `This device stops trusting ${name}, so it won't receive a new swarm key. It still holds the current key until you rotate it: use Rotate swarm key afterwards to cut it off. To connect again it needs a new invite.`,
+    confirm: "Remove",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await invoke("revoke_device", { config_path: await ensureConfig(), query: d.fingerprint });
+    snack(`Removed ${name}`);
+  } catch (err) {
+    snack(`Remove failed: ${err}`);
+  }
+  $("devices-refresh").click();
+}
 
 $("devices-refresh").addEventListener("click", async () => {
   const list = $("devices-list");
@@ -1290,7 +1390,11 @@ $("devices-refresh").addEventListener("click", async () => {
     // Reachable now: the same swarm key, online. Not the same as trusted.
     let reachable = [];
     if (running) {
-      try { reachable = await invoke("remote_devices", null); } catch {}
+      try {
+        reachable = await invoke("remote_devices", null);
+        devices = reachable;
+        renderNavDevices();
+      } catch {}
     }
     const trustedNames = new Set(trusted.map((d) => d.label));
     const unpaired = reachable.filter((d) => !trustedNames.has(d.nickname));
@@ -1301,8 +1405,9 @@ $("devices-refresh").addEventListener("click", async () => {
         icon: "device",
         iconClass: "device",
         headline: d.label || "Unnamed device",
-        meta: `${online ? "Online · " : "Offline · "}trusted since ${formatDate(d.added_at)}`,
+        meta: [online ? "Online" : "Offline", `Trusted since ${formatDate(d.added_at)}`],
         meta2: d.fingerprint,
+        actions: [{ icon: "trash", label: "Remove", run: () => revokeTrusted(d) }],
       }));
     }
     for (const d of unpaired) {

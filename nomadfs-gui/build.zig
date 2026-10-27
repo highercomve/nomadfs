@@ -65,8 +65,14 @@ pub fn build(b: *std.Build) void {
             .version = "0.1.0",
         },
         // The page's camera scans invite QR codes (getUserMedia).
-        .permissions = .{ .camera = "Scan invite QR codes from your other devices" },
+        .permissions = .{
+            .camera = "Scan invite QR codes from your other devices",
+            // Android 13+: the "NomadFS is running" notification.
+            .notifications = "Shows that NomadFS is running in the background",
+        },
         .android = .{
+            // Running in the background (src/background.zig).
+            .keep_running = "Serves this device's shared folders and swarm folder to the user's other devices while the app isn't open",
             // Sharing folders like DCIM/Camera and saving to Download/:
             // "All files access", granted from the system settings page the
             // storage extension opens.

@@ -8,3 +8,5 @@ local.properties
 /app/src/main/java/dev/oriel/*.kt
 # Copied from ../android-src on every build.
 /app/src/main/java/net/nomadfs/app/StorageExtension.kt
+# The list of extension sources the build copied (regenerated).
+/app/.oriel-sources
