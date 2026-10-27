@@ -124,6 +124,7 @@ function setView(view) {
   }
   window.scrollTo(0, 0);
   try { localStorage.setItem("view", view); } catch {}
+  if (view === "settings") $("devices-refresh").click();
   renderNavDevices();
 }
 
@@ -1041,11 +1042,11 @@ $("devices-refresh").addEventListener("click", async () => {
     const trusted = await invoke("devices_list", { config_path: await ensureConfig() });
     list.replaceChildren();
     if (!trusted.length) {
-      list.appendChild(row({ icon: "device", headline: "No trusted devices yet" }));
+      list.appendChild(row({ icon: "device", headline: "No trusted devices yet", meta: "Connect one under Connect devices" }));
       return;
     }
     for (const d of trusted) {
-      list.appendChild(row({ icon: "device", headline: d.label || "Unnamed device", meta: `${d.fingerprint} · added ${d.added_at}`, monoMeta: true }));
+      list.appendChild(row({ icon: "device", iconClass: "device", headline: d.label || "Unnamed device", meta: `${d.fingerprint} · trusted since ${formatDate(d.added_at)}` }));
     }
   } catch (err) {
     snack(`Devices failed: ${err}`);

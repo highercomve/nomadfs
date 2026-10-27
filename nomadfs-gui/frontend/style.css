@@ -781,3 +781,185 @@ main { padding-bottom: calc(104px + env(safe-area-inset-bottom)); }
 
 .recent-head { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; }
 .recent-head .sub-heading { margin: 0; }
+
+/* =====================================================================
+   "Live mesh" theme. NomadFS is a network of devices sharing one
+   filesystem, so the UI looks like one: a deep-space backdrop with a
+   faint node grid and two glows, frosted panels floating on it, the
+   brand's terracotta-to-amber energy on actions, and Oasis cyan for
+   anything live (online, reachable, mounted).
+   ===================================================================== */
+:root {
+  --md-surface: #070a12;
+  --md-surface-container-low: rgb(13 18 30 / .78);
+  --md-surface-container: rgb(17 24 39 / .62);
+  --md-surface-container-high: rgb(30 41 62 / .66);
+  --md-on-surface: #eef2f8;
+  --md-on-surface-variant: #9aa6bb;
+  --md-outline: #3a4a63;
+  --md-outline-variant: rgb(148 163 184 / .13);
+  --md-primary: #ff9a4d;
+  --md-on-primary: #1d0c00;
+  --md-secondary-container: rgb(255 138 61 / .13);
+  --md-on-secondary-container: #ffc79c;
+  --md-tertiary: #3ff0e6;
+  --md-tertiary-container: rgb(63 240 230 / .12);
+  --md-on-tertiary-container: #8ffaf3;
+  --md-error: #ff8f8f;
+
+  --grad-energy: linear-gradient(135deg, #ff6b3d 0%, #ff9a4d 45%, #ffc24a 100%);
+  --grad-live: linear-gradient(135deg, #3ff0e6, #4a9dff);
+  --glass-edge: rgb(255 255 255 / .07);
+  --glow-energy: 0 6px 22px -6px rgb(255 122 61 / .55);
+  --glow-live: 0 0 0 4px rgb(63 240 230 / .14), 0 0 16px rgb(63 240 230 / .45);
+}
+
+body {
+  background-color: var(--md-surface);
+  background-image:
+    radial-gradient(900px 600px at 0% -10%, rgb(63 240 230 / .10), transparent 60%),
+    radial-gradient(800px 700px at 110% 110%, rgb(255 122 61 / .12), transparent 55%),
+    radial-gradient(rgb(148 163 184 / .10) 1px, transparent 1.2px);
+  background-size: auto, auto, 26px 26px;
+  background-attachment: fixed;
+}
+
+/* Frosted chrome and panels */
+.top-app-bar,
+.nav-bar {
+  background: rgb(7 10 18 / .62);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  border-color: var(--md-outline-variant);
+}
+.card,
+.preview-panel {
+  background: var(--md-surface-container);
+  border: 1px solid var(--glass-edge);
+  box-shadow: 0 1px 0 rgb(255 255 255 / .04) inset, 0 18px 40px -24px rgb(0 0 0 / .8);
+  backdrop-filter: blur(14px) saturate(130%);
+  -webkit-backdrop-filter: blur(14px) saturate(130%);
+}
+.result, .picked, .note-card, .composer {
+  border: 1px solid var(--glass-edge);
+}
+
+/* Wordmark: "Nomad" + glowing "FS" */
+h1 { font-weight: 700; letter-spacing: -.3px; }
+h1 .fs {
+  background: var(--grad-energy);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+h2 { font-weight: 600; letter-spacing: -.1px; }
+
+/* Icon tiles carry the energy gradient's tint and a hairline edge */
+.card-head .icon {
+  background: linear-gradient(135deg, rgb(255 107 61 / .22), rgb(255 194 74 / .10));
+  fill: #ffb27a;
+  border: 1px solid rgb(255 154 77 / .22);
+}
+
+/* Actions */
+.btn.filled {
+  background: var(--grad-energy);
+  color: var(--md-on-primary);
+  font-weight: 600;
+  box-shadow: var(--glow-energy);
+}
+.btn.filled:hover { box-shadow: 0 8px 28px -6px rgb(255 122 61 / .75); }
+.btn.filled:disabled { background: rgb(148 163 184 / .12); color: var(--md-on-surface); box-shadow: none; }
+.btn.tonal { background: rgb(255 154 77 / .12); color: #ffc79c; border: 1px solid rgb(255 154 77 / .18); }
+.btn.outlined { border-color: rgb(255 154 77 / .35); color: #ffb27a; }
+.btn.text { color: #ffb27a; }
+
+/* Live status: cyan glow */
+.chip[data-state="on"] {
+  background: rgb(63 240 230 / .10);
+  border: 1px solid rgb(63 240 230 / .30);
+  color: var(--md-on-tertiary-container);
+}
+.chip[data-state="on"] .dot { background: var(--md-tertiary); box-shadow: var(--glow-live); animation: live 2.4s ease-in-out infinite; }
+@keyframes live { 50% { box-shadow: 0 0 0 7px rgb(63 240 230 / 0), 0 0 18px rgb(63 240 230 / .6); } }
+.mount-status[data-state="on"] .dot,
+.nav-item .dot { background: var(--md-tertiary); box-shadow: var(--glow-live); }
+.row-icon.device { background: rgb(63 240 230 / .10); border: 1px solid rgb(63 240 230 / .25); }
+.row-icon.device svg { fill: var(--md-tertiary); }
+.row-icon.folder { background: rgb(255 154 77 / .12); }
+.row-icon.folder svg { fill: #ffb27a; }
+.result-label { color: var(--md-tertiary); letter-spacing: .8px; text-transform: uppercase; font-size: 11px; }
+.saved { background: rgb(63 240 230 / .10); border: 1px solid rgb(63 240 230 / .25); }
+
+/* Lists */
+.list.rows li.clickable:hover { background: rgb(148 163 184 / .07); }
+.list li { border-color: var(--md-outline-variant); }
+
+/* Fields */
+.field input, .field textarea { border-color: rgb(148 163 184 / .25); background: rgb(7 10 18 / .35); }
+.field-label { background: transparent; text-shadow: 0 0 6px var(--md-surface), 0 0 2px var(--md-surface); }
+.field input:focus, .field textarea:focus { border-color: var(--md-primary); box-shadow: 0 0 0 3px rgb(255 154 77 / .15); }
+.composer { background: rgb(7 10 18 / .35); }
+
+/* Phone navigation: active pill in the energy tint */
+.bar-item.active .bar-pill { background: linear-gradient(135deg, rgb(255 107 61 / .28), rgb(255 194 74 / .14)); color: #ffd2ad; }
+
+/* Snackbar: glass, not a white slab */
+#snackbar {
+  background: rgb(22 30 48 / .92);
+  color: var(--md-on-surface);
+  border: 1px solid var(--glass-edge);
+  backdrop-filter: blur(12px);
+}
+
+@media (min-width: 840px) {
+  .nav-drawer {
+    background: rgb(9 13 23 / .55);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border-color: var(--md-outline-variant);
+  }
+  .nav-item.active {
+    background: linear-gradient(90deg, rgb(255 107 61 / .22), rgb(255 194 74 / .06));
+    color: #ffe1c8;
+    box-shadow: inset 3px 0 0 #ff8a4a;
+  }
+  .nav-item.active svg { fill: #ffb27a; }
+  .table-head:not([hidden]) { background: rgb(15 21 34 / .92); }
+}
+
+/* Light systems get the same identity on a bright canvas. */
+@media (prefers-color-scheme: light) {
+  :root {
+    --md-surface: #f3f6fb;
+    --md-surface-container-low: rgb(255 255 255 / .82);
+    --md-surface-container: rgb(255 255 255 / .72);
+    --md-surface-container-high: rgb(236 241 248 / .9);
+    --md-on-surface: #0d1422;
+    --md-on-surface-variant: #4a5568;
+    --md-outline: #b4c0d3;
+    --md-outline-variant: rgb(15 23 42 / .10);
+    --md-primary: #e2572a;
+    --md-on-primary: #ffffff;
+    --md-tertiary: #0aa39b;
+    --md-on-tertiary-container: #066b66;
+    --glass-edge: rgb(15 23 42 / .07);
+  }
+  body {
+    background-image:
+      radial-gradient(900px 600px at 0% -10%, rgb(10 163 155 / .10), transparent 60%),
+      radial-gradient(800px 700px at 110% 110%, rgb(226 87 42 / .10), transparent 55%),
+      radial-gradient(rgb(15 23 42 / .07) 1px, transparent 1.2px);
+  }
+  .top-app-bar, .nav-bar { background: rgb(243 246 251 / .7); }
+  .btn.filled { color: #fff; }
+  .card-head .icon { fill: #c94a1f; }
+  .btn.tonal, .btn.text, .btn.outlined { color: #c94a1f; }
+  .row-icon.folder svg { fill: #c94a1f; }
+  #snackbar { background: rgb(13 20 34 / .92); color: #eef2f8; }
+  @media (min-width: 840px) {
+    .nav-drawer { background: rgb(255 255 255 / .5); }
+    .nav-item.active { color: #7a2a0c; }
+    .table-head:not([hidden]) { background: rgb(243 246 251 / .95); }
+  }
+}
