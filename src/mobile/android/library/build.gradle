@@ -9,6 +9,7 @@ def mobileDir   = new File(projectDir, '../..').canonicalFile
 def zigAndroid  = new File(repoRoot, 'zig-out/android')
 def ndkLibs     = new File(mobileDir, 'android/libs')
 def javaSrc     = new File(mobileDir, 'android/java')
+def androidRes  = new File(mobileDir, 'android/res')
 def stagedLibs  = layout.buildDirectory.dir('staged/libs').get().asFile
 
 // Prebuilt ABIs the zig toolchain ships; AGP staging makes one AAR
@@ -29,6 +30,7 @@ android {
     sourceSets {
         main {
             java.srcDirs += [javaSrc]
+            res.srcDirs += [androidRes]
             jniLibs.srcDirs += [stagedLibs.absolutePath]
         }
     }

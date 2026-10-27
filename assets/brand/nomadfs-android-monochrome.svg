@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108">
+  <title>NomadFS Android Monochrome</title>
+  <g transform="translate(20.72 20.72) scale(0.52)">
+  <g fill="none" stroke="#FFFFFF" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 30 92 V 36 L 98 92 V 36" stroke-width="14"/>
+  </g>
+  <circle cx="30" cy="36" r="10" fill="#FFFFFF"/>
+  <circle cx="98" cy="92" r="10" fill="#FFFFFF"/>
+  <circle cx="30" cy="92" r="9" fill="#FFFFFF"/>
+  <circle cx="98" cy="36" r="9" fill="#FFFFFF"/>
+  <rect x="53" y="53" width="22" height="22" rx="5" transform="rotate(45 64 64)" fill="#FFFFFF"/>
+  </g>
+</svg>

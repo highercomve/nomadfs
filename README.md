@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/brand/nomadfs-banner.svg" alt="NomadFS — Personal device mesh & virtual filesystem for roaming devices" width="100%">
+</p>
+
 # NomadFS
 
 NomadFS is a personal device mesh and virtual file system optimized for **Roaming Devices**—laptops, phones, home workstations, and headless servers that frequently change IP addresses, switch between Wi-Fi and cellular, or go offline.
@@ -34,10 +38,10 @@ Rather than forcing an all-or-nothing global distributed storage cluster across 
 ## 🏗 Architecture Overview
 
 ```
- ┌─────────────────────────────────────────────────────────────┐
- │               Oriel GUI App & Headless Server               │
- │     (Desktop · Mobile · Headless Server / NAS Daemon)       │
- └──────────────┬──────────────────────────────┬───────────────┘
+ ┌──────────────────────────────────────────────────────────────┐
+ │               Oriel GUI App & Headless Server                │
+ │     (Desktop · Mobile · Headless Server / NAS Daemon)        │
+ └──────────────┬──────────────────────────────┬────────────────┘
                 │                              │
  ┌──────────────▼─────────────┐  ┌─────────────▼───────────────┐
  │   On-Demand Mount (FUSE)   │  │   Directed Backup & Sync    │
@@ -51,8 +55,8 @@ Rather than forcing an all-or-nothing global distributed storage cluster across 
  │   Noise XX Session · Yamux Streams · FastCDC · BLAKE3       │
  └──────────────────────────────┬──────────────────────────────┘
                                 │
-          ┌─────────────────────┴────────────────────┐
-          ▼                                          ▼
+          ┌─────────────────────┴─────────────────────┐
+          ▼                                           ▼
    [ Direct LAN P2P ]                     [ Persistent TCP Relay ]
   (mDNS, high-speed Wi-Fi)              (Home Server / VPS Splicer)
 ```

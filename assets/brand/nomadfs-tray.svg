@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <title>NomadFS Tray</title>
+  <path d="M 28 96 V 32 L 100 96 V 32" fill="none" stroke="#F5EFE6" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="28" cy="32" r="12" fill="#F6B042"/>
+  <circle cx="100" cy="96" r="12" fill="#F6B042"/>
+  <circle cx="28" cy="96" r="10" fill="#F5EFE6"/>
+  <circle cx="100" cy="32" r="10" fill="#F5EFE6"/>
+  <rect x="51" y="51" width="26" height="26" rx="6" transform="rotate(45 64 64)" fill="#2EC4B6"/>
+</svg>
