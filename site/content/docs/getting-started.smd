@@ -1,0 +1,147 @@
+---
+.title = "Getting started",
+.description = "Build NomadFS, share a folder, and bring a second device into your swarm.",
+.date = .date("2026-10-27T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "docs.shtml",
+.custom = { "label": "01 · start" },
+---
+
+Every [release](https://github.com/highercomve/nomadfs/releases/latest) has
+the app for Android (an APK) and Linux (AppImage, deb and rpm), and the
+`nomadfs` command line for Linux. On Android, allow installing from your
+browser or file manager when it asks.
+
+To build from source you need [Zig 0.16.0](https://ziglang.org/download/).
+For the Linux mount you also need `fusermount3` (the `fuse3` package on most
+distributions).
+
+# [Build the node]($heading.id('build'))
+
+From the repository root:
+
+```sh
+zig build          # zig-out/bin/nomadfs: the node and the command line
+zig build test     # module, executable and integration tests
+```
+
+`zig build lib` installs only the C ABI library the mobile bindings use.
+
+# [Write a configuration]($heading.id('config'))
+
+Every command reads `nomadfs.conf`, looking in this order: the current folder,
+`~/.nomadfs/nomadfs.conf`, `/etc/nomadfs/nomadfs.conf`, then
+`/usr/share/nomadfs/nomadfs.conf`. A path given on the command line (or with
+`--config`) wins over all of them.
+
+```ini
+[node]
+nickname = "Laptop"
+# 64 hex characters: `openssl rand -hex 32` (or `make gen-swarm-key`)
+swarm_key = "…"
+
+[storage]
+storage_path = "/home/me/.nomadfs/data"
+
+[network]
+port = 9000
+bootstrap_peers = []
+
+# Folders this device shares, repeatable
+share = "Documents:/home/me/Documents"
+```
+
+`nickname`, `swarm_key` and `storage_path` are required. The swarm key is what
+makes devices one swarm: every device that holds it can reach the others. Keep
+it private; to add devices you will normally use an
+[invite]($link.page('docs/connecting-devices')), which hands the key over
+without showing it.
+
+The node's keys are created on first run: `node.key` (transport) and
+`device.key` (the device's Ed25519 identity), with `trust.store` next to them.
+They live in the current folder when a `device.key` is already there, otherwise
+in `~/.nomadfs`. Set `key_path` to the node key's file to keep all three in one
+known place.
+
+# [Run it and share a folder]($heading.id('run'))
+
+```sh
+./zig-out/bin/nomadfs --share Photos:/home/me/Pictures
+```
+
+`--share Name:/path` adds to the shares in the configuration and can be
+repeated. The node starts listening on the configured port and indexes each
+share in the background:
+
+```
+NomadFS Node: Laptop (Storage: true)
+Listening on port: 9000
+Sharing 'Photos' from /home/me/Pictures (indexing in the background)
+```
+
+The node asks the router for a port mapping with UPnP when it can; set
+`upnp_enabled = false` to turn that off.
+
+# [Add a second device]($heading.id('second-device'))
+
+With the node running, open a one-time invite in another terminal:
+
+```sh
+./zig-out/bin/nomadfs --invite
+```
+
+It prints a QR code and a code like
+`nomadfs://invite?addr=192.168.1.20:9001&token=…`, then waits. On the other
+device, open the NomadFS app, go to **Connect devices** and either paste the
+code under **Join with an invite** or tap **Scan QR code** (on Android). The
+invite works once and expires after 10 minutes. Both devices end up trusting
+each other, and the new one receives the swarm key and the address to reconnect
+to. [Connecting devices]($link.page('docs/connecting-devices')) explains what
+happens on the wire.
+
+Two machines that only run the command line can join the same swarm by sharing
+the same `swarm_key` and listing each other in `bootstrap_peers`:
+
+```ini
+bootstrap_peers = ["tcp://192.168.1.20:9000"]
+```
+
+# [Mount everything (Linux)]($heading.id('mount'))
+
+```sh
+mkdir -p ~/NomadFS
+./zig-out/bin/nomadfs --mount ~/NomadFS
+```
+
+This runs the node and mounts every reachable device's shares at
+`~/NomadFS/<device>/<share>` and the swarm folder at `~/NomadFS/Swarm`. Ctrl-C
+unmounts. See [Shared folders & mount]($link.page('docs/shared-folders')).
+
+# [Build the app]($heading.id('app'))
+
+The app in `nomadfs-gui/` is built with [Oriel](https://oriel.foreachdeveloper.com)
+**v0.19.6**, which `zig build` fetches:
+
+```sh
+cd nomadfs-gui
+zig build run        # build and run the desktop app
+zig build package    # deb, rpm and AppImage in zig-out/package/
+oriel android build  # an APK for arm64-v8a and x86_64
+```
+
+With the `oriel` CLI installed, `oriel run`, `oriel build` and `oriel package`
+do the same as the `zig build` steps. On Android the app asks for access to all
+files so it can read the folders you share.
+
+# [Keep the phone reachable (Android)]($heading.id('background'))
+
+Android stops apps you aren't using, and a stopped phone drops out of the
+swarm: your other devices can't browse its shares and the swarm folder waits
+until you open the app. Turn on **Settings → Background → Keep running in the
+background**: NomadFS keeps running with a "NomadFS is running" notification,
+also after you swipe it away from Recents. Its **Stop** button turns it off.
+
+Battery optimization can still stop it, Xiaomi phones sooner than most.
+**Battery & autostart settings** opens NomadFS's page in the system settings:
+set the battery to **No restrictions** (or Unrestricted), and on Xiaomi turn
+on **Autostart**.

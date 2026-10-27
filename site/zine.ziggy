@@ -1,0 +1,20 @@
+.zine_version = "0.14.0",
+// Build from this directory: `zine release` writes the site to public/,
+// `zine` serves it with live reload. CI does the same (.github/workflows/site.yml).
+.site = .simple(.{
+    .title = "NomadFS",
+    .host_url = "https://nomadfs.foreachdeveloper.com",
+    .content_dir_path = "content",
+    .layouts_dir_path = "layouts",
+    .assets_dir_path = "assets",
+    .url_path_prefix = "",
+    // Files no template links with $site.asset(): the fonts are loaded from
+    // style.css, so they have to be listed to be copied into the output.
+    .static_assets = [
+        "fonts/bricolage-grotesque.woff2",
+        "fonts/figtree.woff2",
+        "fonts/figtree-italic.woff2",
+        "fonts/martian-mono.woff2",
+        "fonts/README.md",
+    ],
+}),

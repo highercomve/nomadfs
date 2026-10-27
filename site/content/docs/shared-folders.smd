@@ -1,0 +1,99 @@
+---
+.title = "Shared folders & mount",
+.description = "Share a folder once; every device in the swarm can browse it, and a file downloads only when someone opens it.",
+.date = .date("2026-10-27T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "docs.shtml",
+.custom = { "label": "02 · shared folders" },
+---
+
+A share is a folder on one device, under a name. The device that shares it
+keeps the files where they are; the rest of the swarm sees the share's listing
+and fetches file contents on request.
+
+# [Sharing a folder]($heading.id('sharing'))
+
+From the command line, add `share = "Name:/path"` to the configuration
+(repeatable) or pass `--share Name:/path` when starting the node.
+
+In the app, open **Shared folders** and press **Choose folder…**. The system's
+own folder picker opens (GTK on Linux, the Storage Access Framework on
+Android); the picked folder shows with an editable name, then **Share**. Shares
+are saved in the app's configuration and come back after a restart. On Android,
+folders in shared storage (the camera roll, Pictures, Documents, Download) can
+be shared; folders from cloud providers have no local path and are refused.
+
+# [What gets copied, and what does not]($heading.id('what-moves'))
+
+Sharing does not copy your files into NomadFS. A background scan turns the
+folder into a Merkle tree:
+
+- Files are split into content-defined chunks (FastCDC); each chunk is a block
+  addressed by its SHA-256 hash.
+- For file contents, NomadFS records only where each block is (file, offset,
+  length) and serves it from the file itself, hashing it again on every read.
+  Only the directory blocks and the blocks that index a file's chunks are
+  stored.
+- The scan reuses unchanged files by size and modification time, and runs again
+  every 30 seconds, so the share follows the folder.
+
+A new share is listed as soon as its first scan finishes; until then the app
+shows it as scanning.
+
+# [Browsing another device]($heading.id('browsing'))
+
+Each device answers the others with its list of shares (their root blocks and
+the device's name). Browsing a share loads one directory block at a time, so
+opening a folder costs one small request whatever the size of the files in it.
+
+In the app, **Browse** lists every reachable device; pick one to walk its
+shares with breadcrumbs. On wide windows the reachable devices are also listed
+in the drawer.
+
+# [Opening and downloading files]($heading.id('opening'))
+
+Reading a file asks only for the blocks that cover the bytes being read. Every
+block that arrives is checked against its hash before it is kept, and kept
+blocks are cached in the local block store, so a file opened once opens again
+without the other device.
+
+The app's viewer shows images, video, audio, PDF and text, with previous and
+next through the folder (arrow keys and Esc on the desktop). It reads the file
+in 4 MiB pieces, so it shows progress and works the same on Android.
+**Download** saves a copy in `~/Downloads/NomadFS` (the shared `Download/NomadFS` folder on Android); a name that exists already gets a number.
+
+# [The Linux mount]($heading.id('mount'))
+
+On Linux everything can be mounted as an ordinary folder that any program can
+open:
+
+```
+<mount>/
+├── Laptop/
+│   └── Documents/…
+├── Xiaomi M2007J20CG/
+│   └── Camera/…
+└── Swarm/…
+```
+
+- `<mount>/<device>/<share>/…` is read-only (files `0444`, folders `0555`).
+- `<mount>/Swarm` is the [swarm folder]($link.page('docs/swarm-folder')) and is
+  writable.
+
+From the command line:
+
+```sh
+nomadfs --mount ~/NomadFS
+```
+
+It runs the node, mounts, and unmounts on Ctrl-C or `SIGTERM`. In the desktop
+app, the **Mount** tab mounts at `~/NomadFS` by default (**Change** picks
+another folder), and **Open folder** opens it in your file manager. The tray
+icon has the same switch, so the mount keeps working with the window closed;
+**Quit** in the tray unmounts before exiting. Mounting over a stale NomadFS
+mount at the same folder clears it first.
+
+The driver speaks the kernel's FUSE protocol on `/dev/fuse` directly: there is
+no libfuse or libc dependency. `fusermount3` performs the unprivileged mount, so
+install `fuse3` if it is missing. Mounting is available on Linux only; the
+**Mount** tab does not appear elsewhere.

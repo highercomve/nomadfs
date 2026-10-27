@@ -1,0 +1,79 @@
+---
+.title = "Swarm folder",
+.description = "One folder every device in the swarm reads and writes. Edits merge without a server; concurrent edits keep both versions.",
+.date = .date("2026-10-27T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "docs.shtml",
+.custom = { "label": "03 · swarm" },
+---
+
+[Shares]($link.page('docs/shared-folders')) belong to one device and are
+read-only for the others. The swarm folder belongs to the whole swarm: any
+device can add files and folders, rename them and delete them, and every other
+device sees the change.
+
+# [Using it]($heading.id('using'))
+
+In the app, open **Swarm folder** (on phones, **Swarm** in the navigation
+bar). The header shows how many items it holds, how many devices it last synced
+with and when. From there:
+
+- **Add file…** picks a file with the system picker and adds it.
+- **New folder** creates a folder at the current place in the breadcrumbs.
+- Each row can be downloaded, renamed or deleted; tapping a file opens the same
+  viewer as browsing a device.
+- The **Added by** column (on wide windows) names the device that added each
+  file.
+
+On Linux it is also `<mount>/Swarm` in the [mount]($link.page('docs/shared-folders').ref('mount')),
+where any program can write to it (see [below]($link.ref('from-the-mount'))).
+
+# [How changes travel]($heading.id('sync'))
+
+The swarm folder's listing is a manifest: every path with its kind, content
+hash, size, modification time and author. Each device keeps the whole manifest
+on disk, next to its block store, and merges it with every reachable device
+every 10 seconds.
+
+The manifest is a state-based CRDT: two devices that have seen the same edits
+hold the same manifest, whatever order the edits arrived in. No device is in
+charge and none has to be online for the others to keep working.
+
+File contents are not in the manifest. A file's bytes stay on the device that
+added it and travel when someone opens it: from the local cache first, then
+from the device that added it, then from any device that has it cached.
+
+# [Conflicts]($heading.id('conflicts'))
+
+Every entry carries a version (a Lamport clock and the device that made it) and
+remembers the last 8 versions it replaced. When two versions of the same path
+meet:
+
+- If one has the other in its history, it is the newer edit and wins.
+- If neither does, the edits were made at the same time. **Both are kept**: the
+  higher version keeps the name, and the other is renamed to
+  `name (conflict from <device>).ext`. Every device computes the same name, so
+  the swarm agrees without talking about it.
+- A delete never beats a concurrent edit: the edited file stays.
+- Deletes are recorded as tombstones, so they replicate like any other edit.
+
+What a device receives from its peers is validated before it is merged: path
+length (1024) and depth (32), entry count (100,000) and author names are
+bounded, and unsafe paths are refused.
+
+# [Writing from the mount]($heading.id('from-the-mount'))
+
+`<mount>/Swarm` behaves like a normal folder for editors, file managers and the
+shell:
+
+- Writes go to a staging file first; reads see them straight away. When the file
+  is closed it is chunked and added to the swarm **as one edit**, so other
+  devices never see half a write.
+- Creating, truncating, appending, `mkdir`, `rm`, `rmdir` (refused while the
+  folder is not empty) and `mv` anywhere inside the swarm folder work, including
+  an editor's save-to-temporary-then-rename over an existing file.
+- A renamed folder keeps its contents visible at the new path at once.
+- Moving files between the swarm folder and a device share fails with `EXDEV`
+  (a cross-device move); writing to a device share fails with `EROFS`.
+
+Files in `Swarm` show as `0644`, folders as `0755`.

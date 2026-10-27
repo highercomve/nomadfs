@@ -1,0 +1,78 @@
+name: Site
+
+# Builds the Zine site in site/ and deploys it to Cloudflare Pages at
+# https://nomadfs.foreachdeveloper.com.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/site.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+# One build/deploy at a time, in order, so an older build never deploys last.
+concurrency:
+  group: cloudflare-pages
+  cancel-in-progress: false
+
+env:
+  PROJECT: nomadfs
+  DOMAIN: nomadfs.foreachdeveloper.com
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      HAS_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_ACCOUNT_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Zine
+        run: |
+          mkdir -p /tmp/zine
+          curl -sL -o /tmp/zine/zine.tar.xz https://github.com/kristoff-it/zine/releases/download/v0.14.0/x86_64-linux-musl.tar.xz
+          tar xJf /tmp/zine/zine.tar.xz -C /tmp/zine/
+          chmod +x /tmp/zine/zine
+          echo "/tmp/zine" >> "$GITHUB_PATH"
+
+      - name: Build site
+        working-directory: site
+        run: zine release --force --output public
+
+      # Forks and repos without the secrets still build, they just don't deploy.
+      - name: Skip without Cloudflare credentials
+        if: env.HAS_TOKEN != 'true'
+        run: echo "::notice::CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID is not set; skipping deploy."
+
+      # The Pages project is created on the first deploy if it doesn't exist.
+      - name: Deploy
+        if: env.HAS_TOKEN == 'true'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+          preCommands: npx wrangler pages project create ${{ env.PROJECT }} --production-branch=main || true
+          command: pages deploy site/public --project-name=${{ env.PROJECT }} --branch=main --commit-dirty=true
+
+      # The custom domain, once: Cloudflare answers "already added" after
+      # that. Its DNS record is a CNAME nomadfs -> nomadfs.pages.dev in the
+      # foreachdeveloper.com zone (added with the domain when the zone is in
+      # the same account; by hand otherwise).
+      - name: Custom domain
+        if: env.HAS_TOKEN == 'true'
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          curl -sS -X POST \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{\"name\":\"$DOMAIN\"}" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/$PROJECT/domains" \
+            | python3 -c 'import json,sys; r=json.load(sys.stdin); print("domain:", "added" if r.get("success") else r.get("errors"))'

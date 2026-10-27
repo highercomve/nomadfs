@@ -1,0 +1,12 @@
+/* Code colours on the night code background: Zine's highlighter classes
+   plus the tk-* spans used on the home page. Brand palette: amber for
+   keywords, oasis teal for strings, sand for the rest. */
+.keyword, .keyword_modifier, .keyword_return, .keyword_function, .keyword_type, .keyword_import, .keyword_conditional, .keyword_repeat, .keyword_exception, .keyword_operator, .tk-kw { color: #f6b042; }
+.string, .string_special, .character, .tk-str { color: #5ce1e6; }
+.comment, .comment_documentation, .tk-com { color: #7c776f; font-style: italic; }
+.function, .function_call, .function_method, .function_builtin, .method, .tk-fn { color: #ffcf9e; }
+.type, .type_builtin, .type_definition, .tk-ty { color: #e8833a; }
+.number, .float, .boolean, .constant, .constant_builtin, .tk-num { color: #ff9f6e; }
+.attribute, .label, .tag, .property { color: #9ff2ec; }
+.punctuation, .punctuation_bracket, .punctuation_delimiter, .operator { color: #a99f8f; }
+.variable_builtin, .variable_parameter { color: #f5efe6; }

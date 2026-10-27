@@ -1,0 +1,195 @@
+<extend template="base.shtml">
+<head id="head">
+	<title>NomadFS · Your devices, one filesystem</title>
+</head>
+<body id="body">
+	<main class="home">
+		<section class="hero">
+			<div class="hero-inner">
+				<div class="hero-copy">
+					<p class="eyebrow"><span class="signal" aria-hidden="true"></span>Zig &amp; Oriel · Linux desktop · Android</p>
+					<h1 class="hero-title">Your devices,<br><span class="accent">one filesystem.</span></h1>
+					<p class="hero-lead">NomadFS shares folders across your laptop, phone and home server. Every device sees every shared folder at once; a file only travels when someone opens it. Add a swarm folder that all of them write to, and mount it all on Linux like any other folder.</p>
+					<div class="hero-actions">
+						<a class="btn btn-primary" href="https://github.com/highercomve/nomadfs/releases/latest">Download</a>
+						<a class="btn btn-ghost" href="$site.page('docs/getting-started').link()">Get started</a>
+						<a class="btn btn-ghost" href="https://github.com/highercomve/nomadfs">View on GitHub</a>
+					</div>
+					<dl class="readouts">
+						<div><dt>transport</dt><dd>Noise XXpsk3 · Yamux · TCP</dd></div>
+						<div><dt>storage</dt><dd>Merkle DAG · FastCDC · SHA-256</dd></div>
+						<div><dt>mount</dt><dd>FUSE, no libfuse</dd></div>
+					</dl>
+				</div>
+				<div class="hero-shots">
+					<figure class="plate shot-desktop">
+						<img src="$site.asset('screenshots/browse-desktop.png').link()" alt="NomadFS on the Linux desktop: browsing a phone's Camera folder from the desktop, with name, size and modified columns" width="1270" height="760">
+					</figure>
+					<figure class="shot-phone">
+						<img src="$site.asset('screenshots/browse-phone.png').link()" alt="NomadFS on an Android phone: the Browse section lists the desktop with one shared folder" width="540" height="1200">
+					</figure>
+				</div>
+			</div>
+		</section>
+
+		<section class="section" id="features">
+			<div class="section-head">
+				<p class="plate-label">01 · what it does</p>
+				<h2>Everything you share, from every device</h2>
+				<p>Not a cloud and not a full mirror. Your devices keep their own files and lend them to each other on request.</p>
+			</div>
+			<div class="feature-grid">
+				<article class="feature plate">
+					<div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/><path d="M12 11v5M9.5 13.5 12 16l2.5-2.5"/></svg></div>
+					<h3>Shared folders, on demand</h3>
+					<p>Share a folder and every device can browse it right away. Only the listing travels; a file's bytes move when someone opens it, and only the blocks of the part being read.</p>
+				</article>
+				<article class="feature plate">
+					<div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="2.2"/><circle cx="5" cy="17" r="2.2"/><circle cx="19" cy="17" r="2.2"/><path d="M11 7 6 15M13 7l5 8M7.2 17h9.6"/></svg></div>
+					<h3>A swarm folder</h3>
+					<p>One folder every device reads and writes. Add, rename and delete from anywhere; edits merge without a server, and two edits at once keep both, the other as a conflict copy.</p>
+				</article>
+				<article class="feature plate">
+					<div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 14h.01M11 14h6"/></svg></div>
+					<h3>A Linux mount</h3>
+					<p>Every device's shares appear under <code>&lt;mount&gt;/&lt;device&gt;/&lt;share&gt;</code>, read-only, and the swarm folder under <code>&lt;mount&gt;/Swarm</code>, writable from any app or file manager.</p>
+				</article>
+				<article class="feature plate">
+					<div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM18 18h3v3h-3zM18 14h3M14 18v3"/></svg></div>
+					<h3>One-time invites</h3>
+					<p>Join a device with a code or by scanning its QR code with the phone camera. The invite works once, for ten minutes, and the swarm key travels encrypted: it is never shown.</p>
+				</article>
+				<article class="feature plate">
+					<div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v6c0 4.4 3 7.6 7 9 4-1.4 7-4.6 7-9V6l-7-3z"/><path d="m9 12 2 2 4-4"/></svg></div>
+					<h3>Encrypted, device to device</h3>
+					<p>Devices talk over Noise <code>XXpsk3</code> sessions keyed by your swarm, with Ed25519 device identities you can list and revoke. Every block is checked against its hash when it arrives.</p>
+				</article>
+				<article class="feature plate">
+					<div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="4" width="14" height="11" rx="1.5"/><path d="M6 19h6M9 15v4"/><rect x="16" y="9" width="6" height="11" rx="1.5"/></svg></div>
+					<h3>An app for desktop and phone</h3>
+					<p>Browse devices, preview images, video, audio, PDF and text, manage the swarm folder, mount from a tab or the tray, connect devices, and drop notes between them. Built with <a href="https://oriel.foreachdeveloper.com">Oriel</a>.</p>
+				</article>
+			</div>
+		</section>
+
+		<section class="section" id="screens">
+			<div class="section-head">
+				<p class="plate-label">02 · the app</p>
+				<h2>Night-caravan cartography</h2>
+				<p>The same app on the Linux desktop and on Android phones: a drawer on wide windows, a navigation bar on phones.</p>
+			</div>
+			<div class="gallery">
+				<figure class="plate">
+					<img src="$site.asset('screenshots/swarm-desktop.png').link()" alt="The swarm folder on the desktop: a folder, three files, who added each one, and a conflict copy kept beside notes.md" loading="lazy" width="1270" height="640">
+					<figcaption><strong>Swarm folder</strong> · who added what, synced with the other device, a conflict kept as a copy</figcaption>
+				</figure>
+				<figure class="plate">
+					<img src="$site.asset('screenshots/connect-desktop.png').link()" alt="Connect devices on the desktop: create an invite, join with an invite code or scan a QR code, and rename this device" loading="lazy" width="1270" height="620">
+					<figcaption><strong>Connect devices</strong> · create a one-time invite, or join with a code or a QR scan</figcaption>
+				</figure>
+			</div>
+			<div class="gallery phones">
+				<figure class="plate">
+					<img src="$site.asset('screenshots/swarm-phone.png').link()" alt="The swarm folder on a phone-sized window, with New folder and Add file" loading="lazy" width="412" height="860">
+					<figcaption><strong>Swarm</strong> · on a phone</figcaption>
+				</figure>
+				<figure class="plate">
+					<img src="$site.asset('screenshots/browse-phone.png').link()" alt="Browse on an Android phone, showing the desktop and its shared folder" loading="lazy" width="540" height="1200">
+					<figcaption><strong>Browse</strong> · a Xiaomi phone sees the desktop</figcaption>
+				</figure>
+				<article class="plate phone-notes">
+					<p class="plate-label">on the phone</p>
+					<h3>The same app, in your pocket</h3>
+					<ul>
+						<li><strong>One section at a time</strong>, picked from a navigation bar: Browse, Shared, Connect, Swarm, Settings.</li>
+						<li><strong>Share the camera roll</strong>, Pictures, Documents or Download through the system folder picker.</li>
+						<li><strong>Scan an invite</strong> with the rear camera to join a swarm in one step.</li>
+						<li><strong>Full-screen previews</strong> of photos, video, audio, PDF and text from any device.</li>
+					</ul>
+				</article>
+			</div>
+		</section>
+
+		<section class="section" id="how">
+			<div class="section-head">
+				<p class="plate-label">03 · how it works</p>
+				<h2>The route a file takes</h2>
+				<p>Metadata goes everywhere. Bytes go only where they are asked for.</p>
+			</div>
+			<ol class="route">
+				<li>
+					<span class="stop">01</span>
+					<div>
+						<h3>A folder becomes a tree</h3>
+						<p>A shared folder is scanned into a Merkle tree: files are split with FastCDC into content-addressed blocks. The bytes stay in your files; NomadFS records where each block lives and stores only the directory blocks. Shares are rescanned every 30 seconds.</p>
+					</div>
+				</li>
+				<li>
+					<span class="stop">02</span>
+					<div>
+						<h3>Devices swap listings</h3>
+						<p>Each device asks the others for their share roots and reads one directory block at a time as you browse. Nothing is copied ahead of time.</p>
+					</div>
+				</li>
+				<li>
+					<span class="stop">03</span>
+					<div>
+						<h3>Opening a file fetches its blocks</h3>
+						<p>A read loads only the blocks that cover the requested range, from the device that has them, and checks each against its hash. Fetched blocks are cached, so what you opened once still opens offline.</p>
+					</div>
+				</li>
+				<li>
+					<span class="stop">04</span>
+					<div>
+						<h3>The swarm folder merges itself</h3>
+						<p>Its listing is a replicated manifest, a state-based CRDT, kept on every device and merged with each reachable peer every 10 seconds. Concurrent edits keep both versions under the same conflict name on every device.</p>
+					</div>
+				</li>
+			</ol>
+		</section>
+
+		<section class="section" id="start">
+			<div class="section-head">
+				<p class="plate-label">04 · get started</p>
+				<h2>Build it with <a href="https://ziglang.org/">Zig</a> &amp; <a href="https://oriel.foreachdeveloper.com">Oriel</a></h2>
+				<p>NomadFS is early: built from source with <a href="https://ziglang.org/">Zig 0.16</a>, tested on Linux and Android. The command line node and the app share one core; the app is made with <a href="https://oriel.foreachdeveloper.com">Oriel</a> by <a href="https://www.foreachdeveloper.com/">foreachdeveloper</a>.</p>
+			</div>
+			<div class="code-pair">
+				<figure class="code-card plate">
+					<figcaption><span class="dot"></span>the node and CLI</figcaption>
+<pre><code><span class="tk-com"># build zig-out/bin/nomadfs, run the tests</span>
+zig build
+zig build test
+
+<span class="tk-com"># share a folder, then invite another device</span>
+./zig-out/bin/nomadfs --share <span class="tk-str">Photos:$HOME/Pictures</span>
+./zig-out/bin/nomadfs --invite
+
+<span class="tk-com"># mount every device's shares (Linux)</span>
+./zig-out/bin/nomadfs --mount <span class="tk-str">~/NomadFS</span></code></pre>
+				</figure>
+				<figure class="code-card plate">
+					<figcaption><span class="dot"></span>the app (Oriel)</figcaption>
+<pre><code><span class="tk-com"># fetches Oriel v0.19.6</span>
+cd nomadfs-gui
+zig build run        <span class="tk-com"># the desktop app</span>
+zig build package    <span class="tk-com"># deb, rpm, AppImage</span>
+
+<span class="tk-com"># Android: an APK with arm64-v8a and x86_64</span>
+oriel android build</code></pre>
+				</figure>
+			</div>
+			<p class="note">Every command reads <code>nomadfs.conf</code> from the current folder, <code>~/.nomadfs/</code> or <code>/etc/nomadfs/</code>. The <a href="$site.page('docs/getting-started').link()">getting started guide</a> walks through a first swarm.</p>
+		</section>
+
+		<section class="cta plate">
+			<p class="plate-label">05 · set out</p>
+			<h2>Two devices, one invite, ten minutes</h2>
+			<p>Build the node, share a folder, and scan the invite from your phone.</p>
+			<div class="hero-actions">
+				<a class="btn btn-primary" href="$site.page('docs/getting-started').link()">Read the guide</a>
+				<a class="btn btn-ghost" href="$site.page('docs').link()">Browse the docs</a>
+			</div>
+		</section>
+	</main>
+</body>

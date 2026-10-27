@@ -1,0 +1,95 @@
+---
+.title = "Connecting devices",
+.description = "Bring a device into your swarm with a one-time invite or a QR code, without the swarm key ever being shown.",
+.date = .date("2026-10-27T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "docs.shtml",
+.custom = { "label": "04 · connect" },
+---
+
+Devices that hold the same swarm key form a swarm: they connect to each other,
+list each other's shares and sync the [swarm folder]($link.page('docs/swarm-folder')).
+Connecting a new device means giving it the swarm key and an address to dial,
+safely. One-time invites do both.
+
+# [Invite a device]($heading.id('invite'))
+
+On a device already in the swarm:
+
+- **App:** **Connect devices → Create invite**. The invite shows as a code and
+  a QR code, with a countdown and its status; it can be copied or cancelled.
+- **Command line:** `nomadfs --invite` prints the QR code in the terminal and
+  the code, then waits for the other device. `--address <ip>` sets the address
+  put in the code when the detected LAN address is not the right one.
+
+An invite looks like this:
+
+```
+nomadfs://invite?addr=192.168.1.20:9001&token=<32 hex characters>
+```
+
+It is good for **one** join and expires after **10 minutes**.
+
+# [Join with an invite]($heading.id('join'))
+
+On the new device, open the app and go to **Connect devices**:
+
+- paste the code under **Join with an invite** and press **Join**, or
+- tap **Scan QR code**: a full-screen viewfinder opens on the rear camera and
+  joins as soon as it reads a NomadFS invite.
+
+The scanner uses the web view's `BarcodeDetector`, which Android's web view
+has and WebKitGTK does not, so the button appears on phones and not on the
+Linux desktop: desktops show invites, phones scan them. The app asks for camera
+permission the first time.
+
+When the join completes, each device has the other as a trusted device, the
+new device has the swarm key, and it has saved the inviter's address, so either
+side can reconnect after a restart.
+
+# [What happens on the wire]($heading.id('wire'))
+
+The inviting device opens a short-lived listener on its node port + 1. The
+token in the code is 128 random bits; both sides derive a pre-shared key from
+it and run a Noise `XXpsk3` handshake, so only a holder of the token gets
+through. A 128-bit token resists offline guessing, and a code read off the
+screen after it has been used opens nothing.
+
+Inside that encrypted channel the devices swap signed pairing tickets (each
+device's identity, transport key and addresses), and the inviter sends the
+swarm key and its node port. The swarm key is never part of the code and never
+appears on screen.
+
+# [Device identities and trust]($heading.id('trust'))
+
+Each device has an Ed25519 identity (`device.key`), separate from its transport
+key. In every connection both sides prove their identity with a signature bound
+to that Noise session, so a captured handshake cannot be replayed. Paired
+devices are kept in an owner-only, signed trust store (`trust.store`) that pins
+each device's transport key and checks it again on every handshake.
+
+By default a device with the swarm key can connect even if it is not in the
+trust store; set `require_trusted_devices = true` to accept only trusted
+devices. The app's **Node & trust** section lists trusted devices (marked
+online when reachable) and, below them, devices that are connected but not
+paired.
+
+From the command line:
+
+```sh
+nomadfs --devices             # list trusted devices
+nomadfs --revoke <id>         # remove one, by device ID or fingerprint
+nomadfs --pair                # print this device's pairing ticket and QR code
+nomadfs --trust 'nomadfs://pair?…'   # trust another device's ticket
+```
+
+A revocation is a signed tombstone that is sent on to the other devices the
+revoking device knows, so a removed device is dropped across the swarm, not
+only on one machine. Pairing tickets from `--pair` are valid for 24 hours.
+
+# [Without invites]($heading.id('manual'))
+
+Devices can also share a swarm by configuration: the same `swarm_key` in each
+`nomadfs.conf`, and each other's address in `bootstrap_peers`
+(`"tcp://192.168.1.20:9000"`). This is the way to connect two machines that
+only run the command line, since joining with an invite is done from the app.

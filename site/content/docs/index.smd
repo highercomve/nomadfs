@@ -1,0 +1,43 @@
+---
+.title = "Documentation",
+.description = "How NomadFS shares folders between your devices, and how to set it up.",
+.date = .date("2026-10-27T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "docs.shtml",
+.custom = { "label": "00 · docs" },
+---
+
+NomadFS is a personal filesystem for the devices you own: a laptop, a phone,
+a home server. Each device keeps its own files. What you share is listed on
+every device at once, and a file's bytes travel only when someone opens it.
+
+It is early software. The node, the command line and the Linux mount run on
+Linux; the app runs on the Linux desktop and on Android phones. See the
+[roadmap](https://github.com/highercomve/nomadfs/blob/main/ROADMAP.md) for
+where it is going.
+
+# [Start]($heading.id('start'))
+
+[Getting started]($link.page('docs/getting-started')) builds NomadFS, writes a
+configuration, shares a folder and brings a second device into the swarm.
+
+# [Using NomadFS]($heading.id('using'))
+
+- [Shared folders & mount]($link.page('docs/shared-folders')): what a shared
+  folder is, how devices browse it, what downloads when, and the Linux FUSE
+  mount.
+- [Swarm folder]($link.page('docs/swarm-folder')): the one folder every
+  device reads and writes, how edits merge and what happens on a conflict.
+- [Connecting devices]($link.page('docs/connecting-devices')): swarms, one-time
+  invites and QR codes, trusted devices and revocation.
+
+# [Words used here]($heading.id('words'))
+
+- **Swarm**: all the devices that hold the same swarm key. They can reach each
+  other and see each other's shares.
+- **Share**: a folder on one device, under a name, that the rest of the swarm
+  can browse.
+- **Swarm folder**: one folder that belongs to the whole swarm rather than to
+  one device.
+- **Mount**: on Linux, all of it as an ordinary folder: `<mount>/<device>/<share>`
+  and `<mount>/Swarm`.
