@@ -8,6 +8,17 @@ pub const StorageEngine = struct {
     root_dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     mutex: sync.Mutex = .{},
+    /// Blocks held outside the store (shared folders' file bytes). Asked
+    /// only when no block file exists; what it returns is verified like any
+    /// stored block.
+    external: ?External = null,
+
+    pub const External = struct {
+        ctx: *anyopaque,
+        /// Caller-owned block bytes for `cid`, or null when not held.
+        getFn: *const fn (ctx: *anyopaque, cid: *const [32]u8, allocator: std.mem.Allocator) anyerror!?[]u8,
+        hasFn: *const fn (ctx: *anyopaque, cid: *const [32]u8) bool,
+    };
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !StorageEngine {
         var expanded_path: []const u8 = path;
@@ -73,7 +84,9 @@ pub const StorageEngine = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const hex_cid = std.fmt.bytesToHex(cid[0..32], .lower);
-        return self.hasLocked(&hex_cid);
+        if (self.hasLocked(&hex_cid)) return true;
+        const ext = self.external orelse return false;
+        return ext.hasFn(ext.ctx, cid[0..32]);
     }
 
     fn hasLocked(self: *StorageEngine, hex_cid: []const u8) bool {
@@ -94,7 +107,10 @@ pub const StorageEngine = struct {
 
             const io = std.Io.Threaded.global_single_threaded.io();
             var file = self.root_dir.openFile(io, &hex_cid, .{}) catch |err| switch (err) {
-                error.FileNotFound => return null,
+                error.FileNotFound => {
+                    const ext = self.external orelse return null;
+                    break :blk (try ext.getFn(ext.ctx, cid[0..32], allocator)) orelse return null;
+                },
                 else => return err,
             };
             defer file.close(io);

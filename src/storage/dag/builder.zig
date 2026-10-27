@@ -20,6 +20,16 @@ pub const DagBuilder = struct {
     allocator: std.mem.Allocator,
     store: *StorageEngine,
     layout: Layout,
+    /// When set, leaf blocks are not written to `store`: the sink is told
+    /// where each leaf's bytes sit in the input instead (shared folders keep
+    /// file bytes in the files themselves). Parents are always stored.
+    leaf_sink: ?LeafSink = null,
+
+    pub const LeafSink = struct {
+        ctx: *anyopaque,
+        /// `offset` and `len` locate the leaf's data in the input stream.
+        recordFn: *const fn (ctx: *anyopaque, cid: *const [32]u8, offset: u64, len: u32) anyerror!void,
+    };
 
     /// Main entry point: Turns a file reader into a Root CID owned by the caller.
     pub fn build(self: *DagBuilder, reader: anytype) ![]const u8 {
@@ -39,10 +49,16 @@ pub const DagBuilder = struct {
         defer self.allocator.free(leaf_buf);
         leaf_buf[0] = @intFromEnum(codec.Tag.leaf);
 
+        var offset: u64 = 0;
         while (try chk.next(reader)) |chunk| {
             @memcpy(leaf_buf[1 .. 1 + chunk.len], chunk);
-            const leaf_cid = try self.persistBytes(leaf_buf[0 .. 1 + chunk.len]);
+            const leaf_cid = if (self.leaf_sink) |sink| blk: {
+                const block = Block.new(leaf_buf[0 .. 1 + chunk.len]);
+                try sink.recordFn(sink.ctx, &block.cid, offset, @intCast(chunk.len));
+                break :blk try self.allocator.dupe(u8, &block.cid);
+            } else try self.persistBytes(leaf_buf[0 .. 1 + chunk.len]);
             defer self.allocator.free(leaf_cid);
+            offset += chunk.len;
 
             // Empty name for leaves in list
             try self.appendLink(&leaf_metadata, "", leaf_cid, chunk.len);

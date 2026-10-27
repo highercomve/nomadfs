@@ -39,6 +39,22 @@ pub const Config = struct {
     storage: StorageConfig,
     network: NetworkConfig,
     security: SecurityConfig = .{},
+    /// Folders shared with the swarm: `share = "Name:/path"`, repeatable.
+    shares: []Share = &.{},
+
+    pub const Share = struct {
+        name: []const u8,
+        path: []const u8,
+
+        /// Splits "Name:/path" at the first ':'. Slices point into `spec`.
+        pub fn parse(spec: []const u8) !Share {
+            const colon = std.mem.indexOfScalar(u8, spec, ':') orelse return error.InvalidShare;
+            const name = std.mem.trim(u8, spec[0..colon], " \t");
+            const path = std.mem.trim(u8, spec[colon + 1 ..], " \t");
+            if (name.len == 0 or path.len == 0) return error.InvalidShare;
+            return .{ .name = name, .path = path };
+        }
+    };
 
     pub const NodeConfig = struct {
         nickname: []const u8,
@@ -84,6 +100,31 @@ pub const Config = struct {
             allocator.free(peer);
         }
         allocator.free(self.network.bootstrap_peers);
+        for (self.shares) |share| {
+            allocator.free(share.name);
+            allocator.free(share.path);
+        }
+        allocator.free(self.shares);
+    }
+
+    /// Adds a share (copies `name` and `path`), replacing one of that name.
+    pub fn addShare(self: *Config, allocator: std.mem.Allocator, name: []const u8, path: []const u8) !void {
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        for (self.shares) |*share| {
+            if (!std.mem.eql(u8, share.name, name)) continue;
+            allocator.free(share.name);
+            allocator.free(share.path);
+            share.* = .{ .name = owned_name, .path = owned_path };
+            return;
+        }
+        const grown = try allocator.alloc(Share, self.shares.len + 1);
+        @memcpy(grown[0..self.shares.len], self.shares);
+        grown[self.shares.len] = .{ .name = owned_name, .path = owned_path };
+        allocator.free(self.shares);
+        self.shares = grown;
     }
 };
 
@@ -225,6 +266,9 @@ fn applyConfigEntry(
         }
     } else if (std.mem.eql(u8, key, "bootstrap_peers")) {
         try appendBootstrapPeers(allocator, bootstrap_list, val);
+    } else if (std.mem.eql(u8, key, "share")) {
+        const share = try Config.Share.parse(val);
+        try config.addShare(allocator, share.name, share.path);
     }
 }
 
@@ -321,4 +365,24 @@ test "parseConfigText releases everything on failure" {
     try std.testing.expectError(error.MissingRequiredField, parseConfigText(allocator, "nickname = \"alpha\""));
     try std.testing.expectError(error.UnsupportedTransport, parseConfigText(allocator, text ++ "\ntransport = \"quic\""));
     try std.testing.expectError(error.InvalidTransport, parseConfigText(allocator, text ++ "\ntransport = \"tpc\""));
+}
+
+test "parseConfigText reads repeatable shares" {
+    const allocator = std.testing.allocator;
+    var config = try parseConfigText(allocator,
+        \\nickname = "Desk"
+        \\swarm_key = "0123456789abcdef0123456789abcdef"
+        \\storage_path = "/tmp/x"
+        \\[shares]
+        \\share = "Documents:/home/me/Documents"
+        \\share = "Camera: /sdcard/DCIM/Camera"
+        \\share = "Documents:/srv/docs"
+    );
+    defer config.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), config.shares.len);
+    try std.testing.expectEqualStrings("Documents", config.shares[0].name);
+    try std.testing.expectEqualStrings("/srv/docs", config.shares[0].path);
+    try std.testing.expectEqualStrings("Camera", config.shares[1].name);
+    try std.testing.expectEqualStrings("/sdcard/DCIM/Camera", config.shares[1].path);
+    try std.testing.expectError(error.InvalidShare, Config.Share.parse("no-colon"));
 }

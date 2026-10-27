@@ -5,6 +5,7 @@ pub const config = @import("config.zig");
 pub const net = @import("net/mod.zig");
 pub const storage = @import("storage/mod.zig");
 pub const device = @import("device/mod.zig");
+pub const fs = @import("fs/mod.zig");
 
 /// C ABI bindings for mobile hosts; the shared library target points here.
 pub const mobile_api = @import("mobile/api.zig");
@@ -38,6 +39,8 @@ pub const Node = struct {
     device_paths: device.paths.Paths,
     device_identity: device.identity.Identity,
     trust_store: *device.trust.Store,
+    /// Folders this device shares; null without block storage.
+    shares: ?*fs.ShareIndex,
     bootstrap_thread: ?std.Thread = null,
     bootstrap_running: *std.atomic.Value(bool),
 
@@ -73,6 +76,26 @@ pub const Node = struct {
 
         // Serve our blocks to peers repairing from us.
         discovery_node.block_store = store;
+        discovery_node.nickname = cfg.node.nickname;
+
+        var shares: ?*fs.ShareIndex = null;
+        if (store) |s| {
+            const index = try fs.ShareIndex.create(allocator, std.Io.Threaded.global_single_threaded.io(), s);
+            shares = index;
+            discovery_node.share_source = index.source();
+        }
+        errdefer if (shares) |index| index.destroy();
+        if (shares) |index| {
+            // A folder that cannot be read is reported, not fatal: the node
+            // still serves everything else.
+            for (cfg.shares) |share| {
+                std.debug.print("Sharing '{s}' from {s}...\n", .{ share.name, share.path });
+                index.add(share.name, share.path) catch |err| {
+                    std.debug.print("Share '{s}' unavailable: {any}\n", .{ share.name, err });
+                };
+            }
+            if (cfg.shares.len > 0) try index.start();
+        }
 
         // Register DHT serve loop for new connections
         connection_manager.setConnectionHandler(discovery_node, DiscoveryNode.serve);
@@ -133,6 +156,7 @@ pub const Node = struct {
             .device_paths = device_paths,
             .device_identity = device_identity,
             .trust_store = trust_store,
+            .shares = shares,
             .bootstrap_running = bootstrap_running,
             .bootstrap_thread = null,
         };
@@ -147,6 +171,7 @@ pub const Node = struct {
 
         // Stop network traffic and callbacks BEFORE destroying handlers
         self.connection_manager.stop();
+        if (self.shares) |index| index.destroy();
 
         self.trust_store.deinit();
         self.allocator.destroy(self.trust_store);
@@ -309,6 +334,11 @@ test {
         @import("device/trust.zig"),
         @import("env.zig"),
         @import("errors.zig"),
+        @import("fs/filestore.zig"),
+        @import("fs/remote.zig"),
+        @import("fs/scan.zig"),
+        @import("fs/shares.zig"),
+        @import("fs/tree.zig"),
         @import("metrics.zig"),
         @import("net/compat.zig"),
         @import("net/discovery/kbucket.zig"),

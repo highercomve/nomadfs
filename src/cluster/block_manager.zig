@@ -200,6 +200,13 @@ pub const BlockManager = struct {
         return false;
     }
 
+    /// A connection to `peer_id`, located through the routing table or a
+    /// DHT lookup. Pooled by the connection manager: deinit it after use.
+    pub fn connectTo(self: *BlockManager, peer_id: NodeID) !network.Connection {
+        const peer = try self.findPeer(peer_id);
+        return self.net.connectToPeerMulti(peer.addresses[0..peer.addrs_count], self.dht_node.swarm_key, peer_id);
+    }
+
     fn fetchFrom(self: *BlockManager, provider: NodeID, root: []const u8) !void {
         const store = self.store orelse return error.StorageDisabled;
         const peer = try self.findPeer(provider);

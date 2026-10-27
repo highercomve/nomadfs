@@ -14,8 +14,9 @@ pub fn cidFromSlice(cid: []const u8) !Cid {
     return cid[0..codec.cid_len].*;
 }
 
-/// Pushes a parent's children so that popping yields them in link order.
-pub fn pushChildren(allocator: std.mem.Allocator, stack: *std.ArrayList(Cid), links: codec.LinkIterator) !void {
+/// Pushes a parent's or dir's children so that popping yields them in link
+/// order. `links` is a codec.LinkIterator or codec.EntryIterator.
+pub fn pushChildren(allocator: std.mem.Allocator, stack: *std.ArrayList(Cid), links: anytype) !void {
     var it = links;
     try stack.ensureUnusedCapacity(allocator, it.count);
     const start = stack.items.len;
@@ -49,6 +50,7 @@ pub fn readFile(allocator: std.mem.Allocator, store: *StorageEngine, root: []con
                 total += data.len;
             },
             .parent => |links| try pushChildren(allocator, &stack, links),
+            .dir => return error.IsDirectory,
         }
     }
     return total;
@@ -68,7 +70,7 @@ pub fn isComplete(allocator: std.mem.Allocator, store: *StorageEngine, root: []c
         defer allocator.free(block.data);
         switch (try codec.decode(block.data)) {
             .leaf => {},
-            .parent => |links| try pushChildren(allocator, &stack, links),
+            inline .parent, .dir => |links| try pushChildren(allocator, &stack, links),
         }
     }
     return true;
@@ -88,7 +90,7 @@ pub fn collectReachable(allocator: std.mem.Allocator, store: *StorageEngine, roo
         defer allocator.free(block.data);
         switch (try codec.decode(block.data)) {
             .leaf => {},
-            .parent => |links| try pushChildren(allocator, &stack, links),
+            inline .parent, .dir => |links| try pushChildren(allocator, &stack, links),
         }
     }
     return reached;

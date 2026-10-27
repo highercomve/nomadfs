@@ -38,7 +38,7 @@ pub const RepairManager = struct {
             defer allocator.free(data);
             switch (try codec.decode(data)) {
                 .leaf => {},
-                .parent => |links| try walk.pushChildren(allocator, &stack, links),
+                inline .parent, .dir => |links| try walk.pushChildren(allocator, &stack, links),
             }
         }
         return fetched;

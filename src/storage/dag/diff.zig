@@ -41,7 +41,7 @@ pub const DiffService = struct {
             defer allocator.free(block.data);
             switch (try codec.decode(block.data)) {
                 .leaf => {},
-                .parent => |links| try walk.pushChildren(allocator, &stack, links),
+                inline .parent, .dir => |links| try walk.pushChildren(allocator, &stack, links),
             }
         }
         return result;
@@ -181,7 +181,7 @@ test "DiffService: shift resistance with FastCDC" {
                     leaf_count_a += 1;
                     if (reachable_b.contains(cid.*)) shared_leaves += 1;
                 },
-                .parent => {},
+                .parent, .dir => {},
             }
         }
     }

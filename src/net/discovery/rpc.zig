@@ -33,6 +33,11 @@ pub const MessageType = enum(u8) {
     /// Tell a peer that a device was revoked, signed by the revoking
     /// device's Ed25519 identity. Answered with STORE_ACK.
     REVOKE = 15,
+    /// Ask a device which folders it shares. Answered with SHARES.
+    GET_SHARES = 16,
+    /// Reply to GET_SHARES: a dir block (storage/dag/codec.zig) whose
+    /// entries map each share name to its current root CID.
+    SHARES = 17,
 };
 
 pub const FindValueResult = union(enum) {
@@ -68,6 +73,8 @@ pub const MessagePayload = union(MessageType) {
         /// Informational timestamp; not part of the signature.
         at: u64,
     },
+    GET_SHARES: void,
+    SHARES: struct { nickname: []const u8, listing: []const u8 },
 };
 
 pub const Message = struct {
@@ -140,6 +147,14 @@ pub const Message = struct {
                 try writer.writeAll(&p.signer_key);
                 try writer.writeInt(u64, p.at, .big);
                 try writer.writeAll(&p.signature);
+            },
+            .GET_SHARES => {},
+            .SHARES => |p| {
+                const nick = p.nickname[0..@min(p.nickname.len, max_nickname_len)];
+                try writer.writeByte(@intCast(nick.len));
+                try writer.writeAll(nick);
+                try writer.writeInt(u32, @intCast(p.listing.len), .big);
+                try writer.writeAll(p.listing);
             },
         }
     }
@@ -221,6 +236,14 @@ pub const Message = struct {
                 try reader.readNoEof(&signature);
                 break :blk MessagePayload{ .REVOKE = .{ .device_id = device, .signer_key = signer_key, .at = at, .signature = signature } };
             },
+            .GET_SHARES => MessagePayload{ .GET_SHARES = {} },
+            .SHARES => blk: {
+                const nick_len = try reader.readByte();
+                const nickname = try allocator.alloc(u8, nick_len);
+                errdefer allocator.free(nickname);
+                try reader.readNoEof(nickname);
+                break :blk MessagePayload{ .SHARES = .{ .nickname = nickname, .listing = try readValue(allocator, reader) } };
+            },
         };
 
         return Message{
@@ -228,6 +251,9 @@ pub const Message = struct {
             .payload = payload,
         };
     }
+
+    /// Longest device nickname a SHARES reply carries; longer ones are cut.
+    pub const max_nickname_len = 64;
 
     /// Upper bound on a value carried by STORE / FIND_VALUE_RESPONSE.
     pub const max_value_len = 10 * 1024 * 1024;
@@ -308,6 +334,10 @@ pub const Message = struct {
             .BLOCK => |p| if (p.data) |d| allocator.free(d),
             .PUT_BLOCK => |p| allocator.free(p.data),
             .PROVIDERS => |p| allocator.free(p.providers),
+            .SHARES => |p| {
+                allocator.free(p.nickname);
+                allocator.free(p.listing);
+            },
             else => {},
         }
     }

@@ -37,6 +37,11 @@ pub const Node = struct {
     /// Where revocations from peers are recorded. Without a store a node
     /// refuses revocation messages instead of ignoring them silently.
     trust_store: ?*device_trust.Store = null,
+    /// Answers GET_SHARES. Null on nodes that share nothing: they reply
+    /// with an empty listing.
+    share_source: ?ShareSource = null,
+    /// Human name sent with SHARES (config node.nickname).
+    nickname: []const u8 = "",
     /// This node's Ed25519 identity, used to sign revocations it pushes.
     device_identity: ?identity_mod.Identity = null,
     store_limits: StoreLimits = .{},
@@ -44,6 +49,14 @@ pub const Node = struct {
     stored_bytes: usize = 0,
     /// Who holds content for which key. Guarded by `mutex`.
     providers: providers_mod.ProviderStore = .{},
+
+    /// Produces this node's share listing (an encoded dir block, owned by
+    /// the caller) on demand. Type-erased so the DHT does not depend on the
+    /// filesystem layer that implements it.
+    pub const ShareSource = struct {
+        ctx: *anyopaque,
+        listFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
+    };
 
     pub fn init(allocator: std.mem.Allocator, manager: *network.manager.ConnectionManager, swarm_key: []const u8) Node {
         return .{
@@ -479,6 +492,35 @@ pub const Node = struct {
         }
     }
 
+    pub const SharesReply = struct {
+        nickname: []u8,
+        /// Encoded dir block; validate with codec.decode.
+        listing: []u8,
+    };
+
+    /// Asks `conn`'s peer which folders it shares. Both slices of the reply
+    /// are owned by the caller (allocated with the node's allocator).
+    pub fn fetchShares(self: *Node, conn: network.Connection) !SharesReply {
+        const stream = try conn.openStream();
+        defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
+
+        const msg = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .GET_SHARES = {} },
+        };
+        try msg.serialize(stream.writer());
+
+        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
+        switch (response.payload) {
+            .SHARES => |p| return .{ .nickname = @constCast(p.nickname), .listing = @constCast(p.listing) },
+            else => {
+                response.deinit(self.allocator);
+                return error.InvalidResponse;
+            },
+        }
+    }
+
     /// Pushes a block to `conn`'s peer. The receiver verifies the bytes
     /// against the CID before storing; returns whether it kept the block.
     pub fn putBlock(self: *Node, conn: network.Connection, cid: [32]u8, data: []const u8) !bool {
@@ -801,6 +843,7 @@ pub const Node = struct {
             .FIND_VALUE => |p| try self.handleFindValue(stream, p.key),
             .STORE => |p| try self.handleStore(stream, p.key, p.value),
             .GET_BLOCK => |p| try self.handleGetBlock(stream, p.cid),
+            .GET_SHARES => try self.handleGetShares(stream),
             .PUT_BLOCK => |p| try self.handlePutBlock(stream, p.cid, p.data),
             .REVOKE => |p| try self.handleRevoke(stream, p.device_id, p.signer_key, p.signature),
             .ADD_PROVIDER => |p| try self.handleAddProvider(stream, conn, p.key),
@@ -915,6 +958,20 @@ pub const Node = struct {
         const response = rpc.Message{
             .sender_id = self.manager.node_id,
             .payload = .{ .BLOCK = .{ .data = data } },
+        };
+        try response.serialize(stream.writer());
+    }
+
+    fn handleGetShares(self: *Node, stream: network.Stream) !void {
+        const empty_listing = [_]u8{ 2, 0, 0 }; // dir block, zero entries
+        const listing: []u8 = if (self.share_source) |source|
+            try source.listFn(source.ctx, self.allocator)
+        else
+            try self.allocator.dupe(u8, &empty_listing);
+        defer self.allocator.free(listing);
+        const response = rpc.Message{
+            .sender_id = self.manager.node_id,
+            .payload = .{ .SHARES = .{ .nickname = self.nickname, .listing = listing } },
         };
         try response.serialize(stream.writer());
     }

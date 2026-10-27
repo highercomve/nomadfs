@@ -15,4 +15,5 @@ test {
     _ = @import("dht/auth_test.zig");
     _ = @import("cluster/transfer_test.zig");
     _ = @import("cluster/revocation_test.zig");
+    _ = @import("cluster/share_test.zig");
 }

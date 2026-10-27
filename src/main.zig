@@ -12,7 +12,7 @@ const DevicePaths = device.paths.Paths;
 /// rotates, and an old QR code should not grant access forever.
 const ticket_lifetime_seconds = 24 * 60 * 60;
 
-const Command = enum { run, pair, trust, devices, revoke };
+const Command = enum { run, pair, trust, devices, revoke, mount };
 
 const Options = struct {
     command: Command = .run,
@@ -20,6 +20,9 @@ const Options = struct {
     address: ?[]const u8 = null,
     trust_uri: ?[]const u8 = null,
     revoke_query: ?[]const u8 = null,
+    mountpoint: ?[]const u8 = null,
+    /// --share Name:/path, added to the configured shares.
+    shares: std.ArrayList([]const u8) = .empty,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -27,13 +30,20 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var options: Options = .{};
-    if (!try parseArgs(args, &options)) return;
+    if (!try parseArgs(init.arena.allocator(), args, &options)) return;
 
     var config = loadConfig(allocator, options.config_path) catch |err| {
         std.debug.print("Error: could not load configuration: {any}\n", .{err});
         std.process.exit(1);
     };
     defer config.deinit(allocator);
+    for (options.shares.items) |spec| {
+        const share = config_mod.Config.Share.parse(spec) catch {
+            std.debug.print("Error: --share expects Name:/path, got '{s}'\n", .{spec});
+            std.process.exit(1);
+        };
+        try config.addShare(allocator, share.name, share.path);
+    }
 
     switch (options.command) {
         .pair => try pairCommand(allocator, config, options.address),
@@ -41,11 +51,12 @@ pub fn main(init: std.process.Init) !void {
         .devices => try devicesCommand(allocator, config),
         .revoke => try revokeCommand(allocator, config, options.revoke_query.?),
         .run => try runNode(allocator, config),
+        .mount => try mountCommand(allocator, config, options.mountpoint.?),
     }
 }
 
 /// Returns false when the command was fully handled (help).
-fn parseArgs(args: []const []const u8, options: *Options) !bool {
+fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Options) !bool {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -64,6 +75,11 @@ fn parseArgs(args: []const []const u8, options: *Options) !bool {
         } else if (std.mem.eql(u8, arg, "--revoke")) {
             try selectCommand(options, .revoke);
             options.revoke_query = try nextValue(args, &i, "--revoke");
+        } else if (std.mem.eql(u8, arg, "--mount")) {
+            try selectCommand(options, .mount);
+            options.mountpoint = try nextValue(args, &i, "--mount");
+        } else if (std.mem.eql(u8, arg, "--share")) {
+            try options.shares.append(arena, try nextValue(args, &i, "--share"));
         } else if (std.mem.eql(u8, arg, "--address")) {
             options.address = try nextValue(args, &i, "--address");
         } else if (std.mem.startsWith(u8, arg, "-")) {
@@ -96,7 +112,7 @@ fn nextValue(args: []const []const u8, index: *usize, flag: []const u8) ![]const
 
 fn selectCommand(options: *Options, command: Command) !void {
     if (options.command != .run) {
-        std.debug.print("Error: only one of --pair, --trust, --devices or --revoke may be used\n", .{});
+        std.debug.print("Error: only one of --pair, --trust, --devices, --revoke or --mount may be used\n", .{});
         std.process.exit(1);
     }
     options.command = command;
@@ -112,6 +128,7 @@ fn printHelp() void {
         \\  nomadfs --trust <nomadfs://pair?...> [config_path]
         \\  nomadfs --devices [config_path]
         \\  nomadfs --revoke <device-id-or-fingerprint> [config_path]
+        \\  nomadfs --mount <dir> [config_path]
         \\
         \\Options:
         \\  --config <path>    Path to the configuration file
@@ -120,6 +137,11 @@ fn printHelp() void {
         \\  --trust <uri>      Verify and add a pairing ticket to the trust store
         \\  --devices          List trusted devices
         \\  --revoke <id>      Remove a trusted device by ID or fingerprint
+        \\  --share Name:/path Share a folder with the swarm (repeatable; also
+        \\                     `share = "Name:/path"` in the config)
+        \\  --mount <dir>      Run the node and mount every device's shares at
+        \\                     <dir>/<device>/<share>, read-only; files download
+        \\                     on demand (Linux, needs fusermount3)
         \\  --help, -h         Show this help message
         \\
     , .{});
@@ -152,6 +174,72 @@ fn runNode(allocator: std.mem.Allocator, config: config_mod.Config) !void {
         std.debug.print("Bootstrap error: {any}\n", .{err});
     };
     try node.run(&running, config);
+}
+
+var mounted_at: [std.fs.max_path_bytes:0]u8 = undefined;
+var mounted_len: usize = 0;
+
+fn onStopSignal(_: std.os.linux.SIG) callconv(.c) void {
+    // Unmounting makes the FUSE loop return, which shuts the node down.
+    if (mounted_len > 0) nomadfs.fs.fuse.unmount(mounted_at[0..mounted_len :0]);
+}
+
+fn mountCommand(allocator: std.mem.Allocator, config: config_mod.Config, mountpoint: []const u8) !void {
+    if (comptime !@hasDecl(nomadfs.fs.fuse, "Mount")) {
+        std.debug.print("Error: --mount is only supported on Linux\n", .{});
+        std.process.exit(1);
+    } else {
+        return mountLinux(allocator, config, mountpoint);
+    }
+}
+
+fn mountLinux(allocator: std.mem.Allocator, config: config_mod.Config, mountpoint: []const u8) !void {
+    if (!config.storage.enabled) {
+        std.debug.print("Error: --mount needs storage enabled (fetched blocks are cached there)\n", .{});
+        std.process.exit(1);
+    }
+
+    var node = try nomadfs.Node.init(allocator, config);
+    defer node.deinit();
+    std.debug.print("NomadFS {s}: device {x}\n", .{ config.node.nickname, node.device_identity.deviceId().bytes[0..6] });
+    node.bootstrap(config.network.bootstrap_peers, config.node.swarm_key) catch |err| {
+        std.debug.print("Bootstrap error: {any}\n", .{err});
+    };
+
+    var running = std.atomic.Value(bool).init(true);
+    const run_thread = try std.Thread.spawn(.{}, runUntilStopped, .{ &node, &running, config });
+    defer {
+        running.store(false, .release);
+        run_thread.join();
+    }
+
+    if (mountpoint.len >= mounted_at.len) return error.NameTooLong;
+    @memcpy(mounted_at[0..mountpoint.len], mountpoint);
+    mounted_at[mountpoint.len] = 0;
+    mounted_len = mountpoint.len;
+    const handler = std.os.linux.Sigaction{
+        .handler = .{ .handler = onStopSignal },
+        .mask = std.os.linux.sigemptyset(),
+        .flags = 0,
+    };
+    _ = std.os.linux.sigaction(.INT, &handler, null);
+    _ = std.os.linux.sigaction(.TERM, &handler, null);
+
+    var mount = try nomadfs.fs.fuse.Mount.init(allocator, node.block_manager, node.store.?);
+    defer mount.deinit();
+    std.debug.print("Mounted at {s} (Ctrl-C to unmount)\n", .{mountpoint});
+    mount.serve(mountpoint) catch |err| {
+        std.debug.print("Error: mount failed: {any}\n", .{err});
+        if (err == error.FusermountNotFound) std.debug.print("Install fuse3 (fusermount3).\n", .{});
+        return err;
+    };
+    std.debug.print("Unmounted.\n", .{});
+}
+
+fn runUntilStopped(node: *nomadfs.Node, running: *std.atomic.Value(bool), config: config_mod.Config) void {
+    node.run(running, config) catch |err| {
+        std.debug.print("Node stopped: {any}\n", .{err});
+    };
 }
 
 fn pairCommand(allocator: std.mem.Allocator, config: config_mod.Config, address: ?[]const u8) !void {
