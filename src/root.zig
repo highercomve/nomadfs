@@ -89,8 +89,8 @@ pub const Node = struct {
             // A folder that cannot be read is reported, not fatal: the node
             // still serves everything else.
             for (cfg.shares) |share| {
-                std.debug.print("Sharing '{s}' from {s}...\n", .{ share.name, share.path });
-                index.add(share.name, share.path) catch |err| {
+                std.debug.print("Sharing '{s}' from {s} (indexing in the background)\n", .{ share.name, share.path });
+                index.register(share.name, share.path) catch |err| {
                     std.debug.print("Share '{s}' unavailable: {any}\n", .{ share.name, err });
                 };
             }

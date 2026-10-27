@@ -71,6 +71,14 @@ pub const ShareIndex = struct {
     /// Shares `path` as `name`, replacing any share of that name. The
     /// folder is scanned before this returns, so it is listed right away.
     pub fn add(self: *ShareIndex, name: []const u8, path: []const u8) !void {
+        try self.register(name, path);
+        self.rescanOne(name);
+    }
+
+    /// Records a share without scanning it: it is listed once the rescan
+    /// thread (start) has scanned it, which it does right away. Startup
+    /// uses this so a large folder never delays the node coming up.
+    pub fn register(self: *ShareIndex, name: []const u8, path: []const u8) !void {
         if (!codec.isValidName(name)) return error.InvalidShareName;
         {
             // Fail early on a path that is not a readable folder.
@@ -93,7 +101,6 @@ pub const ShareIndex = struct {
                 try self.shares.insert(self.allocator, at.index, .{ .name = owned_name, .path = owned_path });
             }
         }
-        self.rescanOne(name);
     }
 
     /// Stops sharing `name`: its files are no longer served. Dir and
@@ -260,6 +267,8 @@ pub const ShareIndex = struct {
 
     fn rescanLoop(self: *ShareIndex) void {
         const step = 200 * std.time.ns_per_ms;
+        // Scan at once: registered shares are unlisted until scanned.
+        self.rescanAll();
         var waited: u64 = 0;
         while (self.running.load(.acquire)) {
             sync.sleep(step);

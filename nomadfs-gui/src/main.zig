@@ -33,10 +33,11 @@ pub const Events = struct {
 pub const Commands = struct {
     defaults: void = undefined,
 
-    /// Slow or waiting commands run on a worker thread so the window stays
-    /// responsive: the folder picker waits for the user, sharing scans a
-    /// folder, and the rest talk to other devices.
-    pub const async_commands = .{ "pick_folder", "share_add", "remote_devices", "browse", "download", "read_range", "mount_start", "mount_stop", "invite_create", "invite_accept" };
+    /// Everything that touches the node, the network or the disk runs on a
+    /// worker thread: they share one lock, and a command waiting on it on
+    /// the UI thread would freeze the window (node_open behind a share scan
+    /// did, for 20 s on a phone). Only quick config-file reads stay inline.
+    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download" };
 
     /// `invoke("invite_create", { config_path })`: one-time invite code.
     pub fn invite_create(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.InviteInfo {
