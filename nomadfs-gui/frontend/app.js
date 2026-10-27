@@ -118,15 +118,16 @@ function row({ icon, iconClass = "", headline, meta, monoMeta = false, onClick, 
 
 function setView(view) {
   document.body.dataset.view = view;
-  for (const item of document.querySelectorAll(".nav-item[data-view]")) {
+  for (const item of document.querySelectorAll(".nav-item[data-view], .bar-item[data-view]")) {
     item.classList.toggle("active", item.dataset.view === view);
   }
+  window.scrollTo(0, 0);
   if (view === "text") $("text-drop").open = true;
   try { localStorage.setItem("view", view); } catch {}
   renderNavDevices();
 }
 
-for (const item of document.querySelectorAll(".nav-item[data-view]")) {
+for (const item of document.querySelectorAll(".nav-item[data-view], .bar-item[data-view]")) {
   item.addEventListener("click", () => {
     setView(item.dataset.view);
     if (item.dataset.view === "browse" && path.length) showDevices();
