@@ -80,6 +80,7 @@ pub const Node = struct {
         // Serve our blocks to peers repairing from us.
         discovery_node.block_store = store;
         discovery_node.nickname = cfg.node.nickname;
+        discovery_node.swarm_epoch = cfg.node.swarm_epoch;
 
         var shares: ?*fs.ShareIndex = null;
         if (store) |s| {
@@ -204,6 +205,63 @@ pub const Node = struct {
         }
         self.connection_manager.deinit();
         self.allocator.destroy(self.connection_manager);
+    }
+
+    pub const Delivery = struct {
+        /// Trust-store label, or a short device ID for unpaired devices.
+        name: []u8,
+        status: enum { delivered, refused, not_paired, offline, failed },
+    };
+
+    /// Hands a new swarm key to every reachable *trusted* device. Peers
+    /// whose verified device identity isn't in the trust store are skipped
+    /// (they only know the old key); trusted devices that can't be reached
+    /// are reported offline. Names are owned by the caller (free each and
+    /// the slice).
+    pub fn rotateSwarmKey(self: *Node, allocator: std.mem.Allocator, new_key: [32]u8, epoch: u64) ![]Delivery {
+        var out: std.ArrayList(Delivery) = .empty;
+        errdefer {
+            for (out.items) |d| allocator.free(d.name);
+            out.deinit(allocator);
+        }
+        var reached: std.ArrayList(net.id.NodeID) = .empty;
+        defer reached.deinit(allocator);
+
+        const peers = try fs.remote.knownPeers(self.block_manager, allocator);
+        defer allocator.free(peers);
+        for (peers) |peer| {
+            const conn = self.block_manager.connectTo(peer) catch continue;
+            defer conn.deinit();
+            const dev = conn.getRemoteDeviceID() orelse continue;
+            const entry = self.trust_store.lookup(dev);
+            const trusted = entry != null and self.trust_store.isTrusted(dev);
+            if (!trusted) {
+                const hex = std.fmt.bytesToHex(dev.bytes[0..4].*, .lower);
+                try out.append(allocator, .{ .name = try allocator.dupe(u8, &hex), .status = .not_paired });
+                continue;
+            }
+            try reached.append(allocator, dev);
+            const ok = self.discovery_node.sendRotation(conn, new_key, epoch) catch |err| blk: {
+                std.debug.print("rotation: sending to {s} failed: {any}\n", .{ entry.?.labelSlice(), err });
+                break :blk null;
+            };
+            try out.append(allocator, .{
+                .name = try allocator.dupe(u8, entry.?.labelSlice()),
+                .status = if (ok) |accepted| (if (accepted) .delivered else .refused) else .failed,
+            });
+        }
+        // Paired devices that weren't reachable keep the old key.
+        for (self.trust_store.list()) |e| {
+            const dev = net.id.NodeID.fromPublicKey(e.public_key);
+            if (!self.trust_store.isTrusted(dev)) continue;
+            const seen = for (reached.items) |r| {
+                if (r.eql(dev)) break true;
+            } else false;
+            if (seen) continue;
+            try out.append(allocator, .{ .name = try allocator.dupe(u8, e.labelSlice()), .status = .offline });
+        }
+        self.discovery_node.swarm_epoch = epoch;
+        return out.toOwnedSlice(allocator);
     }
 
     pub fn run(self: *Node, running: *std.atomic.Value(bool), cfg: config.Config) !void {
@@ -331,6 +389,11 @@ pub const metrics = @import("metrics.zig");
 pub const errors = @import("errors.zig");
 pub const resilience = @import("net/resilience.zig");
 
+test "Node.rotateSwarmKey compiles" {
+    std.testing.refAllDecls(Node);
+    _ = &Node.rotateSwarmKey;
+}
+
 test {
     // Compile every module and all of its declarations, including modules
     // nothing imports yet, so broken code and tests cannot hide.
@@ -345,6 +408,7 @@ test {
         @import("device/auth.zig"),
         @import("device/identity.zig"),
         @import("device/invite.zig"),
+        @import("device/rotation.zig"),
         @import("device/pairing.zig"),
         @import("device/paths.zig"),
         @import("device/qr.zig"),

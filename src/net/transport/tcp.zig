@@ -53,6 +53,11 @@ const TcpConnectionImpl = struct {
         return id.NodeID.fromPublicKey(self.noise_stream.remote_static);
     }
 
+    pub fn getRemoteDeviceID(ctx: *anyopaque) ?id.NodeID {
+        const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
+        return self.noise_stream.remote_device_id;
+    }
+
     pub fn isClosed(ctx: *anyopaque) bool {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
         return self.closed.load(.acquire) or self.yamux.isClosed();
@@ -102,6 +107,7 @@ const tcp_connection_vtable = network.Connection.ConnectionVTable{
     .acceptStream = TcpConnectionImpl.acceptStream,
     .getPeerAddress = TcpConnectionImpl.getPeerAddress,
     .getRemoteNodeID = TcpConnectionImpl.getRemoteNodeID,
+    .getRemoteDeviceID = TcpConnectionImpl.getRemoteDeviceID,
     .close = TcpConnectionImpl.close,
     .retain = TcpConnectionImpl.retain,
     .deinit = TcpConnectionImpl.deinit,

@@ -213,6 +213,10 @@ pub const Connection = struct {
         /// Get the NodeID of the remote peer (derived from handshake)
         getRemoteNodeID: *const fn (ctx: *anyopaque) id.NodeID,
 
+        /// The device identity the peer proved in the handshake (hash of
+        /// its Ed25519 key), when the transport authenticates devices.
+        getRemoteDeviceID: ?*const fn (ctx: *anyopaque) ?id.NodeID = null,
+
         /// Signal shutdown of the entire connection. Frees nothing.
         close: *const fn (ctx: *anyopaque) void,
 
@@ -264,6 +268,15 @@ pub const Connection = struct {
         };
 
         return v.getPeerAddress(p);
+    }
+
+    /// The peer's verified device identity, or null when the transport
+    /// did not authenticate one.
+    pub fn getRemoteDeviceID(self: Connection) ?id.NodeID {
+        const p = self.ptr orelse return null;
+        const v = self.vtable orelse return null;
+        const f = v.getRemoteDeviceID orelse return null;
+        return f(p);
     }
 
     pub fn getRemoteNodeID(self: Connection) id.NodeID {

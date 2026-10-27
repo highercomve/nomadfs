@@ -60,6 +60,8 @@ pub const Config = struct {
         nickname: []const u8,
         swarm_key: []const u8,
         key_path: ?[]const u8 = null,
+        /// Bumped by every swarm key rotation; older rotations are refused.
+        swarm_epoch: u64 = 0,
     };
 
     pub const StorageConfig = struct {
@@ -230,6 +232,8 @@ fn applyConfigEntry(
         replaceString(allocator, &config.node.nickname, try allocator.dupe(u8, val));
     } else if (std.mem.eql(u8, key, "swarm_key")) {
         replaceString(allocator, &config.node.swarm_key, try validateSwarmKey(val, allocator));
+    } else if (std.mem.eql(u8, key, "swarm_epoch")) {
+        config.node.swarm_epoch = try std.fmt.parseInt(u64, val, 10);
     } else if (std.mem.eql(u8, key, "key_path")) {
         const path = try allocator.dupe(u8, val);
         if (config.node.key_path) |old| allocator.free(old);

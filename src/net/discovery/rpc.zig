@@ -42,6 +42,9 @@ pub const MessageType = enum(u8) {
     GET_SWARM = 18,
     /// Reply to GET_SWARM: the encoded manifest (fs/manifest.zig).
     SWARM = 19,
+    /// A new swarm key from a trusted device (device/rotation.zig).
+    /// Answered with STORE_ACK.
+    ROTATE_KEY = 20,
 };
 
 pub const FindValueResult = union(enum) {
@@ -81,6 +84,7 @@ pub const MessagePayload = union(MessageType) {
     SHARES: struct { nickname: []const u8, listing: []const u8 },
     GET_SWARM: void,
     SWARM: struct { manifest: []const u8 },
+    ROTATE_KEY: struct { epoch: u64, new_key: [32]u8, signer_key: [32]u8, signature: [64]u8 },
 };
 
 pub const Message = struct {
@@ -163,6 +167,12 @@ pub const Message = struct {
                 try writer.writeAll(p.listing);
             },
             .GET_SWARM => {},
+            .ROTATE_KEY => |p| {
+                try writer.writeInt(u64, p.epoch, .big);
+                try writer.writeAll(&p.new_key);
+                try writer.writeAll(&p.signer_key);
+                try writer.writeAll(&p.signature);
+            },
             .SWARM => |p| {
                 try writer.writeInt(u32, @intCast(p.manifest.len), .big);
                 try writer.writeAll(p.manifest);
@@ -256,6 +266,16 @@ pub const Message = struct {
                 break :blk MessagePayload{ .SHARES = .{ .nickname = nickname, .listing = try readValue(allocator, reader) } };
             },
             .GET_SWARM => MessagePayload{ .GET_SWARM = {} },
+            .ROTATE_KEY => blk: {
+                const epoch = try reader.readInt(u64, .big);
+                var new_key: [32]u8 = undefined;
+                try reader.readNoEof(&new_key);
+                var signer_key: [32]u8 = undefined;
+                try reader.readNoEof(&signer_key);
+                var signature: [64]u8 = undefined;
+                try reader.readNoEof(&signature);
+                break :blk MessagePayload{ .ROTATE_KEY = .{ .epoch = epoch, .new_key = new_key, .signer_key = signer_key, .signature = signature } };
+            },
             .SWARM => MessagePayload{ .SWARM = .{ .manifest = try readValue(allocator, reader) } },
         };
 

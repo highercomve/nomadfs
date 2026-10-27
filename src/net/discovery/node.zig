@@ -8,6 +8,7 @@ const lookup_mod = @import("lookup.zig");
 const StorageEngine = @import("../../storage/engine.zig").StorageEngine;
 const providers_mod = @import("providers.zig");
 const device_trust = @import("../../device/trust.zig");
+const device_rotation = @import("../../device/rotation.zig");
 const identity_mod = @import("../../device/identity.zig");
 
 /// Bounds on values peers can STORE here. Without them any peer could fill
@@ -43,6 +44,11 @@ pub const Node = struct {
     /// Answers GET_SWARM with the swarm folder's manifest. Null: an empty
     /// manifest.
     swarm_source: ?ShareSource = null,
+    /// Told about an accepted swarm key rotation (key, epoch). Without one
+    /// the node refuses rotations.
+    rotation_sink: ?RotationSink = null,
+    /// This device's current key epoch (config node.swarm_epoch).
+    swarm_epoch: u64 = 0,
     /// Human name sent with SHARES (config node.nickname).
     nickname: []const u8 = "",
     /// This node's Ed25519 identity, used to sign revocations it pushes.
@@ -59,6 +65,13 @@ pub const Node = struct {
     pub const ShareSource = struct {
         ctx: *anyopaque,
         listFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
+    };
+
+    pub const RotationSink = struct {
+        ctx: *anyopaque,
+        /// Persist and adopt the new key (restarting the node). Called
+        /// from a request thread after the rotation was verified.
+        applyFn: *const fn (ctx: *anyopaque, new_key: [32]u8, epoch: u64) void,
     };
 
     pub fn init(allocator: std.mem.Allocator, manager: *network.manager.ConnectionManager, swarm_key: []const u8) Node {
@@ -524,6 +537,30 @@ pub const Node = struct {
         }
     }
 
+    /// Hands `new_key` (epoch) to `conn`'s peer, signed with this device's
+    /// identity. Returns whether the peer adopted it. Only call this for a
+    /// connection whose device is trusted: the key travels to whoever it is.
+    pub fn sendRotation(self: *Node, conn: network.Connection, new_key: [32]u8, epoch: u64) !bool {
+        const identity = self.device_identity orelse return error.NoDeviceIdentity;
+        const signature = try identity.sign(&device_rotation.message(epoch, new_key));
+        const stream = try conn.openStream();
+        defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
+        const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .ROTATE_KEY = .{
+            .epoch = epoch,
+            .new_key = new_key,
+            .signer_key = identity.publicKey(),
+            .signature = signature,
+        } } };
+        try msg.serialize(stream.writer());
+        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
+        defer response.deinit(self.allocator);
+        return switch (response.payload) {
+            .STORE_ACK => |ack| ack.stored,
+            else => error.InvalidResponse,
+        };
+    }
+
     /// Asks `conn`'s peer for its swarm folder manifest (caller-owned,
     /// allocated with the node's allocator; validate by merging it).
     pub fn fetchSwarm(self: *Node, conn: network.Connection) ![]u8 {
@@ -866,6 +903,7 @@ pub const Node = struct {
             .GET_BLOCK => |p| try self.handleGetBlock(stream, p.cid),
             .GET_SHARES => try self.handleGetShares(stream),
             .GET_SWARM => try self.handleGetSwarm(stream),
+            .ROTATE_KEY => |p| try self.handleRotateKey(stream, conn, p.epoch, p.new_key, p.signer_key, p.signature),
             .PUT_BLOCK => |p| try self.handlePutBlock(stream, p.cid, p.data),
             .REVOKE => |p| try self.handleRevoke(stream, p.device_id, p.signer_key, p.signature),
             .ADD_PROVIDER => |p| try self.handleAddProvider(stream, conn, p.key),
@@ -995,6 +1033,21 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .SHARES = .{ .nickname = self.nickname, .listing = listing } },
         };
+        try response.serialize(stream.writer());
+    }
+
+    fn handleRotateKey(self: *Node, stream: network.Stream, conn: network.Connection, epoch: u64, new_key: [32]u8, signer_key: [32]u8, signature: [64]u8) !void {
+        var accepted = false;
+        if (self.trust_store) |trust| if (self.rotation_sink) |sink| {
+            if (device_rotation.verify(trust, conn.getRemoteDeviceID(), signer_key, signature, epoch, new_key, self.swarm_epoch)) {
+                self.swarm_epoch = epoch;
+                accepted = true;
+                sink.applyFn(sink.ctx, new_key, epoch);
+            } else |err| {
+                std.debug.print("Refused a swarm key rotation: {any}\n", .{err});
+            }
+        };
+        const response = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .STORE_ACK = .{ .stored = accepted } } };
         try response.serialize(stream.writer());
     }
 

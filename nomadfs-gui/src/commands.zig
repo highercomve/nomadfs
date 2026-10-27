@@ -80,6 +80,9 @@ pub fn nodeOpen(gpa: std.mem.Allocator, args: NodeOpenArgs) !void {
     defer gpa.free(path);
 
     const node = mobile.nomadfs_node_new(path.ptr) orelse return error.ConfigInvalid;
+    // A trusted device may rotate the swarm key: adopt it (see onRotation).
+    rememberConfigPath(args.config_path);
+    node.node.discovery_node.rotation_sink = .{ .ctx = &g_rotation, .applyFn = onRotation };
     if (mobile.nomadfs_node_run(node) != 0) {
         mobile.nomadfs_node_free(node);
         return error.NodeFailedToStart;
@@ -1212,6 +1215,83 @@ pub fn inviteAccept(gpa: std.mem.Allocator, args: InviteAcceptArgs) ![]const u8 
 
     const ticket = Ticket.parseAt(joined.ticket_uri, nomadfs.nowSeconds()) catch return gpa.dupe(u8, "");
     return gpa.dupe(u8, ticket.nicknameSlice());
+}
+
+// ---- Swarm key rotation ----
+
+var g_config_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+var g_config_path_len: usize = 0;
+
+fn rememberConfigPath(path: []const u8) void {
+    const n = @min(path.len, g_config_path_buf.len);
+    @memcpy(g_config_path_buf[0..n], path[0..n]);
+    g_config_path_len = n;
+}
+
+const PendingRotation = struct { key: [32]u8 = undefined, epoch: u64 = 0 };
+var g_rotation: PendingRotation = .{};
+
+/// A trusted device sent a new swarm key (already verified by the node).
+/// Runs on a request thread: persist and restart from another thread, so
+/// this request can still be answered.
+fn onRotation(ctx: *anyopaque, new_key: [32]u8, epoch: u64) void {
+    const pending: *PendingRotation = @ptrCast(@alignCast(ctx));
+    pending.* = .{ .key = new_key, .epoch = epoch };
+    const t = std.Thread.spawn(.{}, adoptRotation, .{pending.*}) catch return;
+    t.detach();
+}
+
+fn adoptRotation(rot: PendingRotation) void {
+    nomadfs.sync.sleep(500 * std.time.ns_per_ms);
+    const gpa = std.heap.page_allocator;
+    const path = gpa.dupe(u8, g_config_path_buf[0..g_config_path_len]) catch return;
+    defer gpa.free(path);
+    writeSwarmKey(gpa, path, rot.key, rot.epoch) catch |err| {
+        std.debug.print("rotation: saving the new key failed: {any}\n", .{err});
+        return;
+    };
+    std.debug.print("rotation: adopted swarm key epoch {d}; restarting the node\n", .{rot.epoch});
+    nodeClose();
+    nodeOpen(gpa, .{ .config_path = path }) catch |err| std.debug.print("rotation: restart failed: {any}\n", .{err});
+}
+
+fn writeSwarmKey(gpa: std.mem.Allocator, path: []const u8, key: [32]u8, epoch: u64) !void {
+    const hex = std.fmt.bytesToHex(key, .lower);
+    const key_line = try std.fmt.allocPrint(gpa, "swarm_key = \"{s}\"", .{&hex});
+    defer gpa.free(key_line);
+    const epoch_line = try std.fmt.allocPrint(gpa, "swarm_epoch = {d}", .{epoch});
+    defer gpa.free(epoch_line);
+    try editConfig(gpa, path, .{ .drop_keys = &.{ "swarm_key", "swarm_epoch" }, .append = &.{ key_line, epoch_line } });
+}
+
+pub const RotationEntry = struct { name: []const u8, status: []const u8 };
+
+/// `swarm_rotate_key { config_path }`: a fresh swarm key for every trusted
+/// device that can be reached now; this device adopts it and restarts.
+/// Devices that aren't paired, or are offline, keep the old key and are
+/// listed so they can be invited again.
+pub fn swarmRotateKey(gpa: std.mem.Allocator, args: ListArgs) ![]RotationEntry {
+    var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
+    const epoch = config.node.swarm_epoch + 1;
+    config.deinit(gpa);
+
+    var key: [32]u8 = undefined;
+    try std.Io.Threaded.global_single_threaded.io().randomSecure(&key);
+    defer std.crypto.secureZero(u8, &key);
+
+    const report = blk: {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        const handle = g_node orelse return error.NotRunning;
+        break :blk try handle.node.rotateSwarmKey(gpa, key, epoch);
+    };
+    try writeSwarmKey(gpa, args.config_path, key, epoch);
+    nodeClose();
+    try nodeOpen(gpa, .{ .config_path = args.config_path });
+
+    const out = try gpa.alloc(RotationEntry, report.len);
+    for (report, out) |r, *o| o.* = .{ .name = r.name, .status = @tagName(r.status) };
+    return out;
 }
 
 pub const NicknameArgs = struct { config_path: []const u8, nickname: []const u8 };

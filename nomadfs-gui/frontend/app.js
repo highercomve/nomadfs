@@ -68,7 +68,7 @@ function iconFor(name, dir) {
 }
 
 /** A Material list row: leading icon, headline + meta, optional trailing button. */
-function row({ icon, iconClass = "", headline, meta, monoMeta = false, onClick, action, actions, cols }) {
+function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = false, onClick, action, actions, cols }) {
   if (action && !actions) actions = [action];
   const li = document.createElement("li");
   const lead = document.createElement("span");
@@ -81,10 +81,11 @@ function row({ icon, iconClass = "", headline, meta, monoMeta = false, onClick, 
   h.className = "headline";
   h.textContent = headline;
   text.appendChild(h);
-  if (meta) {
+  for (const [line, mono] of [[meta, monoMeta], [meta2, true]]) {
+    if (!line) continue;
     const m = document.createElement("span");
-    m.className = monoMeta ? "meta mono" : "meta";
-    m.textContent = meta;
+    m.className = mono ? "meta mono" : "meta";
+    m.textContent = line;
     text.appendChild(m);
   }
   li.appendChild(text);
@@ -126,6 +127,19 @@ function row({ icon, iconClass = "", headline, meta, monoMeta = false, onClick, 
   return li;
 }
 
+// ---- Phones: the "More" sheet holds sections without a bar slot ----
+
+function closeMore() { $("more-sheet").hidden = true; }
+$("bar-more").addEventListener("click", () => {
+  const sheet = $("more-sheet");
+  for (const it of sheet.querySelectorAll(".sheet-item")) it.classList.toggle("active", it.dataset.view === document.body.dataset.view);
+  sheet.hidden = !sheet.hidden;
+});
+$("more-sheet").addEventListener("click", (e) => { if (e.target === $("more-sheet")) closeMore(); });
+for (const it of document.querySelectorAll("#more-sheet .sheet-item")) {
+  it.addEventListener("click", () => { closeMore(); setView(it.dataset.view); });
+}
+
 // ---- Views (wide layout: one section at a time, picked in the drawer) ----
 
 function setView(view) {
@@ -133,6 +147,7 @@ function setView(view) {
   for (const item of document.querySelectorAll(".nav-item[data-view], .bar-item[data-view]")) {
     item.classList.toggle("active", item.dataset.view === view);
   }
+  $("bar-more").classList.toggle("active", view === "text" || view === "settings");
   window.scrollTo(0, 0);
   try { localStorage.setItem("view", view); } catch {}
   if (view === "settings") $("devices-refresh").click();
@@ -177,8 +192,14 @@ function renderNavDevices() {
 
 async function refreshState() {
   const state = await invoke("app_info", null);
-  $("info").textContent = `Zig ${state.zig} · ${state.mode} · ${state.dev ? "dev" : "release"}`;
-  $("nav-info").textContent = $("info").textContent;
+  // Credit line; the build details stay available as a tooltip.
+  const build = `Zig ${state.zig} · ${state.mode} · ${state.dev ? "dev" : "release"}`;
+  for (const el of [$("info"), $("nav-info")]) {
+    el.textContent = "Built with Zig & Oriel · foreachdeveloper";
+    el.title = build;
+    el.classList.add("credit");
+    el.onclick = () => invoke("open_path", { path: "https://www.foreachdeveloper.com/" }).catch(() => {});
+  }
 }
 
 let running = false;
@@ -1280,7 +1301,8 @@ $("devices-refresh").addEventListener("click", async () => {
         icon: "device",
         iconClass: "device",
         headline: d.label || "Unnamed device",
-        meta: `${online ? "Online · " : ""}${d.fingerprint} · trusted since ${formatDate(d.added_at)}`,
+        meta: `${online ? "Online · " : "Offline · "}trusted since ${formatDate(d.added_at)}`,
+        meta2: d.fingerprint,
       }));
     }
     for (const d of unpaired) {
@@ -1296,6 +1318,40 @@ $("devices-refresh").addEventListener("click", async () => {
   } catch (err) {
     snack(`Devices failed: ${err}`);
   }
+});
+
+// ---- Swarm key rotation ----
+
+$("rotate-key").addEventListener("click", async () => {
+  if (!running) return snack("Start the node first");
+  let trusted = [], reachable = [];
+  try {
+    trusted = await invoke("devices_list", { config_path: await ensureConfig() });
+    reachable = await invoke("remote_devices", null);
+  } catch {}
+  const online = new Set(reachable.map((d) => d.nickname));
+  const gets = trusted.filter((d) => online.has(d.label)).map((d) => d.label);
+  const offline = trusted.filter((d) => !online.has(d.label)).map((d) => d.label);
+  const unpaired = reachable.filter((d) => !trusted.some((t) => t.label === d.nickname)).map((d) => d.nickname || d.peer.slice(0, 8));
+  const lines = [
+    "Use this if the swarm key may have leaked. A new key goes to your paired devices that are online; anything that only knew the old key is cut off.",
+    gets.length ? `Gets the new key: ${gets.join(", ")}.` : "No paired device is online: only this device changes key.",
+  ];
+  if (offline.length) lines.push(`Offline, keeps the old key (invite again later): ${offline.join(", ")}.`);
+  if (unpaired.length) lines.push(`Not paired, will be cut off: ${unpaired.join(", ")}.`);
+  const ok = await askDialog({ title: "Rotate the swarm key?", text: lines.join("\n\n"), confirm: "Rotate key", danger: true });
+  if (!ok) return;
+  snack("Rotating the swarm key…", 30000);
+  try {
+    const report = await invoke("swarm_rotate_key", { config_path: await ensureConfig() });
+    const label = { delivered: "got the new key", refused: "refused it", failed: "couldn't be reached", not_paired: "not paired: cut off", offline: "offline: invite again" };
+    const summary = report.length ? report.map((r) => `${r.name}: ${label[r.status] || r.status}`).join("\n") : "No other devices.";
+    await askDialog({ title: "Swarm key rotated", text: `This device now uses the new key.\n\n${summary}`, confirm: "OK" });
+  } catch (err) {
+    snack(`Rotation failed: ${err}`);
+  }
+  await nodeState();
+  $("devices-refresh").click();
 });
 
 // ---- Startup: the node starts with the app ----

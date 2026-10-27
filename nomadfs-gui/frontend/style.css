@@ -1167,10 +1167,32 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 .table-head.swarm-head .th-act { width: 120px; }
 #swarm-scroll .table-head { display: none; }
 
-/* Phones: Text drop lives under Settings (its bar slot is Swarm). */
-@media (max-width: 839px) {
-  body[data-view="settings"] main > #text-drop { display: flex; }
+/* ---- Phones: "More" sheet ---- */
+.sheet { position: fixed; inset: 0; z-index: 25; display: flex; align-items: flex-end; background: rgb(0 0 0 / .5); }
+.sheet[hidden] { display: none; }
+.sheet-panel {
+  width: 100%;
+  padding: 8px 12px calc(16px + env(safe-area-inset-bottom));
+  background: var(--plate);
+  border-top: 1px solid var(--rule-strong);
+  border-radius: 14px 14px 0 0;
+  display: flex; flex-direction: column; gap: 4px;
 }
+.sheet-grip { width: 36px; height: 4px; border-radius: 2px; background: var(--rule-strong); margin: 4px auto 10px; }
+.sheet-item {
+  display: flex; align-items: center; gap: 16px;
+  padding: 12px; border: none; border-radius: 8px;
+  background: transparent; color: var(--sand); text-align: left; cursor: pointer;
+  font: 500 15px var(--font);
+}
+.sheet-item:hover, .sheet-item.active { background: rgb(246 176 66 / .1); }
+.sheet-item svg { width: 22px; height: 22px; flex: none; fill: var(--amber); }
+.sheet-item span { display: flex; flex-direction: column; gap: 2px; }
+.sheet-item small { font: 400 12px var(--font); color: var(--sand-dim); }
+
+/* Trusted devices: status and fingerprint each get a full line. */
+#devices-list .row-text .meta { white-space: normal; overflow: visible; text-overflow: clip; }
+#devices-list .row-text .meta + .meta { margin-top: 1px; }
 
 @media (min-width: 840px) {
   body[data-view="swarm"] main { overflow: hidden; }
@@ -1207,3 +1229,8 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 .ask-panel .supporting { margin: 0; }
 .ask-panel .field[hidden], .ask-panel p[hidden] { display: none; }
 .btn.filled.danger { background: linear-gradient(180deg, #ff8a7a, #e0533f); color: #1d0905; }
+
+.ask-panel #ask-text { white-space: pre-line; }
+
+.credit { cursor: pointer; }
+.credit:hover { color: var(--amber); }
