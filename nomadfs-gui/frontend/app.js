@@ -141,6 +141,7 @@ async function startNode() {
   await nodeState();
   if (running) {
     loadShares();
+    deviceRetries = 0;
     showDevices();
   }
 }
@@ -190,6 +191,9 @@ function busy(on) {
 }
 
 let devices = [];
+// Right after the node starts, peers are still being dialed: retry the
+// empty device list a few times before settling on "none reachable".
+let deviceRetries = 0;
 
 async function showDevices() {
   path = [];
@@ -211,8 +215,13 @@ async function showDevices() {
   list.replaceChildren();
   if (!devices.length) {
     setEmpty("No devices reachable yet. Connect one with its code below.");
+    if (deviceRetries < 5) {
+      deviceRetries++;
+      setTimeout(() => { if (path.length === 0) showDevices(); }, 2000);
+    }
     return;
   }
+  deviceRetries = 0;
   setEmpty("");
   for (const d of devices) {
     const total = d.shares.reduce((s, x) => s + x.size, 0);
