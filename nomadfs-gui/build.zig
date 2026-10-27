@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
         .tray = false,
         .menu = false,
         .store = false,
-        .dialog = false,
+        .dialog = true, // native folder picker for shared folders
         .notification = false,
         .updater = false,
         .sql = false,
@@ -59,9 +59,9 @@ pub fn build(b: *std.Build) void {
         },
         .package = .{
             .id = "net.nomadfs.app",
-            .name = "Nomadfs Gui",
+            .name = "NomadFS",
             // .publisher = "Your Name <you@example.com>", // default: from the app id
-            .summary = "Nomadfs Gui, built with Oriel",
+            .summary = "Share folders across your devices; files download on demand",
             .version = "0.1.0",
         },
         .android = .{

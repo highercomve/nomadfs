@@ -32,6 +32,18 @@ pub const Events = struct {
 pub const Commands = struct {
     defaults: void = undefined,
 
+    /// Slow or waiting commands run on a worker thread so the window stays
+    /// responsive: the folder picker waits for the user, sharing scans a
+    /// folder, and the rest talk to other devices.
+    pub const async_commands = .{ "pick_folder", "share_add", "remote_devices", "browse", "download", "join" };
+
+    /// `invoke("pick_folder")`: the system folder picker. Null when the
+    /// user cancels.
+    pub fn pick_folder(gpa: std.mem.Allocator) !?commands.PickedFolder {
+        const folder = try oriel.dialog.openFolder(gpa, .{ .title = "Choose a folder to share" }) orelse return null;
+        return try commands.pickedFolder(gpa, folder.id, folder.name);
+    }
+
     /// `invoke("app_info")`: how the zig side was built.
     pub fn app_info(_: std.mem.Allocator) struct {
         zig: []const u8,

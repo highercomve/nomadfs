@@ -416,26 +416,47 @@ async function removeShare(name) {
   loadShares();
 }
 
-$("share-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const name = $("share-name").value.trim();
-  const sharePath = $("share-path").value.trim();
-  if (!name || !sharePath) {
-    snack("Give the share a name and a folder path");
-    return;
-  }
+/** Shows the share form for `path`, with the name pre-filled. */
+function stageShare(path, name) {
+  $("share-path").textContent = path;
+  $("share-name").value = name || path.split("/").filter(Boolean).pop() || "";
+  $("share-form").hidden = false;
+}
+
+async function pickFolder() {
   if (!running) {
     snack("Start the node first");
     return;
   }
+  try {
+    const picked = await invoke("pick_folder", null);
+    if (picked) stageShare(picked.path, picked.name);
+  } catch (err) {
+    snack(`${err}`.includes("UnsupportedFolder")
+      ? "That folder isn't on this device's storage. Pick one from internal storage or an SD card."
+      : `Folder picker failed: ${err}`);
+  }
+}
+
+$("share-pick").addEventListener("click", pickFolder);
+$("share-repick").addEventListener("click", pickFolder);
+$("share-cancel").addEventListener("click", () => { $("share-form").hidden = true; });
+
+$("share-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const name = $("share-name").value.trim();
+  const sharePath = $("share-path").textContent;
+  if (!name || !sharePath) {
+    snack("Give the share a name");
+    return;
+  }
   const btn = e.submitter;
   if (btn) btn.disabled = true;
-  snack(`Scanning ${sharePath}…`, 60000);
+  snack(`Indexing ${sharePath}…`, 120000);
   try {
     await invoke("share_add", { config_path: await ensureConfig(), name, path: sharePath });
     snack(`Sharing ${name}`);
-    $("share-name").value = "";
-    $("share-path").value = "";
+    $("share-form").hidden = true;
   } catch (err) {
     snack(`Share failed: ${err}`);
   }
@@ -460,10 +481,7 @@ async function storageSetup() {
     const b = document.createElement("button");
     b.type = "button";
     b.textContent = label;
-    b.addEventListener("click", () => {
-      $("share-name").value = label;
-      $("share-path").value = p;
-    });
+    b.addEventListener("click", () => stageShare(p, label));
     presets.appendChild(b);
   }
   presets.hidden = false;

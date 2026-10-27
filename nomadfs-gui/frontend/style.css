@@ -570,3 +570,23 @@ main { padding-bottom: calc(104px + env(safe-area-inset-bottom)); }
 @media (min-width: 840px) and (prefers-color-scheme: light) {
   .nav-drawer { background: var(--md-surface-container); }
 }
+
+/* ---- Folder picker ---- */
+.actions.start { justify-content: flex-start; }
+.btn.with-icon { display: inline-flex; align-items: center; gap: 8px; padding-left: 16px; }
+.btn.with-icon svg { width: 18px; height: 18px; fill: currentColor; }
+.stack[hidden] { display: none; }
+.picked {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 8px 8px 12px;
+  border-radius: 12px;
+  background: var(--md-surface-container-high);
+}
+.picked-path { flex: 1; min-width: 0; font: 13px/1.4 var(--mono); overflow-wrap: anywhere; }
+
+/* Phones: the navigation bar steps aside while the keyboard is up. */
+@media (max-width: 839px) {
+  body:has(input:focus, textarea:focus) .nav-bar { display: none; }
+}

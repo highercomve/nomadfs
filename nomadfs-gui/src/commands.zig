@@ -408,6 +408,71 @@ pub fn sharesLocal(gpa: std.mem.Allocator) ![]ShareInfo {
     return out;
 }
 
+pub const PickedFolder = struct { path: []const u8, name: []const u8 };
+
+/// Turns the picker's folder id into a path the scanner can read: the path
+/// itself on desktops; on Android, the SAF tree URI of a shared-storage
+/// folder (`.../tree/primary%3ADCIM%2FCamera`) mapped onto
+/// /storage/emulated/0/DCIM/Camera, which all-files access lets us read
+/// directly. Folders of other providers (cloud drives) have no path.
+pub fn pickedFolder(gpa: std.mem.Allocator, id: []const u8, name: []const u8) !PickedFolder {
+    if (!builtin.abi.isAndroid()) return .{ .path = try gpa.dupe(u8, id), .name = try gpa.dupe(u8, name) };
+    return .{ .path = try treeUriToPath(gpa, id), .name = try gpa.dupe(u8, name) };
+}
+
+fn treeUriToPath(gpa: std.mem.Allocator, uri: []const u8) ![]const u8 {
+    const authority = "content://com.android.externalstorage.documents/tree/";
+    if (!std.mem.startsWith(u8, uri, authority)) return error.UnsupportedFolder;
+    var encoded = uri[authority.len..];
+    if (std.mem.indexOfScalar(u8, encoded, '/')) |slash| encoded = encoded[0..slash];
+    const doc_id = try percentDecode(gpa, encoded);
+    defer gpa.free(doc_id);
+    const colon = std.mem.indexOfScalar(u8, doc_id, ':') orelse return error.UnsupportedFolder;
+    const volume = doc_id[0..colon];
+    const rel = std.mem.trim(u8, doc_id[colon + 1 ..], "/");
+    if (std.mem.indexOf(u8, rel, "..") != null or volume.len == 0 or std.mem.indexOfScalar(u8, volume, '/') != null)
+        return error.UnsupportedFolder;
+    const root = if (std.mem.eql(u8, volume, "primary"))
+        try gpa.dupe(u8, "/storage/emulated/0")
+    else
+        try std.fmt.allocPrint(gpa, "/storage/{s}", .{volume}); // SD cards: /storage/XXXX-XXXX
+    defer gpa.free(root);
+    if (rel.len == 0) return gpa.dupe(u8, root);
+    return std.fs.path.join(gpa, &.{ root, rel });
+}
+
+fn percentDecode(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+    const out = try gpa.alloc(u8, text.len);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '%' and i + 2 < text.len) {
+            out[n] = std.fmt.parseInt(u8, text[i + 1 .. i + 3], 16) catch return error.UnsupportedFolder;
+            i += 2;
+        } else {
+            out[n] = text[i];
+        }
+        n += 1;
+    }
+    return gpa.realloc(out, n);
+}
+
+test "commands: SAF tree URIs map onto shared storage paths" {
+    const gpa = testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "content://com.android.externalstorage.documents/tree/primary%3ADCIM%2FCamera", "/storage/emulated/0/DCIM/Camera" },
+        .{ "content://com.android.externalstorage.documents/tree/primary%3A", "/storage/emulated/0" },
+        .{ "content://com.android.externalstorage.documents/tree/1A2B-3C4D%3APhotos", "/storage/1A2B-3C4D/Photos" },
+    };
+    for (cases) |c| {
+        const path = try treeUriToPath(gpa, c[0]);
+        defer gpa.free(path);
+        try testing.expectEqualStrings(c[1], path);
+    }
+    try testing.expectError(error.UnsupportedFolder, treeUriToPath(gpa, "content://com.google.android.apps.docs.storage/tree/abc"));
+    try testing.expectError(error.UnsupportedFolder, treeUriToPath(gpa, "content://com.android.externalstorage.documents/tree/primary%3A..%2Fx"));
+}
+
 pub const ShareAddArgs = struct { config_path: []const u8, name: []const u8, path: []const u8 };
 
 /// `invoke("share_add", { config_path, name, path })`: scans the folder,
