@@ -43,6 +43,34 @@ File contents are not in the manifest. A file's bytes stay on the device that
 added it and travel when someone opens it: from the local cache first, then
 from the device that added it, then from any device that has it cached.
 
+# [Backup devices]($heading.id('backup'))
+
+A file added from a phone is only readable while that phone is reachable,
+unless another device has a copy. A **backup device** keeps a copy of every
+file in the swarm folder: give the job to a computer that stays on, such as a
+desktop or a home server, and the folder stays readable when the phone is off.
+
+- In the app (Linux desktop): **Settings → Swarm backup → Back up the swarm
+  folder here**. The card shows how many files are backed up.
+- On the command line: `--swarm-backup`, or in the configuration:
+
+```ini
+[storage]
+swarm_backup = true
+```
+
+Every 10 seconds the backup device copies each new file, block by block,
+verifying every block against its hash. It asks the device that added the file
+first, then any other device that has a copy, so two backup devices also back
+each other up. It remembers what it copied (`<storage_path>.swarm.json.backup`),
+so a restart doesn't check everything again. Other devices need no setting:
+when the author is offline they try every known device, and the backup
+answers.
+
+The copies stay when a file is deleted or replaced: the space they use isn't
+reclaimed yet. A file that no reachable device has, because its author has
+been offline since adding it, is copied once the author is back.
+
 # [Conflicts]($heading.id('conflicts'))
 
 Every entry carries a version (a Lamport clock and the device that made it) and

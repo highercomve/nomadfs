@@ -40,6 +40,7 @@ All core features are verified on real hardware across Linux desktop and Android
 - **Conflict preservation**: Concurrent edits to the same path are preserved rather than overwritten—the higher version keeps the path while the competing version is renamed to `name (conflict from <device>).ext`.
 - **Edit precedence**: Concurrent edits always win over deletes. Deletes propagate as tombstones.
 - **Distributed content fetching**: File content remains on the author's device and is pulled on demand by peers, after which any caching peer can serve it.
+- **Backup devices**: A desktop or server with `swarm_backup = true` (`--swarm-backup`, or Settings → Swarm backup in the app) keeps a copy of every file, so the folder stays readable while the device that added a file is offline.
 
 ### Desktop Mount (Linux FUSE)
 - **Direct kernel protocol**: Speaks the FUSE kernel protocol on `/dev/fuse` directly (no `libfuse`), mounting unprivileged through `fusermount3`.

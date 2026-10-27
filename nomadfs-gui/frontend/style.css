@@ -1280,4 +1280,4 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 .toggle-row input[type="checkbox"]:focus-visible { outline: 1.5px solid rgb(246 176 66 / .5); outline-offset: 2px; }
 .supporting.small { font-size: 13px; margin: 0; }
 .supporting.small:empty { display: none; }
-#background-section[hidden] { display: none; }
+#background-section[hidden], #backup-section[hidden] { display: none; }

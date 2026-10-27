@@ -23,6 +23,8 @@ const Options = struct {
     mountpoint: ?[]const u8 = null,
     /// --share Name:/path, added to the configured shares.
     shares: std.ArrayList([]const u8) = .empty,
+    /// --swarm-backup: keep a copy of the whole swarm folder.
+    swarm_backup: bool = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -44,6 +46,7 @@ pub fn main(init: std.process.Init) !void {
         };
         try config.addShare(allocator, share.name, share.path);
     }
+    if (options.swarm_backup) config.storage.swarm_backup = true;
 
     switch (options.command) {
         .pair => try pairCommand(allocator, config, options.address),
@@ -83,6 +86,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Optio
             options.mountpoint = try nextValue(args, &i, "--mount");
         } else if (std.mem.eql(u8, arg, "--share")) {
             try options.shares.append(arena, try nextValue(args, &i, "--share"));
+        } else if (std.mem.eql(u8, arg, "--swarm-backup")) {
+            options.swarm_backup = true;
         } else if (std.mem.eql(u8, arg, "--address")) {
             options.address = try nextValue(args, &i, "--address");
         } else if (std.mem.startsWith(u8, arg, "-")) {
@@ -143,6 +148,10 @@ fn printHelp() void {
         \\  --revoke <id>      Remove a trusted device by ID or fingerprint
         \\  --share Name:/path Share a folder with the swarm (repeatable; also
         \\                     `share = "Name:/path"` in the config)
+        \\  --swarm-backup     Keep a copy of every swarm folder file on this device,
+        \\                     so the folder stays readable while the device that
+        \\                     added a file is offline (also `swarm_backup = true`
+        \\                     under [storage])
         \\  --invite           Print a one-time invite code (10 min, one use) that
         \\                     lets another device join this swarm; the swarm key
         \\                     travels encrypted and is never shown
@@ -170,6 +179,7 @@ fn loadConfig(allocator: std.mem.Allocator, config_path: ?[]const u8) !config_mo
 fn runNode(allocator: std.mem.Allocator, config: config_mod.Config) !void {
     std.debug.print("NomadFS Node: {s} (Storage: {any})\n", .{ config.node.nickname, config.storage.enabled });
     std.debug.print("Listening on port: {d}\n", .{config.network.port});
+    if (config.storage.swarm_backup) std.debug.print("Backing up the swarm folder on this device\n", .{});
 
     var node = try nomadfs.Node.init(allocator, config);
     defer node.deinit();

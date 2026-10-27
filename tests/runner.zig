@@ -18,4 +18,5 @@ test {
     _ = @import("cluster/share_test.zig");
     _ = @import("cluster/swarm_test.zig");
     _ = @import("cluster/rotation_test.zig");
+    _ = @import("cluster/swarm_backup_test.zig");
 }

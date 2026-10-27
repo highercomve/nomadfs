@@ -157,7 +157,7 @@ function setView(view) {
   $("bar-more").classList.toggle("active", view === "text" || view === "settings");
   window.scrollTo(0, 0);
   try { localStorage.setItem("view", view); } catch {}
-  if (view === "settings") $("devices-refresh").click();
+  if (view === "settings") { $("devices-refresh").click(); loadBackup(); }
   if (view === "swarm") loadSwarm();
   renderNavDevices();
 }
@@ -1313,6 +1313,41 @@ $("notes-clear").addEventListener("click", () => {
 
 renderNotes();
 updateComposer();
+
+// ---- Swarm backup (desktop) ----
+
+function renderBackup(st) {
+  $("backup-section").hidden = !st.supported;
+  if (!st.supported) return;
+  $("swarm-backup").checked = st.enabled;
+  let text = "";
+  if (st.enabled && !st.running) text = "Starts with the node.";
+  else if (st.enabled && st.last_round === 0) text = "Starting the first backup…";
+  else if (st.enabled) {
+    text = `${st.backed_up} of ${st.files} files backed up (${formatSize(st.bytes)}).`;
+    if (st.unreachable_files) text += ` ${st.unreachable_files} waiting for the device that added them to come online.`;
+  }
+  $("backup-state").textContent = text;
+}
+
+async function loadBackup() {
+  try { renderBackup(await invoke("swarm_backup_status", { config_path: await ensureConfig() })); } catch {}
+}
+
+$("swarm-backup").addEventListener("change", async (e) => {
+  const on = e.target.checked;
+  try {
+    renderBackup(await invoke("swarm_backup_set", { config_path: await ensureConfig(), on }));
+    snack(on ? "This device now backs up the swarm folder" : "Swarm backup turned off; copies already made stay");
+  } catch (err) {
+    e.target.checked = !on;
+    snack(`Couldn't change it: ${err}`);
+  }
+});
+
+// Progress while Settings is open.
+setInterval(() => { if (document.body.dataset.view === "settings" && !document.hidden) loadBackup(); }, 5000);
+loadBackup();
 
 // ---- Background (Android) ----
 

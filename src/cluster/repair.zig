@@ -21,6 +21,19 @@ pub const RepairManager = struct {
         peer: network.Connection,
         root_cid: []const u8,
     ) !usize {
+        return syncWhile(allocator, node, store, peer, root_cid, null);
+    }
+
+    /// `sync`, stopping between blocks with error.Cancelled once
+    /// `keep_going` turns false (a long copy someone switched off).
+    pub fn syncWhile(
+        allocator: std.mem.Allocator,
+        node: *dht.Node,
+        store: *storage.engine.StorageEngine,
+        peer: network.Connection,
+        root_cid: []const u8,
+        keep_going: ?*const std.atomic.Value(bool),
+    ) !usize {
         std.debug.assert(peer.ptr != null);
 
         var stack: std.ArrayList(codec.Cid) = .empty;
@@ -31,6 +44,7 @@ pub const RepairManager = struct {
 
         var fetched: usize = 0;
         while (stack.pop()) |cid| {
+            if (keep_going) |k| if (!k.load(.acquire)) return error.Cancelled;
             if ((try visited.getOrPut(allocator, cid)).found_existing) continue;
             if (visited.count() > max_blocks) return error.DagTooLarge;
 

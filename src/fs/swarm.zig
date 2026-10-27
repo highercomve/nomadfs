@@ -3,6 +3,8 @@
 //! device keeps on disk and merges with its peers' every few seconds; file
 //! bytes stay where they were added and travel only when someone opens
 //! them (from the device that added the file, then anyone who cached it).
+//! A backup device (`swarm_backup`) copies every file as it appears, so the
+//! folder stays readable while the device that added a file is offline.
 
 const std = @import("std");
 const sync = @import("../sync.zig");
@@ -40,6 +42,21 @@ pub const SwarmFolder = struct {
     running: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
+    /// Backup: a copy of every live file in this device's block store.
+    backup_enabled: std.atomic.Value(bool) = .init(false),
+    backup_thread: ?std.Thread = null,
+    /// Serialises setBackup (the app's switch, shutdown).
+    backup_ctl: sync.Mutex = .{},
+    /// Guards `backed_up` and the backup counters.
+    backup_mutex: sync.Mutex = .{},
+    /// Root CIDs of files copied here in full, kept in `<manifest>.backup`
+    /// so a restart doesn't check them all again.
+    backed_up: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+    backed_up_loaded: bool = false,
+    /// Files no reachable device could serve in the last round.
+    backup_unreachable: usize = 0,
+    backup_last_round: u64 = 0,
+
     pub fn create(allocator: std.mem.Allocator, io: std.Io, store: *storage.engine.StorageEngine, self_id: NodeID, self_name: []const u8, file_path: []const u8) !*SwarmFolder {
         const self = try allocator.create(SwarmFolder);
         errdefer allocator.destroy(self);
@@ -60,6 +77,8 @@ pub const SwarmFolder = struct {
 
     pub fn destroy(self: *SwarmFolder) void {
         self.stop();
+        self.setBackup(false) catch {};
+        self.backed_up.deinit(self.allocator);
         self.manifest.deinit();
         self.allocator.free(self.self_name);
         self.allocator.free(self.file_path);
@@ -372,6 +391,201 @@ pub const SwarmFolder = struct {
             waited = 0;
             _ = self.syncNow() catch {};
         }
+    }
+
+    // ---- Backup ----
+
+    pub const BackupStatus = struct {
+        enabled: bool,
+        /// Live files, and how many of them are copied here in full.
+        files: usize,
+        backed_up: usize,
+        /// Size of the copied files.
+        bytes: u64,
+        /// Files no reachable device could serve in the last round.
+        unreachable_files: usize,
+        /// Unix seconds; 0 before the first round.
+        last_round: u64,
+    };
+
+    const BackupWant = struct { cid: [32]u8, author: NodeID };
+
+    /// Turns the backup on or off. On: every live file is copied into this
+    /// device's block store, checked every sync interval for new ones. Other
+    /// devices read from here when the one that added a file is offline (they
+    /// try every known peer). Deleted files' blocks stay (no collection yet).
+    pub fn setBackup(self: *SwarmFolder, on: bool) !void {
+        self.backup_ctl.lock();
+        defer self.backup_ctl.unlock();
+        if (on == self.backup_enabled.load(.acquire)) return;
+        if (!on) {
+            self.backup_enabled.store(false, .release);
+            if (self.backup_thread) |t| t.join();
+            self.backup_thread = null;
+            return;
+        }
+        if (!self.backed_up_loaded) {
+            self.loadBackedUp() catch |err| std.debug.print("swarm backup: starting over ({any})\n", .{err});
+            self.backed_up_loaded = true;
+        }
+        self.backup_enabled.store(true, .release);
+        self.backup_thread = std.Thread.spawn(.{}, backupLoop, .{self}) catch |err| {
+            self.backup_enabled.store(false, .release);
+            return err;
+        };
+    }
+
+    pub fn backupStatus(self: *SwarmFolder) BackupStatus {
+        var files: usize = 0;
+        var done: usize = 0;
+        var bytes: u64 = 0;
+        self.mutex.lock();
+        self.backup_mutex.lock();
+        for (self.manifest.entries.values()) |e| {
+            if (e.deleted or e.kind != .file) continue;
+            files += 1;
+            if (self.backed_up.contains(e.cid)) {
+                done += 1;
+                bytes += e.size;
+            }
+        }
+        const out: BackupStatus = .{
+            .enabled = self.backup_enabled.load(.acquire),
+            .files = files,
+            .backed_up = done,
+            .bytes = bytes,
+            .unreachable_files = self.backup_unreachable,
+            .last_round = self.backup_last_round,
+        };
+        self.backup_mutex.unlock();
+        self.mutex.unlock();
+        return out;
+    }
+
+    fn backupLoop(self: *SwarmFolder) void {
+        const step = 200 * std.time.ns_per_ms;
+        var waited: u64 = self.sync_interval_ns - 3 * std.time.ns_per_s; // first round soon
+        while (self.backup_enabled.load(.acquire)) {
+            sync.sleep(step);
+            waited += step;
+            if (waited < self.sync_interval_ns) continue;
+            waited = 0;
+            self.backupRound() catch |err| std.debug.print("swarm backup: round failed: {any}\n", .{err});
+        }
+    }
+
+    /// Copies every live file not copied yet. Stops early when turned off.
+    pub fn backupRound(self: *SwarmFolder) !void {
+        const bm = self.block_manager orelse return;
+        var want: std.ArrayList(BackupWant) = .empty;
+        defer want.deinit(self.allocator);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.backup_mutex.lock();
+            defer self.backup_mutex.unlock();
+            for (self.manifest.entries.values()) |e| {
+                if (e.deleted or e.kind != .file or self.backed_up.contains(e.cid)) continue;
+                try want.append(self.allocator, .{ .cid = e.cid, .author = .{ .bytes = e.version.device } });
+            }
+        }
+
+        var missing: usize = 0;
+        var added: usize = 0;
+        if (want.items.len > 0) {
+            const peers = try remote_mod.knownPeers(bm, self.allocator);
+            defer self.allocator.free(peers);
+            for (want.items) |w| {
+                if (!self.backup_enabled.load(.acquire)) break;
+                if (!self.copyFile(bm, w, peers)) {
+                    missing += 1;
+                    continue;
+                }
+                self.backup_mutex.lock();
+                defer self.backup_mutex.unlock();
+                try self.backed_up.put(self.allocator, w.cid, {});
+                added += 1;
+                // Now and then, so a long first backup survives a restart.
+                if (added % 32 == 0) self.saveBackedUpLocked() catch {};
+            }
+        }
+
+        self.backup_mutex.lock();
+        defer self.backup_mutex.unlock();
+        self.backup_unreachable = missing;
+        self.backup_last_round = self.now();
+        if (added > 0) {
+            self.saveBackedUpLocked() catch |err| std.debug.print("swarm backup: saving progress failed: {any}\n", .{err});
+            std.debug.print("swarm backup: copied {d} file(s), {d} not reachable\n", .{ added, missing });
+        }
+    }
+
+    /// Whether the whole file is here afterwards: already (added here, or read
+    /// before), else from the device that added it, else from any other peer
+    /// (another backup).
+    fn copyFile(self: *SwarmFolder, bm: *cluster.BlockManager, w: BackupWant, peers: []const NodeID) bool {
+        if (storage.dag.walk.collectReachable(self.allocator, self.store, &w.cid)) |set| {
+            var cids = set;
+            cids.deinit(self.allocator);
+            return true;
+        } else |_| {}
+        if (self.copyFrom(bm, w.author, w.cid)) return true;
+        for (peers) |p| {
+            if (p.eql(w.author) or p.eql(self.self_id)) continue;
+            if (self.copyFrom(bm, p, w.cid)) return true;
+        }
+        return false;
+    }
+
+    fn copyFrom(self: *SwarmFolder, bm: *cluster.BlockManager, peer: NodeID, cid: [32]u8) bool {
+        if (peer.eql(self.self_id)) return false;
+        const conn = bm.connectTo(peer) catch return false;
+        defer conn.deinit();
+        _ = cluster.repair.RepairManager.syncWhile(self.allocator, bm.dht_node, self.store, conn, &cid, &self.backup_enabled) catch return false;
+        return true;
+    }
+
+    fn backupPath(self: *SwarmFolder) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}.backup", .{self.file_path});
+    }
+
+    /// `<manifest>.backup`: the copied files' root CIDs, 32 bytes each.
+    fn loadBackedUp(self: *SwarmFolder) !void {
+        const path = try self.backupPath();
+        defer self.allocator.free(path);
+        var file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer file.close(self.io);
+        const size = (try file.stat(self.io)).size;
+        if (size % 32 != 0 or size > 64 * 1024 * 1024) return error.BackupListCorrupt;
+        const bytes = try self.allocator.alloc(u8, @intCast(size));
+        defer self.allocator.free(bytes);
+        _ = try file.readPositionalAll(self.io, bytes, 0);
+        self.backup_mutex.lock();
+        defer self.backup_mutex.unlock();
+        var i: usize = 0;
+        while (i < bytes.len) : (i += 32) try self.backed_up.put(self.allocator, bytes[i..][0..32].*, {});
+    }
+
+    /// Caller holds `backup_mutex`. Temp file, then rename.
+    fn saveBackedUpLocked(self: *SwarmFolder) !void {
+        const path = try self.backupPath();
+        defer self.allocator.free(path);
+        const tmp = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
+        defer self.allocator.free(tmp);
+        const bytes = try self.allocator.alloc(u8, self.backed_up.count() * 32);
+        defer self.allocator.free(bytes);
+        var it = self.backed_up.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| : (i += 32) @memcpy(bytes[i..][0..32], k);
+        {
+            var file = try std.Io.Dir.cwd().createFile(self.io, tmp, .{ .truncate = true });
+            defer file.close(self.io);
+            try file.writePositionalAll(self.io, bytes, 0);
+        }
+        try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, self.io);
     }
 };
 

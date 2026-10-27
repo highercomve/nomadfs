@@ -73,6 +73,10 @@ pub const Config = struct {
         /// Provider-record acknowledgements a put requires. 0 lets a
         /// device with no peers adopt content offline.
         write_quorum: u8 = 1,
+        /// Keep a copy of every swarm folder file on this device, so the
+        /// folder stays readable while the device that added a file is
+        /// offline (an always-on desktop or server).
+        swarm_backup: bool = false,
     };
 
     pub const SecurityConfig = struct {
@@ -250,6 +254,8 @@ fn applyConfigEntry(
         const n = try std.fmt.parseInt(u8, val, 10);
         if (n > max_replicas) return error.ReplicasOutOfRange;
         config.storage.replicas = n;
+    } else if (std.mem.eql(u8, key, "swarm_backup")) {
+        config.storage.swarm_backup = std.mem.eql(u8, val, "true");
     } else if (std.mem.eql(u8, key, "port")) {
         config.network.port = try std.fmt.parseInt(u16, val, 10);
     } else if (std.mem.eql(u8, key, "upnp_enabled")) {

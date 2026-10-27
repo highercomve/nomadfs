@@ -716,6 +716,65 @@ pub fn swarmList(gpa: std.mem.Allocator, args: SwarmDirArgs) !SwarmListing {
     return .{ .items = out, .entries = st.entries, .peers_synced = st.peers_synced, .last_sync = st.last_sync };
 }
 
+pub const BackupArgs = struct { config_path: []const u8, on: bool };
+
+pub const BackupInfo = struct {
+    /// Not offered on phones: a backup copies the whole folder.
+    supported: bool,
+    enabled: bool,
+    /// The node is running (else the counts are 0).
+    running: bool,
+    files: usize = 0,
+    backed_up: usize = 0,
+    bytes: u64 = 0,
+    unreachable_files: usize = 0,
+    last_round: u64 = 0,
+};
+
+const backup_supported = !builtin.abi.isAndroid();
+
+/// `swarm_backup_status { config_path }`: whether this device keeps a copy
+/// of the whole swarm folder, and how far it got.
+pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
+    if (!backup_supported) return .{ .supported = false, .enabled = false, .running = false };
+    {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        if (swarmFolder()) |folder| {
+            const st = folder.backupStatus();
+            return .{
+                .supported = true,
+                .enabled = st.enabled,
+                .running = true,
+                .files = st.files,
+                .backed_up = st.backed_up,
+                .bytes = st.bytes,
+                .unreachable_files = st.unreachable_files,
+                .last_round = st.last_round,
+            };
+        } else |_| {}
+    }
+    var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
+    defer config.deinit(gpa);
+    return .{ .supported = true, .enabled = config.storage.swarm_backup, .running = false };
+}
+
+/// `swarm_backup_set { config_path, on }`: saved in the config
+/// (`swarm_backup`), and applied to the running node at once.
+pub fn swarmBackupSet(gpa: std.mem.Allocator, args: BackupArgs) !BackupInfo {
+    if (!backup_supported) return error.Unsupported;
+    try editConfig(gpa, args.config_path, .{
+        .drop_keys = &.{"swarm_backup"},
+        .append = &.{if (args.on) "swarm_backup = true" else "swarm_backup = false"},
+    });
+    {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        if (swarmFolder()) |folder| try folder.setBackup(args.on) else |_| {}
+    }
+    return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
+}
+
 /// `swarm_sync`: pull every reachable device's changes now.
 pub fn swarmSync() !usize {
     g_mutex.lock();
