@@ -34,6 +34,10 @@
         <svg viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-5 3c1.1 0 2 .9 2 2s-.9 2-2 2-2-.9-2-2 .9-2 2-2zm4 8h-8v-1c0-1.33 2.67-2 4-2s4 .67 4 2v1z"/></svg>
         <span>Shared folders</span>
       </button>
+      <button class="nav-item" data-view="mount" id="nav-mount" hidden>
+        <svg viewBox="0 0 24 24"><path d="M20 6H4c-1.1 0-2 .9-2 2v8c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-1 7H5v-2h14v2zm-2.5 3.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2zm3 0a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>
+        <span>Mount</span>
+      </button>
       <button class="nav-item" data-view="connect">
         <svg viewBox="0 0 24 24"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>
         <span>Connect devices</span>
@@ -126,6 +130,31 @@
             <button type="submit" class="btn filled">Share</button>
           </div>
         </form>
+      </section>
+
+      <!-- Mount (desktop Linux): every device as a folder on this computer -->
+      <section class="card" id="mount-section" data-view="mount">
+        <div class="card-head">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M20 6H4c-1.1 0-2 .9-2 2v8c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-1 7H5v-2h14v2zm-2.5 3.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2zm3 0a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>
+          <div>
+            <h2>Mount</h2>
+            <p class="supporting">Every device's shared folders appear as an ordinary folder on this computer. Any app can open the files; they download as they're read. Read-only.</p>
+          </div>
+        </div>
+        <div class="mount-status" id="mount-state" data-state="off">
+          <span class="dot"></span>
+          <span id="mount-label">Not mounted</span>
+        </div>
+        <div class="picked">
+          <span class="row-icon folder"><svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg></span>
+          <span id="mount-path" class="picked-path"></span>
+          <button id="mount-change" type="button" class="btn text">Change…</button>
+        </div>
+        <div class="actions">
+          <button id="mount-open" type="button" class="btn tonal" hidden>Open folder</button>
+          <button id="mount-toggle" type="button" class="btn filled">Mount</button>
+        </div>
+        <p class="hint">Also from a terminal: <code>nomadfs --mount ~/NomadFS</code></p>
       </section>
 
       <!-- Join -->
@@ -227,6 +256,32 @@
       <button class="bar-item" data-view="text"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg></span><span>Text</span></button>
       <button class="bar-item" data-view="settings"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg></span><span>Settings</span></button>
     </nav>
+
+    <!-- File preview -->
+    <div id="preview" class="preview" hidden role="dialog" aria-modal="true" aria-labelledby="pv-name">
+      <div class="preview-panel">
+        <div class="preview-bar">
+          <button id="pv-close" class="icon-btn" title="Close (Esc)" aria-label="Close">
+            <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+          </button>
+          <div class="pv-title">
+            <span id="pv-name" class="headline"></span>
+            <span id="pv-meta" class="meta"></span>
+          </div>
+          <button id="pv-prev" class="icon-btn" title="Previous (←)" aria-label="Previous">
+            <svg viewBox="0 0 24 24"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+          </button>
+          <button id="pv-next" class="icon-btn" title="Next (→)" aria-label="Next">
+            <svg viewBox="0 0 24 24"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg>
+          </button>
+          <button id="pv-download" class="btn tonal with-icon">
+            <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+            <span>Download</span>
+          </button>
+        </div>
+        <div id="pv-body" class="preview-body"></div>
+      </div>
+    </div>
 
     <div id="snackbar" role="status" aria-live="polite"></div>
   </body>

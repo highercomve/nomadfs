@@ -99,6 +99,7 @@ pub fn nodeOpen(gpa: std.mem.Allocator, args: NodeOpenArgs) !void {
 pub fn nodeClose() void {
     g_mutex.lock();
     defer g_mutex.unlock();
+    stopMountLocked(); // the mount reads through this node
     if (g_node) |node| {
         mobile.nomadfs_node_free(node);
         g_node = null;
@@ -637,6 +638,204 @@ fn uniquePath(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) ![]cons
         gpa.free(candidate);
     }
     return error.PathAlreadyExists;
+}
+
+pub const ReadRangeArgs = struct { peer: []const u8, cid: []const u8, offset: u64, len: u32 };
+
+/// Largest slice `read_range` returns; previews read files in pieces.
+pub const max_range_len: u32 = 4 * 1024 * 1024;
+
+/// `invoke("read_range", { peer, cid, offset, len })`: bytes of a file in
+/// a device's share, base64-encoded for the page, which builds a preview
+/// from consecutive ranges. Only the blocks covering the range are fetched.
+pub fn readRange(gpa: std.mem.Allocator, args: ReadRangeArgs) ![]const u8 {
+    if (args.len == 0 or args.len > max_range_len) return error.InvalidArgument;
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    var remote = try remoteFor(args.peer);
+    const cid = try parseHex32(args.cid);
+    const buf = try gpa.alloc(u8, args.len);
+    defer gpa.free(buf);
+    const n = try fs.tree.readAt(gpa, remote.loader(), cid, args.offset, buf);
+    const encoder = std.base64.standard.Encoder;
+    const out = try gpa.alloc(u8, encoder.calcSize(n));
+    return encoder.encode(out, buf[0..n]);
+}
+
+// ---- Mounting (desktop Linux) ----
+
+const can_mount = builtin.os.tag == .linux and !builtin.abi.isAndroid();
+
+const MountJob = struct {
+    mount: if (can_mount) fs.fuse.Mount else void,
+    thread: std.Thread,
+    path: [:0]u8,
+    failed: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+};
+
+var g_mount: ?*MountJob = null;
+
+pub const MountStatus = struct {
+    supported: bool,
+    mounted: bool,
+    path: []const u8,
+    default_path: []const u8,
+};
+
+/// `invoke("mount_status")`.
+pub fn mountStatus(gpa: std.mem.Allocator) !MountStatus {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    reapMountLocked();
+    const default_path = defaultMountPath(gpa) catch try gpa.dupe(u8, "");
+    if (g_mount) |job| return .{ .supported = can_mount, .mounted = true, .path = try gpa.dupe(u8, job.path), .default_path = default_path };
+    return .{ .supported = can_mount, .mounted = false, .path = "", .default_path = default_path };
+}
+
+fn defaultMountPath(gpa: std.mem.Allocator) ![]const u8 {
+    const home = nomadfs.env.getEnv(gpa, "HOME") orelse return error.HomeNotFound;
+    defer gpa.free(home);
+    return std.fs.path.join(gpa, &.{ home, "NomadFS" });
+}
+
+pub const MountArgs = struct { path: []const u8 };
+
+/// `invoke("mount_start", { path })`: mounts every reachable device's
+/// shares at `path` (created if missing), read-only; files download when
+/// an app reads them. Returns once the kernel shows the mount.
+pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
+    if (!can_mount) return error.MountUnsupported;
+    if (args.path.len == 0 or args.path[0] != '/') return error.InvalidPath;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    reapMountLocked();
+    if (g_mount != null) return error.AlreadyMounted;
+    const handle = g_node orelse return error.NotRunning;
+    const store = handle.node.store orelse return error.StorageDisabled;
+    try std.Io.Dir.cwd().createDirPath(io, args.path);
+
+    const job = try std.heap.page_allocator.create(MountJob);
+    errdefer std.heap.page_allocator.destroy(job);
+    job.* = .{
+        .mount = try fs.fuse.Mount.init(std.heap.page_allocator, handle.node.block_manager, store),
+        .thread = undefined,
+        .path = try std.heap.page_allocator.dupeZ(u8, args.path),
+    };
+    job.thread = try std.Thread.spawn(.{}, serveMount, .{job});
+    g_mount = job;
+
+    // Wait (bounded) for the kernel to list the mount, or the thread to fail.
+    var waited: u32 = 0;
+    while (waited < 50) : (waited += 1) {
+        if (job.done.load(.acquire)) break;
+        if (isMounted(gpa, args.path)) return;
+        nomadfs.sync.sleep(100 * std.time.ns_per_ms);
+    }
+    if (job.done.load(.acquire)) {
+        reapMountLocked();
+        return error.MountFailed;
+    }
+}
+
+fn serveMount(job: *MountJob) void {
+    if (can_mount) {
+        job.mount.serve(job.path) catch |err| {
+            std.debug.print("mount at {s} failed: {any}\n", .{ job.path, err });
+            job.failed.store(true, .release);
+        };
+    }
+    job.done.store(true, .release);
+}
+
+/// `invoke("mount_stop")`.
+pub fn mountStop() void {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    stopMountLocked();
+}
+
+/// Caller holds g_mutex.
+fn stopMountLocked() void {
+    const job = g_mount orelse return;
+    if (can_mount and !job.done.load(.acquire)) fs.fuse.unmount(job.path);
+    // Unmounting makes the serve loop return.
+    job.thread.join();
+    freeMountJob(job);
+    g_mount = null;
+}
+
+/// Frees a job whose thread has ended on its own (unmounted from outside,
+/// or failed to mount). Caller holds g_mutex.
+fn reapMountLocked() void {
+    const job = g_mount orelse return;
+    if (!job.done.load(.acquire)) return;
+    job.thread.join();
+    freeMountJob(job);
+    g_mount = null;
+}
+
+fn freeMountJob(job: *MountJob) void {
+    if (can_mount) job.mount.deinit();
+    std.heap.page_allocator.free(job.path);
+    std.heap.page_allocator.destroy(job);
+}
+
+/// Whether /proc/self/mountinfo lists a NomadFS mount at `path`.
+fn isMounted(gpa: std.mem.Allocator, path: []const u8) bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = std.Io.Dir.cwd().openFile(io, "/proc/self/mountinfo", .{}) catch return false;
+    defer file.close(io);
+    const buf = gpa.alloc(u8, 1024 * 1024) catch return false;
+    defer gpa.free(buf);
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = file.readStreaming(io, &.{buf[len..]}) catch return false;
+        if (n == 0) break;
+        len += n;
+    }
+    var lines = std.mem.splitScalar(u8, buf[0..len], '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "fuse.nomadfs") == null) continue;
+        var fields = std.mem.splitScalar(u8, line, ' ');
+        var i: usize = 0;
+        while (fields.next()) |field| : (i += 1) {
+            if (i == 4) {
+                if (std.mem.eql(u8, field, path)) return true;
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+pub const OpenPathArgs = struct { path: []const u8 };
+
+/// `invoke("open_path", { path })`: shows a folder or file in the desktop's
+/// file manager / default app (xdg-open).
+pub fn openPath(gpa: std.mem.Allocator, args: OpenPathArgs) !void {
+    if (!can_mount) return error.Unsupported;
+    const linux = std.os.linux;
+    const programs = [_][:0]const u8{ "/usr/bin/xdg-open", "/bin/xdg-open", "/usr/local/bin/xdg-open" };
+    const program = for (programs) |p| {
+        if (linux.errno(linux.access(p.ptr, linux.X_OK)) == .SUCCESS) break p;
+    } else return error.XdgOpenNotFound;
+    const path = try gpa.dupeZ(u8, args.path);
+    defer gpa.free(path);
+    const argv = [_:null]?[*:0]const u8{ program.ptr, path.ptr };
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    const pid = linux.fork();
+    if (linux.errno(pid) != .SUCCESS) return error.ForkFailed;
+    if (pid == 0) {
+        // Detach so the opener outlives nothing of ours.
+        _ = linux.setsid();
+        _ = linux.execve(program.ptr, &argv, envp);
+        linux.exit(127);
+    }
+    var status: u32 = 0;
+    _ = linux.wait4(@intCast(pid), &status, linux.W.NOHANG, null);
 }
 
 // ---- Joining devices ----

@@ -337,6 +337,7 @@ async function showLocation() {
   busy(false);
   // Folders first, then files, each by name.
   entries.sort((a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
+  const files = entries.filter((x) => !x.dir);
   list.replaceChildren();
   setEmpty(entries.length ? "" : "Empty folder.");
   for (const e of entries) {
@@ -356,7 +357,7 @@ async function showLocation() {
         headline: e.name,
         meta: `${formatSize(e.size)} · ${formatDate(e.mtime)}`,
         cols: { size: formatSize(e.size), date: formatDate(e.mtime) },
-        onClick: () => fetchIt(null),
+        onClick: () => openPreview(device, files, files.indexOf(e)),
         action: { icon: "download", label: "Download", run: fetchIt },
       }));
     }
@@ -379,6 +380,203 @@ async function downloadFile(device, entry, btn) {
   downloading.delete(entry.cid);
   if (btn) btn.classList.remove("spin");
 }
+
+// ---- Preview ----
+
+const KINDS = {
+  image: { ext: ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif", "heic"], max: 64 << 20 },
+  video: { ext: ["mp4", "webm", "mov", "m4v", "mkv", "3gp"], max: 512 << 20 },
+  audio: { ext: ["mp3", "m4a", "aac", "ogg", "opus", "wav", "flac"], max: 256 << 20 },
+  pdf: { ext: ["pdf"], max: 64 << 20 },
+  text: { ext: ["txt", "md", "json", "log", "csv", "xml", "yaml", "yml", "toml", "ini", "conf", "zig", "c", "h", "js", "ts", "py", "rs", "go", "sh", "html", "css"], max: 1 << 20 },
+};
+const MIME = {
+  jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp",
+  svg: "image/svg+xml", avif: "image/avif", heic: "image/heic", mp4: "video/mp4", m4v: "video/mp4", webm: "video/webm",
+  mov: "video/quicktime", mkv: "video/x-matroska", "3gp": "video/3gpp", mp3: "audio/mpeg", m4a: "audio/mp4",
+  aac: "audio/aac", ogg: "audio/ogg", opus: "audio/ogg", wav: "audio/wav", flac: "audio/flac", pdf: "application/pdf",
+};
+const RANGE = 4 << 20;
+
+function kindOf(name) {
+  const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+  for (const [kind, k] of Object.entries(KINDS)) if (k.ext.includes(ext)) return { kind, ext };
+  return { kind: null, ext };
+}
+
+let pv = null; // { device, files, index, token, url }
+
+function previewMessage(icon, text, extra) {
+  const box = document.createElement("div");
+  box.className = "preview-msg";
+  box.appendChild(svg(ICONS[icon]));
+  const p = document.createElement("p");
+  p.textContent = text;
+  box.appendChild(p);
+  if (extra) box.appendChild(extra);
+  $("pv-body").replaceChildren(box);
+  return box;
+}
+
+function decodeBase64(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function openPreview(device, files, index) {
+  pv = { device, files, index, token: 0, url: null };
+  $("preview").hidden = false;
+  showPreview();
+}
+
+function closePreview() {
+  if (!pv) return;
+  pv.token++;
+  if (pv.url) URL.revokeObjectURL(pv.url);
+  pv = null;
+  $("pv-body").replaceChildren();
+  $("preview").hidden = true;
+}
+
+async function showPreview() {
+  const token = ++pv.token;
+  if (pv.url) { URL.revokeObjectURL(pv.url); pv.url = null; }
+  const entry = pv.files[pv.index];
+  $("pv-name").textContent = entry.name;
+  $("pv-meta").textContent = `${formatSize(entry.size)} · ${formatDate(entry.mtime)} · ${pv.index + 1} of ${pv.files.length}`;
+  $("pv-prev").disabled = pv.index === 0;
+  $("pv-next").disabled = pv.index === pv.files.length - 1;
+
+  const { kind, ext } = kindOf(entry.name);
+  if (!kind) return previewMessage("file", "No preview for this kind of file.");
+  const limit = KINDS[kind].max;
+  if (kind !== "text" && entry.size > limit) {
+    return previewMessage(kind === "image" ? "image" : "video", `Too large to preview here (${formatSize(entry.size)}). Download it or open it from the mount.`);
+  }
+
+  const total = kind === "text" ? Math.min(entry.size, limit) : entry.size;
+  const bar = document.createElement("div");
+  bar.className = "progress determinate";
+  const msg = previewMessage(kind === "image" ? "image" : kind === "video" ? "video" : "file", `Loading ${formatSize(total)}…`, bar);
+  const parts = [];
+  let offset = 0;
+  try {
+    while (offset < total) {
+      const len = Math.min(RANGE, total - offset);
+      const b64 = await invoke("read_range", { peer: pv.device.peer, cid: entry.cid, offset, len });
+      if (!pv || token !== pv.token) return; // closed or moved on
+      const bytes = decodeBase64(b64);
+      if (bytes.length === 0) break;
+      parts.push(bytes);
+      offset += bytes.length;
+      bar.style.setProperty("--p", `${Math.round((offset / Math.max(total, 1)) * 100)}%`);
+      msg.querySelector("p").textContent = `Loading ${formatSize(offset)} of ${formatSize(total)}…`;
+    }
+  } catch (err) {
+    if (pv && token === pv.token) previewMessage("file", `Preview failed: ${err}`);
+    return;
+  }
+
+  const body = $("pv-body");
+  if (kind === "text") {
+    const pre = document.createElement("pre");
+    pre.textContent = new TextDecoder().decode(concat(parts));
+    if (entry.size > total) pre.textContent += `\n\n… (first ${formatSize(total)} of ${formatSize(entry.size)})`;
+    body.replaceChildren(pre);
+    return;
+  }
+  pv.url = URL.createObjectURL(new Blob(parts, { type: MIME[ext] || "application/octet-stream" }));
+  let el;
+  if (kind === "image") { el = document.createElement("img"); el.alt = entry.name; }
+  else if (kind === "video") { el = document.createElement("video"); el.controls = true; el.autoplay = true; }
+  else if (kind === "audio") { el = document.createElement("audio"); el.controls = true; el.autoplay = true; }
+  else { el = document.createElement("iframe"); el.title = entry.name; }
+  el.src = pv.url;
+  el.addEventListener("error", () => {
+    if (pv && token === pv.token) previewMessage("file", "This app can't display that format. Download it to open it.");
+  });
+  body.replaceChildren(el);
+}
+
+function concat(parts) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.length; }
+  return out;
+}
+
+$("pv-close").addEventListener("click", closePreview);
+$("preview").addEventListener("click", (e) => { if (e.target === $("preview")) closePreview(); });
+$("pv-prev").addEventListener("click", () => { if (pv && pv.index > 0) { pv.index--; showPreview(); } });
+$("pv-next").addEventListener("click", () => { if (pv && pv.index < pv.files.length - 1) { pv.index++; showPreview(); } });
+$("pv-download").addEventListener("click", () => { if (pv) downloadFile(pv.device, pv.files[pv.index], null); });
+document.addEventListener("keydown", (e) => {
+  if (!pv) return;
+  if (e.key === "Escape") closePreview();
+  else if (e.key === "ArrowLeft") $("pv-prev").click();
+  else if (e.key === "ArrowRight") $("pv-next").click();
+});
+
+// ---- Mount (desktop Linux) ----
+
+let mountPath = "";
+let mounted = false;
+
+function renderMount(status) {
+  mounted = status.mounted;
+  if (status.mounted) mountPath = status.path;
+  else if (!mountPath) mountPath = status.default_path;
+  $("mount-path").textContent = mountPath;
+  $("mount-state").dataset.state = mounted ? "on" : "off";
+  $("mount-label").textContent = mounted ? `Mounted at ${mountPath}` : "Not mounted";
+  $("mount-toggle").textContent = mounted ? "Unmount" : "Mount";
+  $("mount-open").hidden = !mounted;
+  $("mount-change").disabled = mounted;
+}
+
+async function loadMount() {
+  let status;
+  try { status = await invoke("mount_status", null); } catch { return; }
+  $("nav-mount").hidden = !status.supported;
+  if (!status.supported && document.body.dataset.view === "mount") setView("browse");
+  renderMount(status);
+}
+
+$("mount-toggle").addEventListener("click", async () => {
+  const btn = $("mount-toggle");
+  btn.disabled = true;
+  $("mount-state").dataset.state = "busy";
+  $("mount-label").textContent = mounted ? "Unmounting…" : "Mounting…";
+  try {
+    if (mounted) {
+      await invoke("mount_stop", null);
+      snack("Unmounted");
+    } else {
+      if (!running) throw new Error("Start the node first");
+      await invoke("mount_start", { path: mountPath });
+      snack(`Mounted at ${mountPath}`);
+    }
+  } catch (err) {
+    snack(`${mounted ? "Unmount" : "Mount"} failed: ${err}`);
+  }
+  btn.disabled = false;
+  loadMount();
+});
+
+$("mount-change").addEventListener("click", async () => {
+  try {
+    const picked = await invoke("pick_folder", null);
+    if (picked) { mountPath = picked.path; $("mount-path").textContent = mountPath; }
+  } catch (err) {
+    snack(`Folder picker failed: ${err}`);
+  }
+});
+
+$("mount-open").addEventListener("click", async () => {
+  try { await invoke("open_path", { path: mountPath }); } catch (err) { snack(`Couldn't open the folder: ${err}`); }
+});
 
 $("remote-refresh").addEventListener("click", () => (path.length ? showLocation() : showDevices()));
 
@@ -632,6 +830,7 @@ async function boot() {
   setView(view);
   refreshState();
   await nodeState();
+  loadMount();
   const storage = await storageSetup();
   const info = await loadJoinInfo();
   // First run on a phone: name the device after its model.

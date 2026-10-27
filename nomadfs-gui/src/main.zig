@@ -35,7 +35,33 @@ pub const Commands = struct {
     /// Slow or waiting commands run on a worker thread so the window stays
     /// responsive: the folder picker waits for the user, sharing scans a
     /// folder, and the rest talk to other devices.
-    pub const async_commands = .{ "pick_folder", "share_add", "remote_devices", "browse", "download", "join" };
+    pub const async_commands = .{ "pick_folder", "share_add", "remote_devices", "browse", "download", "join", "read_range", "mount_start", "mount_stop" };
+
+    /// `invoke("read_range", { peer, cid, offset, len })`: base64 bytes of
+    /// a remote file, for previews.
+    pub fn read_range(gpa: std.mem.Allocator, args: commands.ReadRangeArgs) ![]const u8 {
+        return commands.readRange(gpa, args);
+    }
+
+    /// `invoke("mount_status")`: whether mounting is supported and active.
+    pub fn mount_status(gpa: std.mem.Allocator) !commands.MountStatus {
+        return commands.mountStatus(gpa);
+    }
+
+    /// `invoke("mount_start", { path })`: mount every device's shares.
+    pub fn mount_start(gpa: std.mem.Allocator, args: commands.MountArgs) !void {
+        return commands.mountStart(gpa, args);
+    }
+
+    /// `invoke("mount_stop")`.
+    pub fn mount_stop() void {
+        commands.mountStop();
+    }
+
+    /// `invoke("open_path", { path })`: open in the file manager.
+    pub fn open_path(gpa: std.mem.Allocator, args: commands.OpenPathArgs) !void {
+        return commands.openPath(gpa, args);
+    }
 
     /// `invoke("pick_folder")`: the system folder picker. Null when the
     /// user cancels.
