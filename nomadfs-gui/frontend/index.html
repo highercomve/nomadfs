@@ -23,9 +23,38 @@
       </span>
     </header>
 
+    <div class="layout">
+    <!-- Navigation drawer: shown on wide windows (desktop, tablets, Chromebooks) -->
+    <nav class="nav-drawer" aria-label="Sections">
+      <button class="nav-item" data-view="browse">
+        <svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+        <span>Browse</span>
+      </button>
+      <button class="nav-item" data-view="shares">
+        <svg viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-5 3c1.1 0 2 .9 2 2s-.9 2-2 2-2-.9-2-2 .9-2 2-2zm4 8h-8v-1c0-1.33 2.67-2 4-2s4 .67 4 2v1z"/></svg>
+        <span>Shared folders</span>
+      </button>
+      <button class="nav-item" data-view="connect">
+        <svg viewBox="0 0 24 24"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>
+        <span>Connect devices</span>
+      </button>
+      <button class="nav-item" data-view="text">
+        <svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>
+        <span>Text drop</span>
+      </button>
+      <button class="nav-item" data-view="settings">
+        <svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+        <span>Node &amp; trust</span>
+      </button>
+      <p class="nav-heading">Devices</p>
+      <div id="nav-devices"></div>
+      <div class="nav-spacer"></div>
+      <p id="nav-info" class="nav-info"></p>
+    </nav>
+
     <main>
       <!-- Node -->
-      <section class="card" id="node-section">
+      <section class="card" id="node-section" data-view="settings">
         <div class="card-head">
           <svg class="icon" viewBox="0 0 24 24"><path d="M13 3h-2v10h2V3zm4.83 2.17l-1.42 1.42C17.99 7.86 19 9.81 19 12c0 3.87-3.13 7-7 7s-7-3.13-7-7c0-2.19 1.01-4.14 2.58-5.42L6.17 5.17C4.23 6.82 3 9.26 3 12c0 4.97 4.03 9 9 9s9-4.03 9-9c0-2.74-1.23-5.18-3.17-6.83z"/></svg>
           <div>
@@ -40,7 +69,7 @@
       </section>
 
       <!-- Devices: browse what other devices share -->
-      <section class="card" id="remote-section">
+      <section class="card" id="remote-section" data-view="browse">
         <div class="card-head">
           <svg class="icon" viewBox="0 0 24 24"><path d="M4 6h18V4H4c-1.1 0-2 .9-2 2v11H0v3h14v-3H4V6zm19 2h-6c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h6c.55 0 1-.45 1-1V9c0-.55-.45-1-1-1zm-1 9h-4v-7h4v7z"/></svg>
           <div class="grow">
@@ -52,12 +81,17 @@
           </button>
         </div>
         <nav id="crumbs" class="crumbs" hidden></nav>
-        <ul id="remote-list" class="list rows"></ul>
-        <p id="remote-empty" class="empty-state">Start the node, then join your other devices below.</p>
+        <p id="remote-empty" class="empty-state">Start the node, then add your other devices under Connect devices.</p>
+        <div id="remote-scroll" class="table-scroll">
+          <div id="remote-head" class="table-head" hidden>
+            <span class="th-name">Name</span><span class="th-size">Size</span><span class="th-date">Modified</span><span class="th-act"></span>
+          </div>
+          <ul id="remote-list" class="list rows"></ul>
+        </div>
       </section>
 
       <!-- Shared folders -->
-      <section class="card" id="shares-section">
+      <section class="card" id="shares-section" data-view="shares">
         <div class="card-head">
           <svg class="icon" viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-5 3c1.1 0 2 .9 2 2s-.9 2-2 2-2-.9-2-2 .9-2 2-2zm4 8h-8v-1c0-1.33 2.67-2 4-2s4 .67 4 2v1z"/></svg>
           <div>
@@ -87,7 +121,7 @@
       </section>
 
       <!-- Join -->
-      <section class="card" id="join-section">
+      <section class="card" id="join-section" data-view="connect">
         <div class="card-head">
           <svg class="icon" viewBox="0 0 24 24"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>
           <div>
@@ -123,7 +157,7 @@
       </section>
 
       <!-- Text drop (CID demo) -->
-      <details class="card" id="text-drop">
+      <details class="card" id="text-drop" data-view="text">
         <summary class="card-head">
           <svg class="icon" viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>
           <div>
@@ -159,7 +193,7 @@
       </details>
 
       <!-- Trusted devices -->
-      <section class="card" id="devices-section">
+      <section class="card" id="devices-section" data-view="settings">
         <div class="card-head">
           <svg class="icon" viewBox="0 0 24 24"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16l-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z"/></svg>
           <div>
@@ -175,6 +209,7 @@
 
       <footer id="info"></footer>
     </main>
+    </div>
 
     <div id="snackbar" role="status" aria-live="polite"></div>
   </body>

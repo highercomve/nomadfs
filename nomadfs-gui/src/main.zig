@@ -180,7 +180,7 @@ pub fn main(init: std.process.Init) !u8 {
     initDataDirs();
     return oriel.main(init, .{ .commands = Commands, .events = Events }, .{
         .app = app.build,
-        .window = .{ .title = "NomadFS", .width = 900, .height = 640 },
+        .window = .{ .title = "NomadFS", .width = 1200, .height = 800 },
         .setup = setup,
     });
 }

@@ -64,7 +64,7 @@ function iconFor(name, dir) {
 }
 
 /** A Material list row: leading icon, headline + meta, optional trailing button. */
-function row({ icon, iconClass = "", headline, meta, monoMeta = false, onClick, action }) {
+function row({ icon, iconClass = "", headline, meta, monoMeta = false, onClick, action, cols }) {
   const li = document.createElement("li");
   const lead = document.createElement("span");
   lead.className = `row-icon ${iconClass}`;
@@ -83,6 +83,21 @@ function row({ icon, iconClass = "", headline, meta, monoMeta = false, onClick, 
     text.appendChild(m);
   }
   li.appendChild(text);
+  // Wide layout: Size and Modified columns (CSS hides them on phones).
+  if (cols) {
+    li.classList.add("has-cols");
+    for (const [cls, value] of [["col-size", cols.size], ["col-date", cols.date]]) {
+      const c = document.createElement("span");
+      c.className = `col ${cls}`;
+      c.textContent = value || "";
+      li.appendChild(c);
+    }
+    if (!action) {
+      const pad = document.createElement("span");
+      pad.className = "col act-spacer";
+      li.appendChild(pad);
+    }
+  }
   if (action) {
     const b = document.createElement("button");
     b.className = "icon-btn";
@@ -99,11 +114,57 @@ function row({ icon, iconClass = "", headline, meta, monoMeta = false, onClick, 
   return li;
 }
 
+// ---- Views (wide layout: one section at a time, picked in the drawer) ----
+
+function setView(view) {
+  document.body.dataset.view = view;
+  for (const item of document.querySelectorAll(".nav-item[data-view]")) {
+    item.classList.toggle("active", item.dataset.view === view);
+  }
+  if (view === "text") $("text-drop").open = true;
+  try { localStorage.setItem("view", view); } catch {}
+  renderNavDevices();
+}
+
+for (const item of document.querySelectorAll(".nav-item[data-view]")) {
+  item.addEventListener("click", () => {
+    setView(item.dataset.view);
+    if (item.dataset.view === "browse" && path.length) showDevices();
+  });
+}
+
+/** Reachable devices in the drawer, like a file manager's locations. */
+function renderNavDevices() {
+  const box = $("nav-devices");
+  if (!box) return;
+  box.replaceChildren();
+  const current = path.length ? path[0].device.peer : null;
+  for (const d of devices) {
+    const b = document.createElement("button");
+    b.className = "nav-item";
+    if (document.body.dataset.view === "browse" && d.peer === current) b.classList.add("active");
+    b.appendChild(svg(ICONS.device));
+    const label = document.createElement("span");
+    label.textContent = d.nickname || d.peer.slice(0, 12);
+    b.appendChild(label);
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    b.appendChild(dot);
+    b.addEventListener("click", () => {
+      path = [{ name: label.textContent, device: d }];
+      setView("browse");
+      showLocation();
+    });
+    box.appendChild(b);
+  }
+}
+
 // ---- Node ----
 
 async function refreshState() {
   const state = await invoke("app_info", null);
   $("info").textContent = `Zig ${state.zig} · ${state.mode} · ${state.dev ? "dev" : "release"}`;
+  $("nav-info").textContent = $("info").textContent;
 }
 
 let running = false;
@@ -162,6 +223,8 @@ $("close-node").addEventListener("click", async () => {
 let path = [];
 
 function renderCrumbs() {
+  $("remote-head").hidden = path.length === 0;
+  renderNavDevices();
   const nav = $("crumbs");
   nav.replaceChildren();
   nav.hidden = path.length === 0;
@@ -201,7 +264,7 @@ async function showDevices() {
   const list = $("remote-list");
   if (!running) {
     list.replaceChildren();
-    setEmpty("Start the node, then connect your other devices below.");
+    setEmpty("Start the node, then add your other devices under Connect devices.");
     return;
   }
   busy(true);
@@ -212,9 +275,10 @@ async function showDevices() {
     snack(`Devices failed: ${err}`);
   }
   busy(false);
+  renderNavDevices();
   list.replaceChildren();
   if (!devices.length) {
-    setEmpty("No devices reachable yet. Connect one with its code below.");
+    setEmpty("No devices reachable yet. Add one under Connect devices.");
     if (deviceRetries < 5) {
       deviceRetries++;
       setTimeout(() => { if (path.length === 0) showDevices(); }, 2000);
@@ -252,6 +316,7 @@ async function showLocation() {
         iconClass: "folder",
         headline: s.name,
         meta: `${formatSize(s.size)} · updated ${formatDate(s.mtime)}`,
+        cols: { size: formatSize(s.size), date: formatDate(s.mtime) },
         onClick: () => { path.push({ name: s.name, cid: s.cid }); showLocation(); },
       }));
     }
@@ -280,6 +345,7 @@ async function showLocation() {
         iconClass: "folder",
         headline: e.name,
         meta: formatSize(e.size),
+        cols: { size: formatSize(e.size), date: formatDate(e.mtime) },
         onClick: () => { path.push({ name: e.name, cid: e.cid }); showLocation(); },
       }));
     } else {
@@ -288,6 +354,7 @@ async function showLocation() {
         icon: iconFor(e.name, false),
         headline: e.name,
         meta: `${formatSize(e.size)} · ${formatDate(e.mtime)}`,
+        cols: { size: formatSize(e.size), date: formatDate(e.mtime) },
         onClick: () => fetchIt(null),
         action: { icon: "download", label: "Download", run: fetchIt },
       }));
@@ -541,6 +608,9 @@ $("devices-refresh").addEventListener("click", async () => {
 // ---- Startup: the node starts with the app ----
 
 async function boot() {
+  let view = "browse";
+  try { view = localStorage.getItem("view") || view; } catch {}
+  setView(view);
   refreshState();
   await nodeState();
   const storage = await storageSetup();
