@@ -11,3 +11,8 @@ src/mobile/android/libs/
 src/mobile/android/library/local.properties
 src/mobile/android/library/build/
 src/mobile/android/library/.gradle/
+
+# Oriel GUI app build artifacts
+nomadfs-gui/.zig-cache/
+nomadfs-gui/zig-out/
+nomadfs-gui/zig-pkg/

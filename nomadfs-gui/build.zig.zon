@@ -1,0 +1,14 @@
+.{
+    .name = .nomadfs_gui,
+    .version = "0.1.0",
+    // Derived from the package name; changing it has security and trust implications.
+    .fingerprint = 0x5f521d4994d41c7c,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .oriel = .{ .path = "../../oriel" },
+        // The NomadFS core: same sources the CLI, the C ABI and the mobile
+        // bindings build from.
+        .nomadfs = .{ .path = "../src" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "frontend", "README.md", "icon.png", "isolation" },
+}

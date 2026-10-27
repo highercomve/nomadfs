@@ -128,6 +128,12 @@ pub const BlockManager = struct {
 
         const acks = try self.dht_node.addProvider(key);
         const acks_u8: u8 = @intCast(@min(acks, std.math.maxInt(u8)));
+        if (acks_u8 == 0) {
+            // A lone node with no peers cannot announce a provider record
+            // and must not stall: storefronts like the Desktop GUI surface
+            // the w quorum after the first peer appears.
+            return if (self.quorum.W > 0) error.QuorumNotReached else void{};
+        }
         if (!quorum.isWriteSatisfied(self.quorum, acks_u8)) return error.QuorumNotReached;
     }
 

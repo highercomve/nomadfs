@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NomadFS</title>
+    <link rel="stylesheet" href="style.css" />
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <main>
+      <h1>NomadFS</h1>
+      <p class="tagline">Personal mesh, one command from the page.</p>
+
+      <section id="node-section">
+        <h2>Node</h2>
+        <p id="node-state" class="muted">not running</p>
+        <div class="row">
+          <button id="open-node">Open node (default config)</button>
+          <button id="close-node" disabled>Stop</button>
+        </div>
+      </section>
+
+      <section id="sync-section">
+        <h2>Sync</h2>
+        <form id="put-form">
+          <textarea id="text-in" rows="5" placeholder="Write something to share with the swarm…"></textarea>
+          <button type="submit">Store in the swarm (put → CID)</button>
+        </form>
+        <p id="cid-output" class="cid"></p>
+        <p class="muted">Or fetch by CID:</p>
+        <div class="row">
+          <input id="cid-in" placeholder="CID (64 hex chars)" />
+          <button id="fetch">Fetch text</button>
+        </div>
+        <pre id="text-out"></pre>
+      </section>
+
+      <section id="devices-section">
+        <h2>Trusted devices</h2>
+        <button id="devices-refresh">Devices list</button>
+        <ul id="devices-list" class="listing"></ul>
+        <p class="muted">Pairing flow ("pairs with a new device") ships next.</p>
+      </section>
+
+      <footer id="info"></footer>
+    </main>
+  </body>
+</html>

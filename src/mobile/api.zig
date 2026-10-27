@@ -73,7 +73,7 @@ fn spanSlice(p: ?[*:0]const u8) ?[]const u8 {
 
 const version: [*:0]const u8 = version_string;
 
-export fn nomadfs_version() [*:0]const u8 {
+pub export fn nomadfs_version() [*:0]const u8 {
     return version;
 }
 
@@ -90,13 +90,13 @@ fn nodeNewInternal(config_value: nomadfs.config.Config) !*NodeHandle {
     return self;
 }
 
-export fn nomadfs_node_new(config_path: ?[*:0]const u8) ?*NodeHandle {
+pub export fn nomadfs_node_new(config_path: ?[*:0]const u8) ?*NodeHandle {
     const path = spanSlice(config_path) orelse return null;
     const config = nomadfs.config.parseConfig(allocator, path) catch return null;
     return nodeNewInternal(config) catch null;
 }
 
-export fn nomadfs_node_free(node: ?*NodeHandle) void {
+pub export fn nomadfs_node_free(node: ?*NodeHandle) void {
     const self = node orelse return;
     self.running.store(false, .release);
     // Node.run() exits within one poll interval once the flag drops.
@@ -117,7 +117,7 @@ fn runNodeThread(self: *NodeHandle) void {
 }
 
 /// Starts the listener under a dedicated thread. Non-blocking.
-export fn nomadfs_node_run(node: ?*NodeHandle) c_int {
+pub export fn nomadfs_node_run(node: ?*NodeHandle) c_int {
     const self = node orelse return invalid_argument;
     self.mutex.lock();
     defer self.mutex.unlock();
@@ -132,7 +132,7 @@ export fn nomadfs_node_run(node: ?*NodeHandle) c_int {
 }
 
 /// Connects to a comma-separated list of bootstrap peers in the background.
-export fn nomadfs_node_bootstrap(node: ?*NodeHandle, urls_csv: ?[*:0]const u8) c_int {
+pub export fn nomadfs_node_bootstrap(node: ?*NodeHandle, urls_csv: ?[*:0]const u8) c_int {
     const self = node orelse return invalid_argument;
     const csv = spanSlice(urls_csv) orelse return invalid_argument;
 
@@ -183,7 +183,7 @@ fn freeUrls(urls: []const []const u8) void {
     if (urls.len > 0) allocator.free(urls);
 }
 
-export fn nomadfs_node_stop(node: ?*NodeHandle) c_int {
+pub export fn nomadfs_node_stop(node: ?*NodeHandle) c_int {
     const self = node orelse return invalid_argument;
     self.mutex.lock();
     defer self.mutex.unlock();
@@ -200,7 +200,7 @@ export fn nomadfs_node_stop(node: ?*NodeHandle) c_int {
 /// (NULL) when the provider record cannot reach the write quorum, which is
 /// also what happens while offline; the blocks are kept locally either way
 /// and a retry after connecting announces them.
-export fn nomadfs_put_file(node: ?*NodeHandle, in_path: ?[*:0]const u8) ?[*:0]u8 {
+pub export fn nomadfs_put_file(node: ?*NodeHandle, in_path: ?[*:0]const u8) ?[*:0]u8 {
     const self = node orelse return null;
     const path = spanSlice(in_path) orelse return null;
 
@@ -212,17 +212,14 @@ export fn nomadfs_put_file(node: ?*NodeHandle, in_path: ?[*:0]const u8) ?[*:0]u8
     defer file.close(io);
 
     var reader = FileReader{ .io = io, .file = file };
-    const root = self.node.block_manager.put(&reader) catch |err| {
-        std.debug.print("put failed: {any}\n", .{err});
-        return null;
-    };
+    const root = self.node.block_manager.put(&reader) catch return null;
     defer allocator.free(root);
     return hexCid(root[0..32].*) catch null;
 }
 
 /// Writes the file rooted at the hex CID to `out_path`. Creates or
 /// truncates the output file.
-export fn nomadfs_get_file(node: ?*NodeHandle, cid: ?[*:0]const u8, out_path: ?[*:0]const u8) c_int {
+pub export fn nomadfs_get_file(node: ?*NodeHandle, cid: ?[*:0]const u8, out_path: ?[*:0]const u8) c_int {
     const self = node orelse return invalid_argument;
     const cid_text = spanSlice(cid) orelse return invalid_argument;
     const path = spanSlice(out_path) orelse return invalid_argument;
@@ -248,7 +245,7 @@ export fn nomadfs_get_file(node: ?*NodeHandle, cid: ?[*:0]const u8, out_path: ?[
 
 /// Writes the node's own device ID as a 64 hex-character string into `out`
 /// (`out` must hold at least 65 bytes).
-export fn nomadfs_node_device_id(node: ?*NodeHandle, out: ?[*]u8, out_len: usize) c_int {
+pub export fn nomadfs_node_device_id(node: ?*NodeHandle, out: ?[*]u8, out_len: usize) c_int {
     const self = node orelse return invalid_argument;
     const buf = out orelse return invalid_argument;
     if (out_len < 65) return invalid_argument;
@@ -262,7 +259,7 @@ export fn nomadfs_node_device_id(node: ?*NodeHandle, out: ?[*]u8, out_len: usize
 }
 
 /// Releases a string returned by this API.
-export fn nomadfs_free(ptr: ?*anyopaque) void {
+pub export fn nomadfs_free(ptr: ?*anyopaque) void {
     const p = ptr orelse return;
     const s: [*:0]u8 = @ptrCast(@alignCast(p));
     allocator.free(std.mem.span(s));

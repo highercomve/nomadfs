@@ -9,6 +9,12 @@ pub const device = @import("device/mod.zig");
 /// C ABI bindings for mobile hosts; the shared library target points here.
 pub const mobile_api = @import("mobile/api.zig");
 
+/// Seconds resolution used by tickets, the trust store and revocations.
+pub fn nowSeconds() u64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+}
+
 // Force the C ABI surface into every artifact of this module, so the shared
 // library keeps its exports even though nothing below references it.
 comptime {
