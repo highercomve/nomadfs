@@ -1266,13 +1266,32 @@ $("devices-refresh").addEventListener("click", async () => {
   const list = $("devices-list");
   try {
     const trusted = await invoke("devices_list", { config_path: await ensureConfig() });
-    list.replaceChildren();
-    if (!trusted.length) {
-      list.appendChild(row({ icon: "device", headline: "No trusted devices yet", meta: "Connect one under Connect devices" }));
-      return;
+    // Reachable now: the same swarm key, online. Not the same as trusted.
+    let reachable = [];
+    if (running) {
+      try { reachable = await invoke("remote_devices", null); } catch {}
     }
+    const trustedNames = new Set(trusted.map((d) => d.label));
+    const unpaired = reachable.filter((d) => !trustedNames.has(d.nickname));
+    list.replaceChildren();
     for (const d of trusted) {
-      list.appendChild(row({ icon: "device", iconClass: "device", headline: d.label || "Unnamed device", meta: `${d.fingerprint} · trusted since ${formatDate(d.added_at)}` }));
+      const online = reachable.some((r) => r.nickname === d.label);
+      list.appendChild(row({
+        icon: "device",
+        iconClass: "device",
+        headline: d.label || "Unnamed device",
+        meta: `${online ? "Online · " : ""}${d.fingerprint} · trusted since ${formatDate(d.added_at)}`,
+      }));
+    }
+    for (const d of unpaired) {
+      list.appendChild(row({
+        icon: "device",
+        headline: d.nickname || d.peer.slice(0, 12),
+        meta: "Connected, not paired: shares your swarm key, but its identity isn't verified. Pair it with an invite.",
+      }));
+    }
+    if (!trusted.length && !unpaired.length) {
+      list.appendChild(row({ icon: "device", headline: "No devices yet", meta: "Connect one under Connect devices" }));
     }
   } catch (err) {
     snack(`Devices failed: ${err}`);
