@@ -68,4 +68,19 @@ pub fn build(b: *std.Build) void {
         // through isolation/hook.js first, in a frame the page can't reach.
         // .isolation = .{ .hook = b.path("isolation/hook.js") },
     });
+
+    // zig build test: runs the commands tests with the same imports the
+    // app exe gets (nomadfs core + oriel paths).
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/commands.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "nomadfs", .module = nomadfs_mod },
+        },
+    });
+    const app_test = b.addTest(.{ .root_module = test_mod });
+    const run_test = b.addRunArtifact(app_test);
+    const test_step = b.step("test", "Run the GUI command tests");
+    test_step.dependOn(&run_test.step);
 }

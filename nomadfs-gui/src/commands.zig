@@ -26,6 +26,25 @@ pub const default_config_subpath = ".nomadfs/nomadfs.conf";
 pub const max_text_len: usize = 8 * 1024 * 1024;
 
 var g_node: ?*mobile.NodeHandle = null;
+/// Resolved once; staging files go here instead of /tmp (which does not
+/// exist on Android).
+var g_tmp_dir: ?[]const u8 = null;
+/// Staging dir for the tmp file `nomadfs_put_file` reads: /tmp on
+/// desktop, the Oriel-provided cache dir on Android. Callers already
+/// hold `g_mutex`.
+fn initTmpDir() void {
+    if (g_tmp_dir != null) return;
+    if (builtin.abi.isAndroid() and g_android_data_dir != null) {
+        g_tmp_dir = std.fmt.allocPrint(std.heap.page_allocator, "{s}/cache\x00", .{g_android_data_dir.?}) catch null;
+        if (g_tmp_dir) |d| g_tmp_dir = d[0 .. d.len - 1 :0];
+        if (g_tmp_dir) |dir| {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        }
+    } else {
+        g_tmp_dir = std.heap.page_allocator.dupeZ(u8, "/tmp") catch null;
+    }
+}
 var g_mutex: nomadfs.sync.Mutex = .{};
 var g_tick: u64 = 0;
 
@@ -86,16 +105,40 @@ fn requireRunning() *mobile.NodeHandle {
 
 /// Callers already hold `g_mutex`; this must not lock again.
 fn nextTickPath(buf: []u8, comptime suffix: []const u8) ![:0]u8 {
+    initTmpDir();
+    const base = g_tmp_dir orelse return error.NoTempDir;
     g_tick += 1;
-    return std.fmt.bufPrintZ(buf, "/tmp/nomadfs-gui-{d}{s}", .{ g_tick, suffix });
+    return std.fmt.bufPrintZ(buf, "{s}/nomadfs-gui-{d}{s}", .{ base, g_tick, suffix });
 }
 
 /// The absolute CLI-shaped default: `$HOME/.nomadfs/nomadfs.conf`.
-pub fn defaultConfigPath(gpa: std.mem.Allocator) ![]const u8 {
+/// Where per-device files live: `$HOME` on desktop (same layout the CLI
+/// uses), the Oriel app data dir on Android (no HOME env there).
+/// Set by the app shell (main.zig) at startup on Android, where there is
+/// no $HOME: Oriel hands over the app's private data dir.
+var g_android_data_dir: ?[]const u8 = null;
+
+/// The host data dir Oriel provides; caller keeps it for the process
+/// lifetime (it leaks one allocation by design).
+pub fn initAndroidDataDir(dir: []const u8) void {
+    if (g_android_data_dir == null) {
+        g_android_data_dir = std.heap.page_allocator.dupe(u8, dir) catch null;
+    }
+}
+
+pub fn dataDir(gpa: std.mem.Allocator) ![]const u8 {
+    if (builtin.abi.isAndroid() and g_android_data_dir != null)
+        return gpa.dupe(u8, g_android_data_dir.?);
     const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
     const home = nomadfs.env.getEnv(gpa, home_env) orelse return error.HomeNotFound;
     defer gpa.free(home);
-    return std.fs.path.join(gpa, &.{ home, ".nomadfs", "nomadfs.conf" });
+    return std.fs.path.join(gpa, &.{ home, ".nomadfs" });
+}
+
+pub fn defaultConfigPath(gpa: std.mem.Allocator) ![]const u8 {
+    const dir = try dataDir(gpa);
+    defer gpa.free(dir);
+    return std.fs.path.join(gpa, &.{ dir, "nomadfs.conf" });
 }
 
 /// `invoke("node_state")`.
@@ -119,6 +162,8 @@ pub const NodeStateResult = struct { running: bool, device_id: []const u8 };
 pub const PutTextArgs = struct { text: []const u8 };
 pub const GetTextArgs = struct { cid: []const u8 };
 pub const TrustDeviceArgs = struct { config_path: []const u8, uri: []const u8 };
+pub const ListArgs = struct { config_path: []const u8 };
+pub const PairTicketArgs = struct { config_path: []const u8, address: []const u8 };
 pub const RevokeDeviceArgs = struct { config_path: []const u8, query: []const u8 };
 
 /// Writes a CLI-shaped config the first time, returns the path and whether
@@ -128,6 +173,12 @@ pub fn ensureConfig(gpa: std.mem.Allocator) !ConfigResult {
     const path = try defaultConfigPath(gpa);
     {
         const io = std.Io.Threaded.global_single_threaded.io();
+        const dir = try dataDir(gpa);
+        defer gpa.free(dir);
+        const keys_path = try std.fs.path.join(gpa, &.{ dir, "keys", "node.key" });
+        defer gpa.free(keys_path);
+        const storage_path_abs = try std.fs.path.join(gpa, &.{ dir, "data" });
+        defer gpa.free(storage_path_abs);
         _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
             var swarm: [64]u8 = undefined;
             var prng = std.Random.DefaultPrng.init(nomadfs.nowSeconds() * 7919);
@@ -135,14 +186,17 @@ pub fn ensureConfig(gpa: std.mem.Allocator) !ConfigResult {
             prng.random().bytes(&rnd);
             const swarm_key = std.fmt.bufPrint(&swarm, "{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch unreachable;
             try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path) orelse "/");
+            const keys_dir = try std.fs.path.join(gpa, &.{ dir, "keys" });
+            defer gpa.free(keys_dir);
+            try std.Io.Dir.cwd().createDirPath(io, keys_dir);
             var file = try std.Io.Dir.cwd().createFile(io, path, .{});
             defer file.close(io);
             var text: std.Io.Writer.Allocating = .init(gpa);
             defer text.deinit();
-            try text.writer.print("\n[node]\nnickname = \"gui\"\nswarm_key = \"{s}\"\n" ++
-                "\n[storage]\nenabled = true\nstorage_path = \"~/.nomadfs/data\"\n" ++
+            try text.writer.print("\n[node]\nnickname = \"gui\"\nswarm_key = \"{s}\"\nkey_path = \"{s}\"\n" ++
+                "\n[storage]\nenabled = true\nstorage_path = \"{s}\"\n" ++
                 "\n[network]\nport = 14700\ntransport = \"tcp\"\nupnp_enabled = false\n" ++
-                "enable_mdns = false\nreplicas = 1\n", .{swarm_key});
+                "enable_mdns = false\nwrite_quorum = 0\nreplicas = 1\n", .{ swarm_key, keys_path, storage_path_abs });
             try file.writePositionalAll(io, text.written(), 0);
             return .{ .path = path, .created = true };
         };
@@ -203,7 +257,7 @@ pub fn getText(gpa: std.mem.Allocator, args: GetTextArgs) ![]const u8 {
 /// `invoke("pair_ticket", { config_path, address })`: prints the ticket URL
 /// the CLI's --pair would print (no QR in a webview; the page can render
 /// it from the URI).
-pub fn pairTicket(gpa: std.mem.Allocator, args: struct { config_path: []const u8, address: []const u8 }) !PairTicketResult {
+pub fn pairTicket(gpa: std.mem.Allocator, args: PairTicketArgs) !PairTicketResult {
     var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
     defer config.deinit(gpa);
 
@@ -240,7 +294,7 @@ fn ticketLifetime() u64 {
 }
 
 /// `invoke("devices_list", { config_path })`: trusted devices.
-pub fn devicesList(gpa: std.mem.Allocator, args: struct { config_path: []const u8 }) ![]DeviceEntry {
+pub fn devicesList(gpa: std.mem.Allocator, args: ListArgs) ![]DeviceEntry {
     var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
     defer config.deinit(gpa);
 

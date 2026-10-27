@@ -48,6 +48,10 @@ $("put-form").addEventListener("submit", async (e) => {
   try {
     const cid = await invoke("put_text", { text });
     $("cid-output").textContent = `CID: ${cid}`;
+    const useBtn = $("cid-use");
+    useBtn.style.display = "";
+    useBtn.onclick = () => { $("cid-in").value = cid; };
+    $("node-state").textContent = `stored · ${text.length} bytes`;
     $("node-state").textContent = `stored · ${$("text-in").value.length} bytes`;
   } catch (err) {
     $("cid-output").textContent = `store failed: ${err}`;

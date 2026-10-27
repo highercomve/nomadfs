@@ -13,6 +13,17 @@ const commands = @import("commands.zig");
 
 pub const std_options: std.Options = .{ .logFn = oriel.log.logFn };
 
+/// No $HOME on Android: Oriel hands over the app's private dirs before
+/// main runs; point the command layer at them.
+fn initDataDirs() void {
+    if (builtin.abi.isAndroid()) {
+        const app_id = "net.nomadfs.app";
+        if (oriel.paths.appData(std.heap.page_allocator, .{ .name = app_id })) |dir| {
+            commands.initAndroidDataDir(dir);
+        } else |_| {}
+    }
+}
+
 /// Events pushed from Zig to the page.
 pub const Events = struct {
     node_state: struct { running: bool },
@@ -73,6 +84,26 @@ pub const Commands = struct {
     pub fn get_text(gpa: std.mem.Allocator, args: commands.GetTextArgs) ![]const u8 {
         return commands.getText(gpa, args);
     }
+
+    /// `invoke("pair_ticket", { config_path, address })`.
+    pub fn pair_ticket(gpa: std.mem.Allocator, args: commands.PairTicketArgs) !commands.PairTicketResult {
+        return commands.pairTicket(gpa, args);
+    }
+
+    /// `invoke("devices_list", { config_path })`.
+    pub fn devices_list(gpa: std.mem.Allocator, args: commands.ListArgs) ![]commands.DeviceEntry {
+        return commands.devicesList(gpa, args);
+    }
+
+    /// `invoke("trust_device", { config_path, uri })`.
+    pub fn trust_device(gpa: std.mem.Allocator, args: commands.TrustDeviceArgs) !void {
+        return commands.trustDevice(gpa, args);
+    }
+
+    /// `invoke("revoke_device", { config_path, query })`.
+    pub fn revoke_device(gpa: std.mem.Allocator, args: commands.RevokeDeviceArgs) !void {
+        return commands.revokeDevice(gpa, args);
+    }
 };
 var g_change_once: std.atomic.Value(bool) = .init(false);
 
@@ -94,6 +125,7 @@ fn LogPrint() void {
 }
 
 pub fn main(init: std.process.Init) !u8 {
+    initDataDirs();
     return oriel.main(init, .{ .commands = Commands, .events = Events }, .{
         .app = app.build,
         .window = .{ .title = "NomadFS", .width = 900, .height = 640 },

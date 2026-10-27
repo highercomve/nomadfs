@@ -1,3 +1,7 @@
 .zig-cache/
 zig-out/
 zig-pkg/
+android/app/build/
+android/.gradle/
+android/build/
+android/local.properties
