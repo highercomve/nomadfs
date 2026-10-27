@@ -547,6 +547,9 @@ async function loadMount() {
   renderMount(status);
 }
 
+// The tray can mount or unmount while the window is hidden.
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") loadMount(); });
+
 $("mount-toggle").addEventListener("click", async () => {
   const btn = $("mount-toggle");
   btn.disabled = true;

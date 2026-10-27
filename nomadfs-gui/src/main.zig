@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const oriel = @import("oriel");
 const app = @import("oriel_app");
 const commands = @import("commands.zig");
+const tray = @import("tray.zig");
 
 pub const std_options: std.Options = .{ .logFn = oriel.log.logFn };
 
@@ -71,12 +72,14 @@ pub const Commands = struct {
 
     /// `invoke("mount_start", { path })`: mount every device's shares.
     pub fn mount_start(gpa: std.mem.Allocator, args: commands.MountArgs) !void {
+        defer oriel.App.runOnMain(@as(?*anyopaque, null), refreshTray);
         return commands.mountStart(gpa, args);
     }
 
     /// `invoke("mount_stop")`.
     pub fn mount_stop() void {
         commands.mountStop();
+        oriel.App.runOnMain(@as(?*anyopaque, null), refreshTray);
     }
 
     /// `invoke("open_path", { path })`: open in the file manager.
@@ -207,7 +210,14 @@ pub const Commands = struct {
 
 /// Android's storage extension (all-files access, standard folders) is
 /// callable from the page; other platforms have nothing to grant.
+fn refreshTray(_: ?*anyopaque) void {
+    tray.refresh();
+}
+
 fn setup() !void {
+    // Desktop: a tray icon keeps NomadFS (and its mount) running with the
+    // window closed.
+    tray.setup() catch |err| std.log.warn("tray unavailable: {any}", .{err});
     if (oriel.extensions.get("nomadfs.storage").available())
         oriel.extensions.expose("nomadfs.storage", .{ .methods = &.{ "status", "request", "info" } });
 }
@@ -234,7 +244,8 @@ pub fn main(init: std.process.Init) !u8 {
     initDataDirs();
     return oriel.main(init, .{ .commands = Commands, .events = Events }, .{
         .app = app.build,
-        .window = .{ .title = "NomadFS", .width = 1200, .height = 800 },
+        // With a tray, closing the window hides it; Quit is in the tray.
+        .window = .{ .title = "NomadFS", .width = 1200, .height = 800, .hide_on_close = tray.available },
         .setup = setup,
     });
 }

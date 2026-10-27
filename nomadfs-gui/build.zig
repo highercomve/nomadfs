@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
     const dep = b.dependency("oriel", .{
         .target = target,
         .optimize = optimize,
-        .tray = false,
+        .tray = true, // keeps the app (and its mount) running with the window closed
         .menu = false,
         .store = false,
         .dialog = true, // native folder picker for shared folders

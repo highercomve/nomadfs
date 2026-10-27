@@ -699,6 +699,21 @@ fn defaultMountPath(gpa: std.mem.Allocator) ![]const u8 {
     return std.fs.path.join(gpa, &.{ home, "NomadFS" });
 }
 
+pub const MountPeek = struct { mounted: bool, path: []const u8 };
+
+/// Mount state without waiting: null while another command holds the
+/// lock (a download, a browse), so the UI thread never blocks on one.
+/// `path` points into `buf`.
+pub fn mountPeek(buf: []u8) ?MountPeek {
+    if (!g_mutex.tryLock()) return null;
+    defer g_mutex.unlock();
+    reapMountLocked();
+    const job = g_mount orelse return .{ .mounted = false, .path = "" };
+    const n = @min(buf.len, job.path.len);
+    @memcpy(buf[0..n], job.path[0..n]);
+    return .{ .mounted = true, .path = buf[0..n] };
+}
+
 pub const MountArgs = struct { path: []const u8 };
 
 /// `invoke("mount_start", { path })`: mounts every reachable device's
