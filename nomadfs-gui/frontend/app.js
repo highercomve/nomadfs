@@ -495,7 +495,10 @@ async function showPreview() {
   else { el = document.createElement("iframe"); el.title = entry.name; }
   el.src = pv.url;
   el.addEventListener("error", () => {
-    if (pv && token === pv.token) previewMessage("file", "This app can't display that format. Download it to open it.");
+    if (!pv || token !== pv.token) return;
+    const what = kind === "video" ? "video" : kind === "audio" ? "audio file" : "file";
+    previewMessage(kind === "video" ? "video" : "file",
+      `This ${what} uses a format this device can't play here. Download it, or open it from the mount with your usual player.`);
   });
   body.replaceChildren(el);
 }
