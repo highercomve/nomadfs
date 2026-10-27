@@ -85,6 +85,14 @@ pub fn nodeOpen(gpa: std.mem.Allocator, args: NodeOpenArgs) !void {
         return error.NodeFailedToStart;
     }
     g_node = node;
+
+    // Reach the devices this one joined (config bootstrap_peers).
+    const peers = node.config.network.bootstrap_peers;
+    if (peers.len > 0) {
+        const csv = try std.mem.joinZ(gpa, ",", peers);
+        defer gpa.free(csv);
+        _ = mobile.nomadfs_node_bootstrap(node, csv.ptr);
+    }
 }
 
 /// `invoke("node_close")`.
@@ -193,15 +201,30 @@ pub fn ensureConfig(gpa: std.mem.Allocator) !ConfigResult {
             defer file.close(io);
             var text: std.Io.Writer.Allocating = .init(gpa);
             defer text.deinit();
-            try text.writer.print("\n[node]\nnickname = \"gui\"\nswarm_key = \"{s}\"\nkey_path = \"{s}\"\n" ++
+            var nick_buf: [64]u8 = undefined;
+            try text.writer.print("\n[node]\nnickname = \"{s}\"\nswarm_key = \"{s}\"\nkey_path = \"{s}\"\n" ++
                 "\n[storage]\nenabled = true\nstorage_path = \"{s}\"\n" ++
                 "\n[network]\nport = 14700\ntransport = \"tcp\"\nupnp_enabled = false\n" ++
-                "enable_mdns = false\nwrite_quorum = 0\nreplicas = 1\n", .{ swarm_key, keys_path, storage_path_abs });
+                "enable_mdns = false\nwrite_quorum = 0\nreplicas = 1\n", .{ defaultNickname(&nick_buf), swarm_key, keys_path, storage_path_abs });
             try file.writePositionalAll(io, text.written(), 0);
             return .{ .path = path, .created = true };
         };
     }
     return .{ .path = path, .created = false };
+}
+
+/// What other devices call this one until it is renamed: the hostname on
+/// desktop Linux. Android starts as "gui" and the page renames it after the
+/// phone model on first run.
+fn defaultNickname(buf: *[64]u8) []const u8 {
+    if (builtin.os.tag != .linux or builtin.abi.isAndroid()) return "gui";
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = std.Io.Dir.cwd().openFile(io, "/etc/hostname", .{}) catch return "Desktop";
+    defer file.close(io);
+    const n = file.readPositionalAll(io, buf, 0) catch return "Desktop";
+    const name = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    if (name.len == 0 or std.mem.indexOfAny(u8, name, "\"\n") != null) return "Desktop";
+    return name;
 }
 
 /// `invoke("put_text", { text })`: stores the text and returns its CID.
@@ -351,6 +374,351 @@ pub fn revokeDevice(gpa: std.mem.Allocator, args: RevokeDeviceArgs) !void {
     const id = try store.resolve(args.query) orelse return error.DeviceNotFound;
     _ = try store.revokeDevice(id, identity.deviceId(), @intCast(nomadfs.nowSeconds()));
     try store.save();
+}
+
+// ---- Shared folders ----
+
+const fs = nomadfs.fs;
+
+pub const ShareInfo = struct {
+    name: []const u8,
+    path: []const u8,
+    files: u64,
+    size: u64,
+    /// False until the first scan finished; unscanned shares aren't listed
+    /// to other devices yet.
+    ready: bool,
+};
+
+fn shareIndex(handle: *mobile.NodeHandle) !*fs.ShareIndex {
+    return handle.node.shares orelse error.StorageDisabled;
+}
+
+/// `invoke("shares_local")`: the folders this device shares.
+pub fn sharesLocal(gpa: std.mem.Allocator) ![]ShareInfo {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const handle = g_node orelse return error.NotRunning;
+    const snapshot = try (try shareIndex(handle)).snapshot(gpa);
+    defer gpa.free(snapshot);
+    const out = try gpa.alloc(ShareInfo, snapshot.len);
+    for (snapshot, out) |s, *o| {
+        o.* = .{ .name = s.name, .path = s.path, .files = s.files, .size = s.size, .ready = s.root != null };
+    }
+    return out;
+}
+
+pub const ShareAddArgs = struct { config_path: []const u8, name: []const u8, path: []const u8 };
+
+/// `invoke("share_add", { config_path, name, path })`: scans the folder,
+/// starts sharing it and records it in the config so it survives restarts.
+pub fn shareAdd(gpa: std.mem.Allocator, args: ShareAddArgs) !void {
+    const name = std.mem.trim(u8, args.name, " \t");
+    const path = std.mem.trim(u8, args.path, " \t");
+    if (!nomadfs.storage.dag.codec.isValidName(name) or std.mem.indexOfScalar(u8, name, ':') != null)
+        return error.InvalidShareName;
+    if (path.len == 0 or std.mem.indexOfAny(u8, path, "\"\n") != null) return error.InvalidPath;
+
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const handle = g_node orelse return error.NotRunning;
+    const index = try shareIndex(handle);
+    try index.add(name, path);
+    try index.start();
+
+    const line = try std.fmt.allocPrint(gpa, "share = \"{s}:{s}\"", .{ name, path });
+    defer gpa.free(line);
+    try editConfig(gpa, args.config_path, .{ .drop_share = name, .append = &.{line} });
+}
+
+pub const ShareRemoveArgs = struct { config_path: []const u8, name: []const u8 };
+
+/// `invoke("share_remove", { config_path, name })`.
+pub fn shareRemove(gpa: std.mem.Allocator, args: ShareRemoveArgs) !void {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const handle = g_node orelse return error.NotRunning;
+    _ = (try shareIndex(handle)).remove(args.name);
+    try editConfig(gpa, args.config_path, .{ .drop_share = args.name });
+}
+
+pub const RemoteShare = struct { name: []const u8, cid: []const u8, size: u64, mtime: u64 };
+pub const RemoteDevice = struct { peer: []const u8, nickname: []const u8, shares: []RemoteShare };
+
+/// `invoke("remote_devices")`: every reachable device and what it shares.
+/// Devices that don't answer are left out.
+pub fn remoteDevices(gpa: std.mem.Allocator) ![]RemoteDevice {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const handle = g_node orelse return error.NotRunning;
+    const store = handle.node.store orelse return error.StorageDisabled;
+    const bm = handle.node.block_manager;
+
+    const peers = try fs.remote.knownPeers(bm, gpa);
+    defer gpa.free(peers);
+    var out: std.ArrayList(RemoteDevice) = .empty;
+    for (peers) |peer| {
+        var remote = fs.Remote{ .block_manager = bm, .store = store, .peer = peer };
+        const shares = remote.shares(gpa) catch |err| {
+            std.debug.print("remote_devices: {x} unavailable: {any}\n", .{ peer.bytes[0..4], err });
+            continue;
+        };
+        defer shares.listing.deinit();
+        const list = try gpa.alloc(RemoteShare, shares.listing.entries.len);
+        for (shares.listing.entries, list) |e, *o| {
+            o.* = .{ .name = try gpa.dupe(u8, e.name), .cid = try hexAlloc(gpa, &e.cid), .size = e.size, .mtime = e.mtime };
+        }
+        try out.append(gpa, .{ .peer = try hexAlloc(gpa, &peer.bytes), .nickname = shares.nickname, .shares = list });
+    }
+    return out.items;
+}
+
+pub const BrowseArgs = struct { peer: []const u8, cid: []const u8 };
+pub const BrowseEntry = struct { name: []const u8, cid: []const u8, size: u64, mtime: u64, dir: bool };
+
+/// `invoke("browse", { peer, cid })`: lists a directory of a device's
+/// share. Only that directory's block is fetched.
+pub fn browse(gpa: std.mem.Allocator, args: BrowseArgs) ![]BrowseEntry {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    var remote = try remoteFor(args.peer);
+    const cid = try parseHex32(args.cid);
+    const listing = try fs.tree.listDir(gpa, remote.loader(), &cid);
+    defer gpa.free(listing.entries);
+    const out = try gpa.alloc(BrowseEntry, listing.entries.len);
+    for (listing.entries, out) |e, *o| {
+        o.* = .{ .name = e.name, .cid = try hexAlloc(gpa, &e.cid), .size = e.size, .mtime = e.mtime, .dir = e.kind == .dir };
+    }
+    return out;
+}
+
+pub const DownloadArgs = struct { peer: []const u8, cid: []const u8, name: []const u8 };
+pub const DownloadResult = struct { path: []const u8, size: u64 };
+
+/// `invoke("download", { peer, cid, name })`: copies one file from a
+/// device's share into Downloads/NomadFS and returns where it landed.
+pub fn download(gpa: std.mem.Allocator, args: DownloadArgs) !DownloadResult {
+    if (!nomadfs.storage.dag.codec.isValidName(args.name)) return error.InvalidName;
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    var remote = try remoteFor(args.peer);
+    const cid = try parseHex32(args.cid);
+    const loader = remote.loader();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try downloadsDir(gpa);
+    defer gpa.free(dir);
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const path = try uniquePath(gpa, dir, args.name);
+    errdefer gpa.free(path);
+
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
+    defer file.close(io);
+    errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const chunk = try gpa.alloc(u8, 1024 * 1024);
+    defer gpa.free(chunk);
+    var offset: u64 = 0;
+    while (true) {
+        const n = try fs.tree.readAt(gpa, loader, cid, offset, chunk);
+        if (n == 0) break;
+        try file.writePositionalAll(io, chunk[0..n], offset);
+        offset += n;
+    }
+    return .{ .path = path, .size = offset };
+}
+
+/// Caller holds g_mutex.
+fn remoteFor(peer_hex: []const u8) !fs.Remote {
+    const handle = g_node orelse return error.NotRunning;
+    const store = handle.node.store orelse return error.StorageDisabled;
+    return .{ .block_manager = handle.node.block_manager, .store = store, .peer = .{ .bytes = try parseHex32(peer_hex) } };
+}
+
+fn parseHex32(text: []const u8) ![32]u8 {
+    if (text.len != 64) return error.InvalidArgument;
+    var out: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, text) catch return error.InvalidArgument;
+    return out;
+}
+
+fn hexAlloc(gpa: std.mem.Allocator, bytes: *const [32]u8) ![]const u8 {
+    const hex = std.fmt.bytesToHex(bytes.*, .lower);
+    return gpa.dupe(u8, &hex);
+}
+
+/// Downloads/NomadFS: the shared Download folder on Android (readable by
+/// other apps; needs all-files access), $HOME/Downloads elsewhere.
+fn downloadsDir(gpa: std.mem.Allocator) ![]const u8 {
+    if (builtin.abi.isAndroid()) return gpa.dupe(u8, "/storage/emulated/0/Download/NomadFS");
+    const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+    const home = nomadfs.env.getEnv(gpa, home_env) orelse return error.HomeNotFound;
+    defer gpa.free(home);
+    return std.fs.path.join(gpa, &.{ home, "Downloads", "NomadFS" });
+}
+
+/// `dir/name`, or `dir/name (n).ext` when that exists already.
+fn uniquePath(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) ![]const u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const ext = std.fs.path.extension(name);
+    const stem = name[0 .. name.len - ext.len];
+    var n: u32 = 0;
+    while (n < 1000) : (n += 1) {
+        const candidate = if (n == 0)
+            try std.fs.path.join(gpa, &.{ dir, name })
+        else
+            try std.fmt.allocPrint(gpa, "{s}/{s} ({d}){s}", .{ dir, stem, n, ext });
+        _ = std.Io.Dir.cwd().statFile(io, candidate, .{}) catch return candidate;
+        gpa.free(candidate);
+    }
+    return error.PathAlreadyExists;
+}
+
+// ---- Joining devices ----
+
+pub const JoinInfo = struct { code: []const u8, nickname: []const u8, addresses: []const u8 };
+
+/// `invoke("join_info", { config_path })`: the code another device enters
+/// to join this one's swarm. It carries the swarm key: share it only with
+/// your own devices.
+pub fn joinInfo(gpa: std.mem.Allocator, args: ListArgs) !JoinInfo {
+    var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
+    defer config.deinit(gpa);
+    const key = std.fmt.bytesToHex(config.node.swarm_key[0..32].*, .lower);
+    var ip_buf: [16]u8 = undefined;
+    const ip = primaryIp(&ip_buf) orelse "127.0.0.1";
+    const addresses = try std.fmt.allocPrint(gpa, "{s}:{d}", .{ ip, config.network.port });
+    return .{
+        .code = try std.fmt.allocPrint(gpa, "nomadfs://join?key={s}&addr={s}", .{ &key, addresses }),
+        .nickname = try gpa.dupe(u8, config.node.nickname),
+        .addresses = addresses,
+    };
+}
+
+pub const JoinArgs = struct { config_path: []const u8, code: []const u8 };
+
+/// `invoke("join", { config_path, code })`: adopts the swarm key in
+/// another device's join code and bootstraps to its addresses. A running
+/// node restarts to pick them up.
+pub fn join(gpa: std.mem.Allocator, args: JoinArgs) !void {
+    const code = std.mem.trim(u8, args.code, " \t\r\n");
+    const prefix = "nomadfs://join?";
+    if (!std.mem.startsWith(u8, code, prefix)) return error.InvalidJoinCode;
+    var key: ?[]const u8 = null;
+    var addr: ?[]const u8 = null;
+    var params = std.mem.splitScalar(u8, code[prefix.len..], '&');
+    while (params.next()) |param| {
+        if (std.mem.startsWith(u8, param, "key=")) key = param[4..];
+        if (std.mem.startsWith(u8, param, "addr=")) addr = param[5..];
+    }
+    const swarm_key = key orelse return error.InvalidJoinCode;
+    _ = try parseHex32(swarm_key);
+    const addresses = addr orelse return error.InvalidJoinCode;
+
+    var peers: std.ArrayList(u8) = .empty;
+    defer peers.deinit(gpa);
+    var it = std.mem.splitScalar(u8, addresses, ',');
+    while (it.next()) |a| {
+        if (a.len == 0 or std.mem.indexOfAny(u8, a, "\"[] ") != null) return error.InvalidJoinCode;
+        if (peers.items.len > 0) try peers.append(gpa, ',');
+        try peers.print(gpa, "\"tcp://{s}\"", .{a});
+    }
+    const key_line = try std.fmt.allocPrint(gpa, "swarm_key = \"{s}\"", .{swarm_key});
+    defer gpa.free(key_line);
+    const peers_line = try std.fmt.allocPrint(gpa, "bootstrap_peers = [{s}]", .{peers.items});
+    defer gpa.free(peers_line);
+
+    const was_running = isRunning();
+    if (was_running) nodeClose();
+    try editConfig(gpa, args.config_path, .{ .drop_keys = &.{ "swarm_key", "bootstrap_peers" }, .append = &.{ key_line, peers_line } });
+    if (was_running) try nodeOpen(gpa, .{ .config_path = args.config_path });
+}
+
+pub const NicknameArgs = struct { config_path: []const u8, nickname: []const u8 };
+
+/// `invoke("set_nickname", { config_path, nickname })`: how other devices
+/// list this one. Takes effect on the next node start.
+pub fn setNickname(gpa: std.mem.Allocator, args: NicknameArgs) !void {
+    const nick = std.mem.trim(u8, args.nickname, " \t");
+    if (nick.len == 0 or nick.len > 64 or std.mem.indexOfAny(u8, nick, "\"\n") != null) return error.InvalidNickname;
+    const line = try std.fmt.allocPrint(gpa, "nickname = \"{s}\"", .{nick});
+    defer gpa.free(line);
+    try editConfig(gpa, args.config_path, .{ .drop_keys = &.{"nickname"}, .append = &.{line} });
+}
+
+/// The address this device uses to reach the LAN: the source address the
+/// kernel picks for an outbound UDP "connection" (nothing is sent).
+fn primaryIp(buf: *[16]u8) ?[]const u8 {
+    if (builtin.os.tag != .linux) return null;
+    const linux = std.os.linux;
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var target = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, 9), .addr = std.mem.nativeToBig(u32, 0xC0000201) }; // 192.0.2.1 (TEST-NET-1)
+    if (linux.errno(linux.connect(fd, @ptrCast(&target), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return null;
+    var local: linux.sockaddr.in = undefined;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    if (linux.errno(linux.getsockname(fd, @ptrCast(&local), &len)) != .SUCCESS) return null;
+    const a: [4]u8 = @bitCast(local.addr);
+    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ a[0], a[1], a[2], a[3] }) catch null;
+}
+
+const ConfigEdit = struct {
+    /// Remove `key = ...` lines for these keys.
+    drop_keys: []const []const u8 = &.{},
+    /// Remove the `share = "<name>:..."` line for this share.
+    drop_share: ?[]const u8 = null,
+    append: []const []const u8 = &.{},
+};
+
+/// Rewrites the config file line by line: drops matching lines, appends
+/// new ones. Comments and unrelated settings are kept as they are.
+fn editConfig(gpa: std.mem.Allocator, path: []const u8, edit: ConfigEdit) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const old = blk: {
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const size = (try file.stat(io)).size;
+        if (size > 64 * 1024) return error.ConfigTooLarge;
+        const buf = try gpa.alloc(u8, @intCast(size));
+        errdefer gpa.free(buf);
+        _ = try file.readPositionalAll(io, buf, 0);
+        break :blk buf;
+    };
+    defer gpa.free(old);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var lines = std.mem.splitScalar(u8, old, '\n');
+    while (lines.next()) |line| {
+        if (lines.index == null and line.len == 0) break; // trailing newline
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        const key = std.mem.trim(u8, trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '=') orelse 0], " \t");
+        var drop = false;
+        for (edit.drop_keys) |k| {
+            if (std.mem.eql(u8, key, k)) drop = true;
+        }
+        if (edit.drop_share) |name| {
+            if (std.mem.eql(u8, key, "share")) {
+                const value = std.mem.trim(u8, trimmed[std.mem.indexOfScalar(u8, trimmed, '=').? + 1 ..], " \t\"");
+                if (config_mod.Config.Share.parse(value)) |share| {
+                    if (std.mem.eql(u8, share.name, name)) drop = true;
+                } else |_| {}
+            }
+        }
+        if (drop) continue;
+        try out.appendSlice(gpa, line);
+        try out.append(gpa, '\n');
+    }
+    for (edit.append) |line| {
+        try out.appendSlice(gpa, line);
+        try out.append(gpa, '\n');
+    }
+
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, out.items, 0);
 }
 
 const testing = std.testing;

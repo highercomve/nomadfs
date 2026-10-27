@@ -104,7 +104,59 @@ pub const Commands = struct {
     pub fn revoke_device(gpa: std.mem.Allocator, args: commands.RevokeDeviceArgs) !void {
         return commands.revokeDevice(gpa, args);
     }
+
+    /// `invoke("shares_local")`: folders this device shares.
+    pub fn shares_local(gpa: std.mem.Allocator) ![]commands.ShareInfo {
+        return commands.sharesLocal(gpa);
+    }
+
+    /// `invoke("share_add", { config_path, name, path })`.
+    pub fn share_add(gpa: std.mem.Allocator, args: commands.ShareAddArgs) !void {
+        return commands.shareAdd(gpa, args);
+    }
+
+    /// `invoke("share_remove", { config_path, name })`.
+    pub fn share_remove(gpa: std.mem.Allocator, args: commands.ShareRemoveArgs) !void {
+        return commands.shareRemove(gpa, args);
+    }
+
+    /// `invoke("remote_devices")`: reachable devices and their shares.
+    pub fn remote_devices(gpa: std.mem.Allocator) ![]commands.RemoteDevice {
+        return commands.remoteDevices(gpa);
+    }
+
+    /// `invoke("browse", { peer, cid })`: one directory of a device's share.
+    pub fn browse(gpa: std.mem.Allocator, args: commands.BrowseArgs) ![]commands.BrowseEntry {
+        return commands.browse(gpa, args);
+    }
+
+    /// `invoke("download", { peer, cid, name })`: fetch a file on demand.
+    pub fn download(gpa: std.mem.Allocator, args: commands.DownloadArgs) !commands.DownloadResult {
+        return commands.download(gpa, args);
+    }
+
+    /// `invoke("join_info", { config_path })`: this device's join code.
+    pub fn join_info(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.JoinInfo {
+        return commands.joinInfo(gpa, args);
+    }
+
+    /// `invoke("join", { config_path, code })`: join another device's swarm.
+    pub fn join(gpa: std.mem.Allocator, args: commands.JoinArgs) !void {
+        return commands.join(gpa, args);
+    }
+
+    /// `invoke("set_nickname", { config_path, nickname })`.
+    pub fn set_nickname(gpa: std.mem.Allocator, args: commands.NicknameArgs) !void {
+        return commands.setNickname(gpa, args);
+    }
 };
+
+/// Android's storage extension (all-files access, standard folders) is
+/// callable from the page; other platforms have nothing to grant.
+fn setup() !void {
+    if (oriel.extensions.get("nomadfs.storage").available())
+        oriel.extensions.expose("nomadfs.storage", .{ .methods = &.{ "status", "request", "info" } });
+}
 var g_change_once: std.atomic.Value(bool) = .init(false);
 
 fn stateChanged() void {
@@ -129,5 +181,6 @@ pub fn main(init: std.process.Init) !u8 {
     return oriel.main(init, .{ .commands = Commands, .events = Events }, .{
         .app = app.build,
         .window = .{ .title = "NomadFS", .width = 900, .height = 640 },
+        .setup = setup,
     });
 }

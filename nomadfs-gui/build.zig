@@ -64,6 +64,23 @@ pub fn build(b: *std.Build) void {
             .summary = "Nomadfs Gui, built with Oriel",
             .version = "0.1.0",
         },
+        .android = .{
+            // Sharing folders like DCIM/Camera and saving to Download/:
+            // "All files access", granted from the system settings page the
+            // storage extension opens.
+            .permissions = &.{
+                .{ .name = "android.permission.MANAGE_EXTERNAL_STORAGE" },
+                .{ .name = "android.permission.READ_EXTERNAL_STORAGE", .max_sdk = 32 },
+                .{ .name = "android.permission.WRITE_EXTERNAL_STORAGE", .max_sdk = 29 },
+            },
+        },
+        .extensions = &.{.{
+            .name = "nomadfs.storage",
+            .android = .{
+                .class = "net.nomadfs.app.StorageExtension",
+                .sources = &.{b.path("android-src/StorageExtension.kt")},
+            },
+        }},
         // The isolation pattern: every call from the frontend to Zig goes
         // through isolation/hook.js first, in a frame the page can't reach.
         // .isolation = .{ .hook = b.path("isolation/hook.js") },

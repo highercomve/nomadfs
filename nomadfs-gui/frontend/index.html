@@ -2,49 +2,180 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#12161F" />
     <title>NomadFS</title>
     <link rel="stylesheet" href="style.css" />
     <script type="module" src="app.js"></script>
   </head>
   <body>
+    <header class="top-app-bar">
+      <picture>
+        <source srcset="mark-light.svg" media="(prefers-color-scheme: light)" />
+        <img class="brand-mark" src="mark.svg" alt="" />
+      </picture>
+      <div class="title-block">
+        <h1>NomadFS</h1>
+        <p class="subtitle" id="device-name">Personal mesh</p>
+      </div>
+      <span id="node-chip" class="chip" data-state="off">
+        <span class="dot"></span><span id="node-chip-label">Offline</span>
+      </span>
+    </header>
+
     <main>
-      <h1>NomadFS</h1>
-      <p class="tagline">Personal mesh, one command from the page.</p>
-
-      <section id="node-section">
-        <h2>Node</h2>
-        <p id="node-state" class="muted">not running</p>
-        <div class="row">
-          <button id="open-node">Open node (default config)</button>
-          <button id="close-node" disabled>Stop</button>
+      <!-- Node -->
+      <section class="card" id="node-section">
+        <div class="card-head">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M13 3h-2v10h2V3zm4.83 2.17l-1.42 1.42C17.99 7.86 19 9.81 19 12c0 3.87-3.13 7-7 7s-7-3.13-7-7c0-2.19 1.01-4.14 2.58-5.42L6.17 5.17C4.23 6.82 3 9.26 3 12c0 4.97 4.03 9 9 9s9-4.03 9-9c0-2.74-1.23-5.18-3.17-6.83z"/></svg>
+          <div>
+            <h2>Node</h2>
+            <p id="node-state" class="supporting">Not running</p>
+          </div>
+        </div>
+        <div class="actions">
+          <button id="close-node" class="btn text" disabled>Stop</button>
+          <button id="open-node" class="btn filled">Start node</button>
         </div>
       </section>
 
-      <section id="sync-section">
-        <h2>Sync</h2>
-        <form id="put-form">
-          <textarea id="text-in" rows="5" placeholder="Write something to share with the swarm…"></textarea>
-          <button type="submit">Store in the swarm (put → CID)</button>
+      <!-- Devices: browse what other devices share -->
+      <section class="card" id="remote-section">
+        <div class="card-head">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M4 6h18V4H4c-1.1 0-2 .9-2 2v11H0v3h14v-3H4V6zm19 2h-6c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h6c.55 0 1-.45 1-1V9c0-.55-.45-1-1-1zm-1 9h-4v-7h4v7z"/></svg>
+          <div class="grow">
+            <h2>Devices</h2>
+            <p class="supporting">Browse what your devices share. Files download only when you open them.</p>
+          </div>
+          <button id="remote-refresh" class="icon-btn" title="Refresh" aria-label="Refresh">
+            <svg viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+          </button>
+        </div>
+        <nav id="crumbs" class="crumbs" hidden></nav>
+        <ul id="remote-list" class="list rows"></ul>
+        <p id="remote-empty" class="empty-state">Start the node, then join your other devices below.</p>
+      </section>
+
+      <!-- Shared folders -->
+      <section class="card" id="shares-section">
+        <div class="card-head">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-5 3c1.1 0 2 .9 2 2s-.9 2-2 2-2-.9-2-2 .9-2 2-2zm4 8h-8v-1c0-1.33 2.67-2 4-2s4 .67 4 2v1z"/></svg>
+          <div>
+            <h2>Shared folders</h2>
+            <p class="supporting">Your devices see them right away; a file only travels when someone opens it.</p>
+          </div>
+        </div>
+        <div id="storage-banner" class="banner" hidden>
+          <p>Allow <strong>All files access</strong> so NomadFS can share folders like your camera roll.</p>
+          <button id="storage-grant" class="btn tonal">Allow</button>
+        </div>
+        <ul id="shares-list" class="list rows"></ul>
+        <div id="share-presets" class="chips" hidden></div>
+        <form id="share-form" class="stack">
+          <label class="field">
+            <input id="share-name" placeholder=" " autocomplete="off" />
+            <span class="field-label">Name (e.g. Camera)</span>
+          </label>
+          <label class="field">
+            <input id="share-path" class="mono" placeholder=" " autocomplete="off" spellcheck="false" />
+            <span class="field-label">Folder path</span>
+          </label>
+          <div class="actions">
+            <button type="submit" class="btn filled">Share folder</button>
+          </div>
         </form>
-        <p id="cid-output" class="cid"></p>
-        <button id="cid-use" style="display:none">Use this CID below ⤵</button>
-        <p class="muted">Or fetch by CID:</p>
-        <div class="row">
-          <input id="cid-in" placeholder="CID (64 hex chars)" />
-          <button id="fetch">Fetch text</button>
-        </div>
-        <pre id="text-out"></pre>
       </section>
 
-      <section id="devices-section">
-        <h2>Trusted devices</h2>
-        <button id="devices-refresh">Devices list</button>
-        <ul id="devices-list" class="listing"></ul>
-        <p class="muted">Pairing flow ("pairs with a new device") ships next.</p>
+      <!-- Join -->
+      <section class="card" id="join-section">
+        <div class="card-head">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>
+          <div>
+            <h2>Connect devices</h2>
+            <p class="supporting">Enter this code on your other device, or paste its code here. It holds your swarm key: keep it to your own devices.</p>
+          </div>
+        </div>
+        <div class="result">
+          <span class="result-label">This device</span>
+          <code id="join-code" class="cid">—</code>
+          <div class="actions">
+            <button id="join-copy" class="btn text" type="button">Copy code</button>
+          </div>
+        </div>
+        <form id="join-form" class="stack">
+          <label class="field">
+            <input id="join-in" class="mono" placeholder=" " autocomplete="off" spellcheck="false" />
+            <span class="field-label">Other device's code</span>
+          </label>
+          <div class="actions">
+            <button type="submit" class="btn filled">Join</button>
+          </div>
+        </form>
+        <form id="nick-form" class="stack">
+          <label class="field">
+            <input id="nick-in" placeholder=" " autocomplete="off" />
+            <span class="field-label">This device's name</span>
+          </label>
+          <div class="actions">
+            <button type="submit" class="btn outlined">Rename</button>
+          </div>
+        </form>
+      </section>
+
+      <!-- Text drop (CID demo) -->
+      <details class="card" id="text-drop">
+        <summary class="card-head">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>
+          <div>
+            <h2>Text drop</h2>
+            <p class="supporting">Store a note in the swarm and fetch it by CID.</p>
+          </div>
+        </summary>
+        <form id="put-form" class="stack">
+          <label class="field">
+            <textarea id="text-in" rows="3" placeholder=" "></textarea>
+            <span class="field-label">Text to store</span>
+          </label>
+          <div class="actions">
+            <button type="submit" class="btn filled">Store</button>
+          </div>
+        </form>
+        <div id="cid-box" class="result" hidden>
+          <span class="result-label">CID</span>
+          <code id="cid-output" class="cid"></code>
+          <div class="actions">
+            <button id="cid-copy" class="btn text" type="button">Copy</button>
+            <button id="cid-use" class="btn tonal" type="button">Fetch it below</button>
+          </div>
+        </div>
+        <label class="field">
+          <input id="cid-in" class="mono" placeholder=" " spellcheck="false" autocomplete="off" />
+          <span class="field-label">CID (64 hex chars)</span>
+        </label>
+        <div class="actions">
+          <button id="fetch" class="btn filled">Fetch</button>
+        </div>
+        <pre id="text-out" class="result-text" hidden></pre>
+      </details>
+
+      <!-- Trusted devices -->
+      <section class="card" id="devices-section">
+        <div class="card-head">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16l-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z"/></svg>
+          <div>
+            <h2>Trusted devices</h2>
+            <p class="supporting">QR pairing ships next.</p>
+          </div>
+        </div>
+        <ul id="devices-list" class="list"></ul>
+        <div class="actions">
+          <button id="devices-refresh" class="btn outlined">Refresh</button>
+        </div>
       </section>
 
       <footer id="info"></footer>
     </main>
+
+    <div id="snackbar" role="status" aria-live="polite"></div>
   </body>
 </html>
