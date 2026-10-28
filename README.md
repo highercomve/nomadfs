@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/nomadfs-wordmark-dark.svg">
-    <img src="assets/brand/nomadfs-wordmark.svg" alt="NomadFS" width="420">
-  </picture>
+  <img src="assets/brand/nomadfs-banner.svg" alt="NomadFS — personal device mesh &amp; virtual filesystem for roaming devices" width="100%">
 </p>
 
 <h3 align="center"><em>Your files roam with you.</em></h3>
@@ -10,10 +7,6 @@
 <p align="center">Personal device mesh &amp; virtual filesystem for roaming devices</p>
 
 <p align="center"><sub>Built with <a href="https://ziglang.org/">Zig</a> &amp; <a href="https://oriel.foreachdeveloper.com">Oriel</a> by <a href="https://www.foreachdeveloper.com/">foreachdeveloper</a></sub></p>
-
-<p align="center">
-  <img src="assets/brand/nomadfs-banner.svg" alt="NomadFS banner" width="100%">
-</p>
 
 # NomadFS
 
