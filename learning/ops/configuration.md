@@ -14,9 +14,15 @@ as is. Otherwise `findAndParseConfig` tries, in order:
 3. `/etc/nomadfs/nomadfs.conf`
 4. `/usr/share/nomadfs/nomadfs.conf`
 
-A file that exists but fails to parse is skipped like a missing one; the error
-of the last location is the one reported. A path starting with `~` is
-expanded. The file is read into a 16 KiB buffer, so larger files are cut off.
+Only a missing file moves on to the next location: a file that exists but
+fails to parse stops the search with its error, so a typo never silently
+loads another config. A path starting with `~` is expanded. Files larger than
+16 KiB are refused with `error.ConfigTooLarge` instead of being cut off.
+
+On POSIX systems, the config directory should be kept private with `0700`
+permissions, and `nomadfs.conf` is created and required with private `0600`
+permissions to protect sensitive swarm and device keys. Key files (`device.key`,
+`node.key`, `trust.store`) are likewise created with `0600` permissions.
 
 ## 2. Syntax
 
@@ -27,10 +33,12 @@ swarm_key = "0123…cdef"          # 64 hex characters
 
 [storage]
 storage_path = "/home/me/.nomadfs/data"
+quota_mb = 512
 
 [network]
 port = 9000
 bootstrap_peers = ["tcp://192.168.1.20:9000"]
+upnp_enabled = false
 
 share = "Documents:/home/me/Documents"
 share = "Photos:/home/me/Pictures"
@@ -48,6 +56,7 @@ The format looks like TOML but the parser is much simpler:
   place;
 - a repeated key overwrites the earlier value, except `share` (one per line,
   replaced by name) and `bootstrap_peers` (lists are concatenated).
+- atomic updates in the GUI serialize on an internal configuration mutex.
 
 ## 3. Keys
 
@@ -55,8 +64,8 @@ The format looks like TOML but the parser is much simpler:
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `nickname` | string | **required** | Name other devices show for this one; also the author name in the swarm folder. |
-| `swarm_key` | string | **required** | 32-byte swarm key: 64 hex characters, or a raw 32-byte string. Anything else is `InvalidSwarmKey`. Generate with `openssl rand -hex 32` or `make gen-swarm-key`. |
+| `nickname` | string | **required** | Name other devices show for this one; also the author name in the swarm folder. It is self-asserted: other devices show it only as a hint for devices they have not paired with. |
+| `swarm_key` | string | **required** | 32-byte swarm key: 64 hex characters, or a raw 32-byte string. 32-character hexadecimal strings are rejected as ambiguous (`expected 64 hex characters`). Anything else is `InvalidSwarmKey`. Generate with `openssl rand -hex 32` or `make gen-swarm-key`. |
 | `swarm_epoch` | u64 | `0` | Generation of the swarm key; rotations with an epoch not above it are refused ([Chapter 6.3](../security/invites.md#2-swarm-key-rotation)). Written by the app when it rotates or adopts a key. |
 | `key_path` | path | unset | File of the X25519 transport key (`node.key`). When set, `device.key` and `trust.store` live in the same directory. When unset, the directory is `.` if `./device.key` exists, otherwise `~/.nomadfs` (`src/device/paths.zig`). |
 
@@ -65,6 +74,7 @@ The format looks like TOML but the parser is much simpler:
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `storage_path` | path | **required** | Block store directory (one file per block). The swarm manifest is `<storage_path>.swarm.json`, the backup record `<storage_path>.swarm.json.backup`, the FUSE staging dir `<storage_path>.swarm.json.staging/`. |
+| `quota_mb` | u64 | `0` | Capacity limit for the local block store in MiB. `0` = unlimited. When the store reaches this capacity, `put` calls fail with `StorageFull`. |
 | `enabled` | bool | `true` | Without storage there are no shares, no swarm folder, no mount (`--mount` refuses) and `BlockManager.put`/`get` fail with `StorageDisabled`. The node still joins the DHT and answers RPCs. |
 | `replicas` | u8, ≤ 20 | `0` | Peers closest to a new file's root CID that `BlockManager.put` pushes the whole DAG to (`PUT_BLOCK`). Above 20 is `ReplicasOutOfRange`. Shares and the swarm folder don't use `put`. |
 | `write_quorum` | u8 | `1` | Provider-record acknowledgements (`ADD_PROVIDER`) `BlockManager.put` needs. `0` skips the announcement, so a device with no peers can store. With `1` and no peers, `put` returns `QuorumNotReached` (blocks stay local). |
@@ -78,7 +88,7 @@ The format looks like TOML but the parser is much simpler:
 | `port` | u16 | `9000` | TCP listen port. `0` is rejected. Invites listen on `port + 1`. |
 | `transport` | string | `"tcp"` | Only `tcp` works; `quic` is `UnsupportedTransport`, anything else `InvalidTransport`. |
 | `bootstrap_peers` | list | `[]` | `["tcp://host:port", …]`; the `tcp://` prefix is optional. Dialled at start, 5 attempts each. The app appends the inviter's address here after a join. |
-| `upnp_enabled` | bool | `true` | Ask the router (UPnP IGD) to forward `port`; the mapping is removed on stop. |
+| `upnp_enabled` | bool | `false` | Ask the router (UPnP IGD) to forward port with a 1-hour lease, renewed while running; removed on stop. Off by default: it makes the listener reachable from the Internet. |
 | `enable_mdns` | bool | `true` | LAN announcements (`NMFS{…}` on 224.0.0.251:5354 every 2 s), see [Local Discovery](../net/transport/mdns.md). |
 
 ### Security

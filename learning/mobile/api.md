@@ -21,11 +21,12 @@ Everything `nomadfs.h` declares (all are `export fn` in `api.zig`):
 | :--- | :--- |
 | `nomadfs_version` | Library version string |
 | `nomadfs_node_new(config_path)` | Parse the config and `Node.init`: storage, shares, swarm folder, device identity, trust store. `NULL` on a bad or missing config |
-| `nomadfs_node_free` | Stop the listener, join threads, free everything |
-| `nomadfs_node_run` / `nomadfs_node_stop` | Start/stop `Node.run` on its own thread (non-blocking; repeat `run` is a no-op) |
+| `nomadfs_node_free` | Stop listener and manager threads, safe teardown serialized against concurrent calls, free everything |
+| `nomadfs_node_run` | Binds listener synchronously before returning `NOMADFS_OK`. Idempotent no-op while running. Returns `NOMADFS_UNAVAILABLE` on bind failure or if called after stop |
+| `nomadfs_node_stop` | Stop listener and join threads. Cannot be re-run; allocate a new node to restart |
 | `nomadfs_node_bootstrap(node, urls_csv)` | `Node.bootstrap` with comma-separated `tcp://host:port` peers |
 | `nomadfs_put_file(node, in_path)` | `BlockManager.put`: chunk, store, announce (and replicate if `replicas > 0`); returns a 64-hex root CID |
-| `nomadfs_get_file(node, cid, out_path)` | `BlockManager.get`: fetch missing blocks (holder records, then closest peers) and write the file |
+| `nomadfs_get_file(node, cid, out_path)` | `BlockManager.get`: strictly validates 64-hex CID before creating `out_path`, enforces 4 GiB download limit, fetches missing blocks |
 | `nomadfs_node_device_id(node, out, out_len)` | Device ID as 64 hex characters + NUL |
 | `nomadfs_free` | Release a CID string from `nomadfs_put_file` |
 
@@ -43,7 +44,16 @@ Contract rules:
 
 - statuses are `c_int`, `0` is ok; unknown failures collapse to
   `NOMADFS_INTERNAL_ERROR`; Zig errors never cross the boundary;
-- calls on one handle are serialized by a mutex, so any host thread may call;
+- calls on one handle are serialized by a mutex and reference-counted handle
+  tracking, so any host thread may call and safe teardown is guaranteed;
+- `nomadfs_node_run` binds listeners synchronously, surfacing port bind or
+  network startup failures immediately;
+- once stopped with `nomadfs_node_stop`, a node handle transitions to stopped
+  and cannot be restarted (further `run` calls return `NOMADFS_UNAVAILABLE`);
+  create a new handle with `nomadfs_node_new` instead;
+- `nomadfs_get_file` requires exactly 64 valid hexadecimal characters for the
+  CID, returning `NOMADFS_INVALID_ARGUMENT` without creating or truncating the
+  target file if invalid, and enforces a 4 GiB maximum file size limit;
 - input strings are borrowed; the CID string returned by `nomadfs_put_file`
   is freed with `nomadfs_free`;
 - `nomadfs_put_file` returns `NULL` when the provider-record quorum missed
@@ -55,12 +65,12 @@ Contract rules:
 
 ```c
 NomadNode *node = nomadfs_node_new("/data/nomadfs.conf");
-nomadfs_node_run(node);                                   // listener thread
+nomadfs_node_run(node);                                   // binds listener synchronously
 nomadfs_node_bootstrap(node, "tcp://192.168.1.5:9000");   // join the swarm
 char *cid = nomadfs_put_file(node, "/sdcard/backup.zip");
 int rc = nomadfs_get_file(node, cid, "/data/restore.zip");
 nomadfs_free(cid);
-nomadfs_node_free(node);                                  // stops listener
+nomadfs_node_free(node);                                  // stops listener and frees
 ```
 
 The config file and the key/trust-store locations are the same as for the

@@ -162,19 +162,22 @@ test "sync primitives work correctly" {
     try std.testing.expect(timestamp() > 1700000000);
     try std.testing.expect(milliTimestamp() > 1700000000000);
 
+    var signalled = false;
+    m.lock();
+    errdefer m.unlock();
     wg.start();
     const t = try std.Thread.spawn(.{}, struct {
-        fn run(mutex: *Mutex, cond: *Condition, group: *WaitGroup) void {
+        fn run(mutex: *Mutex, cond: *Condition, group: *WaitGroup, ready: *bool) void {
             mutex.lock();
+            ready.* = true;
             cond.signal();
             mutex.unlock();
             group.finish();
         }
-    }.run, .{ &m, &c, &wg });
+    }.run, .{ &m, &c, &wg, &signalled });
     t.detach();
 
-    m.lock();
-    c.wait(&m);
+    while (!signalled) c.wait(&m);
     m.unlock();
 
     wg.wait();

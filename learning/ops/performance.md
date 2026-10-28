@@ -12,14 +12,18 @@ time, and what they mean in practice.
 | Links per parent block | 174 (balanced tree) | `src/storage/dag/builder.zig` `MAX_LINKS` |
 | File tree depth read by `tree.readAt` | ≤ 64 parent levels | `src/fs/tree.zig` `max_tree_depth` |
 | Dir block size | ≤ 4 MiB encoded | `src/storage/dag/codec.zig` `max_dir_block_len` |
-| Noise frame | ≤ 1024 B plaintext + 16 B tag + 2 B length | `src/net/transport/noise.zig` `write` |
-| Yamux window | 256 KiB per stream | `src/net/transport/yamux.zig` `InitialWindowSize` |
-| Yamux streams | ≤ 64 live per session (→ ≤ 16 MiB buffered) | `yamux.zig` `MaxStreams` |
+| Noise frame | ≤ 65,519 B plaintext + 16 B tag + 2 B length | `src/net/transport/noise.zig` `max_payload` |
+| Yamux window | 1 MiB per stream | `src/net/transport/yamux.zig` `InitialWindowSize` |
+| Yamux streams | ≤ 64 live per session (→ ≤ 64 MiB buffered) | `yamux.zig` `MaxStreams` |
 | Handshake / connect bound | 10 s | `src/net/transport/tcp.zig` |
+| Connection pool cap | ≤ 256 connections | `src/net/transport/manager.zig` `max_connections` |
+| RPC handler cap | ≤ 256 concurrent handlers | `src/net/discovery/node.zig` `max_handlers` |
+| Block store quota | configurable (`quota_mb`), 0 = unlimited | `src/config.zig`, `src/storage/engine.zig` |
 | Idle connection reaped after | 5 min (checked every 10 s) | `src/net/transport/manager.zig` |
 | K-bucket size / lookup parallelism | K = 20 / α = 3 | `src/net/discovery/kbucket.zig`, `lookup.zig` |
 | Share rescan | every 30 s; unchanged size+mtime skipped | `src/fs/shares.zig`, `scan.zig` |
 | Swarm manifest sync / backup round | every 10 s | `src/fs/swarm.zig` |
+| Swarm manifest tombstone horizon | 90 days (7,776,000 s) | `src/fs/manifest.zig` `pruneTombstones` |
 | Swarm manifest from a peer | ≤ 100,000 entries | `src/fs/manifest.zig` |
 | FUSE max write / attribute cache | 128 KiB / 1 s | `src/fs/fuse.zig` |
 
@@ -28,10 +32,9 @@ time, and what they mean in practice.
 - **Reading a range costs one block per tree level plus the leaf.** A file
   under 174 chunks (about 43 MiB at the average chunk size) needs the parent
   and one leaf. See [Merkle DAGs](../storage/dag.md).
-- **Small Noise frames.** Every 1 KiB of payload costs 18 bytes of framing and
-  one AEAD call, and a 1 MiB block becomes about 1,000 frames. This bounds
-  bulk throughput more than the cipher does; it is the first thing to raise
-  if transfers prove slow.
+- **Transport frame sizing.** Noise frames carry up to 65,519 bytes of payload
+  plus framing and tag overhead, allowing bulk data transfers to saturate
+  network links without excessive framing splits.
 - **Requests are stream-per-RPC, blocks one at a time.** `GET_BLOCK` asks for
   one CID per stream, and the fetch paths (`Remote.load`, repair) request
   blocks sequentially, so a cold read over a high-latency link pays one round
@@ -45,8 +48,8 @@ time, and what they mean in practice.
   for never serving stale bytes.
 - **Threads, not an event loop.** Each accepted connection spawns a handshake
   thread, each connection a Yamux reader thread, and each incoming stream a
-  handler thread. Thread count grows with connections and concurrent
-  requests.
+  handler thread. Thread count is bounded by connection caps (256) and RPC
+  handler caps (256).
 
 ## 3. Cryptography Cost
 

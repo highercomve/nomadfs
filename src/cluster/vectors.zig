@@ -77,10 +77,13 @@ pub const VectorClock = struct {
     /// Time Complexity: O(N+M) where N = self.entries.len, M = other.entries.len
     /// Space Complexity: O(1)
     pub fn compare(self: *VectorClock, other: *VectorClock) Order {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
-        other.mutex.lockShared();
-        defer other.mutex.unlockShared();
+        if (self == other) return .Equal;
+        const first = if (@intFromPtr(self) < @intFromPtr(other)) self else other;
+        const second = if (first == self) other else self;
+        first.mutex.lockShared();
+        defer first.mutex.unlockShared();
+        second.mutex.lockShared();
+        defer second.mutex.unlockShared();
 
         var self_is_less = false;
         var other_is_less = false;
@@ -133,10 +136,13 @@ pub const VectorClock = struct {
 
     // Merge two vector clocks (element-wise max)
     pub fn merge(self: *VectorClock, other: *VectorClock) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        other.mutex.lockShared();
-        defer other.mutex.unlockShared();
+        if (self == other) return;
+        // Acquire both clocks in address order, preserving each lock's mode.
+        const self_first = @intFromPtr(self) < @intFromPtr(other);
+        if (self_first) self.mutex.lock() else other.mutex.lockShared();
+        defer if (self_first) self.mutex.unlock() else other.mutex.unlockShared();
+        if (self_first) other.mutex.lockShared() else self.mutex.lock();
+        defer if (self_first) other.mutex.unlockShared() else self.mutex.unlock();
 
         var i: usize = 0;
         var j: usize = 0;
@@ -243,4 +249,33 @@ test "VectorClock does not leak when allocation fails" {
             try a.merge(&b);
         }
     }.run, .{});
+}
+
+test "VectorClock self merge and comparison are no-ops" {
+    var clock = VectorClock.init(std.testing.allocator);
+    defer clock.deinit();
+    try clock.increment("A");
+    try clock.merge(&clock);
+    try std.testing.expectEqual(VectorClock.Order.Equal, clock.compare(&clock));
+    try std.testing.expectEqual(@as(u64, 1), clock.entries.items[0].counter);
+}
+
+test "VectorClock opposite merges and comparisons share lock ordering" {
+    var a = VectorClock.init(std.testing.allocator);
+    defer a.deinit();
+    var b = VectorClock.init(std.testing.allocator);
+    defer b.deinit();
+    try a.increment("A");
+    try b.increment("B");
+    const Worker = struct {
+        fn run(dest: *VectorClock, source: *VectorClock) void {
+            for (0..1000) |_| {
+                dest.merge(source) catch unreachable;
+                _ = dest.compare(source);
+            }
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{ &a, &b });
+    defer t.join();
+    Worker.run(&b, &a);
 }

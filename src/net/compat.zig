@@ -15,9 +15,7 @@ pub const Address = struct {
     }
 
     pub fn initIp6(bytes: [16]u8, port: u16, flow_info: u20, scope_id: u32) Address {
-        _ = flow_info;
-        _ = scope_id;
-        return .{ .ip = .{ .ip6 = .{ .bytes = bytes, .port = port } } };
+        return .{ .ip = .{ .ip6 = .{ .bytes = bytes, .port = port, .flow = flow_info, .interface = .{ .index = scope_id } } } };
     }
 
     pub fn getPort(self: Address) u16 {
@@ -29,6 +27,8 @@ pub const Address = struct {
     }
 
     pub fn eql(self: Address, other: Address) bool {
+        if (self.ip == .ip6 and other.ip == .ip6 and
+            self.ip.ip6.interface.index != other.ip.ip6.interface.index) return false;
         return self.ip.eql(&other.ip);
     }
 
@@ -61,7 +61,8 @@ pub const Address = struct {
                 if (b[0] == 192 and b[1] == 168) return true;
                 return false;
             },
-            .ip6 => return false,
+            .ip6 => |ip6| return ip6.bytes[0] & 0xfe == 0xfc or
+                (ip6.bytes[0] == 0xfe and ip6.bytes[1] & 0xc0 == 0x80),
         }
     }
 
@@ -70,17 +71,32 @@ pub const Address = struct {
         return 1;
     }
 
-    pub fn toPosix(self: Address) std.posix.sockaddr.in {
-        const port_be = std.mem.nativeToBig(u16, self.getPort());
-        const addr_bytes = switch (self.ip) {
-            .ip4 => |ip4| ip4.bytes,
-            .ip6 => [4]u8{ 0, 0, 0, 0 },
-        };
-        const addr_u32 = @as(u32, @bitCast(addr_bytes));
-        return .{
-            .family = std.posix.AF.INET,
-            .port = port_be,
-            .addr = addr_u32,
+    pub const PosixAddress = extern union {
+        ip4: std.posix.sockaddr.in,
+        ip6: std.posix.sockaddr.in6,
+
+        pub fn len(self: *const PosixAddress) std.posix.socklen_t {
+            return if (self.ip4.family == std.posix.AF.INET6)
+                @sizeOf(std.posix.sockaddr.in6)
+            else
+                @sizeOf(std.posix.sockaddr.in);
+        }
+    };
+
+    pub fn toPosix(self: Address) PosixAddress {
+        return switch (self.ip) {
+            .ip4 => |ip4| .{ .ip4 = .{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = @bitCast(ip4.bytes),
+            } },
+            .ip6 => |ip6| .{ .ip6 = .{
+                .family = std.posix.AF.INET6,
+                .port = std.mem.nativeToBig(u16, ip6.port),
+                .addr = ip6.bytes,
+                .flowinfo = std.mem.nativeToBig(u32, ip6.flow),
+                .scope_id = ip6.interface.index,
+            } },
         };
     }
 
@@ -110,15 +126,18 @@ pub const Stream = struct {
 
     pub fn read(self: Stream, buffer: []u8) !usize {
         if (builtin.os.tag == .linux) {
-            const rc = std.posix.system.read(@intCast(self.inner.socket.handle), buffer.ptr, buffer.len);
-            return switch (std.posix.errno(rc)) {
-                .SUCCESS => @intCast(rc),
-                .BADF => 0,
-                .AGAIN => error.WouldBlock,
-                .CONNRESET => error.ConnectionResetByPeer,
-                .PIPE => error.BrokenPipe,
-                else => |err| std.posix.unexpectedErrno(err),
-            };
+            while (true) {
+                const rc = std.posix.system.read(@intCast(self.inner.socket.handle), buffer.ptr, buffer.len);
+                if (std.posix.errno(rc) == .INTR) continue;
+                return switch (std.posix.errno(rc)) {
+                    .SUCCESS => @intCast(rc),
+                    .BADF => error.FileDescriptorClosed,
+                    .AGAIN => error.WouldBlock,
+                    .CONNRESET => error.ConnectionResetByPeer,
+                    .PIPE => error.BrokenPipe,
+                    else => |err| std.posix.unexpectedErrno(err),
+                };
+            }
         } else {
             const io = std.Io.Threaded.global_single_threaded.io();
             var bufs: [1][]u8 = .{buffer};
@@ -128,14 +147,17 @@ pub const Stream = struct {
 
     pub fn write(self: Stream, buffer: []const u8) !usize {
         if (builtin.os.tag == .linux) {
-            const rc = std.posix.system.write(@intCast(self.inner.socket.handle), buffer.ptr, buffer.len);
-            return switch (std.posix.errno(rc)) {
-                .SUCCESS => @intCast(rc),
-                .BADF, .PIPE => error.BrokenPipe,
-                .AGAIN => error.WouldBlock,
-                .CONNRESET => error.ConnectionResetByPeer,
-                else => |err| std.posix.unexpectedErrno(err),
-            };
+            while (true) {
+                const rc = std.os.linux.sendto(@intCast(self.inner.socket.handle), buffer.ptr, buffer.len, std.os.linux.MSG.NOSIGNAL, null, 0);
+                if (std.posix.errno(rc) == .INTR) continue;
+                return switch (std.posix.errno(rc)) {
+                    .SUCCESS => @intCast(rc),
+                    .BADF, .PIPE => error.BrokenPipe,
+                    .AGAIN => error.WouldBlock,
+                    .CONNRESET => error.ConnectionResetByPeer,
+                    else => |err| std.posix.unexpectedErrno(err),
+                };
+            }
         } else {
             const io = std.Io.Threaded.global_single_threaded.io();
             var bufs: [1][]const u8 = .{buffer};
@@ -191,7 +213,26 @@ pub const Server = struct {
 
     pub fn accept(self: *Server) !Connection {
         const io = std.Io.Threaded.global_single_threaded.io();
-        const client_stream = try self.inner.accept(io);
+        const client_stream = if (builtin.os.tag == .linux) blk: {
+            var sa: std.os.linux.sockaddr.storage = undefined;
+            var len: std.os.linux.socklen_t = @sizeOf(@TypeOf(sa));
+            const rc = while (true) {
+                const result = std.os.linux.accept4(self.inner.socket.handle, @ptrCast(&sa), &len, std.os.linux.SOCK.CLOEXEC);
+                switch (std.posix.errno(result)) {
+                    .SUCCESS => break result,
+                    .INTR => continue,
+                    .BADF, .INVAL, .NOTSOCK => return error.FileDescriptorClosed,
+                    .MFILE, .NFILE => return error.SystemResources,
+                    .CONNABORTED => return error.ConnectionAborted,
+                    else => |err| return std.posix.unexpectedErrno(err),
+                }
+            };
+            const addr: Address = if (sa.family == std.posix.AF.INET6) addr6: {
+                const ip6: *const std.os.linux.sockaddr.in6 = @ptrCast(&sa);
+                break :addr6 Address.initIp6(ip6.addr, std.mem.bigToNative(u16, ip6.port), @intCast(std.mem.bigToNative(u32, ip6.flowinfo)), ip6.scope_id);
+            } else Address.fromPosix(@as(*const std.posix.sockaddr.in, @ptrCast(&sa)).*);
+            break :blk std.Io.net.Stream{ .socket = .{ .handle = @intCast(rc), .address = addr.ip } };
+        } else try self.inner.accept(io);
         return .{
             .stream = .{ .inner = client_stream },
             .address = .{ .ip = client_stream.socket.address },
@@ -250,7 +291,7 @@ pub fn tcpConnectToAddressTimeout(address: Address, timeout_ms: u32) !Stream {
             break :blk .{ @ptrCast(&sa4), @sizeOf(linux.sockaddr.in) };
         },
         .ip6 => |ip6| blk: {
-            sa6 = .{ .port = std.mem.nativeToBig(u16, ip6.port), .flowinfo = 0, .addr = ip6.bytes, .scope_id = 0 };
+            sa6 = .{ .port = std.mem.nativeToBig(u16, ip6.port), .flowinfo = std.mem.nativeToBig(u32, ip6.flow), .addr = ip6.bytes, .scope_id = ip6.interface.index };
             break :blk .{ @ptrCast(&sa6), @sizeOf(linux.sockaddr.in6) };
         },
     };
@@ -304,4 +345,24 @@ fn connectErrno(err: std.os.linux.E) anyerror {
         .ADDRNOTAVAIL => error.AddressUnavailable,
         else => std.posix.unexpectedErrno(err),
     };
+}
+
+test "IPv6 POSIX conversion preserves scope and private ranges" {
+    const address = Address.initIp6(.{ 0xfe, 0x80 } ++ .{0} ** 14, 1234, 42, 7);
+    try std.testing.expect(address.isPrivate());
+    try std.testing.expect((try Address.parseIp("fc00::1", 1)).isPrivate());
+    try std.testing.expect((try Address.parseIp("fd00::1", 1)).isPrivate());
+    try std.testing.expect(!(try Address.parseIp("2001:db8::1", 1)).isPrivate());
+    const sa = address.toPosix();
+    try std.testing.expectEqual(@as(u32, 7), sa.ip6.scope_id);
+    try std.testing.expectEqual(@as(u32, 42), std.mem.bigToNative(u32, sa.ip6.flowinfo));
+    try std.testing.expectEqual(@as(u16, 1234), std.mem.bigToNative(u16, sa.ip6.port));
+    try std.testing.expectEqual(@as(std.posix.socklen_t, @sizeOf(std.posix.sockaddr.in6)), sa.len());
+}
+
+test "bad socket descriptor is an error rather than EOF" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const stream = Stream{ .inner = .{ .socket = .{ .handle = -1, .address = Address.initIp4(.{ 0, 0, 0, 0 }, 0).ip } } };
+    var byte: [1]u8 = undefined;
+    try std.testing.expectError(error.FileDescriptorClosed, stream.read(&byte));
 }

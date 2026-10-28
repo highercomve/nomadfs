@@ -139,7 +139,8 @@ pub const BlockManager = struct {
 
     /// Writes the file rooted at `root` to `writer` (anything with writeAll)
     /// and returns its size. Missing blocks are fetched from the provider
-    /// first, so a failure never leaves partial output in `writer`.
+    /// first. Read failures (including error.DagTooLarge when the visit
+    /// budget is exhausted) propagate and may leave partial output in `writer`.
     pub fn get(self: *BlockManager, root: []const u8, writer: anytype, options: walk.ReadOptions) !u64 {
         const store = self.store orelse return error.StorageDisabled;
         if (!try walk.isComplete(self.allocator, store, root)) {

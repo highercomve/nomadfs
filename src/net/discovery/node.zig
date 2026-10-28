@@ -7,6 +7,8 @@ const network = @import("../transport/mod.zig");
 const relay = network.relay;
 const local_addrs = @import("../local_addrs.zig");
 const lookup_mod = @import("lookup.zig");
+const chunker = @import("../../storage/chunker.zig");
+const codec = @import("../../storage/dag/codec.zig");
 const StorageEngine = @import("../../storage/engine.zig").StorageEngine;
 const providers_mod = @import("providers.zig");
 const device_trust = @import("../../device/trust.zig");
@@ -31,6 +33,9 @@ pub const Node = struct {
     /// Set by request threads when an inbound PING proves we are reachable.
     is_public: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     handlers_wg: sync.WaitGroup = .{},
+    handlers_mutex: sync.Mutex = .{},
+    stopping: std.atomic.Value(bool) = .init(false),
+    active_handlers: usize = 0,
     /// Bound on every blocking step of a DHT RPC, in both directions, so a
     /// peer that accepts a stream and goes silent cannot stall a lookup or
     /// pin a request thread.
@@ -50,7 +55,9 @@ pub const Node = struct {
     /// the node refuses rotations.
     rotation_sink: ?RotationSink = null,
     /// This device's current key epoch (config node.swarm_epoch).
+    /// Runtime writers must use setSwarmEpoch; guarded by rotation_mutex.
     swarm_epoch: u64 = 0,
+    rotation_mutex: sync.Mutex = .{},
     /// Human name sent with SHARES (config node.nickname).
     nickname: []const u8 = "",
     /// This node's Ed25519 identity, used to sign revocations it pushes.
@@ -65,6 +72,11 @@ pub const Node = struct {
     /// Devices no relay reached lately -> when to try again (ms). Guarded
     /// by `mutex`.
     relay_misses: std.AutoHashMapUnmanaged(id.NodeID, i64) = .empty,
+
+    discovery_dials: std.AutoHashMapUnmanaged(id.NodeID, i64) = .empty,
+
+    pub const max_handlers = 256;
+    const max_recent_peers = 1024;
 
     /// Produces this node's share listing (an encoded dir block, owned by
     /// the caller) on demand. Type-erased so the DHT does not depend on the
@@ -98,12 +110,23 @@ pub const Node = struct {
     /// after we dial it (the handshake proves the ID) and it answers a PING.
     pub fn onDiscovery(self: *Node, peer_id: id.NodeID, addr: network.Address) void {
         if (peer_id.eql(self.manager.node_id)) return;
-        const known = blk: {
+        if (local_addrs.classify(addr) == .invalid) return;
+        if (!addr.isLoopback() and !local_addrs.onLink(addr)) return;
+        if (self.stopping.load(.acquire)) return;
+        if (self.manager.existingConnection(peer_id)) |conn| {
+            conn.deinit();
+            return;
+        }
+        {
             self.mutex.lock();
             defer self.mutex.unlock();
-            break :blk self.routing_table.contains(peer_id);
-        };
-        if (known) return;
+            if (self.routing_table.contains(peer_id)) return;
+            const now = sync.monotonicMillis();
+            pruneRecent(&self.discovery_dials, now);
+            if (self.discovery_dials.contains(peer_id)) return;
+            if (self.discovery_dials.count() >= max_recent_peers) return;
+            self.discovery_dials.put(self.allocator, peer_id, now + 30_000) catch return;
+        }
 
         const conn = self.manager.connectToPeer(addr, self.swarm_key, peer_id) catch return;
         defer conn.deinit();
@@ -111,8 +134,7 @@ pub const Node = struct {
     }
 
     fn pingLruAndEvict(self: *Node, lru: kbucket.PeerInfo) void {
-        const addr = lru.getBestAddress();
-        if (self.manager.connectToPeer(addr, self.swarm_key, lru.id)) |conn| {
+        if (self.manager.connectToPeerMulti(lru.addresses[0..lru.addrs_count], self.swarm_key, lru.id)) |conn| {
             defer conn.deinit();
             self.ping(conn) catch {
                 self.mutex.lock();
@@ -140,10 +162,32 @@ pub const Node = struct {
         // We wait for an INCOMING connection on our listen port.
     }
 
-    pub fn deinit(self: *Node) void {
-        // Wait for all in-flight request handlers to finish.
-        // They might be detached threads accessing 'self'.
+    /// Stops admission before waiting, so repeated drains are safe.
+    pub fn drainHandlers(self: *Node) void {
+        self.handlers_mutex.lock();
+        self.stopping.store(true, .release);
+        self.handlers_mutex.unlock();
         self.handlers_wg.wait();
+    }
+
+    fn startHandler(self: *Node) bool {
+        self.handlers_mutex.lock();
+        defer self.handlers_mutex.unlock();
+        if (self.stopping.load(.acquire) or self.active_handlers >= max_handlers) return false;
+        self.active_handlers += 1;
+        self.handlers_wg.start();
+        return true;
+    }
+
+    fn finishHandler(self: *Node) void {
+        self.handlers_mutex.lock();
+        self.active_handlers -= 1;
+        self.handlers_mutex.unlock();
+        self.handlers_wg.finish();
+    }
+
+    pub fn deinit(self: *Node) void {
+        self.drainHandlers();
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -155,12 +199,14 @@ pub const Node = struct {
         self.storage.deinit(self.allocator);
         self.providers.deinit(self.allocator);
         self.relay_misses.deinit(self.allocator);
+        self.discovery_dials.deinit(self.allocator);
     }
 
     /// This device's addresses on every network it's on, to announce.
     fn announced(self: *Node) rpc.Announced {
         var a: rpc.Announced = .{};
-        a.count = @intCast(local_addrs.list(&a.addrs, self.manager.bound_port));
+        if (self.manager.bound_port == 0) return a;
+        a.count = std.math.cast(u8, local_addrs.list(&a.addrs, self.manager.bound_port)) orelse 0;
         return a;
     }
 
@@ -185,8 +231,6 @@ pub const Node = struct {
         const peer_id = conn.getRemoteNodeID();
         if (!response.sender_id.eql(peer_id)) return error.PeerIdMismatch;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
         var info = kbucket.PeerInfo{
             .id = peer_id,
             .last_seen = sync.timestamp(),
@@ -195,16 +239,23 @@ pub const Node = struct {
         // opened this connection, its source port is a random one.
         // Relayed: no address of the peer's own; it announces its own.
         var address = conn.getPeerAddress();
-        if (response.payload.PONG.port) |port| address.setPort(port);
-        if (!conn.getPeerAddress().isUnspecified()) _ = info.addAddress(address);
-        for (response.payload.PONG.announced.slice()) |addr| _ = info.addAddress(addr);
-        _ = try self.routing_table.addPeer(info);
+        if (response.payload.PONG.port) |port| if (port != 0) address.setPort(port);
+        if (!conn.getPeerAddress().isUnspecified() and local_addrs.classify(address) != .invalid)
+            _ = info.addAddressFrom(address, .observed, info.last_seen);
+        for (response.payload.PONG.announced.slice()) |addr| {
+            if (acceptAnnounced(addr, conn.getPeerAddress())) _ = info.addAddressFrom(addr, .announced, info.last_seen);
+        }
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            _ = try self.routing_table.addPeer(info);
+        }
 
         // Outbound connections are the natural propagation point: every
         // PONG we just verified is an authenticated peer that can now hear
         // which devices we stopped trusting.
         if (self.trust_store) |trust| {
-            if (trust.revocationsSlice().len > 0) {
+            if (trust.revocationCount() > 0) {
                 _ = self.pushRevocations(conn) catch {};
             }
         }
@@ -379,11 +430,13 @@ pub const Node = struct {
     }
 
     fn lookupValueWorker(node: *Node, state: *lookup_mod.LookupState, peer: kbucket.PeerInfo, target: id.NodeID, result_ptr: *?[]u8, result_mutex: *sync.Mutex) void {
-        const result_or_err = node.sendFindValue(peer.addresses[0..peer.addrs_count], target, peer.id);
+        const candidate = node.lookupCandidate(peer);
+        var via: ?network.Address = null;
+        const result_or_err = node.sendFindValue(candidate.peer.addresses[0..candidate.peer.addrs_count], target, peer.id, &via);
         if (result_or_err) |result| {
             // Successful response, verify peer
-            var p_updates = peer;
-            p_updates.last_seen = sync.timestamp();
+            var p_updates = kbucket.PeerInfo{ .id = peer.id, .last_seen = sync.timestamp() };
+            if (via) |addr| _ = p_updates.addAddressFrom(addr, .observed, p_updates.last_seen);
             node.addVerifiedPeer(p_updates);
 
             switch (result) {
@@ -407,7 +460,7 @@ pub const Node = struct {
             state.reportFailure(peer.id);
             node.mutex.lock();
             defer node.mutex.unlock();
-            node.routing_table.markDisconnected(peer.id);
+            if (candidate.tried_known) node.routing_table.markDisconnected(peer.id);
         }
     }
 
@@ -624,8 +677,20 @@ pub const Node = struct {
     /// Signs and pushes `device`'s revocation to `conn`'s peer. Fails when
     /// this node has no device identity to sign with.
     pub fn sendRevoke(self: *Node, conn: network.Connection, device_id: id.NodeID) !bool {
+        if (self.trust_store) |trust| {
+            const tombstones = try trust.copyRevocations(self.allocator);
+            defer self.allocator.free(tombstones);
+            for (tombstones) |r| {
+                if (r.device_id.eql(device_id)) return self.sendRevokeAt(conn, device_id, r.at);
+            }
+        }
+        const now = std.math.cast(u64, sync.timestamp()) orelse return error.InvalidTimestamp;
+        return self.sendRevokeAt(conn, device_id, now);
+    }
+
+    fn sendRevokeAt(self: *Node, conn: network.Connection, device_id: id.NodeID, at: u64) !bool {
         const identity = self.device_identity orelse return error.NoDeviceIdentity;
-        const signed = device_trust.revocationMessage(device_id, identity.deviceId());
+        const signed = device_trust.revocationMessage(device_id, identity.deviceId(), at);
         const stream = try conn.openStream();
         defer stream.close();
         stream.setTimeout(self.rpc_timeout_ms);
@@ -634,7 +699,7 @@ pub const Node = struct {
 
         const msg = rpc.Message{
             .sender_id = self.manager.node_id,
-            .payload = .{ .REVOKE = .{ .device_id = device_id, .signer_key = identity.publicKey(), .at = @intCast(sync.timestamp()), .signature = signature } },
+            .payload = .{ .REVOKE = .{ .device_id = device_id, .signer_key = identity.publicKey(), .at = at, .signature = signature } },
         };
         try msg.send(self.allocator, stream);
 
@@ -652,11 +717,12 @@ pub const Node = struct {
     pub fn pushRevocations(self: *Node, conn: network.Connection) !usize {
         const trust = self.trust_store orelse return 0;
         if (self.device_identity == null) return 0;
-        const tombstones = trust.revocationsSlice();
+        const tombstones = try trust.copyRevocations(self.allocator);
+        defer self.allocator.free(tombstones);
 
         var honored: usize = 0;
         for (tombstones) |r| {
-            const ok = self.sendRevoke(conn, r.device_id) catch |err| {
+            const ok = self.sendRevokeAt(conn, r.device_id, r.at) catch |err| {
                 std.debug.print("Failed to push revocation of {x}: {any}\n", .{ r.device_id.bytes[0..4], err });
                 continue;
             };
@@ -671,9 +737,9 @@ pub const Node = struct {
     /// accepted at least one revocation.
     pub fn sweepRevocations(self: *Node, sample: usize) !usize {
         const trust = self.trust_store orelse return 0;
-        const ids = try trust.copyRevocationIds(self.allocator);
-        defer self.allocator.free(ids);
-        if (ids.len == 0 or self.device_identity == null) return 0;
+        const tombstones = try trust.copyRevocations(self.allocator);
+        defer self.allocator.free(tombstones);
+        if (tombstones.len == 0 or self.device_identity == null) return 0;
 
         self.mutex.lock();
         const maybe_peers = self.routing_table.getClosestPeers(self.manager.node_id, sample) catch |err| {
@@ -697,8 +763,8 @@ pub const Node = struct {
             defer conn.deinit();
 
             var any_honored = false;
-            for (ids) |device_id| {
-                const ok = self.sendRevoke(conn, device_id) catch |err| {
+            for (tombstones) |r| {
+                const ok = self.sendRevokeAt(conn, r.device_id, r.at) catch |err| {
                     std.debug.print("Revocation sweep: push to {x} failed: {any}\n", .{ peer.id.bytes[0..4], err });
                     continue;
                 };
@@ -715,9 +781,11 @@ pub const Node = struct {
         closer_peers: []kbucket.PeerInfo,
     };
 
-    pub fn sendFindValue(self: *Node, addresses: []const network.Address, key: id.NodeID, peer_id: ?id.NodeID) !FindValueResult {
+    pub fn sendFindValue(self: *Node, addresses: []const network.Address, key: id.NodeID, peer_id: ?id.NodeID, via: *?network.Address) !FindValueResult {
+        via.* = null;
         const conn = try self.manager.connectToPeerMulti(addresses, self.swarm_key, peer_id);
         defer conn.deinit();
+        via.* = matchingAddress(conn.getPeerAddress(), addresses);
 
         const stream = try conn.openStream();
         defer stream.close();
@@ -749,7 +817,25 @@ pub const Node = struct {
         }
     }
 
+    const LookupCandidate = struct { peer: kbucket.PeerInfo, tried_known: bool };
+
+    fn lookupCandidate(self: *Node, hearsay: kbucket.PeerInfo) LookupCandidate {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.routing_table.getPeer(hearsay.id)) |known| {
+            var merged = known;
+            // Do not replace known addresses while constructing the dial list.
+            for (hearsay.addresses[0..hearsay.addrs_count]) |addr| {
+                if (merged.addrs_count == kbucket.MAX_PEER_ADDRESSES) break;
+                _ = merged.addAddressFrom(addr, .hearsay, hearsay.last_seen);
+            }
+            return .{ .peer = merged, .tried_known = known.addrs_count > 0 };
+        }
+        return .{ .peer = hearsay, .tried_known = false };
+    }
+
     fn addVerifiedPeer(self: *Node, peer: kbucket.PeerInfo) void {
+        if (peer.addrs_count == 0) return;
         var lru_to_ping: ?kbucket.PeerInfo = null;
         {
             self.mutex.lock();
@@ -772,14 +858,16 @@ pub const Node = struct {
     fn lookupNodeWorker(node: *Node, state: *lookup_mod.LookupState, peer: kbucket.PeerInfo, target: id.NodeID) void {
         // std.debug.print("Lookup: [{x}] Querying peer {x}\n", .{ target.bytes[0..4], peer.id.bytes[0..4] });
 
-        if (node.sendFindNode(peer.addresses[0..peer.addrs_count], target, peer.id)) |closer_peers| {
+        const candidate = node.lookupCandidate(peer);
+        var via: ?network.Address = null;
+        if (node.sendFindNode(candidate.peer.addresses[0..candidate.peer.addrs_count], target, peer.id, &via)) |closer_peers| {
             // std.debug.print("Lookup: [{x}] Peer {x} replied with {d} peers\n", .{ target.bytes[0..4], peer.id.bytes[0..4], closer_peers.len });
             defer node.allocator.free(closer_peers);
             state.reportReply(peer.id, closer_peers) catch {};
 
             // We successfully contacted 'peer'. Update it in our routing table.
-            var p_updates = peer;
-            p_updates.last_seen = sync.timestamp();
+            var p_updates = kbucket.PeerInfo{ .id = peer.id, .last_seen = sync.timestamp() };
+            if (via) |addr| _ = p_updates.addAddressFrom(addr, .observed, p_updates.last_seen);
             node.addVerifiedPeer(p_updates);
 
             // NOTE: We do NOT add closer_peers to the routing table anymore (Hearsay).
@@ -789,7 +877,7 @@ pub const Node = struct {
             state.reportFailure(peer.id);
             node.mutex.lock();
             defer node.mutex.unlock();
-            node.routing_table.markDisconnected(peer.id);
+            if (candidate.tried_known) node.routing_table.markDisconnected(peer.id);
         }
     }
 
@@ -821,9 +909,11 @@ pub const Node = struct {
         }
     }
 
-    pub fn sendFindNode(self: *Node, addresses: []const network.Address, target: id.NodeID, peer_id: ?id.NodeID) ![]kbucket.PeerInfo {
+    pub fn sendFindNode(self: *Node, addresses: []const network.Address, target: id.NodeID, peer_id: ?id.NodeID, via: *?network.Address) ![]kbucket.PeerInfo {
+        via.* = null;
         const conn = try self.manager.connectToPeerMulti(addresses, self.swarm_key, peer_id);
         defer conn.deinit();
+        via.* = matchingAddress(conn.getPeerAddress(), addresses);
 
         const stream = try conn.openStream();
         defer stream.close();
@@ -852,6 +942,7 @@ pub const Node = struct {
         const now = sync.timestamp();
         var i: usize = 0;
         while (i < 256) : (i += 1) {
+            if (self.stopping.load(.acquire) or !self.manager.running.load(.acquire)) return;
             var needs_refresh = false;
             {
                 self.mutex.lock();
@@ -887,7 +978,7 @@ pub const Node = struct {
             // connection reference so the stream outlives connection reaping.
             const handler = struct {
                 fn run(n: *Node, s: network.Stream, c: network.Connection) void {
-                    defer n.handlers_wg.finish();
+                    defer n.finishHandler();
                     defer c.deinit();
                     s.setTimeout(n.rpc_timeout_ms);
                     // A relay request takes the stream over.
@@ -898,11 +989,14 @@ pub const Node = struct {
                     if (!taken) s.close();
                 }
             };
+            if (!self.startHandler()) {
+                stream.close();
+                continue;
+            }
             conn.retain();
-            self.handlers_wg.start();
             const thread = std.Thread.spawn(.{}, handler.run, .{ self, stream, conn }) catch |err| {
                 std.debug.print("Failed to spawn DHT request handler: {any}\n", .{err});
-                self.handlers_wg.finish();
+                self.finishHandler();
                 conn.deinit();
                 stream.close();
                 continue;
@@ -929,8 +1023,8 @@ pub const Node = struct {
             .GET_SHARES => try self.handleGetShares(stream),
             .GET_SWARM => try self.handleGetSwarm(stream),
             .ROTATE_KEY => |p| try self.handleRotateKey(stream, conn, p.epoch, p.new_key, p.signer_key, p.signature),
-            .PUT_BLOCK => |p| try self.handlePutBlock(stream, p.cid, p.data),
-            .REVOKE => |p| try self.handleRevoke(stream, p.device_id, p.signer_key, p.signature),
+            .PUT_BLOCK => |p| try self.handlePutBlock(stream, conn, p.cid, p.data),
+            .REVOKE => |p| try self.handleRevoke(stream, p.device_id, p.signer_key, p.at, p.signature),
             .ADD_PROVIDER => |p| try self.handleAddProvider(stream, conn, p.key),
             .GET_PROVIDERS => |p| try self.handleGetProviders(stream, p.key),
             .DIAL_BACK => |p| try self.handleDialBack(conn, p.port),
@@ -974,6 +1068,7 @@ pub const Node = struct {
         {
             self.mutex.lock();
             defer self.mutex.unlock();
+            pruneRecent(&self.relay_misses, sync.monotonicMillis());
             if (self.relay_misses.get(target)) |until| {
                 if (sync.monotonicMillis() < until) return error.NoRelay;
             }
@@ -981,7 +1076,11 @@ pub const Node = struct {
         const conn = self.dialThroughRelayOnce(target) catch |err| {
             self.mutex.lock();
             defer self.mutex.unlock();
-            self.relay_misses.put(self.allocator, target, sync.monotonicMillis() + relay_retry_ms) catch {};
+            const now = sync.monotonicMillis();
+            pruneRecent(&self.relay_misses, now);
+            if (self.relay_misses.count() < max_recent_peers) {
+                self.relay_misses.put(self.allocator, target, now + relay_retry_ms) catch {};
+            }
             return err;
         };
         self.mutex.lock();
@@ -1140,7 +1239,7 @@ pub const Node = struct {
         var address = conn.getPeerAddress();
         const relayed = address.isUnspecified();
         std.debug.print("Received PING from {x}. Address from sock: {f}, Port from payload: {d}\n", .{ sender_id.bytes[0..4], address, port });
-        address.setPort(port);
+        if (port != 0) address.setPort(port);
 
         // Add to routing table with CORRECT port
         var info = kbucket.PeerInfo{
@@ -1148,9 +1247,11 @@ pub const Node = struct {
             .last_seen = sync.timestamp(),
         };
         // Through a relay the socket says nothing about the sender.
-        if (!relayed) _ = info.addAddress(address);
+        if (!relayed and local_addrs.classify(address) != .invalid) _ = info.addAddressFrom(address, .observed, info.last_seen);
         // And every other way it says it can be reached (Tailscale, ...).
-        for (announced_addrs) |addr| _ = info.addAddress(addr);
+        for (announced_addrs) |addr| {
+            if (acceptAnnounced(addr, conn.getPeerAddress())) _ = info.addAddressFrom(addr, .announced, info.last_seen);
+        }
         self.addVerifiedPeer(info);
         std.debug.print("Added peer {f} ({d} addresses) to routing table.\n", .{ address, info.addrs_count });
 
@@ -1252,19 +1353,31 @@ pub const Node = struct {
         try response.send(self.allocator, stream);
     }
 
+    pub fn setSwarmEpoch(self: *Node, epoch: u64) void {
+        self.rotation_mutex.lock();
+        defer self.rotation_mutex.unlock();
+        self.swarm_epoch = epoch;
+    }
+
     fn handleRotateKey(self: *Node, stream: network.Stream, conn: network.Connection, epoch: u64, new_key: [32]u8, signer_key: [32]u8, signature: [64]u8) !void {
-        var accepted = false;
-        if (self.trust_store) |trust| if (self.rotation_sink) |sink| {
-            if (device_rotation.verify(trust, conn.getRemoteDeviceID(), signer_key, signature, epoch, new_key, self.swarm_epoch)) {
-                self.swarm_epoch = epoch;
-                accepted = true;
-                sink.applyFn(sink.ctx, new_key, epoch);
-            } else |err| {
-                std.debug.print("Refused a swarm key rotation: {any}\n", .{err});
-            }
-        };
+        const accepted = self.applyRotation(conn.getRemoteDeviceID(), epoch, new_key, signer_key, signature);
         const response = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .STORE_ACK = .{ .stored = accepted } } };
         try response.send(self.allocator, stream);
+    }
+
+    fn applyRotation(self: *Node, peer_device: ?id.NodeID, epoch: u64, new_key: [32]u8, signer_key: [32]u8, signature: [64]u8) bool {
+        self.rotation_mutex.lock();
+        defer self.rotation_mutex.unlock();
+        if (epoch == std.math.maxInt(u64)) return false;
+        const trust = self.trust_store orelse return false;
+        const sink = self.rotation_sink orelse return false;
+        device_rotation.verify(trust, peer_device, signer_key, signature, epoch, new_key, self.swarm_epoch) catch |err| {
+            std.debug.print("Refused a swarm key rotation: {any}\n", .{err});
+            return false;
+        };
+        self.swarm_epoch = epoch;
+        sink.applyFn(sink.ctx, new_key, epoch);
+        return true;
     }
 
     fn handleGetSwarm(self: *Node, stream: network.Stream) !void {
@@ -1280,22 +1393,35 @@ pub const Node = struct {
     /// PUT_BLOCK: verify the bytes against their CID, then keep the block.
     /// A node with no block storage acknowledges nothing, so the sender does
     /// not count it as a replica.
-    fn handlePutBlock(self: *Node, stream: network.Stream, cid: [32]u8, data: []const u8) !void {
+    fn handlePutBlock(self: *Node, stream: network.Stream, conn: network.Connection, cid: [32]u8, data: []const u8) !void {
         var stored = false;
-        if (self.block_store) |block_store| {
+        _ = conn;
+        if (canPutBlock(data.len)) if (self.block_store) |block_store| {
             // put() rejects bytes that do not hash to `cid`.
             if (block_store.put(.{ .cid = cid, .data = data })) {
                 stored = true;
             } else |err| {
                 std.debug.print("PUT_BLOCK rejected: {any}\n", .{err});
             }
-        }
+        };
         const response = rpc.Message{
             .sender_id = self.manager.node_id,
             .payload = .{ .STORE_ACK = .{ .stored = stored } },
         };
         try response.send(self.allocator, stream);
     }
+
+    /// Admission to the swarm is the write authorization: under the default
+    /// policy any swarm-key holder may push replicas (learning/security/model.md),
+    /// and under `require_trusted_devices` the handshake already refused untrusted
+    /// devices. What is bounded here is the size: no valid encoded block (a leaf
+    /// is a chunk plus its tag byte, a dir block is capped by the codec) is larger.
+    /// The CID check, the handler cap and the storage quota bound the rest.
+    fn canPutBlock(len: usize) bool {
+        return len <= max_put_block_len;
+    }
+
+    const max_put_block_len = @max((chunker.Params{}).max_size + 1, codec.max_dir_block_len);
 
     /// REVOKE: only honored when the signature verifies, the signer is not
     /// the revoked device, and the signer's Ed25519 identity is in this
@@ -1305,14 +1431,18 @@ pub const Node = struct {
         stream: network.Stream,
         device_id: id.NodeID,
         signer_key: [32]u8,
+        at: u64,
         signature: [64]u8,
     ) !void {
         var honored = false;
         if (self.trust_store) |trust| {
-            honored = device_trust.applyRevocation(trust, device_id, signer_key, signature, @intCast(sync.timestamp())) catch false;
+            const now = std.math.cast(u64, sync.timestamp()) orelse return error.InvalidTimestamp;
+            const outcome = device_trust.applyRevocation(trust, device_id, signer_key, at, signature, now) catch .rejected;
+            honored = outcome != .rejected;
+            if (outcome == .applied) _ = self.manager.closePeer(device_id);
             // Accepted tombstones must survive a restart, or every re-dial
             // replays the whole revocation.
-            if (honored) trust.save() catch |err| {
+            if (outcome == .applied) trust.save() catch |err| {
                 std.debug.print("Failed to persist accepted revocation: {any}\n", .{err});
             };
         }
@@ -1363,8 +1493,18 @@ pub const Node = struct {
     }
 };
 
-fn addressesMatch(a: network.Address, b: network.Address) bool {
-    return a.eql(b);
+// Remove expired entries without allocating or invalidating a live iterator.
+fn pruneRecent(map: *std.AutoHashMapUnmanaged(id.NodeID, i64), now: i64) void {
+    var stale: [Node.max_recent_peers]id.NodeID = undefined;
+    var count: usize = 0;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* <= now) {
+            stale[count] = entry.key_ptr.*;
+            count += 1;
+        }
+    }
+    for (stale[0..count]) |key| _ = map.remove(key);
 }
 
 test "localStore enforces value, byte and key limits" {
@@ -1387,4 +1527,178 @@ test "localStore enforces value, byte and key limits" {
     try node.localStore(k1, "1234");
     try std.testing.expectEqual(@as(usize, 8), node.stored_bytes);
     try std.testing.expectError(error.StorageFull, node.localStore(k3, "1"));
+}
+
+test "handler admission is capped and drain permanently stops admission" {
+    const allocator = std.testing.allocator;
+    var manager = network.manager.ConnectionManager.initExplicit(allocator, .tcp, network.noise.KeyPair.generate());
+    defer manager.deinit();
+    var node = Node.init(allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    for (0..Node.max_handlers) |_| try std.testing.expect(node.startHandler());
+    try std.testing.expect(!node.startHandler());
+    node.finishHandler();
+    try std.testing.expect(node.startHandler());
+    for (0..Node.max_handlers) |_| node.finishHandler();
+    node.drainHandlers();
+    node.drainHandlers();
+    try std.testing.expect(!node.startHandler());
+}
+
+test "PUT_BLOCK accepts any valid encoded block size and nothing larger" {
+    try std.testing.expect(Node.canPutBlock(1));
+    try std.testing.expect(Node.canPutBlock((chunker.Params{}).max_size + 1));
+    try std.testing.expect(Node.canPutBlock(codec.max_dir_block_len));
+    try std.testing.expect(!Node.canPutBlock(Node.max_put_block_len + 1));
+}
+
+test "recent peer maps prune expired deadlines" {
+    var map: std.AutoHashMapUnmanaged(id.NodeID, i64) = .empty;
+    defer map.deinit(std.testing.allocator);
+    const old = id.NodeID{ .bytes = [_]u8{1} ** 32 };
+    const live = id.NodeID{ .bytes = [_]u8{2} ** 32 };
+    try map.put(std.testing.allocator, old, 30);
+    try map.put(std.testing.allocator, live, 31);
+    pruneRecent(&map, 30);
+    try std.testing.expect(!map.contains(old));
+    try std.testing.expect(map.contains(live));
+}
+
+test "drain waits for an admitted handler and refuses concurrent admission" {
+    const allocator = std.testing.allocator;
+    var manager = network.manager.ConnectionManager.initExplicit(allocator, .tcp, network.noise.KeyPair.generate());
+    defer manager.deinit();
+    var node = Node.init(allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    try std.testing.expect(node.startHandler());
+    var finished: std.atomic.Value(bool) = .init(false);
+    const Waiter = struct {
+        fn run(n: *Node, done: *std.atomic.Value(bool)) void {
+            n.drainHandlers();
+            done.store(true, .release);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{ &node, &finished });
+    while (!node.stopping.load(.acquire)) sync.sleep(std.time.ns_per_ms);
+    const stopped_admission = !node.startHandler();
+    const waited = !finished.load(.acquire);
+    node.finishHandler();
+    thread.join();
+    try std.testing.expect(stopped_admission);
+    try std.testing.expect(waited);
+    try std.testing.expect(finished.load(.acquire));
+}
+
+test "concurrent rotations apply an epoch once and reject the maximum epoch" {
+    const allocator = std.testing.allocator;
+    var manager = network.manager.ConnectionManager.initExplicit(allocator, .tcp, network.noise.KeyPair.generate());
+    defer manager.deinit();
+    var node = Node.init(allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(std.testing.io, &path_buf)];
+    const path = try std.fs.path.join(allocator, &.{ base, "trust" });
+    defer allocator.free(path);
+    const identity = try identity_mod.Identity.fromSeed([_]u8{3} ** 32);
+    const peer = try identity_mod.Identity.fromSeed([_]u8{4} ** 32);
+    var trust = try device_trust.Store.load(allocator, path, identity.seed());
+    defer trust.deinit();
+    _ = try trust.upsert(peer.publicKey(), [_]u8{9} ** 32, "peer", 1);
+    node.trust_store = &trust;
+    const Sink = struct {
+        count: usize = 0,
+        fn apply(ctx: *anyopaque, _: [32]u8, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+        }
+        fn run(n: *Node, signer: identity_mod.Identity, sig: [64]u8) void {
+            _ = n.applyRotation(signer.deviceId(), 5, [_]u8{7} ** 32, signer.publicKey(), sig);
+        }
+    };
+    var sink = Sink{};
+    node.rotation_sink = .{ .ctx = &sink, .applyFn = Sink.apply };
+    const key = [_]u8{7} ** 32;
+    const signature = try peer.sign(&device_rotation.message(5, key));
+    const t1 = try std.Thread.spawn(.{}, Sink.run, .{ &node, peer, signature });
+    const t2 = std.Thread.spawn(.{}, Sink.run, .{ &node, peer, signature }) catch |err| {
+        t1.join();
+        return err;
+    };
+    t1.join();
+    t2.join();
+    const count = sink.count;
+    try std.testing.expectEqual(@as(usize, 1), count);
+    const max_sig = try peer.sign(&device_rotation.message(std.math.maxInt(u64), key));
+    try std.testing.expect(!node.applyRotation(peer.deviceId(), std.math.maxInt(u64), key, peer.publicKey(), max_sig));
+}
+
+/// Only a socket equal to a dial candidate proves that candidate was used.
+fn matchingAddress(sock: network.Address, candidates: []const network.Address) ?network.Address {
+    if (local_addrs.classify(sock) == .invalid) return null;
+    for (candidates) |addr| if (addr.eql(sock)) return sock;
+    return null;
+}
+
+fn acceptAnnounced(addr: network.Address, sock: network.Address) bool {
+    const scope = local_addrs.classify(addr);
+    const socket_scope = local_addrs.classify(sock);
+    return acceptAnnouncedScope(scope, socket_scope, if (scope == .private) local_addrs.onLink(addr) else false, if (scope == .cgnat) local_addrs.haveCgnat() else false);
+}
+
+fn acceptAnnouncedScope(scope: local_addrs.Scope, socket: local_addrs.Scope, on_link: bool, have_cgnat: bool) bool {
+    return switch (scope) {
+        .invalid => false,
+        .loopback => socket == .loopback,
+        .private => socket == .loopback or socket == .private or socket == .cgnat or on_link,
+        .cgnat => socket == .cgnat or have_cgnat,
+        .public => true,
+    };
+}
+
+test "announced scopes respect the authenticated socket and local networks" {
+    try std.testing.expect(!acceptAnnouncedScope(.private, .public, false, false));
+    try std.testing.expect(acceptAnnouncedScope(.private, .public, true, false));
+    try std.testing.expect(acceptAnnouncedScope(.private, .private, false, false));
+    try std.testing.expect(acceptAnnouncedScope(.loopback, .loopback, false, false));
+    try std.testing.expect(!acceptAnnouncedScope(.loopback, .public, false, false));
+    try std.testing.expect(!acceptAnnouncedScope(.cgnat, .public, false, false));
+    try std.testing.expect(acceptAnnouncedScope(.cgnat, .public, false, true));
+    try std.testing.expect(!acceptAnnouncedScope(.invalid, .loopback, true, true));
+}
+
+test "lookup candidate socket matching rejects inbound pooled and relay addresses" {
+    const addr = network.Address.initIp4(.{ 127, 0, 0, 1 }, 13500);
+    try std.testing.expect(matchingAddress(addr, &.{addr}) != null);
+    try std.testing.expect(matchingAddress(network.Address.initIp4(.{ 127, 0, 0, 1 }, 55555), &.{addr}) == null);
+    try std.testing.expect(matchingAddress(network.Address.initIp4(.{ 0, 0, 0, 0 }, 0), &.{addr}) == null);
+}
+
+test "lookup prioritizes known addresses and confines hearsay-only failure" {
+    const allocator = std.testing.allocator;
+    var manager = network.manager.ConnectionManager.initExplicit(allocator, .tcp, network.noise.KeyPair.generate());
+    defer manager.deinit();
+    var node = Node.init(allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    var peer = kbucket.PeerInfo{ .id = .{ .bytes = [_]u8{9} ** 32 }, .last_seen = 1 };
+    const real = network.Address.initIp4(.{ 127, 0, 0, 1 }, 13505);
+    _ = peer.addAddress(real);
+    _ = try node.routing_table.addPeer(peer);
+    var hearsay = kbucket.PeerInfo{ .id = peer.id, .last_seen = 2 };
+    _ = hearsay.addAddressFrom(network.Address.initIp4(.{ 192, 0, 2, 1 }, 9), .hearsay, 2);
+    const candidate = node.lookupCandidate(hearsay);
+    try std.testing.expect(candidate.tried_known);
+    try std.testing.expect(candidate.peer.addresses[0].eql(real));
+    hearsay.id = .{ .bytes = [_]u8{10} ** 32 };
+    const hearsay_only = node.lookupCandidate(hearsay);
+    try std.testing.expect(!hearsay_only.tried_known);
+    try std.testing.expectEqual(@as(u8, 1), hearsay_only.peer.addrs_count);
+    var state = try lookup_mod.LookupState.init(allocator, hearsay.id, &.{hearsay});
+    defer state.deinit();
+    node.rpc_timeout_ms = 20;
+    // Empty addresses fail immediately; the actual worker must preserve known peers.
+    hearsay.addrs_count = 0;
+    Node.lookupNodeWorker(&node, &state, hearsay, hearsay.id);
+    try std.testing.expect(node.routing_table.contains(peer.id));
 }

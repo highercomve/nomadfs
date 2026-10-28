@@ -224,6 +224,11 @@ for (const item of document.querySelectorAll(".nav-item[data-view], .bar-item[da
   });
 }
 
+// The mount's folder name: a paired device's label, or an unpaired device's claimed nickname with a
+// fingerprint suffix, so an unpaired device never shows a paired device's name.
+const deviceTitle = (d) => d.mount_name || (d.trusted === true ? d.label : `Device ${d.fingerprint ? d.fingerprint.slice(0, 9) : (d.peer ? d.peer.slice(0, 8) : "")}`);
+const deviceBadge = (d) => (d.trusted === true) ? "Paired" : "Not paired";
+
 /** Reachable devices in the drawer, like a file manager's locations. */
 function renderNavDevices() {
   const box = $("nav-devices");
@@ -236,7 +241,7 @@ function renderNavDevices() {
     if (document.body.dataset.view === "browse" && d.peer === current) b.classList.add("active");
     b.appendChild(svg(ICONS.device));
     const label = document.createElement("span");
-    label.textContent = d.nickname || d.peer.slice(0, 12);
+    label.textContent = deviceTitle(d);
     b.appendChild(label);
     const dot = document.createElement("span");
     dot.className = "dot";
@@ -388,14 +393,19 @@ async function showDevices() {
   setEmpty("");
   for (const d of devices) {
     const total = d.shares.reduce((s, x) => s + x.size, 0);
+    const title = deviceTitle(d);
+    const badge = deviceBadge(d);
+    const fpShort = d.fingerprint ? d.fingerprint.slice(0, 9) : (d.peer ? d.peer.slice(0, 8) : "");
+    const sharesText = d.shares.length
+      ? `${d.shares.length} shared folder${d.shares.length === 1 ? "" : "s"} · ${formatSize(total)}`
+      : "Shares nothing yet";
+    const qualifier = (!d.trusted && d.nickname) ? ` · claims to be "${d.nickname}"` : "";
     list.appendChild(row({
       icon: "device",
       iconClass: "device",
-      headline: d.nickname || d.peer.slice(0, 12),
-      meta: d.shares.length
-        ? `${d.shares.length} shared folder${d.shares.length === 1 ? "" : "s"} · ${formatSize(total)}`
-        : "Shares nothing yet",
-      onClick: () => { path = [{ name: d.nickname || d.peer.slice(0, 12), device: d }]; showLocation(); },
+      headline: title,
+      meta: `${badge} · ${fpShort}${qualifier} · ${sharesText}`,
+      onClick: () => { path = [{ name: title, device: d }]; showLocation(); },
     }));
   }
 }
@@ -1877,11 +1887,10 @@ $("devices-refresh").addEventListener("click", async () => {
         renderNavDevices();
       } catch {}
     }
-    const trustedNames = new Set(trusted.map((d) => d.label));
-    const unpaired = reachable.filter((d) => !trustedNames.has(d.nickname));
+    const unpaired = reachable.filter((d) => !d.trusted);
     list.replaceChildren();
     for (const d of trusted) {
-      const online = reachable.some((r) => r.nickname === d.label);
+      const online = reachable.some((r) => r.trusted && r.fingerprint === d.fingerprint);
       list.appendChild(row({
         icon: "device",
         iconClass: "device",
@@ -1892,10 +1901,13 @@ $("devices-refresh").addEventListener("click", async () => {
       }));
     }
     for (const d of unpaired) {
+      const title = deviceTitle(d);
+      const qualifier = d.nickname ? `Claims to be "${d.nickname}". ` : "";
       list.appendChild(row({
         icon: "device",
-        headline: d.nickname || d.peer.slice(0, 12),
-        meta: "Connected, not paired: shares your swarm key, but its identity isn't verified. Pair it with an invite.",
+        headline: title,
+        meta: `${qualifier}Connected, not paired: shares your swarm key, but its identity isn't verified. Pair it with an invite.`,
+        meta2: d.fingerprint,
       }));
     }
     if (!trusted.length && !unpaired.length) {
@@ -1915,10 +1927,10 @@ $("rotate-key").addEventListener("click", async () => {
     trusted = await invoke("devices_list", { config_path: await ensureConfig() });
     reachable = await invoke("remote_devices", null);
   } catch {}
-  const online = new Set(reachable.map((d) => d.nickname));
-  const gets = trusted.filter((d) => online.has(d.label)).map((d) => d.label);
-  const offline = trusted.filter((d) => !online.has(d.label)).map((d) => d.label);
-  const unpaired = reachable.filter((d) => !trusted.some((t) => t.label === d.nickname)).map((d) => d.nickname || d.peer.slice(0, 8));
+  const online = new Set(reachable.filter((r) => r.trusted).map((r) => r.fingerprint));
+  const gets = trusted.filter((d) => online.has(d.fingerprint)).map((d) => d.label);
+  const offline = trusted.filter((d) => !online.has(d.fingerprint)).map((d) => d.label);
+  const unpaired = reachable.filter((r) => !r.trusted).map(deviceTitle);
   const lines = [
     "Use this if the swarm key may have leaked. A new key goes to your paired devices that are online; anything that only knew the old key is cut off.",
     gets.length ? `Gets the new key: ${gets.join(", ")}.` : "No paired device is online: only this device changes key.",

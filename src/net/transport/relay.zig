@@ -63,9 +63,15 @@ const RelayedConnectionImpl = struct {
         return self.closed.load(.acquire) or self.yamux.isClosed() or self.via.isClosed();
     }
 
+    fn maintain(ctx: *anyopaque) void {
+        const self: *RelayedConnectionImpl = @ptrCast(@alignCast(ctx));
+        self.yamux.reapClosed(@import("../../sync.zig").monotonicMillis());
+    }
+
     fn isInUse(ctx: *anyopaque) bool {
         const self: *RelayedConnectionImpl = @ptrCast(@alignCast(ctx));
-        return self.refs.load(.acquire) > 1 or self.yamux.streamCount() > 0;
+        const streams = self.yamux.streamCount();
+        return self.refs.load(.acquire) > 1 or streams > 0;
     }
 
     /// Signals shutdown: ends the stream through the relay, which wakes
@@ -109,6 +115,7 @@ const vtable = network.Connection.ConnectionVTable{
     .deinit = RelayedConnectionImpl.deinit,
     .isClosed = RelayedConnectionImpl.isClosed,
     .isInUse = RelayedConnectionImpl.isInUse,
+    .maintain = RelayedConnectionImpl.maintain,
 };
 
 const stream_vtable = network.Stream.StreamVTable{

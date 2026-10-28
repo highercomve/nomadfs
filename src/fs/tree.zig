@@ -172,7 +172,7 @@ fn collectLeaves(allocator: std.mem.Allocator, loader: Loader, cid: Cid, levels:
     var pos = base;
     while (links.next()) |link| {
         const lo = pos;
-        pos += link.size;
+        pos = std.math.add(u64, pos, link.size) catch return error.InvalidTree;
         if (pos <= start) continue;
         if (lo >= end or out.items.len >= max) return;
         if (levels == 1) {

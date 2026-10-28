@@ -7,12 +7,14 @@ const builtin = @import("builtin");
 
 pub const scan = @import("scan.zig");
 pub const shares = @import("shares.zig");
+pub const inode_table = @import("inode_table.zig");
 pub const tree = @import("tree.zig");
 pub const remote = @import("remote.zig");
 pub const filestore = @import("filestore.zig");
 pub const manifest = @import("manifest.zig");
 pub const swarm = @import("swarm.zig");
 pub const readahead = @import("readahead.zig");
+pub const device_names = @import("device_names.zig");
 /// Read-only FUSE mount of every device's shares (desktop Linux only).
 pub const fuse = if (builtin.os.tag == .linux and !builtin.abi.isAndroid()) @import("fuse.zig") else struct {};
 
@@ -26,9 +28,11 @@ test {
     _ = @import("scan_cache.zig");
     _ = shares;
     _ = tree;
+    _ = inode_table;
     _ = remote;
     _ = filestore;
     _ = manifest;
     _ = swarm;
+    _ = device_names;
     std.testing.refAllDecls(fuse);
 }

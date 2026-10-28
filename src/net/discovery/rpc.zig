@@ -5,6 +5,7 @@ const std = @import("std");
 const id = @import("../id.zig");
 const kbucket = @import("kbucket.zig");
 const providers_mod = @import("providers.zig");
+const pairing = @import("../../device/pairing.zig");
 
 /// In-memory target for Message.serialize (Message.send).
 const MessageBuffer = struct {
@@ -172,7 +173,7 @@ pub const Message = struct {
                 switch (p) {
                     .value => |val| {
                         try writer.writeByte(1); // 1 indicates found value
-                        try writer.writeInt(u32, @intCast(val.len), .big);
+                        try writer.writeInt(u32, try valueLen(val.len), .big);
                         try writer.writeAll(val);
                     },
                     .closer_peers => |peers| {
@@ -183,7 +184,7 @@ pub const Message = struct {
             },
             .STORE => |p| {
                 try writer.writeAll(&p.key.bytes);
-                try writer.writeInt(u32, @intCast(p.value.len), .big);
+                try writer.writeInt(u32, try valueLen(p.value.len), .big);
                 try writer.writeAll(p.value);
             },
             .DIAL_BACK => |p| {
@@ -198,18 +199,18 @@ pub const Message = struct {
             .GET_PROVIDERS => |p| try writer.writeAll(&p.key.bytes),
             .PROVIDERS => |p| {
                 if (p.providers.len > providers_mod.max_per_key) return error.TooManyProviders;
-                try writer.writeByte(@intCast(p.providers.len));
+                try writer.writeByte(std.math.cast(u8, p.providers.len) orelse return error.TooManyProviders);
                 for (p.providers) |provider| try writer.writeAll(&provider.bytes);
             },
             .BLOCK => |p| {
                 const data = p.data orelse return writer.writeByte(0);
                 try writer.writeByte(1);
-                try writer.writeInt(u32, @intCast(data.len), .big);
+                try writer.writeInt(u32, try valueLen(data.len), .big);
                 try writer.writeAll(data);
             },
             .PUT_BLOCK => |p| {
                 try writer.writeAll(&p.cid);
-                try writer.writeInt(u32, @intCast(p.data.len), .big);
+                try writer.writeInt(u32, try valueLen(p.data.len), .big);
                 try writer.writeAll(p.data);
             },
             .REVOKE => |p| {
@@ -220,10 +221,8 @@ pub const Message = struct {
             },
             .GET_SHARES => {},
             .SHARES => |p| {
-                const nick = p.nickname[0..@min(p.nickname.len, max_nickname_len)];
-                try writer.writeByte(@intCast(nick.len));
-                try writer.writeAll(nick);
-                try writer.writeInt(u32, @intCast(p.listing.len), .big);
+                try writeNickname(p.nickname, writer);
+                try writer.writeInt(u32, try valueLen(p.listing.len), .big);
                 try writer.writeAll(p.listing);
             },
             .GET_SWARM => {},
@@ -234,7 +233,7 @@ pub const Message = struct {
                 try writer.writeAll(&p.signature);
             },
             .SWARM => |p| {
-                try writer.writeInt(u32, @intCast(p.manifest.len), .big);
+                try writer.writeInt(u32, try valueLen(p.manifest.len), .big);
                 try writer.writeAll(p.manifest);
             },
         }
@@ -272,11 +271,13 @@ pub const Message = struct {
                 break :blk MessagePayload{ .FIND_VALUE = .{ .key = key } };
             },
             .FIND_VALUE_RESPONSE => blk: {
-                const found_byte = try reader.readByte();
-                if (found_byte == 1) {
-                    break :blk MessagePayload{ .FIND_VALUE_RESPONSE = .{ .value = try readValue(allocator, reader) } };
+                // Only the two tags the serializer writes; anything else is
+                // not a peer list and must not be read as one.
+                switch (try reader.readByte()) {
+                    1 => break :blk MessagePayload{ .FIND_VALUE_RESPONSE = .{ .value = try readValue(allocator, reader) } },
+                    0 => break :blk MessagePayload{ .FIND_VALUE_RESPONSE = .{ .closer_peers = try readPeers(allocator, reader) } },
+                    else => return error.InvalidMessage,
                 }
-                break :blk MessagePayload{ .FIND_VALUE_RESPONSE = .{ .closer_peers = try readPeers(allocator, reader) } };
             },
             .STORE => blk: {
                 var key: id.NodeID = undefined;
@@ -325,9 +326,11 @@ pub const Message = struct {
             .GET_SHARES => MessagePayload{ .GET_SHARES = {} },
             .SHARES => blk: {
                 const nick_len = try reader.readByte();
+                if (nick_len > max_nickname_len) return error.InvalidNickname;
                 const nickname = try allocator.alloc(u8, nick_len);
                 errdefer allocator.free(nickname);
                 try reader.readNoEof(nickname);
+                if (!isValidNickname(nickname)) return error.InvalidNickname;
                 break :blk MessagePayload{ .SHARES = .{ .nickname = nickname, .listing = try readValue(allocator, reader) } };
             },
             .GET_SWARM => MessagePayload{ .GET_SWARM = {} },
@@ -362,14 +365,14 @@ pub const Message = struct {
     }
 
     /// Longest device nickname a SHARES reply carries; longer ones are cut.
-    pub const max_nickname_len = 64;
+    /// The same limit pairing applies to a device's name.
+    pub const max_nickname_len = pairing.max_nickname_len;
 
     /// Upper bound on a value carried by STORE / FIND_VALUE_RESPONSE.
     pub const max_value_len = 10 * 1024 * 1024;
 
     fn writePeers(peers: []const kbucket.PeerInfo, writer: anytype) !void {
-        if (peers.len > 255) return error.TooManyPeers;
-        try writer.writeByte(@intCast(peers.len));
+        try writer.writeByte(std.math.cast(u8, peers.len) orelse return error.TooManyPeers);
         for (peers) |peer| {
             try writer.writeAll(&peer.id.bytes);
             try writer.writeByte(peer.addrs_count);
@@ -396,7 +399,9 @@ pub const Message = struct {
             if (addrs_count > kbucket.MAX_PEER_ADDRESSES) return error.TooManyAddresses;
 
             for (0..addrs_count) |_| {
-                _ = peer.addAddress(try deserializeAddress(reader));
+                const addr = try deserializeAddress(reader);
+                if (@import("../local_addrs.zig").classify(addr) != .invalid)
+                    _ = peer.addAddressFrom(addr, .hearsay, peer.last_seen);
             }
         }
         return peers;
@@ -419,15 +424,24 @@ pub const Message = struct {
         };
     }
 
-    /// Reads a length-prefixed value; the returned slice is caller-owned.
+    /// Reads a length-prefixed value; the returned slice is caller-owned. The
+    /// buffer grows as bytes arrive, so a peer that declares a large length and
+    /// then stalls costs only the bytes it actually sent.
     fn readValue(allocator: std.mem.Allocator, reader: anytype) ![]u8 {
         const len = try reader.readInt(u32, .big);
         if (len > max_value_len) return error.ValueTooLarge;
 
-        const val = try allocator.alloc(u8, len);
-        errdefer allocator.free(val);
-        try reader.readNoEof(val);
-        return val;
+        var val: std.ArrayList(u8) = .empty;
+        errdefer val.deinit(allocator);
+        var remaining: usize = len;
+        while (remaining > 0) {
+            const n = @min(remaining, read_chunk_len);
+            const start = val.items.len;
+            try val.resize(allocator, start + n);
+            try reader.readNoEof(val.items[start..]);
+            remaining -= n;
+        }
+        return val.toOwnedSlice(allocator);
     }
 
     pub fn deinit(self: Message, allocator: std.mem.Allocator) void {
@@ -453,6 +467,43 @@ pub const Message = struct {
     }
 };
 
+/// Bytes read from the stream per step of readValue.
+const read_chunk_len = 64 * 1024;
+
+/// Length prefix of a value the receiver accepts (readValue). A value over
+/// Message.max_value_len fails here instead of being sent and then rejected.
+fn valueLen(len: usize) !u32 {
+    if (len > Message.max_value_len) return error.ValueTooLarge;
+    return std.math.cast(u32, len) orelse error.ValueTooLarge;
+}
+
+fn isPrintableAscii(byte: u8) bool {
+    return byte >= 0x20 and byte <= 0x7e;
+}
+
+/// A SHARES nickname: printable ASCII within the pairing limit. Empty is fine
+/// (a device without a name).
+fn isValidNickname(nickname: []const u8) bool {
+    if (nickname.len > Message.max_nickname_len) return false;
+    for (nickname) |byte| {
+        if (!isPrintableAscii(byte)) return false;
+    }
+    return true;
+}
+
+/// Writes the nickname as the receiver will accept it. A name this device
+/// cannot send as printable ASCII keeps its length, with each other byte
+/// replaced by '?', so peers still get the listing.
+fn writeNickname(nickname: []const u8, writer: anytype) !void {
+    const n = @min(nickname.len, Message.max_nickname_len);
+    var buf: [Message.max_nickname_len]u8 = undefined;
+    for (nickname[0..n], buf[0..n]) |byte, *out| {
+        out.* = if (isPrintableAscii(byte)) byte else '?';
+    }
+    try writer.writeByte(std.math.cast(u8, n) orelse return error.InvalidNickname);
+    try writer.writeAll(buf[0..n]);
+}
+
 fn writeAnnounced(a: Announced, writer: anytype) !void {
     try writer.writeByte(a.count);
     for (a.slice()) |addr| try serializeAddress(addr, writer);
@@ -462,8 +513,12 @@ fn readAnnounced(reader: anytype) !Announced {
     var a: Announced = .{};
     const count = try reader.readByte();
     if (count > max_announced) return error.TooManyAddresses;
-    for (0..count) |i| a.addrs[i] = try deserializeAddress(reader);
-    a.count = count;
+    for (0..count) |_| {
+        const addr = try deserializeAddress(reader);
+        if (@import("../local_addrs.zig").classify(addr) == .invalid) continue;
+        a.addrs[a.count] = addr;
+        a.count += 1;
+    }
     return a;
 }
 
@@ -612,4 +667,100 @@ test "rpc: PONG carries the listening port, and reads without it from older node
     defer old_pong.deinit(allocator);
     try std.testing.expectEqual(@as(?u16, null), old_pong.payload.PONG.port);
     try std.testing.expectEqual(@as(u8, 1), old_pong.payload.PONG.announced.count);
+}
+
+test "rpc: readValue bounds allocation before payload arrival" {
+    var input = TestBuffer{ .allocator = std.testing.allocator };
+    defer input.list.deinit(std.testing.allocator);
+    try input.writer().writeInt(u32, Message.max_value_len, .big);
+    var memory: [128 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    try std.testing.expectError(error.EndOfStream, Message.readValue(fixed.allocator(), input.reader()));
+    input.pos = 0;
+    input.list.clearRetainingCapacity();
+    try input.writer().writeInt(u32, Message.max_value_len + 1, .big);
+    try std.testing.expectError(error.ValueTooLarge, Message.readValue(std.testing.allocator, input.reader()));
+}
+
+test "rpc: readValue grows across chunks and cleans up truncated payloads" {
+    const allocator = std.testing.allocator;
+    var input = TestBuffer{ .allocator = allocator };
+    defer input.list.deinit(allocator);
+    const data = try allocator.alloc(u8, read_chunk_len + 7);
+    defer allocator.free(data);
+    @memset(data, 42);
+    try input.writer().writeInt(u32, @intCast(data.len), .big);
+    try input.writer().writeAll(data);
+    const value = try Message.readValue(allocator, input.reader());
+    defer allocator.free(value);
+    try std.testing.expectEqualSlices(u8, data, value);
+    input.pos = 0;
+    input.list.items.len -= 1;
+    try std.testing.expectError(error.EndOfStream, Message.readValue(allocator, input.reader()));
+}
+
+test "rpc: unknown find-value response tags and invalid nicknames are rejected" {
+    const allocator = std.testing.allocator;
+    const sender = id.NodeID{ .bytes = [_]u8{3} ** 32 };
+    var input = TestBuffer{ .allocator = allocator };
+    defer input.list.deinit(allocator);
+    const msg = Message{ .sender_id = sender, .payload = .{ .FIND_VALUE_RESPONSE = .{ .closer_peers = &.{} } } };
+    try msg.serialize(input.writer());
+    input.list.items[33] = 2;
+    try std.testing.expectError(error.InvalidMessage, Message.deserialize(allocator, input.reader()));
+    input.list.clearRetainingCapacity();
+    input.pos = 0;
+    try (Message{ .sender_id = sender, .payload = .{ .SHARES = .{ .nickname = "ok", .listing = "" } } }).serialize(input.writer());
+    input.list.items[34] = 0x1b;
+    try std.testing.expectError(error.InvalidNickname, Message.deserialize(allocator, input.reader()));
+    input.pos = 0;
+    input.list.items[33] = Message.max_nickname_len + 1;
+    try std.testing.expectError(error.InvalidNickname, Message.deserialize(allocator, input.reader()));
+    try std.testing.expectError(error.ValueTooLarge, valueLen(Message.max_value_len + 1));
+}
+
+test "rpc peer lists and announcements skip invalid addresses without changing framing" {
+    const allocator = std.testing.allocator;
+    var peer = kbucket.PeerInfo{ .id = .{ .bytes = [_]u8{3} ** 32 }, .last_seen = 1 };
+    const addresses = [_]Address{
+        Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+        Address.initIp4(.{ 224, 0, 0, 1 }, 1),
+        Address.initIp4(.{ 10, 0, 0, 1 }, 0),
+        Address.initIp4(.{ 192, 0, 2, 7 }, 14700),
+    };
+    for (addresses) |a| _ = peer.addAddress(a);
+    var buf = TestBuffer{ .allocator = allocator };
+    defer buf.list.deinit(allocator);
+    try Message.writePeers(&.{peer}, buf.writer());
+    const peers = try Message.readPeers(allocator, buf.reader());
+    defer allocator.free(peers);
+    try std.testing.expectEqual(@as(u8, 1), peers[0].addrs_count);
+    try std.testing.expect(peers[0].addresses[0].eql(addresses[3]));
+    try std.testing.expectEqual(kbucket.AddrSource.hearsay, peers[0].sources[0]);
+    buf.pos = 0;
+    buf.list.clearRetainingCapacity();
+    var announced_addrs: Announced = .{};
+    @memcpy(announced_addrs.addrs[0..addresses.len], &addresses);
+    announced_addrs.count = addresses.len;
+    try writeAnnounced(announced_addrs, buf.writer());
+    const parsed = try readAnnounced(buf.reader());
+    try std.testing.expectEqual(@as(u8, 1), parsed.count);
+    try std.testing.expectEqual(buf.list.items.len, buf.pos);
+}
+
+test "rpc bounded random inputs do not panic" {
+    var bytes: [128]u8 = undefined;
+    var seed: u64 = 12345;
+    const allocator = std.testing.allocator;
+    for (0..256) |iteration| {
+        for (&bytes) |*byte| {
+            seed = seed *% 6364136223846793005 +% 1;
+            byte.* = @truncate(seed >> 32);
+        }
+        var buf = TestBuffer{ .allocator = allocator };
+        defer buf.list.deinit(allocator);
+        try buf.list.appendSlice(allocator, bytes[0 .. iteration % bytes.len]);
+        const msg = Message.deserialize(allocator, buf.reader()) catch continue;
+        msg.deinit(allocator);
+    }
 }

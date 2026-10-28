@@ -36,7 +36,7 @@ pub const LookupState = struct {
     queried: std.AutoHashMapUnmanaged(id.NodeID, void),
     in_flight: std.AutoHashMapUnmanaged(id.NodeID, void),
     failed: std.AutoHashMapUnmanaged(id.NodeID, void),
-    mutex: sync.Mutex = .{},
+    mutex: sync.Mutex = {},
 };
 ```
 
@@ -76,17 +76,22 @@ pub fn isFinished(self: *LookupState) bool {
 2.  `runLookupRound` starts one thread per peer (at most 3), running
     `lookupNodeWorker`, and **joins them all** before the next round. Our own
     ID is never queried.
-3.  `lookupNodeWorker` calls `sendFindNode(addresses, target, peer_id)`. It
-    dials with the expected node ID, so a different key at that address fails
-    the call.
+3.  `lookupNodeWorker` calls `sendFindNode(addresses, target, peer_id, &via)`.
+    It dials with the expected node ID, so a different key at that address
+    fails the call. `via` is set to the address the connection really used (it
+    stays empty when a pooled connection was reused).
 
 `lookup` returns nothing. Its effect is on the routing table: every peer that
-replied is added through `addVerifiedPeer`.
+replied is added with **only the address it was reached on**.
 
 ### Hearsay is not trusted
 Peers listed in a `FIND_NODE_RESPONSE` go into the lookup's candidate list
-only. They enter the routing table once *they* are queried and reply over an
-authenticated connection. A peer can't fill our table with made-up entries.
+only, **together with the addresses the replier gave for them**. Those
+addresses are never copied into the routing table: a peer enters the table when
+*it* replies over an authenticated connection, and then with the address that
+connection came from. A peer can't fill our table with made-up entries or
+made-up addresses. A failed attempt to reach a candidate by hearsay addresses
+alone does not remove anything already in the table.
 
 ## 4. Handling Failures and Churn
 
@@ -95,7 +100,8 @@ authenticated connection. A peer can't fill our table with made-up entries.
 2.  **Isolation**: `reportFailure` puts the peer in `failed` for the rest of
     the lookup.
 3.  **Table cleanup**: the worker calls `routing_table.markDisconnected(id)`,
-    which also promotes a replacement ([Chapter 2.2](./kbucket.md)).
+    which also promotes a replacement ([Chapter 2.2](./kbucket.md)), when the
+    peer's own known addresses were tried and failed.
 4.  **Continuity**: the next round picks the next best candidates.
 
 `tests/dht/churn_test.zig` checks this on **5** nodes on loopback: the node

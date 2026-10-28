@@ -31,7 +31,9 @@ a few far away. See [Chapter 2.2](./kbucket.md).
 
 A peer enters the table only after it has answered over an authenticated
 connection (a `PING` whose ID matches the handshake, or a reply during a
-lookup). Peers merely *named* in someone's reply ("hearsay") are not added.
+lookup), with the address that connection used. Peers merely *named* in
+someone's reply ("hearsay") are not added, nor are third-party addresses for a
+peer that did reply.
 
 ## 3. Where Peers Come From
 

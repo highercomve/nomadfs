@@ -26,11 +26,11 @@ public final class NomadFs implements AutoCloseable {
         return handle == 0 ? null : new NomadFs(handle);
     }
 
-    public int run() {
+    public synchronized int run() {
         return run(handle);
     }
 
-    public int stop() {
+    public synchronized int stop() {
         return stop(handle);
     }
 
@@ -38,7 +38,7 @@ public final class NomadFs implements AutoCloseable {
      * Connects to comma-separated tcp://host:port bootstrap peers in the
      * background.
      */
-    public int bootstrap(String urlsCsv) {
+    public synchronized int bootstrap(String urlsCsv) {
         return bootstrap(handle, urlsCsv);
     }
 
@@ -47,22 +47,22 @@ public final class NomadFs implements AutoCloseable {
      * null while the provider record cannot reach its write quorum.
      * Blocks are kept locally either way; a retry announces them.
      */
-    public String put(String inPath) {
+    public synchronized String put(String inPath) {
         return put(handle, inPath);
     }
 
     /** Reassembles the file rooted at `cid` into `outPath`. */
-    public int get(String cid, String outPath) {
+    public synchronized int get(String cid, String outPath) {
         return get(handle, cid, outPath);
     }
 
     /** This node's device ID as 64 hex characters, or null on failure. */
-    public String deviceId() {
+    public synchronized String deviceId() {
         return deviceId(handle);
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
         if (handle != 0) {
             free(handle);
             handle = 0;

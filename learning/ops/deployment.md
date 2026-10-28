@@ -135,7 +135,9 @@ contact.
   `Noise Handshake FAILED` with a decrypt error at message 3 means the two
   devices have different swarm keys.
 - **Reachability**: the TCP `port` (default 9000; 14700 in the app's
-  generated config) must be reachable; invites use `port + 1`.
+  generated config) must be reachable; invites use `port + 1`. UPnP is
+  disabled by default; set `upnp_enabled = true` in `nomadfs.conf` to ask
+  the gateway to forward the port.
 - **LAN discovery**: UDP 5354 multicast to 224.0.0.251 must be allowed; the
   app's own config turns it off.
 - **Mount**: `FusermountNotFound` means `fuse3` is missing.

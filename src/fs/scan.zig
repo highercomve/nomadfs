@@ -14,7 +14,7 @@
 //! are skipped rather than failing the whole share.
 //!
 //! A first scan of a large folder takes long, so it can report progress: a
-//! root of everything scanned so far, every `Progress.interval_ns`.
+//! root of everything scanned so far, every `Progress.interval_ns``.
 
 const std = @import("std");
 const storage = @import("../storage/mod.zig");
@@ -39,6 +39,8 @@ pub const Result = struct {
 const Remembered = struct {
     size: u64,
     mtime_ns: i96,
+    ctime_ns: i96,
+    inode: u64,
     cid: Cid,
     /// Where the file's leaves sit (filestore scans only; owned). Empty
     /// for an entry loaded from the scan cache until a scan needs them.
@@ -117,7 +119,7 @@ pub const Scanner = struct {
                 return err;
             };
         }
-        gop.value_ptr.* = .{ .size = e.size, .mtime_ns = e.mtime_ns, .cid = e.cid };
+        gop.value_ptr.* = .{ .size = e.size, .mtime_ns = e.mtime_ns, .ctime_ns = e.ctime_ns, .inode = e.inode, .cid = e.cid };
     }
 
     /// ScanCache.open visitor: a forgotten entry.
@@ -159,62 +161,47 @@ pub const Scanner = struct {
     /// Drops what's remembered under `root` that this scan didn't see
     /// (deleted or moved files).
     fn forgetUnseen(self: *Scanner, root: []const u8) void {
-        const prefix = std.mem.trimEnd(u8, root, "/");
-        var gone: std.ArrayList([]const u8) = .empty;
-        defer gone.deinit(self.allocator);
         var it = self.remembered.iterator();
         while (it.next()) |e| {
+            if (!std.mem.startsWith(u8, e.key_ptr.*, root)) continue;
             if (e.value_ptr.generation == self.generation) continue;
-            const key = e.key_ptr.*;
-            if (key.len <= prefix.len or !std.mem.startsWith(u8, key, prefix) or key[prefix.len] != '/') continue;
-            gone.append(self.allocator, key) catch return;
-        }
-        for (gone.items) |key| {
-            if (self.cache) |*c| c.drop(key) catch {};
-            const kv = self.remembered.fetchRemove(key) orelse continue;
-            self.allocator.free(kv.value.leaves);
-            self.allocator.free(kv.key);
+            if (self.cache) |*c| c.drop(e.key_ptr.*) catch {};
+            self.allocator.free(e.key_ptr.*);
+            self.allocator.free(e.value_ptr.leaves);
+            self.remembered.removeByPtr(e.key_ptr);
         }
     }
 
-    /// Writes new cache records; rewrites the cache once it is mostly stale.
     fn saveCache(self: *Scanner) void {
-        const c = &(self.cache orelse return);
-        c.flush() catch |err| std.debug.print("share: saving the scan cache failed: {any}\n", .{err});
-        if (!c.wantsCompaction(self.remembered.count())) return;
-        var live: LiveEntries = .{ .it = self.remembered.iterator() };
-        c.compact(&live) catch |err| std.debug.print("share: compacting the scan cache failed: {any}\n", .{err});
-    }
-
-    /// The CID of an empty dir block (stored once).
-    fn emptyDir(self: *Scanner) !*const Cid {
-        if (self.empty_dir == null) {
-            const bytes = try codec.encodeDir(self.allocator, &.{});
-            defer self.allocator.free(bytes);
-            const block = Block.new(bytes);
-            try self.store.put(block);
-            self.empty_dir = block.cid;
+        const cache = &(self.cache orelse return);
+        cache.flush() catch |err| std.debug.print("share: saving the scan cache failed: {any}\n", .{err});
+        if (cache.wantsCompaction(self.remembered.count())) {
+            var it = CompactionIterator{ .inner = self.remembered.iterator() };
+            cache.compact(&it) catch |err| std.debug.print("share: compacting the scan cache failed: {any}\n", .{err});
         }
-        return &self.empty_dir.?;
     }
 
-    const LiveEntries = struct {
-        it: std.StringHashMapUnmanaged(Remembered).Iterator,
-        pub fn next(self: *LiveEntries) ?struct { path: []const u8, entry: @import("scan_cache.zig").Entry } {
-            const e = self.it.next() orelse return null;
+    const CompactionIterator = struct {
+        inner: std.StringHashMapUnmanaged(Remembered).Iterator,
+
+        pub fn next(self: *CompactionIterator) ?struct { path: []const u8, entry: @import("scan_cache.zig").Entry } {
+            const e = self.inner.next() orelse return null;
             return .{ .path = e.key_ptr.*, .entry = cacheEntry(e.value_ptr.*) };
         }
     };
 
-    /// Reports progress when it's due: a root built from the directories
-    /// still being scanned, each holding what it has so far. Subfolders not
-    /// reached yet are listed empty, with mtime 0, so the folders show up
-    /// at once (the app reads mtime 0 and no size as "indexing").
+    /// Flushes what has been scanned so far as a consistent tree and calls
+    /// `progress.reportFn`. Does nothing until `next_report_ns`.
     fn checkpoint(self: *Scanner) !void {
         const p = self.progress orelse return;
         const t = now(self.io);
         if (t < self.next_report_ns) return;
         self.next_report_ns = t + p.interval_ns;
+
+        // Walk backwards up the stack: for each directory not finished yet,
+        // encode a block with the entries done so far, the subfolder being
+        // scanned (using the block just built for it), and empty dirs for
+        // the subfolders not reached yet.
         var child: ?codec.DirEntry = null;
         var child_cid: Cid = undefined;
         var i = self.frames.items.len;
@@ -224,19 +211,17 @@ pub const Scanner = struct {
             var entries: std.ArrayList(codec.DirEntry) = .empty;
             defer entries.deinit(self.allocator);
             try entries.appendSlice(self.allocator, frame.entries.items);
-            for (frame.dirs[frame.next_dir.*..]) |pending| {
-                try entries.append(self.allocator, .{ .name = pending, .cid = try self.emptyDir(), .size = 0, .kind = .dir, .mtime = 0 });
-            }
-            var size = frame.total.*;
-            if (child) |c| {
-                try entries.append(self.allocator, c);
-                size += c.size;
+            if (child) |c| try entries.append(self.allocator, c);
+            const empty = try self.emptyDirCid();
+            for (frame.dirs[frame.next_dir.*..]) |dir_name| {
+                try entries.append(self.allocator, .{ .name = dir_name, .cid = &empty, .size = 0, .kind = .dir, .mtime = 0 });
             }
             sortEntries(entries.items);
             const bytes = try codec.encodeDir(self.allocator, entries.items);
             defer self.allocator.free(bytes);
             const block = Block.new(bytes);
             try self.store.put(block);
+            const size = frame.total.* + if (child) |c| c.size else 0;
             child_cid = block.cid;
             child = .{ .name = frame.name, .cid = &child_cid, .size = size, .kind = .dir, .mtime = 0 };
         }
@@ -260,7 +245,12 @@ pub const Scanner = struct {
         var it = dir.iterate();
         while (try it.next(self.io)) |entry| {
             if (!codec.isValidName(entry.name)) continue;
-            switch (entry.kind) {
+            var kind = entry.kind;
+            if (kind == .unknown) {
+                const stat = dir.statFile(self.io, entry.name, .{ .follow_symlinks = false }) catch null;
+                if (stat) |st| kind = st.kind;
+            }
+            switch (kind) {
                 .file => try file_names.append(arena, try arena.dupe(u8, entry.name)),
                 .directory => if (depth + 1 < max_depth) try dir_names.append(arena, try arena.dupe(u8, entry.name)),
                 else => {},
@@ -340,13 +330,15 @@ pub const Scanner = struct {
     const Built = struct { cid: Cid, size: u64, mtime: u64 };
 
     fn scanFile(self: *Scanner, dir: std.Io.Dir, name: []const u8, full_path: []const u8) !Built {
-        var file = try dir.openFile(self.io, name, .{});
+        var file = try filestore.openRegular(self.io, dir, name);
         defer file.close(self.io);
         const stat = try file.stat(self.io);
         const mtime_ns = stat.mtime.nanoseconds;
+        const ctime_ns = stat.ctime.nanoseconds;
+        const inode: u64 = @intCast(stat.inode);
 
         if (self.remembered.getPtr(full_path)) |seen| reuse: {
-            if (seen.size != stat.size or seen.mtime_ns != mtime_ns) break :reuse;
+            if (seen.size != stat.size or seen.mtime_ns != mtime_ns or seen.ctime_ns != ctime_ns or seen.inode != inode) break :reuse;
             if (self.table) |table| {
                 // From the scan cache: the leaves are listed by the file's
                 // parent blocks, already in the store.
@@ -390,7 +382,7 @@ pub const Scanner = struct {
                 return err;
             };
         }
-        gop.value_ptr.* = .{ .size = reader.offset, .mtime_ns = mtime_ns, .cid = cid, .leaves = owned_leaves, .generation = self.generation };
+        gop.value_ptr.* = .{ .size = reader.offset, .mtime_ns = mtime_ns, .ctime_ns = ctime_ns, .inode = inode, .cid = cid, .leaves = owned_leaves, .generation = self.generation };
         if (self.cache) |*c| c.put(full_path, cacheEntry(gop.value_ptr.*)) catch {};
         return .{ .cid = cid, .size = reader.offset, .mtime = mtimeSeconds(stat) };
     }
@@ -408,6 +400,7 @@ pub const Scanner = struct {
             return try leaves.toOwnedSlice(self.allocator);
         };
         defer self.allocator.free(bytes);
+
         var offset: u64 = 0;
         switch (codec.decode(bytes) catch return null) {
             .parent => |links| if (!try self.appendLeaves(links, &offset, &leaves)) return null,
@@ -444,6 +437,16 @@ pub const Scanner = struct {
         }
         return true;
     }
+
+    fn emptyDirCid(self: *Scanner) !Cid {
+        if (self.empty_dir) |c| return c;
+        const bytes = try codec.encodeDir(self.allocator, &.{});
+        defer self.allocator.free(bytes);
+        const block = Block.new(bytes);
+        try self.store.put(block);
+        self.empty_dir = block.cid;
+        return block.cid;
+    }
 };
 
 fn sortEntries(entries: []codec.DirEntry) void {
@@ -455,7 +458,13 @@ fn sortEntries(entries: []codec.DirEntry) void {
 }
 
 fn cacheEntry(r: Remembered) @import("scan_cache.zig").Entry {
-    return .{ .size = r.size, .mtime_ns = @intCast(std.math.clamp(r.mtime_ns, std.math.minInt(i64), std.math.maxInt(i64))), .cid = r.cid };
+    return .{
+        .size = r.size,
+        .mtime_ns = @intCast(std.math.clamp(r.mtime_ns, std.math.minInt(i64), std.math.maxInt(i64))),
+        .ctime_ns = @intCast(std.math.clamp(r.ctime_ns, std.math.minInt(i64), std.math.maxInt(i64))),
+        .inode = r.inode,
+        .cid = r.cid,
+    };
 }
 
 fn now(io: std.Io) i96 {

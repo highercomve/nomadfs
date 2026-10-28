@@ -104,6 +104,7 @@ pub const KnownPeers = struct {
 };
 
 fn addAddr(e: *Entry, a: Address) void {
+    if (@import("../local_addrs.zig").classify(a) == .invalid) return;
     for (e.slice()) |have| if (have.eql(a)) return;
     if (e.count == e.addrs.len) return;
     e.addrs[e.count] = a;
@@ -127,6 +128,7 @@ fn parseLine(line: []const u8) ?Entry {
         const colon = std.mem.lastIndexOfScalar(u8, tok, ':') orelse continue;
         const port = std.fmt.parseInt(u16, tok[colon + 1 ..], 10) catch continue;
         const a = Address.parseIp(tok[0..colon], port) catch continue;
+        if (@import("../local_addrs.zig").classify(a) == .loopback) continue;
         addAddr(&e, a);
     }
     dropStrayPorts(&e);
@@ -241,4 +243,10 @@ test "known peers: a stray source port saved by older versions is dropped" {
     dropStrayPorts(&tie);
     try std.testing.expectEqual(@as(u8, 1), tie.count);
     try std.testing.expectEqual(@as(u16, 14700), tie.addrs[0].getPort());
+}
+
+test "known peers sanitize invalid and loopback destinations on load" {
+    const entry = parseLine("51d647593011e46b8a907f94c331a941a64a8538c9f6d86b91c051fdd1667df9 1 127.0.0.1:22 0.0.0.0:0 224.0.0.1:5 192.168.1.5:7865").?;
+    try std.testing.expectEqual(@as(u8, 1), entry.count);
+    try std.testing.expect(entry.addrs[0].eql(Address.initIp4(.{ 192, 168, 1, 5 }, 7865)));
 }

@@ -51,9 +51,10 @@ pub const Table = struct {
         if (leaves.len == 0) return;
         const owned = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned);
-        try self.paths.append(self.allocator, owned);
-        const file: u32 = @intCast(self.paths.items.len - 1);
+        try self.paths.ensureUnusedCapacity(self.allocator, 1);
         try self.refs.ensureUnusedCapacity(self.allocator, @intCast(leaves.len));
+        const file: u32 = @intCast(self.paths.items.len);
+        self.paths.appendAssumeCapacity(owned);
         for (leaves) |leaf| {
             // Identical chunks in several files: any copy serves.
             self.refs.putAssumeCapacity(leaf.cid, .{ .file = file, .offset = leaf.offset, .len = leaf.len });
@@ -168,7 +169,7 @@ pub const Filestore = struct {
         const at = self.locate(cid) orelse return null;
         const path = at.path_buf[0..at.path_len];
 
-        var file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch return null;
+        var file = openRegular(self.io, std.Io.Dir.cwd(), path) catch return null;
         defer file.close(self.io);
         const block = try allocator.alloc(u8, 1 + @as(usize, at.ref.len));
         errdefer allocator.free(block);
@@ -197,3 +198,17 @@ pub const Filestore = struct {
         return self.has(cid);
     }
 };
+
+/// Do not follow a swapped-in symlink or wait for a FIFO writer.
+pub fn openRegular(io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
+    var file: std.Io.File = if (@import("builtin").os.tag == .windows)
+        try dir.openFile(io, path, .{ .follow_symlinks = false })
+    else
+        .{
+            .handle = try std.posix.openat(dir.handle, path, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0),
+            .flags = .{ .nonblocking = true },
+        };
+    errdefer file.close(io);
+    if ((try file.stat(io)).kind != .file) return error.NotRegularFile;
+    return file;
+}

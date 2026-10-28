@@ -281,10 +281,11 @@ fn inviteCommand(allocator: std.mem.Allocator, config: config_mod.Config, addres
     const uri = try ticket.toUri(&uri_buf);
 
     const host = try invite.Host.start(allocator, .{
+        .identity = identity,
         .swarm_key = config.node.swarm_key[0..32].*,
         .node_port = config.network.port,
         .ticket_uri = uri,
-    }, config.network.port +% 1, invite.default_lifetime_s, now);
+    }, try std.math.add(u16, config.network.port, 1), invite.default_lifetime_s, now);
     defer host.destroy();
 
     var code_buf: [160]u8 = undefined;
@@ -314,8 +315,14 @@ fn inviteCommand(allocator: std.mem.Allocator, config: config_mod.Config, addres
     const joiner = try Ticket.parseAt(joined_uri, nowSeconds());
     var store = try TrustStore.load(allocator, paths.trust, identity.seed());
     defer store.deinit();
-    _ = try store.trustTicket(joiner, nowSeconds());
-    try store.save();
+    // The joiner proved it holds this ticket's identity; a newer ticket
+    // already on file still wins over it.
+    if (store.trustTicket(joiner, nowSeconds())) |_| {
+        try store.save();
+    } else |err| switch (err) {
+        error.StaleTicket => std.debug.print("Warning: a newer ticket for this device is already trusted; kept it.\n", .{}),
+        else => return err,
+    }
     var fp_buf: [19]u8 = undefined;
     std.debug.print("{s} joined ({s}, {s}) and is now trusted.\n", .{
         joiner.nicknameSlice(),
@@ -377,7 +384,13 @@ fn trustCommand(allocator: std.mem.Allocator, config: config_mod.Config, uri: []
         return err;
     };
 
-    const added = try store.trustTicket(ticket, now);
+    const added = store.trustTicket(ticket, now) catch |err| switch (err) {
+        error.StaleTicket => {
+            std.debug.print("Refused: a newer ticket for this device is already trusted. Ask it for a fresh one.\n", .{});
+            return err;
+        },
+        else => return err,
+    };
     try store.save();
 
     var fingerprint_buf: [19]u8 = undefined;

@@ -142,11 +142,16 @@ A `Loader` returns verified bytes for a CID. `Loader.local(store)` reads the loc
   present; otherwise it connects to `peer` (`BlockManager.connectTo`), calls `dht_node.fetchBlock`,
   and `store.put`s the result, which rejects bytes that don't hash to the CID. The store is the
   cache: a file read once reads offline afterwards.
-- **`Remote.shares()`**: sends `GET_SHARES`, returns the nickname and decoded listing.
+- **`Remote.shares()`**: sends `GET_SHARES`, returns the nickname, the listing and the peer's authenticated device ID.
 - **`MultiRemote { peers }`**: tries the local store, then each peer in order until one serves the
   block. The swarm folder uses it ([Chapter 5.2](./swarm.md)).
 - **`knownPeers(block_manager, allocator)`**: every node ID in the routing table. This is the
   "devices I know" list used by the mount, the swarm sync and the backup.
+- **Per-peer health gate (`HealthGate`)**: tracks unreachable or failing peers with exponential
+  backoff (5 s up to 60 s). When a dial or block fetch times out or fails with connection errors,
+  the peer is marked down. Subsequent `Remote.load` attempts fail fast with `error.PeerDown` without
+  waiting on network timeouts or stalling thread workers. A successful block fetch or `GET_SHARES`
+  response clears the backoff (`markUp`).
 
 ```mermaid
 sequenceDiagram

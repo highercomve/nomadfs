@@ -7,6 +7,7 @@
 //! exactly one free() call from NomadFs.close().
 
 #include <jni.h>
+#include <stdint.h>
 #include "nomadfs.h"
 
 static NomadNode *asNode(jlong handle) {
@@ -72,8 +73,12 @@ JNIEXPORT jint JNICALL
 Java_net_nomadfs_NomadFs_get(JNIEnv *env, jclass _cls, jlong handle, jstring j_cid, jstring j_out) {
     (void)_cls;
     const char *cid = (*env)->GetStringUTFChars(env, j_cid, NULL);
+    if (cid == NULL) return 1001;
     const char *out = (*env)->GetStringUTFChars(env, j_out, NULL);
-    if (cid == NULL || out == NULL) return 1001;
+    if (out == NULL) {
+        (*env)->ReleaseStringUTFChars(env, j_cid, cid);
+        return 1001;
+    }
     int rc = nomadfs_get_file(asNode(handle), cid, out);
     (*env)->ReleaseStringUTFChars(env, j_out, out);
     (*env)->ReleaseStringUTFChars(env, j_cid, cid);

@@ -1,8 +1,10 @@
 test {
     _ = @import("network/integration.zig");
     _ = @import("network/security_test.zig");
+    _ = @import("network/noise_v2_test.zig");
     _ = @import("network/manager_test.zig");
     _ = @import("network/mdns_test.zig");
+    _ = @import("network/upnp_test.zig");
     _ = @import("network/yamux_test.zig");
     _ = @import("network/yamux_flow_control_test.zig");
     _ = @import("dht/lookup_test.zig");
@@ -11,6 +13,7 @@ test {
     _ = @import("dht/store_test.zig");
     _ = @import("dht/discovery_test.zig");
     _ = @import("dht/churn_test.zig");
+    _ = @import("dht/poison_test.zig");
     _ = @import("dht/kbucket_standard_test.zig");
     _ = @import("dht/auth_test.zig");
     _ = @import("dht/relay_test.zig");
@@ -19,6 +22,10 @@ test {
     _ = @import("cluster/share_test.zig");
     _ = @import("cluster/swarm_test.zig");
     _ = @import("cluster/rotation_test.zig");
+    _ = @import("cluster/tickets_test.zig");
     _ = @import("cluster/swarm_backup_test.zig");
     _ = @import("cluster/readahead_test.zig");
+    _ = @import("cluster/fuse_inodes_test.zig");
+    _ = @import("cluster/fuse_mt_test.zig");
+    _ = @import("cluster/device_names_test.zig");
 }

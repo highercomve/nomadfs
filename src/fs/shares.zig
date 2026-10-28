@@ -26,6 +26,7 @@ pub const Share = struct {
     size: u64 = 0,
     files: u64 = 0,
     scanned_at: u64 = 0,
+    generation: u64 = 0,
 };
 
 pub const ShareIndex = struct {
@@ -104,10 +105,11 @@ pub const ShareIndex = struct {
             defer self.mutex.unlock();
             const at = self.indexOf(name);
             if (at.found) {
+                const gen = self.shares.items[at.index].generation +% 1;
                 freeShare(self.allocator, self.shares.items[at.index]);
-                self.shares.items[at.index] = .{ .name = owned_name, .path = owned_path };
+                self.shares.items[at.index] = .{ .name = owned_name, .path = owned_path, .generation = gen };
             } else {
-                try self.shares.insert(self.allocator, at.index, .{ .name = owned_name, .path = owned_path });
+                try self.shares.insert(self.allocator, at.index, .{ .name = owned_name, .path = owned_path, .generation = 0 });
             }
         }
     }
@@ -129,7 +131,7 @@ pub const ShareIndex = struct {
     const Position = struct { index: usize, found: bool };
 
     /// Caller holds `mutex`.
-    fn indexOf(self: *ShareIndex, name: []const u8) Position {
+    fn indexOf(self: *const ShareIndex, name: []const u8) Position {
         for (self.shares.items, 0..) |s, i| {
             switch (std.mem.order(u8, s.name, name)) {
                 .lt => {},
@@ -165,43 +167,38 @@ pub const ShareIndex = struct {
         self.scan_mutex.lock();
         defer self.scan_mutex.unlock();
 
-        const path = blk: {
+        const snap = blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
             const at = self.indexOf(name);
             if (!at.found) return;
-            break :blk self.allocator.dupe(u8, self.shares.items[at.index].path) catch return;
+            const s = self.shares.items[at.index];
+            break :blk .{
+                .path = self.allocator.dupe(u8, s.path) catch return,
+                .first = s.root == null,
+                .generation = s.generation,
+            };
         };
-        defer self.allocator.free(path);
+        defer self.allocator.free(snap.path);
 
-        // A first scan publishes as it goes (onProgress): the files done
-        // so far are handed to the filestore in segments, so the partial
-        // roots it lists can be read. Later scans swap a whole table in.
-        const first = blk: {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            const at = self.indexOf(name);
-            if (!at.found) return;
-            break :blk self.shares.items[at.index].root == null;
-        };
         // Segments left by an earlier share of this name.
-        if (first) self.files.remove(name);
+        if (snap.first) self.files.remove(name);
         self.scanner.table = newTable(self.allocator) catch return;
         defer if (self.scanner.table) |t| {
             t.deinit();
             self.allocator.destroy(t);
             self.scanner.table = null;
         };
-        var progress: ProgressCtx = .{ .index = self, .name = name };
-        if (first) self.scanner.progress = .{
+        var progress: ProgressCtx = .{ .index = self, .name = name, .generation = snap.generation };
+        if (snap.first) self.scanner.progress = .{
             .ctx = &progress,
             .reportFn = ProgressCtx.report,
             .first_ns = self.progress_first_ns,
             .interval_ns = self.progress_interval_ns,
         };
         const started = std.Io.Timestamp.now(self.io, .awake);
-        const result = self.scanner.scan(path) catch |err| {
-            std.debug.print("share '{s}': scan of {s} failed: {any}\n", .{ name, path, err });
+        const result = self.scanner.scan(snap.path) catch |err| {
+            std.debug.print("share '{s}': scan of {s} failed: {any}\n", .{ name, snap.path, err });
             return;
         };
 
@@ -209,11 +206,12 @@ pub const ShareIndex = struct {
         defer self.mutex.unlock();
         const at = self.indexOf(name);
         if (!at.found) return; // removed while scanning
-        const table = self.scanner.table.?;
-        (if (first) self.files.append(name, table) else self.files.replace(name, table)) catch return;
-        self.scanner.table = null;
         const share = &self.shares.items[at.index];
-        if (first) {
+        if (share.generation != snap.generation or !std.mem.eql(u8, share.path, snap.path)) return; // changed or re-added while scanning
+        const table = self.scanner.table.?;
+        (if (snap.first) self.files.append(name, table) else self.files.replace(name, table)) catch return;
+        self.scanner.table = null;
+        if (snap.first) {
             const ms = @divFloor(started.durationTo(std.Io.Timestamp.now(self.io, .awake)).nanoseconds, std.time.ns_per_ms);
             std.debug.print("share '{s}': indexed {d} files ({d} MiB) in {d} ms\n", .{ name, result.files, result.size >> 20, ms });
         }
@@ -243,6 +241,7 @@ pub const ShareIndex = struct {
     const ProgressCtx = struct {
         index: *ShareIndex,
         name: []const u8,
+        generation: u64,
 
         fn report(ctx: *anyopaque, partial: scan.Result) anyerror!void {
             const self: *ProgressCtx = @ptrCast(@alignCast(ctx));
@@ -256,6 +255,7 @@ pub const ShareIndex = struct {
             defer index.mutex.unlock();
             const at = index.indexOf(self.name);
             if (!at.found) return error.ScanCancelled; // removed meanwhile
+            if (index.shares.items[at.index].generation != self.generation) return error.ScanCancelled;
             // Hand over the files scanned since the last report.
             try index.files.append(self.name, index.scanner.table.?);
             index.scanner.table = next;
@@ -579,4 +579,41 @@ test "shares: a share not scanned yet is listed empty, as indexing" {
     defer scanned.deinit();
     try testing.expect(scanned.find("Movies").?.mtime > 0);
     try testing.expectEqual(@as(u64, 4), scanned.find("Movies").?.size);
+}
+
+test "shares: re-add mid-scan does not install stale result" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "old_folder");
+    try tmp.dir.createDirPath(io, "new_folder");
+    try tmp.dir.createDirPath(io, "blocks");
+    try tmp.dir.writeFile(io, .{ .sub_path = "old_folder/old.txt", .data = "old" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "new_folder/new.txt", .data = "new" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const blocks = try std.fs.path.join(allocator, &.{ base, "blocks" });
+    defer allocator.free(blocks);
+    const old_path = try std.fs.path.join(allocator, &.{ base, "old_folder" });
+    defer allocator.free(old_path);
+    const new_path = try std.fs.path.join(allocator, &.{ base, "new_folder" });
+    defer allocator.free(new_path);
+
+    var store = try storage.engine.StorageEngine.init(allocator, blocks);
+    defer store.deinit();
+    const index = try ShareIndex.create(allocator, io, &store);
+    defer index.destroy();
+
+    try index.register("test_share", old_path);
+    const gen0 = index.shares.items[0].generation;
+
+    // Re-registering with new path increments generation
+    try index.register("test_share", new_path);
+    const gen1 = index.shares.items[0].generation;
+    try testing.expect(gen1 != gen0);
+    try testing.expectEqualStrings(new_path, index.shares.items[0].path);
 }

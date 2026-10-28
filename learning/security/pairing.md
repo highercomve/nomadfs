@@ -105,10 +105,20 @@ Device A                          Device B
 while `now <= e`. The `k` transport key is recorded with the entry and pinned:
 the paired device must present the same X25519 key in every later handshake
 (see section 6), so a leaked or rotated `node.key` cannot take over a paired
-identity without an explicit re-pairing. Default lifetime is 24 hours. The ticket is a bearer object
-until it expires: anyone who photographs the QR code can present it. That is
-acceptable for first contact on a trusted channel, and is why the fingerprint
-is printed alongside the QR - compare it with the other device's screen.
+identity without an explicit re-pairing. Default lifetime is 24 hours.
+
+A ticket proves that the identity key signed its transport key, nickname,
+addresses and expiry. It does not prove who presents it or when it was signed.
+Anyone who photographs the QR code can present it until expiry; compare its
+fingerprint with the other device's screen before trusting it. A copied ticket
+does not let its holder authenticate as that device: every handshake still
+requires its identity and transport private keys. Invites additionally require
+the presented ticket to match the identity proved in that invite's handshake.
+
+Imports return `error.StaleTicket` if `e` is smaller than the expiry already
+recorded for that device. Equal expiry is accepted for idempotent re-import.
+Keep the ticket lifetime fixed at 24 hours: expiry serves as the freshness
+sequence, so a shorter-lived new ticket might be refused as stale.
 
 `--devices` lists what the store currently trusts:
 
@@ -127,23 +137,31 @@ loaded with the device seed refuses files the device did not write
 edits). CLI invocations and running nodes sign with the same `device.key`.
 
 ```
-NMDFSTR1
-<device_id_hex>\t<public_key_b64>\t<added_at>\t<label_b64>\t<transport_key_b64>
+NMDFSTR2
+<device_id_hex>\t<public_key_b64>\t<added_at>\t<label_b64>\t<transport_key_b64>\t<ticket_e>
 ```
 
+- **Label**: the nickname from the signed ticket at pairing time. It names the
+  device in the app and in the mount, and changes only when the device is
+  paired again.
 - **Keyed by device ID**: re-pairing the same identity updates the label and
   the pinned transport key, and keeps the original `added_at` instead of
-  creating a second entry. This is how a device rotates `node.key`.
+  creating a second entry. Rotate `node.key` by importing a ticket with a
+  newer expiry; an older ticket cannot roll the pinned key back.
 - **Pinned transport key**: the fifth column records the X25519 key from the
-  pairing ticket. Handshakes verify it again (section 6). Entries saved by
-  older versions have four columns and stay unpinned until they re-pair.
+  pairing ticket. Handshakes verify it again (section 6). The sixth column
+  records the highest accepted ticket expiry (`0` for a direct API upsert).
 - **Cross-checked on load**: the device ID must equal the hash of the stored
   public key. A mismatch means the file was edited or written by an
   incompatible version, and loading fails with `error.CorruptTrustStore`.
-- **Bounded**: at most 64 entries (32 KiB file). Writes fail with
+- **Bounded**: at most 64 entries and 256 tombstones (64 KiB file). Writes fail with
   `error.TrustStoreFull` rather than growing without limit.
 - **Atomic**: the store is written to `<path>.tmp` with mode `0600` and then
   renamed over the original. A failed write leaves the old file intact.
+- **Retired format**: an `NMDFSTR1` file is moved to `<path>.v1.bak` once,
+  logged, and replaced by an empty store. An existing backup is preserved.
+  Old trust decisions are not imported: devices must re-join. Only six-column
+  `NMDFSTR2` entries are accepted.
 - **Strict**: a missing file is an empty store; an unparsable, unsigned or
   wrongly signed file is an error. Silently discarding trust decisions is
   worse than refusing to start. (Files written before signatures existed
@@ -192,10 +210,15 @@ require_trusted_devices = true
 When enabled, a peer whose device ID is absent from `trust.store` is rejected
 during the handshake with `error.UntrustedDevice`. It defaults to `false`
 because a fresh install has an empty store and must still pair; the signature
-check runs either way.
+check runs either way. Under either policy (`require_trusted_devices = false`
+or `true`), a device whose ID matches a tombstone in the local trust store is
+rejected with `error.UntrustedDevice`.
 
 This is wire-incompatible: message 2 grew from 80 to 193 bytes and message 3
-from 64 to 161, so both peers must run this version.
+from 64 to 161, so both peers must run this version. The v2 Noise handshake
+increases message 1 from 32 to 48 bytes and rejects the previous handshake.
+Update every device together. Transport keys and device identity files retain
+their existing format.
 
 ## 7. QR Output
 
@@ -239,12 +262,25 @@ removal, and every tombstone it holds is pushed to peers as the
 `REVOKE` RPC message, which each node sends opportunistically on connections
 it dials itself (bootstrap peers, discovered peers).
 
-A receiver applies a `REVOKE` only when:
+The v2 revocation domain is `nomadfs-revoke-v2`. A signed revocation binds
+the domain, the revoked device, the signer's device ID and the revocation
+timestamp `at` as a big-endian u64 (`revocationMessage`).
 
-1. the Ed25519 signature covers `revocation domain || revoked device || signer`,
+A receiver verifies and applies a `REVOKE` atomically under the store mutex:
+
+1. the Ed25519 signature covers `revocation_domain || revoked_device || signer_id || at`,
    verified with the signer's key,
-2. the signer is not the revoked device, and
-3. the signer's device is itself in the receiver's trust store.
+2. the signer is not the revoked device (`signer != revoked`),
+3. the signer's device is itself in the receiver's trust store,
+4. the timestamp `at` is within the future skew limit of 24 hours
+   (`max_revocation_skew = 86400` s), and
+5. the revoked device was not re-paired at or after the revocation was created
+   (`added_at < at`); re-pairing supersedes prior revocations.
+
+The outcome is classified into three results:
+- **`rejected`**: signature failed, signer untrusted, future skew exceeded, or device was re-paired at or after `at`.
+- **`duplicate`**: a tombstone already records `existing.at >= at`. Nothing changed, so no save is performed.
+- **`applied`**: the entry was removed and/or the tombstone was recorded or advanced. The store is immediately persisted to disk, and all active sessions with the revoked device or transport node are closed via `closePeer`.
 
 Everything else is refused rather than softened: an unknown signer, a broken
 signature, or a self-revocation never touches entries. Honoring only locally
@@ -257,16 +293,17 @@ clears the tombstone. Propagation happens on two paths
 (`src/net/discovery/node.zig`):
 
 - **On dial**: after a verified `PING`/`PONG` on a connection this node
-  opened, `pushRevocations` sends every tombstone it holds.
+  opened, `pushRevocations` sends every tombstone it holds, preserving each
+  tombstone's original `at` timestamp.
 - **Sweep**: the maintenance loop in `src/root.zig` calls
   `sweepRevocations(4)` every 60 seconds, which dials the 4 peers closest to
-  this node's ID in the routing table and replays every tombstone, so peers
-  that never dial us still hear them.
+  this node's ID in the routing table and replays every tombstone.
 
 A node that honours a `REVOKE` records the tombstone too (signed by the
 original signer's ID) and persists the store at once. When it later pushes
-that tombstone, it signs a fresh `REVOKE` with its *own* identity, so the
-revocation spreads hop by hop through devices that trust each other.
+that tombstone, it preserves the original timestamp `at` and signs a fresh `REVOKE`
+with its *own* identity, so the revocation spreads hop by hop through devices
+that trust each other.
 
 ## 8. Threat Notes & Next Steps
 
@@ -274,8 +311,8 @@ revocation spreads hop by hop through devices that trust each other.
 | :--- | :--- | :--- |
 | Unknown device joining | Handshake binds the Ed25519 identity; `require_trusted_devices` rejects unknown IDs | Policy defaults to off so fresh installs can pair |
 | Tampered ticket | Ed25519 signature over canonical URI | - |
-| Replay of an old ticket | 24-hour expiry, plus handshake identity check | Revocation reaches a peer only on a dial or a sweep; a peer offline for long learns it late |
-| Stolen ticket | Bearer until expiry | Fingerprint check is manual |
+| Replay of an old ticket | Expiry plus refusal of tickets older than the recorded expiry | Fixed ticket lifetime and a sensible issuing clock are required |
+| Stolen ticket | Cannot authenticate as the device; invites require proof of possession | Human imports still need a fingerprint check |
 | Rotated or stolen `node.key` | Trust store pins the ticket's X25519 key and the handshake re-checks it | Re-pairing required after a rotation |
 | Malicious trust file edit | Whole-file Ed25519 signature from the owning device; `0600`; ID/public-key cross-check | - |
 

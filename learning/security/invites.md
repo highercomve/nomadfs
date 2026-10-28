@@ -41,9 +41,11 @@ pub fn derivePsk(token: [16]u8) [32]u8 // SHA-256("nomadfs-invite-v1:" ‖ token
 
 The invite channel is an ordinary `Noise_XXpsk3` connection
 ([Chapter 1.1](../net/transport/noise.md)) whose `psk` is this value instead
-of the swarm key. Only a holder of the token can finish the handshake. A
-128-bit random token cannot be guessed offline, which is why there is no PAKE
-(a short PIN would need one).
+of the swarm key. The invite channel uses the same v2-only Noise handshake,
+including the `nomadfs-noise-v2` prologue and tagged 48-byte first message.
+Only a holder of the token can finish the handshake. A 128-bit random token
+cannot be guessed offline, which is why there is no PAKE (a short PIN would
+need one).
 
 ### 1.3 The inviting side: `Host`
 
@@ -79,13 +81,15 @@ inviter -> joiner  : [32 B swarm key][u16 BE node port][u16 BE len][inviter's ti
 ```
 
 Tickets on this wire are bounded by `max_ticket_len = 2048`. The first
-connection that delivers a ticket while the state is `waiting` flips it to
+connection that delivers a valid, unexpired ticket matching its proved device
+identity while the state is `waiting` flips it to
 `joined`; any later one gets `error.InviteUsed`. One invite, one join.
 
 ### 1.5 The joining side: `join`
 
-`join(allocator, code_text, my_ticket_uri) -> Joined` dials `addr` with its
-own throwaway key and the derived PSK, sends its ticket and reads back
+`join(allocator, code_text, my_ticket_uri, identity) -> Joined` dials `addr` with its
+own throwaway X25519 transport key, real Ed25519 identity and derived PSK,
+sends its ticket and reads back
 `{ swarm_key, node_port, ticket_uri, host_ip }`. A wrong, used or expired
 token surfaces as `error.InviteRejected`.
 
@@ -93,10 +97,13 @@ Joining is done from the app (`inviteAccept` in
 `nomadfs-gui/src/commands.zig`); the CLI can only create invites. After a
 successful join the app:
 
-1. writes `swarm_key = "<hex>"` into `nomadfs.conf`;
+1. writes `swarm_key = "<hex>"` into `nomadfs.conf` and resets `swarm_epoch = 0`
+   on the joining device so that it can receive future swarm key rotations;
 2. adds `tcp://<host_ip>:<node_port>` to `bootstrap_peers`;
 3. trusts the inviter's ticket (trust store upsert, transport key pinned);
 4. restarts the node if it was running.
+
+Atomic updates to configuration files serialize on an internal config mutex.
 
 On the inviting side, the CLI (`inviteCommand`) trusts the joiner's ticket
 once the state is `joined`; the app does the same when it next polls
@@ -109,13 +116,17 @@ transport keys.
 | :--- | :--- |
 | Code read off the screen later is useless | One join per invite, 10-minute expiry, listener stopped afterwards |
 | Swarm key never displayed | It travels only inside the PSK-keyed Noise channel |
-| Joiner can't be impersonated afterwards | Its ticket (with transport key) is pinned in the inviter's trust store |
+| Joiner can't be impersonated afterwards | Its live handshake proves possession of the ticket's identity, and later connections check the pinned transport key |
+| Token holder cannot pin a third device | The ticket identity must match the signed device hello |
 | Throwaway keys | The invite session does not reveal either device's real transport key |
 
-The handshake on the invite listener has no device authenticator
-configured, so `NoiseStream.handshake` uses an in-memory Ed25519 identity for
-the hello; device identity for this exchange comes from the signed tickets,
-not from the session.
+Both invite managers configure a device authenticator with the real Ed25519
+identity. Each device signs the Noise handshake hash, then verifies that the
+received ticket names that session identity. A mismatched joiner is rejected
+with `TicketNotOwned` before the one-time invite is consumed; the joiner sees
+`InviteRejected`. The joiner also rejects a mismatched inviter. This proof of
+possession is always enforced, with no legacy mode. A local join call rejects
+an invalid, expired or foreign ticket before connecting.
 
 ---
 
@@ -129,7 +140,7 @@ signed = "nomadfs-rotate-v1:" ‖ epoch (u64 BE) ‖ new_key (32 B)
 
 The `ROTATE_KEY` RPC (`src/net/discovery/rpc.zig`, message type 20) carries
 `{ epoch, new_key, signer_key, signature }` over an existing, encrypted
-connection. The reply is `STORE_ACK { stored }`.
+connection. The reply is `STORE_ACK { stored }`.\
 
 ### 2.2 Sending: `Node.rotateSwarmKey`
 
@@ -166,6 +177,9 @@ unless all hold:
 The second rule stops a trusted device's rotation from being relayed by
 someone else; the fourth stops replays of an old rotation.
 
+A rotation mutex serializes verify, check, update, and adoption on the receiver,
+preventing concurrent rotation races and refusing `maxInt(u64)`.
+
 A node also needs a **rotation sink** to adopt the key. Only the app sets one
 (`discovery_node.rotation_sink` in `nomadfs-gui/src/commands.zig`); its
 handler writes `swarm_key` and `swarm_epoch` to the config and restarts the
@@ -189,15 +203,14 @@ The full mechanism is in [Chapter 6.2, "Revocation Propagation"](./pairing.md#re
 | :--- | :--- | :--- |
 | Command | `nomadfs --revoke <id or fingerprint>` | Removes the entry and records a tombstone; local only |
 | Tombstone | `trust.store`, `@`-prefixed lines | `device_id`, `signer_id`, `at`; at most `max_revocations = 256` (`TrustStoreFull` beyond) |
-| Signed payload | `trust.revocationMessage` | `"nomadfs-revoke-v1"` ‖ revoked device ID ‖ signer device ID, Ed25519 |
-| RPC | `REVOKE` (type 15) → `STORE_ACK` | `{ device_id, signer_key, at, signature }`; `at` is informational, not signed |
-| Accept rule | `trust.applyRevocation` | Signature valid, signer ≠ revoked, signer trusted locally |
-| Push on dial | `DiscoveryNode.ping` → `pushRevocations` | After a verified PONG on a connection this node opened |
-| Sweep | `src/root.zig`, every 60 s | `sweepRevocations(4)`: the 4 peers closest to this node's ID |
+| Signed payload | `trust.revocationMessage` | `"nomadfs-revoke-v2"` ‖ revoked device ID ‖ signer device ID ‖ at (u64 BE), Ed25519 |
+| RPC | `REVOKE` (type 15) → `STORE_ACK` | `{ device_id, signer_key, at, signature }`; `at` is signed and verified |
+| Accept rule | `trust.applyRevocation` | Signature valid, signer ≠ revoked, signer trusted locally, `at <= now + max_revocation_skew`, device not re-paired after `at` (`added_at < at`) |
+| Push on dial | `DiscoveryNode.ping` → `pushRevocations` | After a verified PONG on a connection this node opened; forwards original `at` |
+| Sweep | `src/root.zig`, every 60 s | `sweepRevocations(4)`: the 4 peers closest to this node's ID; forwards original `at` |
 | Undo | `--trust` a fresh ticket | Re-pairing clears the tombstone (`clearRevocation`) |
 
-A node that accepts a revocation saves the store at once, so a restart
-does not replay it, and later pushes it under its own signature.
+A node that accepts a revocation saves the store at once if the outcome was `.applied` (duplicates are not re-saved), immediately closes any live sessions with the revoked device via `closePeer`, and later pushes it preserving the original timestamp `at` under its own signature.
 
 ---
 

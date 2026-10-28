@@ -9,6 +9,8 @@
 //!   with `nomadfs_node_free`; `nomadfs_free` releases returned strings;
 //! - calls on one handle are serialized internally, so it is safe to call
 //!   from different threads, but each call blocks the others;
+//! - `nomadfs_node_free` waits for calls already in progress; callers must
+//!   not reuse a freed handle (its address may be reused by a new node);
 //! - config paths, file paths and CID strings follow the CLI semantics.
 
 const std = @import("std");
@@ -27,6 +29,7 @@ const unavailable: c_int = 3;
 const file_too_large: c_int = 4;
 const not_found: c_int = 5;
 const internal_error: c_int = 9;
+const max_file_bytes: u64 = 4 * 1024 * 1024 * 1024;
 
 fn mapError(err: anyerror) c_int {
     return switch (err) {
@@ -63,8 +66,60 @@ pub const NodeHandle = struct {
     /// still be reading. Freed after `node.deinit()` joins that thread.
     urls: []const []const u8 = &.{},
     running: *std.atomic.Value(bool),
-    run_thread: ?std.Thread = null,
+    started: bool = false,
+    stopped: bool = false,
+    refs: usize = 0,
+    next: ?*NodeHandle = null,
 };
+
+// Registry lookup pins a handle before touching its mutex. Free removes it
+// first, preventing new pins, then waits for both active and queued calls.
+var handles_mutex: sync.Mutex = .{};
+var handles_cond: sync.Condition = .{};
+var handles: ?*NodeHandle = null;
+
+fn registerHandle(self: *NodeHandle) void {
+    handles_mutex.lock();
+    defer handles_mutex.unlock();
+    self.next = handles;
+    handles = self;
+}
+
+fn acquireHandle(node: ?*NodeHandle) ?*NodeHandle {
+    const requested = node orelse return null;
+    handles_mutex.lock();
+    defer handles_mutex.unlock();
+    var current = handles;
+    while (current) |self| : (current = self.next) {
+        if (self == requested) {
+            self.refs += 1;
+            return self;
+        }
+    }
+    return null;
+}
+
+fn releaseHandle(self: *NodeHandle) void {
+    handles_mutex.lock();
+    defer handles_mutex.unlock();
+    std.debug.assert(self.refs > 0);
+    self.refs -= 1;
+    if (self.refs == 0) handles_cond.broadcast();
+}
+
+fn retireHandle(node: ?*NodeHandle) ?*NodeHandle {
+    const requested = node orelse return null;
+    handles_mutex.lock();
+    defer handles_mutex.unlock();
+    var link = &handles;
+    while (link.*) |self| : (link = &self.next) {
+        if (self != requested) continue;
+        link.* = self.next;
+        while (self.refs != 0) handles_cond.wait(&handles_mutex);
+        return self;
+    }
+    return null;
+}
 
 fn spanSlice(p: ?[*:0]const u8) ?[]const u8 {
     if (p) |ptr| return std.mem.span(ptr);
@@ -87,6 +142,7 @@ fn nodeNewInternal(config_value: nomadfs.config.Config) !*NodeHandle {
     running.* = std.atomic.Value(bool).init(false);
     const self = try allocator.create(NodeHandle);
     self.* = .{ .node = node, .config = config, .running = running };
+    registerHandle(self);
     return self;
 }
 
@@ -97,10 +153,8 @@ pub export fn nomadfs_node_new(config_path: ?[*:0]const u8) ?*NodeHandle {
 }
 
 pub export fn nomadfs_node_free(node: ?*NodeHandle) void {
-    const self = node orelse return;
+    const self = retireHandle(node) orelse return;
     self.running.store(false, .release);
-    // Node.run() exits within one poll interval once the flag drops.
-    if (self.run_thread) |t| t.join();
     self.node.deinit();
     self.config.deinit(allocator);
     for (self.urls) |url| allocator.free(url);
@@ -109,31 +163,30 @@ pub export fn nomadfs_node_free(node: ?*NodeHandle) void {
     allocator.destroy(self);
 }
 
-fn runNodeThread(self: *NodeHandle) void {
-    self.node.run(self.running, self.config) catch |err| {
-        std.debug.print("mobile node stopped: {any}\n", .{err});
-    };
-    self.running.store(false, .release);
-}
-
-/// Starts the listener under a dedicated thread. Non-blocking.
+/// Binds the listener before reporting success; the manager owns its threads.
 pub export fn nomadfs_node_run(node: ?*NodeHandle) c_int {
-    const self = node orelse return invalid_argument;
+    const self = acquireHandle(node) orelse return invalid_argument;
+    defer releaseHandle(self);
     self.mutex.lock();
     defer self.mutex.unlock();
-    if (self.run_thread != null) return nomadfs_ok;
+    if (self.stopped) return unavailable;
+    if (self.started) return if (self.running.load(.acquire)) nomadfs_ok else unavailable;
 
     self.running.store(true, .release);
-    self.run_thread = std.Thread.spawn(.{}, runNodeThread, .{self}) catch {
+    self.node.listen(self.running, self.config) catch {
         self.running.store(false, .release);
-        return internal_error;
+        self.node.stopListener();
+        self.stopped = true;
+        return unavailable;
     };
+    self.started = true;
     return nomadfs_ok;
 }
 
 /// Connects to a comma-separated list of bootstrap peers in the background.
 pub export fn nomadfs_node_bootstrap(node: ?*NodeHandle, urls_csv: ?[*:0]const u8) c_int {
-    const self = node orelse return invalid_argument;
+    const self = acquireHandle(node) orelse return invalid_argument;
+    defer releaseHandle(self);
     const csv = spanSlice(urls_csv) orelse return invalid_argument;
 
     self.mutex.lock();
@@ -184,14 +237,13 @@ fn freeUrls(urls: []const []const u8) void {
 }
 
 pub export fn nomadfs_node_stop(node: ?*NodeHandle) c_int {
-    const self = node orelse return invalid_argument;
+    const self = acquireHandle(node) orelse return invalid_argument;
+    defer releaseHandle(self);
     self.mutex.lock();
     defer self.mutex.unlock();
     self.running.store(false, .release);
-    if (self.run_thread) |t| {
-        t.join();
-        self.run_thread = null;
-    }
+    self.node.stopListener();
+    self.stopped = true;
     return nomadfs_ok;
 }
 
@@ -201,7 +253,8 @@ pub export fn nomadfs_node_stop(node: ?*NodeHandle) c_int {
 /// also what happens while offline; the blocks are kept locally either way
 /// and a retry after connecting announces them.
 pub export fn nomadfs_put_file(node: ?*NodeHandle, in_path: ?[*:0]const u8) ?[*:0]u8 {
-    const self = node orelse return null;
+    const self = acquireHandle(node) orelse return null;
+    defer releaseHandle(self);
     const path = spanSlice(in_path) orelse return null;
 
     self.mutex.lock();
@@ -220,22 +273,22 @@ pub export fn nomadfs_put_file(node: ?*NodeHandle, in_path: ?[*:0]const u8) ?[*:
 /// Writes the file rooted at the hex CID to `out_path`. Creates or
 /// truncates the output file.
 pub export fn nomadfs_get_file(node: ?*NodeHandle, cid: ?[*:0]const u8, out_path: ?[*:0]const u8) c_int {
-    const self = node orelse return invalid_argument;
+    const self = acquireHandle(node) orelse return invalid_argument;
+    defer releaseHandle(self);
     const cid_text = spanSlice(cid) orelse return invalid_argument;
     const path = spanSlice(out_path) orelse return invalid_argument;
 
     self.mutex.lock();
     defer self.mutex.unlock();
 
-    var root: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&root, cid_text) catch return invalid_argument;
+    const root = parseCid(cid_text) catch return invalid_argument;
 
     const io = std.Io.Threaded.global_single_threaded.io();
     var file = std.Io.Dir.cwd().createFile(io, path, .{}) catch return internal_error;
     defer file.close(io);
 
     var writer = FileWriter{ .io = io, .file = file };
-    _ = self.node.block_manager.get(&root, &writer, .{}) catch |err| {
+    _ = self.node.block_manager.get(&root, &writer, .{ .max_bytes = max_file_bytes }) catch |err| {
         std.debug.print("get failed: {any}\n", .{err});
         _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
         return mapError(err);
@@ -246,7 +299,8 @@ pub export fn nomadfs_get_file(node: ?*NodeHandle, cid: ?[*:0]const u8, out_path
 /// Writes the node's own device ID as a 64 hex-character string into `out`
 /// (`out` must hold at least 65 bytes).
 pub export fn nomadfs_node_device_id(node: ?*NodeHandle, out: ?[*]u8, out_len: usize) c_int {
-    const self = node orelse return invalid_argument;
+    const self = acquireHandle(node) orelse return invalid_argument;
+    defer releaseHandle(self);
     const buf = out orelse return invalid_argument;
     if (out_len < 65) return invalid_argument;
 
@@ -263,6 +317,13 @@ pub export fn nomadfs_free(ptr: ?*anyopaque) void {
     const p = ptr orelse return;
     const s: [*:0]u8 = @ptrCast(@alignCast(p));
     allocator.free(std.mem.span(s));
+}
+
+fn parseCid(text: []const u8) ![32]u8 {
+    if (text.len != 64) return error.InvalidCid;
+    var root: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&root, text);
+    return root;
 }
 
 fn hexCid(cid: [32]u8) ![*:0]u8 {
@@ -393,4 +454,55 @@ test "mobile: two nodes put and retrieve a file through the C ABI" {
 
     try testing.expectEqual(nomadfs_ok, nomadfs_node_stop(node_b));
     try testing.expectEqual(nomadfs_ok, nomadfs_node_stop(node_a));
+    try testing.expectEqual(unavailable, nomadfs_node_run(node_a));
+}
+
+test "mobile: CID parsing requires exactly 64 hex characters" {
+    try testing.expectError(error.InvalidCid, parseCid(""));
+    try testing.expectError(error.InvalidCid, parseCid("aa"));
+    try testing.expectError(error.InvalidCid, parseCid("a" ** 63));
+    try testing.expectError(error.InvalidCid, parseCid("a" ** 65));
+    try testing.expectError(error.InvalidCharacter, parseCid("z" ** 64));
+    try testing.expectEqualSlices(u8, &([_]u8{0xaa} ** 32), &(try parseCid("a" ** 64)));
+}
+
+test "mobile: retiring a handle waits for pinned calls and rejects new calls" {
+    var self: NodeHandle = undefined;
+    self.refs = 0;
+    self.next = null;
+    registerHandle(&self);
+    const pinned = acquireHandle(&self).?;
+    var finished = std.atomic.Value(bool).init(false);
+    const worker = try std.Thread.spawn(.{}, struct {
+        fn run(handle: *NodeHandle, done: *std.atomic.Value(bool)) void {
+            std.debug.assert(retireHandle(handle) == handle);
+            done.store(true, .release);
+        }
+    }.run, .{ &self, &finished });
+    // Wait for retirement to remove the handle; our pin keeps it alive.
+    while (acquireHandle(&self)) |extra| {
+        releaseHandle(extra);
+        sync.sleep(std.time.ns_per_ms);
+    }
+    try testing.expect(!finished.load(.acquire));
+    releaseHandle(pinned);
+    worker.join();
+    try testing.expect(finished.load(.acquire));
+    try testing.expect(retireHandle(&self) == null);
+}
+
+test "mobile: listener startup failure never reports success on later runs" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = "test_mobile_start_failure";
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const path = "test_mobile_start_failure.conf";
+    defer cleanupFiles(io, &.{path});
+    try writeConfig(path, "fail", 13202, dir ++ "/data", dir);
+    var config = try nomadfs.config.parseConfig(allocator, path);
+    config.network.transport = .quic;
+    const handle = try nodeNewInternal(config);
+    defer nomadfs_node_free(handle);
+    try testing.expectEqual(unavailable, nomadfs_node_run(handle));
+    try testing.expectEqual(unavailable, nomadfs_node_run(handle));
 }

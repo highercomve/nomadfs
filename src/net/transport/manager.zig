@@ -17,6 +17,8 @@ pub const ConnectionManager = struct {
         handler_thread: ?std.Thread = null,
     };
 
+    pub const max_connections = 256;
+
     allocator: std.mem.Allocator,
     connections: std.ArrayListUnmanaged(ManagedConnection),
     transport_type: config.Config.TransportType,
@@ -40,6 +42,7 @@ pub const ConnectionManager = struct {
     mdns: ?network.mdns.MDNS = null,
     ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
     handshake_wg: sync.WaitGroup = .{},
+    handshakes: tcp.Handshakes = .{},
     stopping: bool = false,
     tcp_server: ?network.Server = null,
     heap_allocated: bool = false,
@@ -131,8 +134,11 @@ pub const ConnectionManager = struct {
         self.stop_mutex.lock();
         defer self.stop_mutex.unlock();
 
-        if (self.stopping) return error.ManagerStopping;
         if (self.reaper_thread != null) return;
+        self.mutex.lock();
+        self.stopping = false;
+        self.mutex.unlock();
+        self.handshakes.restart();
 
         self.running.store(true, .release);
         self.reaper_thread = try std.Thread.spawn(.{}, ConnectionManager.runReaper, .{self});
@@ -212,6 +218,8 @@ pub const ConnectionManager = struct {
         self.stopping = true;
 
         self.running.store(false, .release);
+        self.mutex.unlock();
+        self.handshakes.stop();
         if (self.mdns) |*m| {
             m.stop();
         }
@@ -219,7 +227,6 @@ pub const ConnectionManager = struct {
             s.deinit();
             self.tcp_server = null;
         }
-        self.mutex.unlock();
 
         if (self.accept_thread) |t| {
             t.join();
@@ -229,6 +236,7 @@ pub const ConnectionManager = struct {
         // Wait for all handshake threads to finish without holding the lock
         // as they might need to acquire it to add themselves or clean up.
         self.handshake_wg.wait();
+        self.handshakes.wg.wait();
 
         // Collect and cleanup connections and their handler threads
         self.mutex.lock();
@@ -271,6 +279,24 @@ pub const ConnectionManager = struct {
             }
             if (!self.running.load(.acquire)) break;
 
+            // Maintenance may send resets. Keep references, but never keep
+            // the pool locked across transport writes or shutdown cannot run.
+            var active: [max_connections]network.Connection = undefined;
+            self.mutex.lock();
+            var active_count: usize = 0;
+            for (self.connections.items) |mc| {
+                const vtable = mc.conn.vtable orelse continue;
+                if (vtable.maintain == null) continue;
+                mc.conn.retain();
+                active[active_count] = mc.conn;
+                active_count += 1;
+            }
+            self.mutex.unlock();
+            for (active[0..active_count]) |conn| {
+                conn.maintain();
+                conn.deinit();
+            }
+
             self.mutex.lock();
             var i: usize = 0;
             const now = sync.timestamp();
@@ -301,6 +327,26 @@ pub const ConnectionManager = struct {
         mc.conn.close();
         if (mc.handler_thread) |t| t.join();
         mc.conn.deinit();
+    }
+
+    /// Drops pooled sessions authenticated as this device or transport node.
+    pub fn closePeer(self: *ConnectionManager, peer: id.NodeID) usize {
+        var removed: [max_connections]ManagedConnection = undefined;
+        var count: usize = 0;
+        self.mutex.lock();
+        var i: usize = 0;
+        while (i < self.connections.items.len) {
+            const conn = self.connections.items[i].conn;
+            const device = conn.getRemoteDeviceID();
+            if (conn.getRemoteNodeID().eql(peer) or (device != null and device.?.eql(peer))) {
+                removed[count] = self.connections.orderedRemove(i);
+                count += 1;
+            } else i += 1;
+        }
+        self.mutex.unlock();
+        for (removed[0..count]) |mc| mc.conn.close();
+        for (removed[0..count]) |mc| retireConnection(mc);
+        return count;
     }
 
     pub fn getConnectionsCount(self: *ConnectionManager) usize {
@@ -356,6 +402,10 @@ pub const ConnectionManager = struct {
         defer self.mutex.unlock();
 
         if (self.stopping) return error.ManagerStopping;
+        if (self.connections.items.len >= max_connections) {
+            conn.close();
+            return error.TooManyConnections;
+        }
 
         // Reserve first so that nothing can fail after the handler starts.
         try self.connections.ensureUnusedCapacity(self.allocator, 1);
@@ -406,6 +456,26 @@ pub const ConnectionManager = struct {
     }
 
     pub fn listen(self: *ConnectionManager, cfg: config.Config, running: ?*std.atomic.Value(bool)) !void {
+        self.stop_mutex.lock();
+        defer self.stop_mutex.unlock();
+        _ = running;
+        if (self.tcp_server != null) return;
+        self.mutex.lock();
+        self.stopping = false;
+        self.mutex.unlock();
+        self.running.store(true, .release);
+        self.handshakes.restart();
+        if (self.mdns) |*m| m.deinit();
+        self.mdns = null;
+        // Unwind every partially started service before a retry.
+        errdefer {
+            if (self.mdns) |*m| m.deinit();
+            self.mdns = null;
+            if (self.tcp_server) |*server| server.deinit();
+            self.tcp_server = null;
+            if (self.upnp_thread) |t| t.join();
+            self.upnp_thread = null;
+        }
         self.bound_port = cfg.network.port;
 
         // Initialize mDNS
@@ -453,7 +523,7 @@ pub const ConnectionManager = struct {
                     .handshake_timeout_ms = self.handshake_timeout_ms,
                     .swarm_key = cfg.node.swarm_key,
                     .static_key = self.identity_key,
-                    .running = running,
+                    .running = &self.running,
                     .manager = self,
                     .device_auth = self.deviceAuthPtr(),
                 });
@@ -466,7 +536,7 @@ pub const ConnectionManager = struct {
                         .handshake_timeout_ms = self.handshake_timeout_ms,
                         .swarm_key = cfg.node.swarm_key,
                         .static_key = self.identity_key,
-                        .running = running,
+                        .running = &self.running,
                         .manager = self,
                         .device_auth = self.deviceAuthPtr(),
                     },
@@ -526,6 +596,7 @@ pub const ConnectionManager = struct {
         {
             self.mutex.lock();
             defer self.mutex.unlock();
+            if (self.stopping) return error.ManagerStopping;
             if (self.findConnectionLocked(addresses, remote_node_id)) |c| return c;
         }
 
@@ -542,6 +613,8 @@ pub const ConnectionManager = struct {
         std.mem.sort(network.Address, sorted_addrs, SortCtx{}, SortCtx.lessThan);
 
         for (sorted_addrs) |addr| {
+            // Port 0, multicast, link-local and the like can't be a peer.
+            if (@import("../local_addrs.zig").classify(addr) == .invalid) continue;
             if (self.connectToPeer(addr, swarm_key, remote_node_id)) |conn| {
                 return conn;
             } else |err| {
@@ -558,12 +631,13 @@ pub const ConnectionManager = struct {
         {
             self.mutex.lock();
             defer self.mutex.unlock();
+            if (self.stopping) return error.ManagerStopping;
             if (self.findConnectionLocked(&.{address}, remote_node_id)) |c| return c;
         }
 
         switch (self.transport_type) {
             .tcp => {
-                const conn = try tcp.connect(self.allocator, address, swarm_key, self.identity_key, self.handshake_timeout_ms, self.deviceAuthPtr());
+                const conn = try tcp.connectTracked(self.allocator, address, swarm_key, self.identity_key, self.handshake_timeout_ms, self.deviceAuthPtr(), &self.handshakes);
                 errdefer conn.deinit();
 
                 // The Noise handshake authenticated the remote key; make sure
@@ -589,4 +663,115 @@ pub const ConnectionManager = struct {
 
 fn addressesMatch(a: network.Address, b: network.Address) bool {
     return a.eql(b);
+}
+
+const TestConnection = struct {
+    node: id.NodeID,
+    device: ?id.NodeID = null,
+    closed: bool = false,
+    released: usize = 0,
+    fn stream(_: *anyopaque) anyerror!network.Stream {
+        return error.SessionClosed;
+    }
+    fn address(_: *anyopaque) network.Address {
+        return network.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+    }
+    fn nodeId(ctx: *anyopaque) id.NodeID {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.node;
+    }
+    fn deviceId(ctx: *anyopaque) ?id.NodeID {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.device;
+    }
+    fn close(ctx: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.closed = true;
+    }
+    fn retain(_: *anyopaque) void {}
+    fn deinit(ctx: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.released += 1;
+    }
+    fn isClosed(ctx: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.closed;
+    }
+    fn isInUse(_: *anyopaque) bool {
+        return false;
+    }
+    fn connection(self: *@This()) network.Connection {
+        return network.Connection.init(self, &vtable);
+    }
+    const vtable: network.Connection.ConnectionVTable = .{
+        .openStream = stream,
+        .acceptStream = stream,
+        .getPeerAddress = address,
+        .getRemoteNodeID = nodeId,
+        .getRemoteDeviceID = deviceId,
+        .close = close,
+        .retain = retain,
+        .deinit = deinit,
+        .isClosed = isClosed,
+        .isInUse = isInUse,
+    };
+};
+
+test "pool caps sessions and closes every matching device or node" {
+    var manager = ConnectionManager.initExplicit(std.testing.allocator, .tcp, noise.KeyPair.generate());
+    defer manager.deinit();
+    const peer = id.NodeID{ .bytes = .{1} ** 32 };
+    const other = id.NodeID{ .bytes = .{2} ** 32 };
+    var mocks: [ConnectionManager.max_connections + 1]TestConnection = undefined;
+    for (&mocks) |*mock| mock.* = .{ .node = other };
+    mocks[0].node = peer;
+    mocks[1].device = peer;
+    for (mocks[0..ConnectionManager.max_connections]) |*mock| try manager.addConnection(mock.connection());
+    try std.testing.expectError(error.TooManyConnections, manager.addConnection(mocks[ConnectionManager.max_connections].connection()));
+    try std.testing.expect(mocks[ConnectionManager.max_connections].closed);
+    try std.testing.expectEqual(@as(usize, 2), manager.closePeer(peer));
+    try std.testing.expectEqual(@as(usize, 0), manager.closePeer(peer));
+    try std.testing.expect(mocks[0].closed and mocks[1].closed);
+    try std.testing.expectEqual(@as(usize, 1), mocks[0].released);
+    try std.testing.expectEqual(@as(usize, ConnectionManager.max_connections - 2), manager.getConnectionsCount());
+    manager.stop();
+    for (mocks[0..ConnectionManager.max_connections]) |mock| try std.testing.expectEqual(@as(usize, 1), mock.released);
+}
+
+test "stop joins mDNS callbacks without the pool mutex" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var manager = ConnectionManager.initExplicit(std.testing.allocator, .tcp, noise.KeyPair.generate());
+    defer manager.deinit();
+    manager.mdns = network.mdns.MDNS.init(std.testing.allocator, manager.node_id, 0, 0, ConnectionManager.onMdnsDiscovery, &manager);
+    manager.mdns.?.running.store(true, .release);
+    manager.mdns.?.thread = try std.Thread.spawn(.{}, struct {
+        fn run(cm: *ConnectionManager) void {
+            while (cm.mdns.?.running.load(.acquire)) sync.sleep(std.time.ns_per_ms);
+            cm.mutex.lock();
+            defer cm.mutex.unlock();
+        }
+    }.run, .{&manager});
+    manager.stop();
+    try std.testing.expect(manager.mdns.?.thread == null);
+}
+
+test "listen is idempotent and can restart after stop" {
+    var manager = ConnectionManager.initExplicit(std.testing.allocator, .tcp, noise.KeyPair.generate());
+    defer manager.deinit();
+    const cfg = config.Config{
+        .node = .{ .nickname = "test", .swarm_key = "x" ** 32 },
+        .storage = .{ .enabled = false, .storage_path = "" },
+        .network = .{ .port = 0, .bootstrap_peers = &.{}, .transport = .tcp, .upnp_enabled = false, .enable_mdns = false },
+    };
+    try manager.start();
+    try manager.listen(cfg, null);
+    const handle = manager.tcp_server.?.inner.socket.handle;
+    try manager.listen(cfg, null);
+    try std.testing.expectEqual(handle, manager.tcp_server.?.inner.socket.handle);
+    manager.stop();
+    try std.testing.expect(manager.accept_thread == null and manager.tcp_server == null);
+    try manager.start();
+    try manager.listen(cfg, null);
+    try std.testing.expect(manager.accept_thread != null and manager.tcp_server != null);
+    manager.stop();
 }

@@ -38,6 +38,20 @@ graph TD
    concrete types. `Stream` has `read`, `write`, `close` and an optional
    `setTimeout`.
 
+### Addressing and IPv6 Support (`src/net/compat.zig`)
+
+The network abstraction `Address` handles IPv4 and IPv6 transparently:
+
+*   **Scope and interface tracking**: IPv6 addresses preserve scope IDs (interface
+    indices) and flow labels. Scope IDs are retained when dialing (essential
+    for link-local `fe80::/10` connections) and compared when testing equality.
+*   **Private address classification**: `isPrivate()` identifies IPv4 RFC 1918
+    subnets as well as IPv6 Unique Local Addresses (ULA `fc00::/7`, such as `fc00::`
+    and `fd00::`) and link-local ranges.
+*   **POSIX conversion**: `Address.toPosix()` builds a `PosixAddress` union
+    that emits properly sized and formatted `sockaddr_in` and `sockaddr_in6`
+    structures, guaranteeing accurate `socklen_t` bounds during socket system calls.
+
 ## 2. Establishing a Connection (`tcp.zig`)
 
 Both directions end in the same function, `establish()`:
@@ -70,8 +84,7 @@ listener: acceptLoop() → handleIncomingConnection()  ────┤
 A finished handshake leaves two identities on the connection:
 
 | Accessor | Value | Derived from |
-| :--- | :--- | :--- |
-| `getRemoteNodeID()` | DHT node ID | BLAKE2s-256 of the peer's X25519 static key (`NodeID.fromPublicKey`, `src/net/id.zig`) |
+| :--- | :--- | :--- |\n| `getRemoteNodeID()` | DHT node ID | BLAKE2s-256 of the peer's X25519 static key (`NodeID.fromPublicKey`, `src/net/id.zig`) |
 | `getRemoteDeviceID()` | device ID | BLAKE2s-256 of the peer's Ed25519 identity key, from the verified device hello (`src/device/auth.zig`) |
 
 The DHT routing table is keyed by node ID. Pairing, the trust store,

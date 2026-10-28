@@ -13,10 +13,18 @@ pub fn getEnv(allocator: std.mem.Allocator, key: []const u8) ?[]const u8 {
         var file = std.Io.Dir.cwd().openFile(io, "/proc/self/environ", .{}) catch return null;
         defer file.close(io);
 
-        var buf: [16384]u8 = undefined;
-        const n = file.readPositionalAll(io, &buf, 0) catch return null;
-        var it = std.mem.splitScalar(u8, buf[0..n], 0);
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(allocator);
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = file.readPositionalAll(io, &buf, bytes.items.len) catch return null;
+            bytes.appendSlice(allocator, buf[0..n]) catch return null;
+            if (n < buf.len) break;
+        }
+        var it = std.mem.splitScalar(u8, bytes.items, 0);
         while (it.next()) |entry| {
+            // Only complete NUL-terminated entries can be environment values.
+            if (it.index == null) break;
             if (std.mem.startsWith(u8, entry, key) and entry.len > key.len and entry[key.len] == '=') {
                 return allocator.dupe(u8, entry[key.len + 1 ..]) catch null;
             }

@@ -53,6 +53,10 @@ registered.
 
 ## 3. Connection Pooling
 
+The connection pool is capped at `max_connections = 256`. If an incoming or
+outgoing connection would exceed this limit, `addConnection` returns
+`error.TooManyConnections` and closes the new connection.
+
 `connectToPeer(address, swarm_key, remote_node_id)`:
 
 1.  **Look up first.** Under the mutex, `findConnectionLocked` looks for a
@@ -72,18 +76,30 @@ registered.
 Incoming connections take the same `addConnection` path from
 `tcp.handleIncomingConnection`.
 
+When a peer is revoked or disconnected, `closePeer(peer: id.NodeID)` drops and
+retires all pooled connections authenticated as that device or transport node
+ID.
+
 ## 4. Address Priority (LAN vs WAN)
 
 A peer record can hold up to 8 addresses
 ([Chapter 2.2](../discovery/kbucket.md)). `connectToPeerMulti` sorts a copy
-by `network.addressPriority` (`src/net/transport/mod.zig`) and tries each in
-turn, returning `error.AllAddressesFailed` if none works:
+by `network.addressPriority` (`src/net/transport/mod.zig`,
+`src/net/local_addrs.zig`) and tries each in turn, returning
+`error.AllAddressesFailed` if none works.
 
-| Priority | Addresses |
-| :--- | :--- |
-| 0 | loopback (`127.0.0.0/8`, `::1`) |
-| 1 | private / LAN (RFC 1918 and similar) |
-| 2 | everything else |
+The classifier assigns one of four tiers:
+
+| Priority | Tier | Addresses |
+| :--- | :--- | :--- |
+| 0 | Loopback | `127.0.0.0/8`, `::1` |
+| 1 | Private | LAN (RFC 1918 `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, IPv6 ULA `fc00::/7`, link-local) |
+| 2 | CGNAT | Shared address space (`100.64.0.0/10`), including Tailscale |
+| 3 | Public | Globally routable Internet addresses |
+
+Invalid addresses (priority 255: `0.0.0.0`, port 0, multicast `224.0.0.0/4`,
+broadcast `255.255.255.255`, link-local unicast `169.254.0.0/16`, reserved
+`240.0.0.0/4`) are never dialed.
 
 Two devices on the same Wi-Fi therefore connect over the LAN even when the
 DHT also knows a public address. `PeerInfo.getBestAddress` uses the same
@@ -105,19 +121,28 @@ order.
 `last_active` is set when a connection is registered, when
 `findConnectionLocked` hands it out, and by the reaper while it is in use.
 
-## 6. Shutdown
+## 6. Shutdown and Restart
 
 `stop()` marks the manager as stopping (`addConnection` then returns
 `error.ManagerStopping`), stops the LAN announcer, closes the listening
 socket, joins the accept thread, waits for in-flight handshakes, retires every
 pooled connection, joins the reaper and UPnP threads, and finally removes the
-UPnP port mapping if one was made. Mappings are requested with an infinite
-lease, so leaving one behind would keep the port forwarded.
+UPnP port mapping if one was made.
+
+Mappings use a one-hour lease that is renewed every 30 minutes, so a crash leaves
+a rule for at most an hour (routers that only accept permanent leases keep it
+until removed).
+
+`listen()` is idempotent and the manager can cleanly restart after `stop()`:
+handshake state is reset, sockets re-bound, and threads restarted. Shutdown
+releases the pool mutex before joining threads to avoid deadlocks with in-flight
+transport writes or mDNS callbacks.
 
 ## 7. Why This Matters
 
 *   **Resource limits**: idle and dead connections don't pile up. A peer that
     connects and never speaks is cut off by the 10-second handshake timeout.
+    The pool cap (256) bounds descriptor and memory exhaustion.
 *   **Mobile**: idle sockets are closed after 5 minutes, so the radio can
     sleep.
 *   **Roaming**: a device that changes address shows up as a new connection,

@@ -11,13 +11,25 @@ const Hkdf = std.crypto.kdf.hkdf.Hkdf(Hmac);
 const Aead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 const X25519 = std.crypto.dh.X25519;
 
+pub const prologue_v2 = "nomadfs-noise-v2";
+
 pub const KeyPair = struct {
     public_key: [32]u8,
     private_key: [32]u8,
 
+    /// Legacy node.key layout: public key followed by private key, 32 bytes each.
+    pub fn encode(self: KeyPair) [64]u8 {
+        return self.public_key ++ self.private_key;
+    }
+
+    pub fn decode(bytes: [64]u8) KeyPair {
+        return .{ .public_key = bytes[0..32].*, .private_key = bytes[32..64].* };
+    }
+
     pub fn generate() KeyPair {
         const io = std.Io.Threaded.global_single_threaded.io();
-        const kp = X25519.KeyPair.generate(io);
+        var kp = X25519.KeyPair.generate(io);
+        defer std.crypto.secureZero(u8, &kp.secret_key);
         return .{
             .public_key = kp.public_key,
             .private_key = kp.secret_key,
@@ -32,10 +44,13 @@ pub const KeyPair = struct {
         var file = try std.Io.Dir.cwd().openFile(io, path, .{});
         defer file.close(io);
 
-        if ((try file.stat(io)).size != @sizeOf(KeyPair)) return error.InvalidKeyFile;
-        var kp: KeyPair = undefined;
-        const bytes_read = try file.readPositionalAll(io, std.mem.asBytes(&kp), 0);
-        if (bytes_read != @sizeOf(KeyPair)) return error.InvalidKeyFile;
+        if ((try file.stat(io)).size != 64) return error.InvalidKeyFile;
+        var bytes: [64]u8 = undefined;
+        defer std.crypto.secureZero(u8, &bytes);
+        const bytes_read = try file.readPositionalAll(io, &bytes, 0);
+        if (bytes_read != 64) return error.InvalidKeyFile;
+        var kp = decode(bytes);
+        errdefer std.crypto.secureZero(u8, &kp.private_key);
 
         const derived = X25519.recoverPublicKey(kp.private_key) catch return error.InvalidKeyFile;
         if (!std.mem.eql(u8, &derived, &kp.public_key)) return error.InvalidKeyFile;
@@ -55,7 +70,9 @@ pub const KeyPair = struct {
         });
         defer file.close(io);
 
-        try file.writePositionalAll(io, std.mem.asBytes(&self), 0);
+        var bytes = self.encode();
+        defer std.crypto.secureZero(u8, &bytes);
+        try file.writePositionalAll(io, &bytes, 0);
     }
 };
 
@@ -83,6 +100,7 @@ pub const CipherState = struct {
             return error.EncryptionNotReady;
         }
 
+        if (self.n == std.math.maxInt(u64)) return error.NonceExhausted;
         var nonce = [_]u8{0} ** 12;
         std.mem.writeInt(u64, nonce[4..12], self.n, .little);
 
@@ -101,6 +119,7 @@ pub const CipherState = struct {
         if (ciphertext.len < 16) return error.DecryptionFailed;
         const msg_len = ciphertext.len - 16;
 
+        if (self.n == std.math.maxInt(u64)) return error.NonceExhausted;
         var nonce = [_]u8{0} ** 12;
         std.mem.writeInt(u64, nonce[4..12], self.n, .little);
 
@@ -110,16 +129,6 @@ pub const CipherState = struct {
         try Aead.decrypt(out[0..msg_len], ciphertext[0..msg_len], tag, ad, nonce, self.k);
 
         self.n += 1;
-    }
-
-    pub fn rekey(self: *CipherState) void {
-        var out = [_]u8{0} ** 64;
-        const nonce = [_]u8{0xff} ** 12; // Use max nonce for rekey
-        const zeros = [_]u8{0} ** 32;
-        var tag: [16]u8 = undefined;
-        Aead.encrypt(out[0..32], &tag, zeros[0..], &[_]u8{}, nonce, self.k);
-        // Standard Noise rekey just takes the first 32 bytes of encryption of zeros
-        self.k = out[0..32].*;
     }
 };
 
@@ -146,7 +155,9 @@ pub const SymmetricState = struct {
 
     pub fn mixKey(self: *SymmetricState, ikm: []const u8) void {
         var output: [64]u8 = undefined;
-        const prk = Hkdf.extract(&self.ck, ikm);
+        defer std.crypto.secureZero(u8, &output);
+        var prk = Hkdf.extract(&self.ck, ikm);
+        defer std.crypto.secureZero(u8, &prk);
         Hkdf.expand(&output, &[_]u8{}, prk);
 
         self.ck = output[0..32].*;
@@ -162,7 +173,9 @@ pub const SymmetricState = struct {
 
     pub fn mixKeyAndHash(self: *SymmetricState, psk: []const u8) void {
         var output: [96]u8 = undefined;
-        const prk = Hkdf.extract(&self.ck, psk);
+        defer std.crypto.secureZero(u8, &output);
+        var prk = Hkdf.extract(&self.ck, psk);
+        defer std.crypto.secureZero(u8, &prk);
         Hkdf.expand(&output, &[_]u8{}, prk);
 
         self.ck = output[0..32].*;
@@ -171,19 +184,29 @@ pub const SymmetricState = struct {
     }
 
     pub fn encryptAndHash(self: *SymmetricState, plaintext: []const u8, out: []u8) !void {
-        try self.cipher_state.encryptWithAd(&self.h, plaintext, out);
+        if (self.cipher_state.has_key) {
+            try self.cipher_state.encryptWithAd(&self.h, plaintext, out);
+        } else {
+            @memcpy(out[0..plaintext.len], plaintext);
+        }
         const ct_len = if (self.cipher_state.has_key) plaintext.len + 16 else plaintext.len;
         self.mixHash(out[0..ct_len]);
     }
 
     pub fn decryptAndHash(self: *SymmetricState, ciphertext: []const u8, out: []u8) !void {
-        try self.cipher_state.decryptWithAd(&self.h, ciphertext, out);
+        if (self.cipher_state.has_key) {
+            try self.cipher_state.decryptWithAd(&self.h, ciphertext, out);
+        } else {
+            @memcpy(out[0..ciphertext.len], ciphertext);
+        }
         self.mixHash(ciphertext);
     }
 
     pub fn split(self: *SymmetricState) [2]CipherState {
         var output: [64]u8 = undefined;
-        const prk = Hkdf.extract(&self.ck, &[_]u8{});
+        defer std.crypto.secureZero(u8, &output);
+        var prk = Hkdf.extract(&self.ck, &[_]u8{});
+        defer std.crypto.secureZero(u8, &prk);
         Hkdf.expand(&output, &[_]u8{}, prk);
 
         var c1 = CipherState.init();
@@ -206,9 +229,13 @@ pub const HandshakeState = struct {
     auth: *const device_auth.Authenticator,
     remote_device_id: ?NodeID = null,
 
+    fixed_e: ?KeyPair = null, // Deterministic test input; production generates a fresh key.
+
     pub fn init(initiator: bool, static_key: KeyPair, swarm_key: [32]u8, auth: *const device_auth.Authenticator) HandshakeState {
+        var symmetric = SymmetricState.init("Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s");
+        symmetric.mixHash(prologue_v2);
         return .{
-            .symmetric = SymmetricState.init("Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s"),
+            .symmetric = symmetric,
             .s = static_key,
             .e = null,
             .rs = null,
@@ -224,6 +251,7 @@ pub const NoiseStream = struct {
     inner: network.Stream,
     send_cipher: CipherState,
     recv_cipher: CipherState,
+    handshake_hash: [32]u8,
     remote_static: [32]u8,
     remote_device_id: NodeID,
     read_buffer: []u8,
@@ -246,11 +274,9 @@ pub const NoiseStream = struct {
         initiator: bool,
         auth: ?*const device_auth.Authenticator,
     ) !NoiseStream {
-        const role = if (initiator) "Initiator" else "Responder";
-        std.debug.print("* Noise_XXpsk3 handshake start ({s})\n", .{role});
-
         if (swarm_key_bytes.len != 32) return error.InvalidSwarmKey;
         var swarm_key: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &swarm_key);
         @memcpy(&swarm_key, swarm_key_bytes);
 
         // Callers that have no device identity yet (tests, embedded use) still
@@ -263,14 +289,9 @@ pub const NoiseStream = struct {
 
         var hs = HandshakeState.init(initiator, static_key, swarm_key, auth_ptr);
 
-        const result = runHandshakeSteps(allocator, inner, &hs, initiator);
-        if (result) |ns| {
-            std.debug.print("* Noise Handshake complete\n", .{});
-            return ns;
-        } else |err| {
-            std.debug.print("* Noise Handshake FAILED ({s}): {}\n", .{ role, err });
-            return err;
-        }
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&hs));
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&fallback_auth));
+        return runHandshakeSteps(allocator, inner, &hs, initiator);
     }
 
     fn runHandshakeSteps(allocator: std.mem.Allocator, inner: network.Stream, hs: *HandshakeState, initiator: bool) !NoiseStream {
@@ -284,7 +305,8 @@ pub const NoiseStream = struct {
             try readMessage3(inner, hs);
         }
 
-        const ciphers = hs.symmetric.split();
+        var ciphers = hs.symmetric.split();
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&ciphers));
         const read_buf = try allocator.alloc(u8, 65535 + 16);
         errdefer allocator.free(read_buf);
         const write_buf = try allocator.alloc(u8, 2 + 65535);
@@ -294,6 +316,7 @@ pub const NoiseStream = struct {
             .inner = inner,
             .send_cipher = if (initiator) ciphers[0] else ciphers[1],
             .recv_cipher = if (initiator) ciphers[1] else ciphers[0],
+            .handshake_hash = hs.symmetric.h,
             .remote_static = hs.rs.?,
             .remote_device_id = hs.remote_device_id.?,
             .read_buffer = read_buf,
@@ -304,74 +327,76 @@ pub const NoiseStream = struct {
         };
     }
 
-    /// Message 1 (initiator): -> e
-    fn writeMessage1(inner: network.Stream, hs: *HandshakeState) !void {
-        std.debug.print("* Noise (OUT): Message 1 -> sending ephemeral public key (e)\n", .{});
-        hs.e = KeyPair.generate();
-        hs.symmetric.mixHash(&hs.e.?.public_key);
-        writeHandshakeMessage(inner, &hs.e.?.public_key) catch |err| return logError("Message 1 write", err);
+    fn mixE(hs: *HandshakeState, public_key: []const u8) void {
+        hs.symmetric.mixHash(public_key);
+        hs.symmetric.mixKey(public_key);
     }
 
-    /// Message 1 (responder): -> e
+    fn buildMessage1(hs: *HandshakeState, payload: []const u8, out: []u8) ![]u8 {
+        hs.e = hs.fixed_e orelse KeyPair.generate();
+        mixE(hs, &hs.e.?.public_key);
+        @memcpy(out[0..32], &hs.e.?.public_key);
+        try hs.symmetric.encryptAndHash(payload, out[32..]);
+        return out[0 .. 48 + payload.len];
+    }
+
+    fn consumeMessage1(hs: *HandshakeState, msg: []const u8, payload: []u8) !void {
+        if (msg.len != 48 + payload.len) return error.HandshakeFailed;
+        hs.re = msg[0..32].*;
+        mixE(hs, msg[0..32]);
+        try hs.symmetric.decryptAndHash(msg[32..], payload);
+    }
+
+    /// Message 1: -> e, encrypted empty payload (48 bytes).
+    fn writeMessage1(inner: network.Stream, hs: *HandshakeState) !void {
+        var buf: [48]u8 = undefined;
+        try writeHandshakeMessage(inner, try buildMessage1(hs, "", &buf));
+    }
+
     fn readMessage1(inner: network.Stream, hs: *HandshakeState) !void {
-        var re: [32]u8 = undefined;
-        readHandshakeMessage(inner, &re) catch |err| return logError("Message 1 read", err);
-        std.debug.print("* Noise (IN):  Message 1 <- received ephemeral public key (e)\n", .{});
-        hs.re = re;
-        hs.symmetric.mixHash(&re);
+        var buf: [48]u8 = undefined;
+        try readHandshakeMessage(inner, &buf);
+        try consumeMessage1(hs, &buf, &.{});
     }
 
     /// Message 2 (responder): <- e, ee, s, es
     fn writeMessage2(inner: network.Stream, hs: *HandshakeState) !void {
-        std.debug.print("* Noise (OUT): Message 2 -> sending ephemeral (e) and static (s) keys (encrypted)\n", .{});
-        hs.e = KeyPair.generate();
-        hs.symmetric.mixHash(&hs.e.?.public_key);
-
-        // ee
-        const ee = X25519.scalarmult(hs.e.?.private_key, hs.re.?) catch |err| return logError("Message 2 DH (ee)", err);
-        hs.symmetric.mixKey(&ee);
-
-        // s
-        var s_ct: [32 + 16]u8 = undefined;
-        try hs.symmetric.encryptAndHash(&hs.s.public_key, &s_ct);
-
-        // es
-        const es = X25519.scalarmult(hs.s.private_key, hs.re.?) catch |err| return logError("Message 2 DH (es)", err);
-        hs.symmetric.mixKey(&es);
-
+        var msg2: [32 + 48 + device_auth.hello_len + 16]u8 = undefined;
+        try buildMessage2Prefix(hs, &msg2);
         const hello = try hs.auth.createHello(hs.symmetric.h);
         var payload_ct: [device_auth.hello_len + 16]u8 = undefined;
         try hs.symmetric.encryptAndHash(&hello, &payload_ct);
 
-        var msg2: [32 + 48 + device_auth.hello_len + 16]u8 = undefined;
-        @memcpy(msg2[0..32], &hs.e.?.public_key);
-        @memcpy(msg2[32..80], &s_ct);
         @memcpy(msg2[80..], &payload_ct);
         writeHandshakeMessage(inner, &msg2) catch |err| return logError("Message 2 write", err);
+    }
+
+    fn buildMessage2Prefix(hs: *HandshakeState, out: []u8) !void {
+        hs.e = hs.fixed_e orelse KeyPair.generate();
+        mixE(hs, &hs.e.?.public_key);
+
+        // ee
+        var ee = X25519.scalarmult(hs.e.?.private_key, hs.re.?) catch |err| return logError("Message 2 DH (ee)", err);
+        defer std.crypto.secureZero(u8, &ee);
+        hs.symmetric.mixKey(&ee);
+
+        // s
+        try hs.symmetric.encryptAndHash(&hs.s.public_key, out[32..80]);
+
+        // es
+        var es = X25519.scalarmult(hs.s.private_key, hs.re.?) catch |err| return logError("Message 2 DH (es)", err);
+        defer std.crypto.secureZero(u8, &es);
+        hs.symmetric.mixKey(&es);
+
+        @memcpy(out[0..32], &hs.e.?.public_key);
     }
 
     /// Message 2 (initiator): <- e, ee, s, es
     fn readMessage2(inner: network.Stream, hs: *HandshakeState) !void {
         var buf: [32 + 48 + device_auth.hello_len + 16]u8 = undefined; // re, rs (encrypted), device hello
         readHandshakeMessage(inner, &buf) catch |err| return logError("Message 2 read", err);
-        std.debug.print("* Noise (IN):  Message 2 <- received ephemeral (e) and static (s) keys (encrypted)\n", .{});
 
-        // e
-        hs.re = buf[0..32].*;
-        hs.symmetric.mixHash(buf[0..32]);
-
-        // ee
-        const ee = X25519.scalarmult(hs.e.?.private_key, hs.re.?) catch |err| return logError("Message 2 DH (ee)", err);
-        hs.symmetric.mixKey(&ee);
-
-        // s
-        var rs: [32]u8 = undefined;
-        hs.symmetric.decryptAndHash(buf[32..80], &rs) catch |err| return logError("Message 2 Decrypt (s)", err);
-        hs.rs = rs;
-
-        // es
-        const es = X25519.scalarmult(hs.e.?.private_key, hs.rs.?) catch |err| return logError("Message 2 DH (es)", err);
-        hs.symmetric.mixKey(&es);
+        try consumeMessage2Prefix(hs, &buf);
 
         // Device identity, signed over the handshake hash that also
         // authenticates this payload.
@@ -381,48 +406,60 @@ pub const NoiseStream = struct {
         hs.remote_device_id = hs.auth.verifyHello(&hello, transcript, hs.rs.?) catch |err| return logError("Message 2 device identity", err);
     }
 
+    fn consumeMessage2Prefix(hs: *HandshakeState, buf: []const u8) !void {
+        // e
+        hs.re = buf[0..32].*;
+        mixE(hs, buf[0..32]);
+
+        // ee
+        var ee = X25519.scalarmult(hs.e.?.private_key, hs.re.?) catch |err| return logError("Message 2 DH (ee)", err);
+        defer std.crypto.secureZero(u8, &ee);
+        hs.symmetric.mixKey(&ee);
+
+        // s
+        var rs: [32]u8 = undefined;
+        hs.symmetric.decryptAndHash(buf[32..80], &rs) catch |err| return logError("Message 2 Decrypt (s)", err);
+        hs.rs = rs;
+
+        // es
+        var es = X25519.scalarmult(hs.e.?.private_key, hs.rs.?) catch |err| return logError("Message 2 DH (es)", err);
+        defer std.crypto.secureZero(u8, &es);
+        hs.symmetric.mixKey(&es);
+    }
+
     /// Message 3 (initiator): -> s, se, psk
     fn writeMessage3(inner: network.Stream, hs: *HandshakeState) !void {
-        std.debug.print("* Noise (OUT): Message 3 -> sending static key (s) and PSK authentication\n", .{});
-        // s
-        var s_ct: [32 + 16]u8 = undefined;
-        try hs.symmetric.encryptAndHash(&hs.s.public_key, &s_ct);
-
-        // se
-        const se = X25519.scalarmult(hs.s.private_key, hs.re.?) catch |err| return logError("Message 3 DH (se)", err);
-        hs.symmetric.mixKey(&se);
-
-        // psk
-        hs.symmetric.mixKeyAndHash(&hs.psk);
+        var msg3: [48 + device_auth.hello_len + 16]u8 = undefined;
+        try buildMessage3Prefix(hs, &msg3);
 
         // Payload: device identity, signed over the psk-mixed handshake hash.
         const hello = try hs.auth.createHello(hs.symmetric.h);
         var payload_ct: [device_auth.hello_len + 16]u8 = undefined;
         try hs.symmetric.encryptAndHash(&hello, &payload_ct);
 
-        var msg3: [48 + device_auth.hello_len + 16]u8 = undefined;
-        @memcpy(msg3[0..48], &s_ct);
         @memcpy(msg3[48..], &payload_ct);
         writeHandshakeMessage(inner, &msg3) catch |err| return logError("Message 3 write", err);
+    }
+
+    fn buildMessage3Prefix(hs: *HandshakeState, out: []u8) !void {
+        // s
+        try hs.symmetric.encryptAndHash(&hs.s.public_key, out[0..48]);
+
+        // se
+        var se = X25519.scalarmult(hs.s.private_key, hs.re.?) catch |err| return logError("Message 3 DH (se)", err);
+        defer std.crypto.secureZero(u8, &se);
+        hs.symmetric.mixKey(&se);
+
+        // psk
+        hs.symmetric.mixKeyAndHash(&hs.psk);
     }
 
     /// Message 3 (responder): -> s, se, psk
     fn readMessage3(inner: network.Stream, hs: *HandshakeState) !void {
         var buf: [48 + device_auth.hello_len + 16]u8 = undefined;
         readHandshakeMessage(inner, &buf) catch |err| return logError("Message 3 read", err);
-        std.debug.print("* Noise (IN):  Message 3 <- received static key (s) and PSK authentication\n", .{});
 
-        // s
-        var rs: [32]u8 = undefined;
-        hs.symmetric.decryptAndHash(buf[0..48], &rs) catch |err| return logError("Message 3 Decrypt (s)", err);
-        hs.rs = rs;
-
-        // se
-        const se = X25519.scalarmult(hs.e.?.private_key, hs.rs.?) catch |err| return logError("Message 3 DH (se)", err);
-        hs.symmetric.mixKey(&se);
-
-        // psk
-        hs.symmetric.mixKeyAndHash(&hs.psk);
+        try consumeMessage3Prefix(hs, &buf);
 
         // payload: device identity (also verifies the PSK-derived key)
         const transcript = hs.symmetric.h;
@@ -431,8 +468,24 @@ pub const NoiseStream = struct {
         hs.remote_device_id = hs.auth.verifyHello(&hello, transcript, hs.rs.?) catch |err| return logError("Message 3 device identity", err);
     }
 
+    fn consumeMessage3Prefix(hs: *HandshakeState, buf: []const u8) !void {
+        // s
+        var rs: [32]u8 = undefined;
+        hs.symmetric.decryptAndHash(buf[0..48], &rs) catch |err| return logError("Message 3 Decrypt (s)", err);
+        hs.rs = rs;
+
+        // se
+        var se = X25519.scalarmult(hs.e.?.private_key, hs.rs.?) catch |err| return logError("Message 3 DH (se)", err);
+        defer std.crypto.secureZero(u8, &se);
+        hs.symmetric.mixKey(&se);
+
+        // psk
+        hs.symmetric.mixKeyAndHash(&hs.psk);
+    }
+
     fn logError(step: []const u8, err: anyerror) anyerror {
-        std.debug.print("* Noise Error at step '{s}': {}\n", .{ step, err });
+        _ = step;
+
         return err;
     }
 
@@ -531,6 +584,10 @@ pub const NoiseStream = struct {
 
     pub fn deinit(self: *NoiseStream) void {
         self.close();
+        std.crypto.secureZero(u8, &self.send_cipher.k);
+        std.crypto.secureZero(u8, &self.recv_cipher.k);
+        std.crypto.secureZero(u8, self.read_buffer);
+        std.crypto.secureZero(u8, self.write_buffer);
         self.allocator.free(self.read_buffer);
         self.allocator.free(self.write_buffer);
     }
@@ -580,4 +637,137 @@ test "KeyPair files are private and never silently replaced" {
         try file.writePositionalAll(io, "short", 0);
     }
     try std.testing.expectError(error.InvalidKeyFile, KeyPair.loadFromFile(path));
+}
+
+test "KeyPair explicit encoding preserves legacy byte order" {
+    const bytes = [_]u8{0x12} ** 32 ++ [_]u8{0x34} ** 32;
+    const kp = KeyPair.decode(bytes);
+    try std.testing.expectEqualSlices(u8, bytes[0..32], &kp.public_key);
+    try std.testing.expectEqualSlices(u8, bytes[32..64], &kp.private_key);
+    try std.testing.expectEqualSlices(u8, &bytes, &kp.encode());
+    // This assertion guards compatibility with files written by the old struct dump.
+    try std.testing.expectEqualSlices(u8, &bytes, std.mem.asBytes(&kp));
+}
+
+test "Noise refuses reserved exhausted nonce" {
+    var cipher = CipherState.init();
+    cipher.initializeKey(.{0} ** 32);
+    cipher.n = std.math.maxInt(u64);
+    var out: [16]u8 = undefined;
+    try std.testing.expectError(error.NonceExhausted, cipher.encryptWithAd("", "", &out));
+    try std.testing.expectError(error.NonceExhausted, cipher.decryptWithAd("", &out, &.{}));
+}
+
+fn testHex(comptime hex: []const u8) [hex.len / 2]u8 {
+    var bytes: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, hex) catch unreachable;
+    return bytes;
+}
+
+fn testKey(comptime hex: []const u8) !KeyPair {
+    const secret = testHex(hex);
+    return .{ .private_key = secret, .public_key = try X25519.recoverPublicKey(secret) };
+}
+
+test "noise v2: cacophony XXpsk3 vector" {
+    // https://github.com/mcginty/snow/blob/main/tests/vectors/cacophony.txt
+    const auth: device_auth.Authenticator = .{
+        .identity = try identity_mod.Identity.fromSeed(.{0x31} ** 32),
+    };
+    const psk = testHex("54686973206973206d7920417573747269616e20706572737065637469766521");
+    var initiator = HandshakeState.init(true, try testKey("e61ef9919cde45dd5f82166404bd08e38bceb5dfdfded0a34c8df7ed542214d1"), psk, &auth);
+    var responder = HandshakeState.init(false, try testKey("4a3acbfdb163dec651dfa3194dece676d437029c62a408b4c5ea9114246e4893"), psk, &auth);
+    initiator.fixed_e = try testKey("893e28b9dc6ca8d611ab664754b8ceb7bac5117349a4439a6b0569da977c464a");
+    responder.fixed_e = try testKey("bbdb4cdbd309f1a1f2e1456967fe288cadd6f712d65dc7b7793d5e63da6b375b");
+    // Replace the application's prologue with the published vector's prologue.
+    initiator.symmetric = SymmetricState.init("Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s");
+    initiator.symmetric.mixHash("John Galt");
+    responder.symmetric = initiator.symmetric;
+    const payloads = .{ "Ludwig von Mises", "Murray Rothbard", "F. A. Hayek" };
+    const expected = .{
+        testHex("ca35def5ae56cec33dc2036731ab14896bc4c75dbb07a61f879f8e3afa4c7944325ea71699951ece20f284b6ad9604a029eb335bf84564c308b6ade90ae45078"),
+        testHex("95ebc60d2b1fa672c1f46a8aa265ef51bfe38e7ccb39ec5be34069f1448088432645535233ffe1432564d66a85227b677ced6fc2730ae0998ff49aa1dc56b8186e31b16e416f5d9c03c71f6c34fd37ec013105020070a8b00c000ce7ed56629c119795f96463274bc05519d5c24dc1"),
+        testHex("adf16c5375ec4172576783fd59f2bfa5c7a320d0a13b759592e1a2ddf5524cce59ccbb92ff5d321fced3bdb2840596df562c0e68aad41b090abd285f6d300130072e06964a6ba494e58d47"),
+    };
+    var out: [256]u8 = undefined;
+    var plain: [32]u8 = undefined;
+    const first = try NoiseStream.buildMessage1(&initiator, payloads[0], &out);
+    try std.testing.expectEqualSlices(u8, &expected[0], first);
+    try NoiseStream.consumeMessage1(&responder, first, plain[0..payloads[0].len]);
+    try std.testing.expectEqualStrings(payloads[0], plain[0..payloads[0].len]);
+    try NoiseStream.buildMessage2Prefix(&responder, &out);
+    try responder.symmetric.encryptAndHash(payloads[1], out[80..]);
+    try std.testing.expectEqualSlices(u8, &expected[1], out[0..expected[1].len]);
+    try NoiseStream.consumeMessage2Prefix(&initiator, &out);
+    try initiator.symmetric.decryptAndHash(out[80..expected[1].len], plain[0..payloads[1].len]);
+    try std.testing.expectEqualStrings(payloads[1], plain[0..payloads[1].len]);
+    try NoiseStream.buildMessage3Prefix(&initiator, &out);
+    try initiator.symmetric.encryptAndHash(payloads[2], out[48..]);
+    try std.testing.expectEqualSlices(u8, &expected[2], out[0..expected[2].len]);
+    try NoiseStream.consumeMessage3Prefix(&responder, &out);
+    try responder.symmetric.decryptAndHash(out[48..expected[2].len], plain[0..payloads[2].len]);
+    try std.testing.expectEqualStrings(payloads[2], plain[0..payloads[2].len]);
+    const hash = testHex("fc0819f08aebc23de9a783653d8d7d6395b7d243d9deec12f5d6fe2f4c206673");
+    try std.testing.expectEqualSlices(u8, &hash, &initiator.symmetric.h);
+    try std.testing.expectEqualSlices(u8, &hash, &responder.symmetric.h);
+    var i_ciphers = initiator.symmetric.split();
+    var r_ciphers = responder.symmetric.split();
+    const transport = testHex("dcdc045c8e9ec36c8ea4078552e5849f87cb9bdfbd2a4eee3baaf6");
+    // The responder sends the first transport message using Split's second key.
+    try r_ciphers[1].encryptWithAd("", "Carl Menger", &out);
+    try std.testing.expectEqualSlices(u8, &transport, out[0..transport.len]);
+    try i_ciphers[1].decryptWithAd("", &transport, plain[0..11]);
+    try std.testing.expectEqualStrings("Carl Menger", plain[0..11]);
+}
+
+test "noise v2: message 1 rejects legacy lengths and tampered tags" {
+    const auth: device_auth.Authenticator = .{
+        .identity = try identity_mod.Identity.fromSeed(.{0x32} ** 32),
+    };
+    var initiator = HandshakeState.init(true, KeyPair.generate(), .{0} ** 32, &auth);
+    var responder = HandshakeState.init(false, KeyPair.generate(), .{0} ** 32, &auth);
+    var buf: [48]u8 = undefined;
+    _ = try NoiseStream.buildMessage1(&initiator, "", &buf);
+    try std.testing.expectError(error.HandshakeFailed, NoiseStream.consumeMessage1(&responder, buf[0..32], &.{}));
+    try std.testing.expectError(error.HandshakeFailed, NoiseStream.consumeMessage1(&responder, buf[0..47], &.{}));
+    buf[47] ^= 1;
+    try std.testing.expectError(error.AuthenticationFailed, NoiseStream.consumeMessage1(&responder, &buf, &.{}));
+}
+
+test "noise symmetric state passes through unkeyed payloads" {
+    var sender = SymmetricState.init("test");
+    var receiver = sender;
+    var out: [5]u8 = undefined;
+    var plain: [5]u8 = undefined;
+    try sender.encryptAndHash("hello", &out);
+    try receiver.decryptAndHash(&out, &plain);
+    try std.testing.expectEqualStrings("hello", &plain);
+    try std.testing.expectEqualSlices(u8, &sender.h, &receiver.h);
+}
+
+test "noise v2: replayed first message cannot reuse an old session" {
+    const auth: device_auth.Authenticator = .{
+        .identity = try identity_mod.Identity.fromSeed(.{0x33} ** 32),
+    };
+    var initiator = HandshakeState.init(true, KeyPair.generate(), .{0x41} ** 32, &auth);
+    var responder = HandshakeState.init(false, KeyPair.generate(), .{0x41} ** 32, &auth);
+    var replay_target = responder;
+    var first: [48]u8 = undefined;
+    _ = try NoiseStream.buildMessage1(&initiator, "", &first);
+    try NoiseStream.consumeMessage1(&responder, &first, &.{});
+    try NoiseStream.consumeMessage1(&replay_target, &first, &.{});
+    var second: [96]u8 = undefined;
+    try NoiseStream.buildMessage2Prefix(&responder, &second);
+    try responder.symmetric.encryptAndHash("", second[80..]);
+    try NoiseStream.consumeMessage2Prefix(&initiator, &second);
+    try initiator.symmetric.decryptAndHash(second[80..], &.{});
+    var third: [64]u8 = undefined;
+    try NoiseStream.buildMessage3Prefix(&initiator, &third);
+    try initiator.symmetric.encryptAndHash("", third[48..]);
+    try NoiseStream.consumeMessage3Prefix(&responder, &third);
+    try responder.symmetric.decryptAndHash(third[48..], &.{});
+    // A fresh responder uses its own ephemeral even when message 1 is replayed.
+    try NoiseStream.buildMessage2Prefix(&replay_target, &second);
+    try replay_target.symmetric.encryptAndHash("", second[80..]);
+    try std.testing.expectError(error.AuthenticationFailed, NoiseStream.consumeMessage3Prefix(&replay_target, &third));
 }

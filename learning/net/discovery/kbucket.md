@@ -38,15 +38,20 @@ bucket 2: 100x xxxx ...
 pub const PeerInfo = struct {
     id: NodeID,
     addresses: [MAX_PEER_ADDRESSES]network.Address = undefined,
+    sources: [MAX_PEER_ADDRESSES]AddrSource = [_]AddrSource{.observed} ** MAX_PEER_ADDRESSES,
+    learned: [MAX_PEER_ADDRESSES]i64 = [_]i64{0} ** MAX_PEER_ADDRESSES,
     addrs_count: u8 = 0,
     last_seen: i64,
 };
 ```
 
-A peer can have up to **8 addresses** (LAN, public, IPv4, IPv6). `addAddress`
-skips duplicates and ignores addresses past the 8th, and `mergeAddresses`
-combines records for the same ID. `getBestAddress` picks the lowest
-`network.addressPriority`: loopback, then private, then public (see
+A peer can have up to **8 addresses**, each tagged with where it came from:
+`observed` (the address of an authenticated connection, with the port the peer
+says it listens on), `announced` (an address the peer itself listed in a
+`PING`/`PONG`) or, only inside a running lookup, `hearsay`. When the 8 slots
+are full a more reliable address replaces the weakest, oldest one; hearsay
+never replaces anything and is never stored. `getBestAddress` still picks the
+lowest `network.addressPriority` (see
 [Chapter 1.4](../transport/management.md#4-address-priority-lan-vs-wan)).
 
 ## 3. Finding the Right Bucket
@@ -87,15 +92,16 @@ replacement into it. Removing a replacement just drops it.
 `discovery.Node` drives this (`src/net/discovery/node.zig`):
 
 *   **`addVerifiedPeer`**: when `addPeer` returns `false` (the bucket is
-    full), the node pings the bucket's least recently seen peer
-    (`pingLruAndEvict`). If it doesn't answer, it is removed and a
+    full), the node pings the bucket's least recently seen peer across all its
+    known addresses (`pingLruAndEvict`). If none answer, it is removed and a
     replacement is promoted.
-*   **Lookups**: a peer that fails a `FIND_NODE` or `FIND_VALUE` is removed
-    with `markDisconnected` ([Chapter 2.3](./lookup.md)).
+*   **Lookups**: a peer whose known addresses fail a `FIND_NODE` or
+    `FIND_VALUE` is removed with `markDisconnected` ([Chapter 2.3](./lookup.md)).
 
-Only *verified* peers are added: senders of an authenticated `PING`, peers
-that answered our `PING`, and peers that replied during a lookup. Peers
-merely listed in someone's reply are not.
+Only *verified* data is stored: the address of an authenticated `PING`/`PONG`
+or lookup reply, and the addresses the peer announces itself after filtering
+([Chapter 2.4](./rpc.md#6-safety-and-validation)). Addresses merely listed in
+someone else's reply are not.
 
 ## 5. Bucket Refresh
 
@@ -111,8 +117,7 @@ for an hour (3600 s). That repopulates quiet regions of the ID space.
     the slice). This answers `FIND_NODE` and seeds lookups.
 *   `getAllPeers()`: every main-list peer. The swarm folder syncs with these
     (`fs.remote.knownPeers`).
-*   `contains`, `getPeer`: main list only; replacements don't count.
-*   `dump()`: prints every non-empty bucket with its peers, addresses and
+*   `contains`, `getPeer`: main list only; replacements don't count.\n*   `dump()`: prints every non-empty bucket with its peers, addresses and
     replacement count.
 
 The table has no lock of its own. `discovery.Node.mutex` guards it.

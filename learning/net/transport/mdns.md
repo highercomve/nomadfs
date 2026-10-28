@@ -56,10 +56,20 @@ receive timeout; and a send socket with multicast loopback enabled. It then spaw
     forwards to the discovery handler).
 
 In a node that handler is `discovery.Node.onDiscovery`
-(`src/net/discovery/node.zig`). If the node ID isn't already in the routing
-table, it dials the address with `connectToPeer(addr, swarm_key, peer_id)`
-and sends a `PING`. The peer enters the routing table only after the `PONG`
-([Chapter 2.4](../discovery/rpc.md)).
+(`src/net/discovery/node.zig`), which deduplicates and rate-limits connections:
+
+*   **Connected-peer deduplication**: If the peer ID is already present in the
+    routing table (`self.routing_table.contains(peer_id)`), the announcement is
+    ignored without dialing.
+*   **Bounded retry suppression**: Outbound discovery dials are tracked in
+    `discovery_dials` (capped at `max_recent_peers`). When a dial attempt is
+    made, further announcements for that peer are suppressed for 30 seconds
+    (`now + 30_000` ms). This prevents redundant dials and dial storms if the
+    peer is unreachable or failing handshakes.
+
+If the peer is neither connected nor suppressed, it dials the address with
+`connectToPeer(addr, swarm_key, peer_id)` and sends a `PING`. The peer enters
+the routing table only after the `PONG` ([Chapter 2.4](../discovery/rpc.md)).
 
 ## 4. Security Considerations
 

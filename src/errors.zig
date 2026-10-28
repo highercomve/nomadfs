@@ -16,6 +16,7 @@ pub const NomadError = error{
     BlockNotFound,
     InvalidCid,
     StorageFull,
+    DagTooLarge,
 
     // Consensus errors
     ConflictDetected,
@@ -67,7 +68,7 @@ pub fn categorizeError(err: anyerror) ErrorCategory {
         NomadError.InvalidSwarmKey, NomadError.InvalidConfig, NomadError.InvalidCid, NomadError.QuorumNotReached => .Fatal,
 
         // Storage/consensus issues - treat as fatal
-        NomadError.BlockNotFound, NomadError.StorageFull, NomadError.ConflictDetected => .Fatal,
+        NomadError.BlockNotFound, NomadError.StorageFull, NomadError.DagTooLarge, NomadError.ConflictDetected => .Fatal,
 
         // Implementation issues - treat as fatal
         NomadError.NotImplemented, NomadError.PeerUnreachable, NomadError.LookupFailed => .Fatal,

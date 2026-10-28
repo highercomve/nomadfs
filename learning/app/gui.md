@@ -50,7 +50,9 @@ Command groups in `commands.zig` (the page calls them in snake_case, e.g. `node_
 The navigation (a drawer on wide windows, a bottom bar on phones) has:
 
 - **Browse**: every reachable device and its shares, walked one dir block at a time
-  ([Chapter 5.1](../fs/shares.md)). The viewer previews images, video, audio, PDF and text, reading
+  ([Chapter 5.1](../fs/shares.md)). Paired devices show their local trust-store label and a "Paired"
+  badge; unpaired devices show their short fingerprint and a "Not paired" badge, with any claimed
+  nickname qualified in secondary text. The viewer previews images, video, audio, PDF and text, reading
   in pieces with `readRange`; **Download** saves to `~/Downloads/NomadFS` (Android:
   `Download/NomadFS`). On touch screens a sideways swipe in the viewer opens the next or previous
   file. Refresh walks the open path again by name from the device's current share list, since a
@@ -69,7 +71,8 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
 - **Text drop**: store a short note in the swarm and open it on another device with its code (the
   CID returned by `nomadfs_put_file`).
 - **Node & trust**: node state and device ID, nickname, trusted devices and revocation
-  ([Device identity & pairing](../security/pairing.md)), swarm key rotation, and the "Back up the swarm folder
+  ([Device identity & pairing](../security/pairing.md)), swarm key rotation (cross-referencing online
+  devices by authenticated fingerprint rather than claimed nickname), and the "Back up the swarm folder
   here" switch.
 - **About** (also the "built with" line at the bottom of the drawer): the NomadFS, Oriel and Zig
   versions and the commit the app was built from, the platform and app size, this device's name,

@@ -16,19 +16,23 @@ const linux = std.os.linux;
 const NodeID = @import("../net/id.zig").NodeID;
 const cluster = @import("../cluster/mod.zig");
 const storage = @import("../storage/mod.zig");
+const sync = @import("../sync.zig");
 const tree = @import("tree.zig");
 const remote_mod = @import("remote.zig");
 const swarm_mod = @import("swarm.zig");
 const manifest_mod = @import("manifest.zig");
-const Remote = remote_mod.Remote;
+pub const Remote = remote_mod.Remote;
+const InodeTable = @import("inode_table.zig").Table(Inode);
+const device_names = @import("device_names.zig");
+const device_trust = @import("../device/trust.zig");
 
 // ---- Kernel protocol (include/uapi/linux/fuse.h) ----
 
 const kernel_major = 7;
 const kernel_minor = 31;
-const root_id = 1;
+pub const root_id = 1;
 
-const Opcode = enum(u32) {
+pub const Opcode = enum(u32) {
     lookup = 1,
     forget = 2,
     getattr = 3,
@@ -60,8 +64,8 @@ const Opcode = enum(u32) {
 };
 
 // Write side (only the swarm folder is writable).
-const CreateIn = extern struct { flags: u32, mode: u32, umask: u32, open_flags: u32 };
-const WriteIn = extern struct { fh: u64, offset: u64, size: u32, write_flags: u32, lock_owner: u64, flags: u32, padding: u32 };
+pub const CreateIn = extern struct { flags: u32, mode: u32, umask: u32, open_flags: u32 };
+pub const WriteIn = extern struct { fh: u64, offset: u64, size: u32, write_flags: u32, lock_owner: u64, flags: u32, padding: u32 };
 const WriteOut = extern struct { size: u32, padding: u32 = 0 };
 const SetattrIn = extern struct {
     valid: u32,
@@ -82,9 +86,13 @@ const SetattrIn = extern struct {
     unused5: u32,
 };
 const MkdirIn = extern struct { mode: u32, umask: u32 };
-const RenameIn = extern struct { newdir: u64 };
-const Rename2In = extern struct { newdir: u64, flags: u32, padding: u32 };
-const ReleaseIn = extern struct { fh: u64, flags: u32, release_flags: u32, lock_owner: u64 };
+pub const RenameIn = extern struct { newdir: u64 };
+pub const Rename2In = extern struct { newdir: u64, flags: u32, padding: u32 };
+pub const ReleaseIn = extern struct { fh: u64, flags: u32, release_flags: u32, lock_owner: u64 };
+
+pub const ForgetIn = extern struct { nlookup: u64 };
+pub const BatchForgetIn = extern struct { count: u32, dummy: u32 };
+pub const ForgetOne = extern struct { nodeid: u64, nlookup: u64 };
 
 const FATTR_SIZE = 1 << 3;
 const FATTR_FH = 1 << 6;
@@ -93,7 +101,7 @@ const FUSE_ATOMIC_O_TRUNC = 1 << 3;
 const FUSE_BIG_WRITES = 1 << 5;
 const max_write = 128 * 1024;
 
-const InHeader = extern struct {
+pub const InHeader = extern struct {
     len: u32,
     opcode: u32,
     unique: u64,
@@ -105,13 +113,13 @@ const InHeader = extern struct {
     padding: u16,
 };
 
-const OutHeader = extern struct {
+pub const OutHeader = extern struct {
     len: u32,
     @"error": i32,
     unique: u64,
 };
 
-const Attr = extern struct {
+pub const Attr = extern struct {
     ino: u64,
     size: u64,
     blocks: u64,
@@ -130,7 +138,7 @@ const Attr = extern struct {
     flags: u32 = 0,
 };
 
-const EntryOut = extern struct {
+pub const EntryOut = extern struct {
     nodeid: u64,
     generation: u64 = 0,
     entry_valid: u64,
@@ -140,7 +148,7 @@ const EntryOut = extern struct {
     attr: Attr,
 };
 
-const AttrOut = extern struct {
+pub const AttrOut = extern struct {
     attr_valid: u64,
     attr_valid_nsec: u32 = 0,
     dummy: u32 = 0,
@@ -180,7 +188,7 @@ const OpenOut = extern struct {
     padding: u32 = 0,
 };
 
-const ReadIn = extern struct {
+pub const ReadIn = extern struct {
     fh: u64,
     offset: u64,
     size: u32,
@@ -216,6 +224,9 @@ const StatfsOut = extern struct {
 };
 
 comptime {
+    std.debug.assert(@sizeOf(ForgetIn) == 8);
+    std.debug.assert(@sizeOf(BatchForgetIn) == 8);
+    std.debug.assert(@sizeOf(ForgetOne) == 16);
     std.debug.assert(@sizeOf(InHeader) == 40);
     std.debug.assert(@sizeOf(Attr) == 88);
     std.debug.assert(@sizeOf(EntryOut) == 128);
@@ -239,11 +250,11 @@ const Errno = enum(i32) {
     IO = 5,
     BADF = 9,
     ACCES = 13,
-    NOTDIR = 20,
-    ISDIR = 21,
     BUSY = 16,
     EXIST = 17,
     XDEV = 18,
+    NOTDIR = 20,
+    ISDIR = 21,
     INVAL = 22,
     ROFS = 30,
     NAMETOOLONG = 36,
@@ -258,10 +269,15 @@ const cache_seconds = 1;
 const device_refresh_ns = 5 * std.time.ns_per_s;
 /// Large enough for any request a read-only mount receives.
 const request_buffer_len = 1024 * 1024 + 4096;
+const worker_max = 16;
+const refresh_parallel = 8;
+const first_refresh_wait_ms = 3000;
+
+threadlocal var tl_reply: std.ArrayList(u8) = .empty;
 
 // ---- Filesystem state ----
 
-const Kind = enum {
+pub const Kind = enum {
     root,
     device,
     dir,
@@ -270,138 +286,483 @@ const Kind = enum {
     swarm_dir,
     swarm_file,
 
-    fn isFile(k: Kind) bool {
+    pub fn isFile(k: Kind) bool {
         return k == .file or k == .swarm_file;
     }
 };
 
-const Inode = struct {
+pub const Inode = struct {
     kind: Kind,
     /// Index into Mount.devices (device, dir and file inodes).
     device: u32 = 0,
     cid: tree.Cid = undefined,
     size: u64 = 0,
     mtime: u64 = 0,
-    /// Swarm inodes: path inside the swarm folder (owned by path_arena)
-    /// and the device that added the file.
-    swarm_path: []const u8 = "",
+    /// The device that added a swarm file.
     author: [32]u8 = [_]u8{0} ** 32,
 };
 
 /// A swarm file open for writing: bytes go to a staging file and are added
 /// to the swarm folder on release.
-const Handle = struct {
+pub const Handle = struct {
     ino: u64,
-    /// Path inside the swarm folder (owned).
-    path: []u8,
     /// Staging file (owned, NUL-terminated for open(2)).
     staging: [:0]u8,
     fd: i32,
     dirty: bool,
 };
 
-const Device = struct {
+pub const Device = struct {
     name: []u8,
     remote: *Remote,
     shares: ?tree.Listing = null,
     online: bool = false,
+    last_seen_ms: i64 = 0,
+    device_id: ?[32]u8 = null,
+    claimed: []u8 = &[_]u8{},
 };
 
 pub const Mount = struct {
     allocator: std.mem.Allocator,
-    block_manager: *cluster.BlockManager,
+    block_manager: ?*cluster.BlockManager = null,
     store: *storage.engine.StorageEngine,
     fd: i32 = -1,
     uid: u32,
     gid: u32,
-    /// inode number - 1 -> inode. Inodes are never reused while mounted.
-    inodes: std.ArrayList(Inode) = .empty,
-    /// (parent inode, name) -> inode number, so a path keeps its inode.
-    children: std.StringHashMapUnmanaged(u64) = .empty,
+    lock: sync.Mutex = .{},
+    table: InodeTable,
     devices: std.ArrayList(Device) = .empty,
-    devices_refreshed_ns: i96 = 0,
-    request: []align(8) u8 = &.{},
     /// Shown as the mtime of the root and device folders.
     mounted_at: u64 = 0,
     /// The swarm folder, shown as <mount>/Swarm when set.
     swarm: ?*swarm_mod.SwarmFolder = null,
     /// Fetches ahead of sequential reads (video players read in order).
     read_ahead: ?*@import("readahead.zig").ReadAhead = null,
-    /// Swarm paths held by inodes.
-    path_arena: std.heap.ArenaAllocator,
     /// Open write handles on swarm files: fh -> handle.
     handles: std.AutoHashMapUnmanaged(u64, Handle) = .empty,
     /// Inode -> the fh writing it, so reads see unsaved bytes.
     writing: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     next_fh: u64 = 1,
-    reply: std.ArrayList(u8) = .empty,
+    send_hook: ?*const fn (*Mount, []const u8) anyerror!bool = null,
+    hooks: struct {
+        before_network: ?*const fn (?*anyopaque) void = null,
+        ctx: ?*anyopaque = null,
+    } = .{},
+    stopping: std.atomic.Value(bool) = .init(false),
+    idle: std.atomic.Value(u32) = .init(0),
+    pool: struct {
+        mutex: sync.Mutex = .{},
+        threads: std.ArrayList(std.Thread) = .empty,
+        count: u32 = 0,
+    } = .{},
+    refresh: struct {
+        mutex: sync.Mutex = .{},
+        cond: sync.Condition = .{},
+        wanted: bool = false,
+        first_done: bool = false,
+        last_start_ms: i64 = 0,
+        thread: ?std.Thread = null,
+    } = .{},
 
-    pub fn init(allocator: std.mem.Allocator, block_manager: *cluster.BlockManager, store: *storage.engine.StorageEngine) !Mount {
+    pub fn init(allocator: std.mem.Allocator, block_manager: ?*cluster.BlockManager, store: *storage.engine.StorageEngine) !Mount {
         var self = Mount{
-            .path_arena = std.heap.ArenaAllocator.init(allocator),
+            .table = try InodeTable.init(allocator, .{ .kind = .root }),
             .allocator = allocator,
             .block_manager = block_manager,
             .store = store,
             .uid = linux.getuid(),
             .gid = linux.getgid(),
         };
-        const now = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .real).nanoseconds;
-        self.mounted_at = @intCast(@max(0, @divFloor(now, std.time.ns_per_s)));
-        try self.inodes.append(allocator, .{ .kind = .root, .mtime = self.mounted_at });
-        self.request = try allocator.alignedAlloc(u8, .@"8", request_buffer_len);
+        const now = sync.timestamp();
+        self.mounted_at = @intCast(@max(0, now));
+        errdefer self.table.deinit();
+        self.table.map.getPtr(root_id).?.data.mtime = self.mounted_at;
         return self;
     }
 
     pub fn deinit(self: *Mount) void {
+        self.stopping.store(true, .release);
+        self.stopRefresher();
+        while (true) {
+            const thread = blk: {
+                self.pool.mutex.lock();
+                defer self.pool.mutex.unlock();
+                if (self.pool.threads.items.len > 0) {
+                    break :blk self.pool.threads.pop();
+                }
+                break :blk null;
+            };
+            if (thread) |t| {
+                t.join();
+            } else {
+                break;
+            }
+        }
+        self.pool.threads.deinit(self.allocator);
         if (self.fd >= 0) _ = linux.close(self.fd);
-        var hit = self.handles.valueIterator();
-        while (hit.next()) |h| self.dropHandle(h.*);
+        var hit = self.handles.iterator();
+        while (hit.next()) |entry| self.dropHandle(entry.key_ptr.*, entry.value_ptr.*);
         self.handles.deinit(self.allocator);
         self.writing.deinit(self.allocator);
-        self.path_arena.deinit();
-        var it = self.children.keyIterator();
-        while (it.next()) |k| self.allocator.free(k.*);
-        self.children.deinit(self.allocator);
+        self.table.deinit();
         for (self.devices.items) |d| {
             self.allocator.free(d.name);
+            if (d.claimed.len > 0) self.allocator.free(d.claimed);
             if (d.shares) |s| s.deinit();
             self.allocator.destroy(d.remote);
         }
         self.devices.deinit(self.allocator);
-        self.inodes.deinit(self.allocator);
-        self.allocator.free(self.request);
-        self.reply.deinit(self.allocator);
+        tl_reply.deinit(self.allocator);
+        tl_reply = .empty;
     }
 
     /// Mounts at `mountpoint` and serves requests until it is unmounted
     /// (fusermount3 -u, or `unmount`).
     pub fn serve(self: *Mount, mountpoint: []const u8) !void {
+        if (self.swarm) |s| s.cleanStaging();
         self.fd = try mountWithFusermount(self.allocator, mountpoint);
+        try self.run();
+    }
+
+    /// Split out so tests can drive it with a socketpair instead of /dev/fuse.
+    pub fn run(self: *Mount) !void {
+        try self.startRefresher();
+        {
+            self.pool.mutex.lock();
+            self.pool.count = 1;
+            self.pool.mutex.unlock();
+        }
+        self.workerMain();
+        self.stopping.store(true, .release);
+        self.stopRefresher();
         while (true) {
-            const rc = linux.read(self.fd, self.request.ptr, self.request.len);
+            const thread = blk: {
+                self.pool.mutex.lock();
+                defer self.pool.mutex.unlock();
+                if (self.pool.threads.items.len > 0) {
+                    break :blk self.pool.threads.pop();
+                }
+                break :blk null;
+            };
+            if (thread) |t| {
+                t.join();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn workerMain(self: *Mount) void {
+        defer {
+            tl_reply.deinit(self.allocator);
+            tl_reply = .empty;
+        }
+        const req_buf = self.allocator.alignedAlloc(u8, .@"8", request_buffer_len) catch |err| {
+            std.debug.print("fuse: failed to allocate request buffer: {any}\n", .{err});
+            return;
+        };
+        defer self.allocator.free(req_buf);
+
+        while (!self.stopping.load(.acquire)) {
+            _ = self.idle.fetchAdd(1, .monotonic);
+
+            const rc = linux.read(self.fd, req_buf.ptr, req_buf.len);
+            if (rc == 0) {
+                _ = self.idle.fetchSub(1, .monotonic);
+                self.stopping.store(true, .release);
+                return;
+            }
+
             switch (linux.errno(rc)) {
                 .SUCCESS => {},
-                // Interrupted, or the request was aborted before we read it.
-                .INTR, .NOENT, .AGAIN => continue,
-                // Unmounted.
-                .NODEV => return,
+                .INTR, .NOENT, .AGAIN => {
+                    _ = self.idle.fetchSub(1, .monotonic);
+                    continue;
+                },
+                .NODEV => {
+                    _ = self.idle.fetchSub(1, .monotonic);
+                    self.stopping.store(true, .release);
+                    return;
+                },
                 else => |e| {
+                    _ = self.idle.fetchSub(1, .monotonic);
                     std.debug.print("fuse: read failed: {s}\n", .{@tagName(e)});
-                    return error.FuseReadFailed;
+                    self.stopping.store(true, .release);
+                    return;
                 },
             }
-            if (rc < @sizeOf(InHeader)) continue;
-            const done = self.dispatch(self.request[0..rc]) catch |err| blk: {
+
+            if (rc < @sizeOf(InHeader)) {
+                _ = self.idle.fetchSub(1, .monotonic);
+                continue;
+            }
+
+            const header: *const InHeader = @ptrCast(req_buf.ptr);
+            const op: Opcode = @enumFromInt(header.opcode);
+            const was_idle = self.idle.fetchSub(1, .monotonic);
+            if (op != .forget and op != .batch_forget) {
+                if (was_idle == 1) {
+                    self.spawnWorker();
+                }
+            }
+
+            const done = self.dispatch(req_buf[0..rc]) catch |err| blk: {
                 std.debug.print("fuse: request failed: {any}\n", .{err});
                 break :blk false;
             };
-            if (done) return;
+            if (done) {
+                self.stopping.store(true, .release);
+                return;
+            }
+        }
+    }
+
+    fn spawnWorker(self: *Mount) void {
+        self.pool.mutex.lock();
+        defer self.pool.mutex.unlock();
+        if (self.pool.count >= worker_max or self.stopping.load(.acquire)) return;
+        const thread = std.Thread.spawn(.{}, workerMain, .{self}) catch |err| {
+            std.debug.print("fuse: failed to spawn worker: {any}\n", .{err});
+            return;
+        };
+        self.pool.threads.append(self.allocator, thread) catch |err| {
+            std.debug.print("fuse: failed to track worker thread: {any}\n", .{err});
+        };
+        self.pool.count += 1;
+    }
+
+    fn startRefresher(self: *Mount) !void {
+        self.refresh.mutex.lock();
+        defer self.refresh.mutex.unlock();
+        if (self.refresh.thread != null) return;
+        self.refresh.thread = try std.Thread.spawn(.{}, refresherMain, .{self});
+    }
+
+    fn stopRefresher(self: *Mount) void {
+        const thread = blk: {
+            self.refresh.mutex.lock();
+            defer self.refresh.mutex.unlock();
+            self.refresh.wanted = true;
+            self.refresh.cond.broadcast();
+            const t = self.refresh.thread;
+            self.refresh.thread = null;
+            break :blk t;
+        };
+        if (thread) |t| t.join();
+    }
+
+    fn refresherMain(self: *Mount) void {
+        while (!self.stopping.load(.acquire)) {
+            self.refresh.mutex.lock();
+            while (!self.refresh.wanted and !self.stopping.load(.acquire)) {
+                self.refresh.cond.wait(&self.refresh.mutex);
+            }
+            if (self.stopping.load(.acquire)) {
+                self.refresh.mutex.unlock();
+                return;
+            }
+            self.refresh.wanted = false;
+            self.refresh.last_start_ms = sync.monotonicMillis();
+            self.refresh.mutex.unlock();
+
+            self.refreshAll();
+
+            self.refresh.mutex.lock();
+            self.refresh.first_done = true;
+            self.refresh.cond.broadcast();
+            self.refresh.mutex.unlock();
+        }
+    }
+
+    fn requestRefresh(self: *Mount) void {
+        self.refresh.mutex.lock();
+        defer self.refresh.mutex.unlock();
+        const now = sync.monotonicMillis();
+        if (now - self.refresh.last_start_ms >= @divFloor(device_refresh_ns, std.time.ns_per_ms)) {
+            self.refresh.wanted = true;
+            self.refresh.cond.signal();
+        }
+    }
+
+    fn refreshAll(self: *Mount) void {
+        const bm = self.block_manager orelse return;
+        const peers = remote_mod.knownPeers(bm, self.allocator) catch return;
+        defer self.allocator.free(peers);
+
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const now = sync.monotonicMillis();
+            for (self.devices.items) |*d| {
+                if (now - d.last_seen_ms > 10 * 60 * 1000) {
+                    if (d.shares) |listing| listing.deinit();
+                    d.shares = null;
+                    d.online = false;
+                }
+            }
+        }
+
+        var i: usize = 0;
+        while (i < peers.len and !self.stopping.load(.acquire)) {
+            const batch_end = @min(i + refresh_parallel, peers.len);
+            const batch = peers[i..batch_end];
+            i = batch_end;
+
+            const ProbeContext = struct {
+                mount: *Mount,
+                peer: NodeID,
+                shares_res: ?Remote.Shares = null,
+
+                fn run(ctx: *@This()) void {
+                    var probe = Remote{
+                        .block_manager = ctx.mount.block_manager.?,
+                        .store = ctx.mount.store,
+                        .peer = ctx.peer,
+                    };
+                    ctx.shares_res = probe.shares(ctx.mount.allocator) catch null;
+                }
+            };
+
+            var contexts: [refresh_parallel]ProbeContext = undefined;
+            var threads: [refresh_parallel]?std.Thread = [_]?std.Thread{null} ** refresh_parallel;
+
+            for (batch, 0..) |peer, b_idx| {
+                contexts[b_idx] = .{ .mount = self, .peer = peer };
+                threads[b_idx] = std.Thread.spawn(.{}, ProbeContext.run, .{&contexts[b_idx]}) catch null;
+                if (threads[b_idx] == null) {
+                    contexts[b_idx].run();
+                }
+            }
+
+            for (batch, 0..) |peer, b_idx| {
+                if (threads[b_idx]) |t| t.join();
+                if (contexts[b_idx].shares_res) |shares| {
+                    self.applyShares(peer, shares);
+                } else {
+                    self.lock.lock();
+                    for (self.devices.items) |*d| {
+                        if (d.remote.peer.eql(peer)) {
+                            d.online = false;
+                            break;
+                        }
+                    }
+                    self.lock.unlock();
+                    remote_mod.health.markDown(peer);
+                }
+            }
+        }
+    }
+
+    fn applyShares(self: *Mount, peer: NodeID, shares: Remote.Shares) void {
+        defer self.allocator.free(shares.nickname);
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        const bm = self.block_manager orelse {
+            shares.listing.deinit();
+            return;
+        };
+        const index = for (self.devices.items, 0..) |d, i| {
+            if (d.remote.peer.eql(peer)) break i;
+        } else blk: {
+            const remote = self.allocator.create(Remote) catch {
+                shares.listing.deinit();
+                return;
+            };
+            errdefer self.allocator.destroy(remote);
+            remote.* = .{ .block_manager = bm, .store = self.store, .peer = peer };
+            const name = self.allocator.dupe(u8, "") catch {
+                self.allocator.destroy(remote);
+                shares.listing.deinit();
+                return;
+            };
+            self.devices.append(self.allocator, .{ .name = name, .remote = remote }) catch {
+                self.allocator.free(name);
+                self.allocator.destroy(remote);
+                shares.listing.deinit();
+                return;
+            };
+            break :blk self.devices.items.len - 1;
+        };
+        const device = &self.devices.items[index];
+
+        if (device.shares) |old| old.deinit();
+        device.online = true;
+        device.last_seen_ms = sync.monotonicMillis();
+        device.device_id = if (shares.device_id) |id| id.bytes else peer.bytes;
+        if (device.claimed.len > 0) self.allocator.free(device.claimed);
+        device.claimed = self.allocator.dupe(u8, shares.nickname) catch &[_]u8{};
+        device.shares = shares.listing;
+
+        self.recomputeNames();
+    }
+
+    /// Recomputes mount folder names for all online devices.
+    /// Caller holds self.lock.
+    fn recomputeNames(self: *Mount) void {
+        var online_count: usize = 0;
+        for (self.devices.items) |d| {
+            if (d.online) online_count += 1;
+        }
+        if (online_count == 0) return;
+
+        const online_indices = self.allocator.alloc(usize, online_count) catch return;
+        defer self.allocator.free(online_indices);
+        const entries = self.allocator.alloc(device_names.Entry, online_count) catch return;
+        defer self.allocator.free(entries);
+        const out = self.allocator.alloc([]u8, online_count) catch return;
+        defer self.allocator.free(out);
+
+        const trust_store = if (self.block_manager) |bm| bm.dht_node.trust_store else null;
+        var trust_entries: std.ArrayList(device_trust.Entry) = .empty;
+        defer trust_entries.deinit(self.allocator);
+        trust_entries.ensureTotalCapacity(self.allocator, online_count) catch return;
+
+        var j: usize = 0;
+        for (self.devices.items, 0..) |d, i| {
+            if (!d.online) continue;
+            online_indices[j] = i;
+            const dev_id = d.device_id orelse d.remote.peer.bytes;
+            var trusted_info: ?device_names.TrustedInfo = null;
+            if (trust_store) |ts| {
+                if (ts.lookup(NodeID{ .bytes = dev_id })) |te| {
+                    trust_entries.appendAssumeCapacity(te);
+                    const last_te = &trust_entries.items[trust_entries.items.len - 1];
+                    trusted_info = .{
+                        .label = last_te.labelSlice(),
+                        .added_at = last_te.added_at,
+                    };
+                }
+            }
+            entries[j] = .{
+                .device_id = dev_id,
+                .trusted = trusted_info,
+                .nickname = d.claimed,
+            };
+            j += 1;
+        }
+
+        device_names.assign(self.allocator, entries, out) catch |err| {
+            std.debug.print("recomputeNames: assign failed: {any}\n", .{err});
+            return;
+        };
+
+        for (online_indices, out) |dev_idx, new_name| {
+            const old_name = self.devices.items[dev_idx].name;
+            if (std.mem.eql(u8, old_name, new_name)) {
+                self.allocator.free(new_name);
+                continue;
+            }
+            self.devices.items[dev_idx].name = new_name;
+            self.allocator.free(old_name);
         }
     }
 
     /// Handles one request; true once the kernel tears the session down.
-    fn dispatch(self: *Mount, bytes: []align(8) u8) !bool {
+    pub fn dispatch(self: *Mount, bytes: []align(8) u8) !bool {
         const header: *const InHeader = @ptrCast(bytes.ptr);
+        if (bytes.len < @sizeOf(InHeader)) return false;
+        if (header.len < @sizeOf(InHeader)) return false;
         const body = bytes[@sizeOf(InHeader)..@min(bytes.len, header.len)];
         const op: Opcode = @enumFromInt(header.opcode);
         switch (op) {
@@ -425,25 +786,31 @@ pub const Mount = struct {
             .rename => try self.opRename(header, body, false),
             .rename2 => try self.opRename(header, body, true),
             // No reply expected.
-            .forget, .batch_forget, .interrupt => {},
+            .forget => if (readStruct(ForgetIn, body)) |in| {
+                self.lock.lock();
+                defer self.lock.unlock();
+                self.table.unref(header.nodeid, in.nlookup);
+            },
+            .batch_forget => self.opBatchForget(body),
+            .interrupt => {},
             .destroy => {
                 try self.replyEmpty(header);
                 return true;
             },
-            .getxattr, .listxattr => try self.replyError(header, .NOSYS),
-            _ => try self.replyError(header, .NOSYS),
+            else => try self.replyError(header, .NOSYS),
         }
         return false;
     }
 
-    // ---- Operations ----
-
     fn opInit(self: *Mount, header: *const InHeader, body: []const u8) !void {
         const in = readStruct(InitIn, body) orelse return self.replyError(header, .IO);
-        if (in.major != kernel_major) return self.replyError(header, .IO);
+        if (in.major != kernel_major) {
+            std.debug.print("fuse: kernel major {d} != {d}\n", .{ in.major, kernel_major });
+            return self.replyError(header, .IO);
+        }
         try self.replyStruct(header, InitOut{
             .major = kernel_major,
-            .minor = @min(in.minor, kernel_minor),
+            .minor = @min(kernel_minor, in.minor),
             .max_readahead = in.max_readahead,
             .flags = in.flags & (FUSE_ATOMIC_O_TRUNC | FUSE_BIG_WRITES),
             .max_write = max_write,
@@ -459,19 +826,20 @@ pub const Mount = struct {
     }
 
     fn opLookup(self: *Mount, header: *const InHeader, name: []const u8) !void {
-        const ino = (self.child(header.nodeid, name) catch |err| return self.replyError(header, errnoFor(err))) orelse
+        const ino = (self.lookupChild(header.nodeid, name) catch |err| return self.replyError(header, errnoFor(err))) orelse
             return self.replyError(header, .NOENT);
-        try self.replyStruct(header, EntryOut{
+        const node = self.inode(ino) orelse return self.replyError(header, .NOENT);
+        try self.replyReferenced(header, ino, EntryOut{
             .nodeid = ino,
             .entry_valid = cache_seconds,
             .attr_valid = cache_seconds,
-            .attr = self.attr(ino),
-        });
+            .attr = self.attrOf(ino, node),
+        }, null);
     }
 
     fn opGetattr(self: *Mount, header: *const InHeader) !void {
-        if (header.nodeid == 0 or header.nodeid > self.inodes.items.len) return self.replyError(header, .NOENT);
-        try self.replyStruct(header, AttrOut{ .attr_valid = cache_seconds, .attr = self.attr(header.nodeid) });
+        const node = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
+        try self.replyStruct(header, AttrOut{ .attr_valid = cache_seconds, .attr = self.attrOf(header.nodeid, node) });
     }
 
     fn opOpen(self: *Mount, header: *const InHeader, want: enum { dir, file }, body: []const u8) !void {
@@ -483,6 +851,12 @@ pub const Mount = struct {
             const in = readStruct(OpenIn, body) orelse return self.replyError(header, .IO);
             if (in.flags & O_ACCMODE != 0) {
                 if (node.kind != .swarm_file) return self.replyError(header, .ROFS);
+                {
+                    self.lock.lock();
+                    const busy = self.writing.contains(header.nodeid);
+                    self.lock.unlock();
+                    if (busy) return self.replyError(header, .BUSY);
+                }
                 const fh = self.openForWrite(header.nodeid, node, in.flags & O_TRUNC != 0) catch |err| return self.replyError(header, errnoFor(err));
                 return self.replyStruct(header, OpenOut{ .fh = fh });
             }
@@ -497,98 +871,125 @@ pub const Mount = struct {
         if (in.offset >= node.size) return self.replyBytes(header, &.{});
 
         const want: usize = @intCast(@min(in.size, node.size - in.offset));
-        try self.reply.resize(self.allocator, @sizeOf(OutHeader) + want);
-        const dest = self.reply.items[@sizeOf(OutHeader)..];
-        const n = self.readFile(node, in.offset, dest) catch |err| {
+        try tl_reply.resize(self.allocator, @sizeOf(OutHeader) + want);
+        const dest = tl_reply.items[@sizeOf(OutHeader)..];
+        const n = self.readFile(header.nodeid, node, in.offset, dest) catch |err| {
             std.debug.print("fuse: read of {x} failed: {any}\n", .{ node.cid[0..4], err });
             return self.replyError(header, .IO);
         };
         try self.sendPrepared(header, n);
     }
 
-    fn readFile(self: *Mount, node: Inode, offset: u64, dest: []u8) !usize {
+    fn readFile(self: *Mount, ino: u64, node: Inode, offset: u64, dest: []u8) !usize {
         // A file being written reads from its staging copy.
-        if (self.writingHandle(node)) |h| {
-            const rc = linux.pread(h.fd, dest.ptr, dest.len, @intCast(offset));
-            if (linux.errno(rc) != .SUCCESS) return error.InputOutput;
-            return rc;
-        }
+        const staging_read: ?usize = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.writingHandle(ino)) |h| {
+                const rc = linux.pread(h.fd, dest.ptr, dest.len, @intCast(offset));
+                if (linux.errno(rc) != .SUCCESS) return error.InputOutput;
+                break :blk @intCast(rc);
+            }
+            break :blk null;
+        };
+        if (staging_read) |n| return n;
+
         if (node.kind == .swarm_file) {
             const folder = self.swarm orelse return error.FileNotFound;
             return folder.readAt(self.allocator, node.cid, node.author, offset, dest);
         }
-        const remote = self.devices.items[node.device].remote;
-        if (self.read_ahead) |ra| return ra.readAt(self.allocator, &.{remote.peer}, node.cid, offset, dest);
+        const remote = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (node.device >= self.devices.items.len) return error.FileNotFound;
+            break :blk self.devices.items[node.device].remote;
+        };
+        if (self.hooks.before_network) |hook| hook(self.hooks.ctx);
+        if (self.read_ahead) |ra| {
+            return ra.readAt(self.allocator, &.{remote.peer}, node.cid, offset, dest);
+        }
         return tree.readAt(self.allocator, remote.loader(), node.cid, offset, dest);
     }
 
     fn opReaddir(self: *Mount, header: *const InHeader, body: []const u8) !void {
         const in = readStruct(ReadIn, body) orelse return self.replyError(header, .IO);
-        const node = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
+        const parent = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
+        if (parent.kind.isFile()) return self.replyError(header, .NOTDIR);
 
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const entries = self.childrenOf(arena, node) catch |err| return self.replyError(header, errnoFor(err));
+        const entries = self.childrenOf(arena, header.nodeid, parent) catch |err| return self.replyError(header, errnoFor(err));
 
-        self.reply.clearRetainingCapacity();
-        try self.reply.appendNTimes(self.allocator, 0, @sizeOf(OutHeader));
-        var index: usize = @intCast(@min(in.offset, entries.len));
+        try tl_reply.resize(self.allocator, @sizeOf(OutHeader));
+        var index = in.offset;
         while (index < entries.len) : (index += 1) {
             const entry = entries[index];
             const entry_len = std.mem.alignForward(usize, @sizeOf(Dirent) + entry.name.len, 8);
-            if (self.reply.items.len - @sizeOf(OutHeader) + entry_len > in.size) break;
-            const ino = try self.upsert(header.nodeid, entry.name, entry.node);
+            if (tl_reply.items.len - @sizeOf(OutHeader) + entry_len > in.size) break;
+            const ino = blk: {
+                self.lock.lock();
+                defer self.lock.unlock();
+                break :blk self.table.find(header.nodeid, entry.name) orelse synthIno(header.nodeid, entry.name);
+            };
             const dirent = Dirent{
                 .ino = ino,
                 .off = index + 1,
                 .namelen = @intCast(entry.name.len),
                 .type = if (entry.node.kind.isFile()) DT_REG else DT_DIR,
             };
-            try self.reply.appendSlice(self.allocator, std.mem.asBytes(&dirent));
-            try self.reply.appendSlice(self.allocator, entry.name);
-            try self.reply.appendNTimes(self.allocator, 0, entry_len - @sizeOf(Dirent) - entry.name.len);
+            try tl_reply.appendSlice(self.allocator, std.mem.asBytes(&dirent));
+            try tl_reply.appendSlice(self.allocator, entry.name);
+            try tl_reply.appendNTimes(self.allocator, 0, entry_len - @sizeOf(Dirent) - entry.name.len);
         }
-        try self.sendPrepared(header, self.reply.items.len - @sizeOf(OutHeader));
+        try self.sendPrepared(header, tl_reply.items.len - @sizeOf(OutHeader));
     }
 
     // ---- Writing (swarm folder only) ----
 
-    fn swarmChildPath(self: *Mount, arena: std.mem.Allocator, parent: Inode, name: []const u8) ![]u8 {
-        _ = self;
+    fn swarmPath(self: *Mount, arena: std.mem.Allocator, ino: u64) ![]u8 {
+        const stop = self.table.find(root_id, "Swarm") orelse return error.Detached;
+        return self.table.pathOf(arena, ino, stop);
+    }
+
+    fn swarmChildPath(self: *Mount, arena: std.mem.Allocator, parent_ino: u64, name: []const u8) ![]u8 {
+        const parent = if (self.table.map.get(parent_ino)) |e| e.data else return error.FileNotFound;
         if (parent.kind != .swarm_dir) return error.ReadOnly;
         if (name.len > 255) return error.NameTooLong;
-        const path = if (parent.swarm_path.len == 0)
-            try arena.dupe(u8, name)
-        else
-            try std.fmt.allocPrint(arena, "{s}/{s}", .{ parent.swarm_path, name });
+        const base = try self.swarmPath(arena, parent_ino);
+        const path = if (base.len == 0) try arena.dupe(u8, name) else try std.fmt.allocPrint(arena, "{s}/{s}", .{ base, name });
         if (!manifest_mod.validPath(path)) return error.InvalidPath;
         return path;
     }
 
     fn nowSeconds() u64 {
-        const t = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .real).nanoseconds;
-        return @intCast(@max(0, @divFloor(t, std.time.ns_per_s)));
+        const t = sync.timestamp();
+        return @intCast(@max(0, t));
     }
 
-    fn writingHandle(self: *Mount, node: Inode) ?*Handle {
-        if (node.kind != .swarm_file) return null;
-        // Find the inode number for this node via the handle table.
-        var it = self.handles.valueIterator();
-        while (it.next()) |h| {
-            if (std.mem.eql(u8, self.inodes.items[h.ino - 1].swarm_path, node.swarm_path)) return h;
-        }
-        return null;
+    fn writingHandle(self: *Mount, ino: u64) ?*Handle {
+        return self.handles.getPtr(self.writing.get(ino) orelse return null);
     }
 
     /// A staging file and handle for `path`; when `copy_from` is set its
     /// current bytes are copied in first.
-    fn newHandle(self: *Mount, ino: u64, path: []const u8, copy_from: ?Inode) !u64 {
+    fn newHandle(self: *Mount, ino: u64, copy_from: ?Inode) !u64 {
         const folder = self.swarm orelse return error.ReadOnly;
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.writing.contains(ino)) return error.DeviceOrResourceBusy;
+        }
         const dir = try folder.stagingDir(self.allocator);
         defer self.allocator.free(dir);
-        const fh = self.next_fh;
-        self.next_fh += 1;
+
+        const fh = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const f = self.next_fh;
+            self.next_fh += 1;
+            break :blk f;
+        };
         const staging = try std.fmt.allocPrintSentinel(self.allocator, "{s}/{d}.part", .{ dir, fh }, 0);
         errdefer self.allocator.free(staging);
         const rc = linux.open(staging.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
@@ -609,28 +1010,42 @@ pub const Mount = struct {
                 offset += n;
             }
         }
-        const owned_path = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(owned_path);
-        try self.handles.put(self.allocator, fh, .{ .ino = ino, .path = owned_path, .staging = staging, .fd = fd, .dirty = copy_from == null });
-        try self.writing.put(self.allocator, ino, fh);
+
+        // Critical section: atomic check-and-insert under L1
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.writing.contains(ino)) return error.DeviceOrResourceBusy;
+        try self.handles.ensureUnusedCapacity(self.allocator, 1);
+        try self.writing.ensureUnusedCapacity(self.allocator, 1);
+        self.handles.putAssumeCapacity(fh, .{ .ino = ino, .staging = staging, .fd = fd, .dirty = copy_from == null });
+        self.writing.putAssumeCapacity(ino, fh);
+        self.table.pin(ino);
         return fh;
     }
 
-    fn dropHandle(self: *Mount, h: Handle) void {
+    fn dropHandle(self: *Mount, fh: u64, h: Handle) void {
         _ = linux.close(h.fd);
         _ = linux.unlink(h.staging.ptr);
-        if (self.writing.get(h.ino)) |fh| {
-            if (self.handles.get(fh)) |cur| if (cur.fd == h.fd) {
-                _ = self.writing.remove(h.ino);
-            };
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.writing.get(h.ino)) |wfh| {
+                if (wfh == fh) {
+                    _ = self.writing.remove(h.ino);
+                }
+            }
+            self.table.unpin(h.ino);
         }
-        self.allocator.free(h.path);
         self.allocator.free(h.staging);
     }
 
-    fn openForWrite(self: *Mount, ino: u64, node: Inode, truncate: bool) !u64 {
-        const fh = try self.newHandle(ino, node.swarm_path, if (truncate) null else node);
-        if (truncate) self.inodes.items[ino - 1].size = 0;
+    pub fn openForWrite(self: *Mount, ino: u64, node: Inode, truncate: bool) !u64 {
+        const fh = try self.newHandle(ino, if (truncate) null else node);
+        if (truncate) {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.table.map.getPtr(ino)) |e| e.data.size = 0;
+        }
         return fh;
     }
 
@@ -638,58 +1053,94 @@ pub const Mount = struct {
     fn commit(self: *Mount, h: *Handle) !void {
         if (!h.dirty) return;
         const folder = self.swarm orelse return error.ReadOnly;
-        const slash = std.mem.lastIndexOfScalar(u8, h.path, '/');
-        const dir = if (slash) |sl| h.path[0..sl] else "";
-        const name = h.path[if (slash) |sl| sl + 1 else 0..];
-        try folder.addFile(dir, name, h.staging);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const path = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            break :blk self.swarmPath(arena.allocator(), h.ino) catch |err| {
+                if (err == error.Detached) {
+                    h.dirty = false;
+                    return;
+                }
+                return err;
+            };
+        };
+        const slash = std.mem.lastIndexOfScalar(u8, path, '/');
+        const dir = if (slash) |sl| path[0..sl] else "";
+        const name = path[if (slash) |sl| sl + 1 else 0..];
         h.dirty = false;
-        if (folder.fileInfo(h.path)) |info| {
-            const node = &self.inodes.items[h.ino - 1];
-            node.cid = info.cid;
-            node.size = info.size;
-            node.mtime = info.mtime;
-            node.author = info.author;
+        folder.addFile(dir, name, h.staging) catch |err| {
+            h.dirty = true;
+            return err;
+        };
+        if (folder.fileInfo(path)) |info| {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.table.map.getPtr(h.ino)) |e| {
+                const node = &e.data;
+                node.cid = info.cid;
+                node.size = info.size;
+                node.mtime = info.mtime;
+                node.author = info.author;
+            }
         }
     }
 
     fn opCreate(self: *Mount, header: *const InHeader, body: []const u8) !void {
         if (body.len <= @sizeOf(CreateIn)) return self.replyError(header, .INVAL);
         const name = std.mem.sliceTo(body[@sizeOf(CreateIn)..], 0);
-        const parent = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
-        const path = self.swarmChildPath(arena_state.allocator(), parent, name) catch |err| return self.replyError(header, errnoFor(err));
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            _ = self.swarmChildPath(arena_state.allocator(), header.nodeid, name) catch |err| return self.replyError(header, errnoFor(err));
+        }
 
+        const swarm = self.swarm orelse return self.replyError(header, .ROFS);
         const ino = try self.upsert(header.nodeid, name, .{
             .kind = .swarm_file,
             .size = 0,
             .mtime = nowSeconds(),
-            .swarm_path = path,
-            .author = (self.swarm.?.self_id).bytes,
+            .author = swarm.self_id.bytes,
         });
-        const fh = self.newHandle(ino, path, null) catch |err| return self.replyError(header, errnoFor(err));
+        const fh = self.newHandle(ino, null) catch |err| {
+            self.lock.lock();
+            self.table.evictIfDead(ino);
+            self.lock.unlock();
+            return self.replyError(header, errnoFor(err));
+        };
+        const node = self.inode(ino) orelse return self.replyError(header, .NOENT);
         const Reply = extern struct { entry: EntryOut, open: OpenOut };
-        try self.replyStruct(header, Reply{
-            .entry = .{ .nodeid = ino, .entry_valid = cache_seconds, .attr_valid = cache_seconds, .attr = self.attr(ino) },
+        try self.replyReferenced(header, ino, Reply{
+            .entry = .{ .nodeid = ino, .entry_valid = cache_seconds, .attr_valid = cache_seconds, .attr = self.attrOf(ino, node) },
             .open = .{ .fh = fh },
-        });
+        }, fh);
     }
 
     fn opWrite(self: *Mount, header: *const InHeader, body: []const u8) !void {
         const in = readStruct(WriteIn, body) orelse return self.replyError(header, .INVAL);
         const data = body[@sizeOf(WriteIn)..];
         if (data.len < in.size) return self.replyError(header, .INVAL);
-        const h = self.handles.getPtr(in.fh) orelse return self.replyError(header, .BADF);
-        var done: usize = 0;
-        while (done < in.size) {
-            const rc = linux.pwrite(h.fd, data[done..].ptr, in.size - done, @intCast(in.offset + done));
-            if (linux.errno(rc) != .SUCCESS) return self.replyError(header, .IO);
-            done += rc;
+
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const h = self.handles.getPtr(in.fh) orelse return self.replyError(header, .BADF);
+            var done: usize = 0;
+            while (done < in.size) {
+                const rc = linux.pwrite(h.fd, data[done..].ptr, in.size - done, @intCast(in.offset + done));
+                if (linux.errno(rc) != .SUCCESS) return self.replyError(header, .IO);
+                done += rc;
+            }
+            h.dirty = true;
+            if (self.table.map.getPtr(h.ino)) |e| {
+                const node = &e.data;
+                node.size = @max(node.size, in.offset + in.size);
+                node.mtime = nowSeconds();
+            }
         }
-        h.dirty = true;
-        const node = &self.inodes.items[h.ino - 1];
-        node.size = @max(node.size, in.offset + in.size);
-        node.mtime = nowSeconds();
         try self.replyStruct(header, WriteOut{ .size = in.size });
     }
 
@@ -698,37 +1149,61 @@ pub const Mount = struct {
         const node = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
         if (in.valid & FATTR_SIZE != 0) {
             if (node.kind != .swarm_file) return self.replyError(header, if (node.kind == .file) .ROFS else .ISDIR);
-            const fh = if (in.valid & FATTR_FH != 0 and self.handles.contains(in.fh)) in.fh else self.writing.get(header.nodeid);
+            const fh = blk: {
+                self.lock.lock();
+                defer self.lock.unlock();
+                if (in.valid & FATTR_FH != 0 and self.handles.contains(in.fh)) break :blk in.fh;
+                break :blk self.writing.get(header.nodeid);
+            };
             if (fh) |f| {
-                const h = self.handles.getPtr(f).?;
+                self.lock.lock();
+                defer self.lock.unlock();
+                const h = self.handles.getPtr(f) orelse return self.replyError(header, .BADF);
                 if (linux.errno(linux.ftruncate(h.fd, @intCast(in.size))) != .SUCCESS) return self.replyError(header, .IO);
                 h.dirty = true;
-                self.inodes.items[header.nodeid - 1].size = in.size;
+                if (self.table.map.getPtr(header.nodeid)) |e| {
+                    e.data.size = in.size;
+                }
             } else {
                 // Truncate without an open file: stage, cut, add at once.
-                const f = self.newHandle(header.nodeid, node.swarm_path, if (in.size == 0) null else node) catch |err| return self.replyError(header, errnoFor(err));
-                const h = self.handles.getPtr(f).?;
-                _ = linux.ftruncate(h.fd, @intCast(in.size));
-                h.dirty = true;
-                self.commit(h) catch |err| {
-                    std.debug.print("fuse: truncate of {s} failed: {any}\n", .{ h.path, err });
+                const f = self.newHandle(header.nodeid, if (in.size == 0) null else node) catch |err| return self.replyError(header, errnoFor(err));
+                var h_removed = blk: {
+                    self.lock.lock();
+                    defer self.lock.unlock();
+                    const h = self.handles.getPtr(f) orelse return self.replyError(header, .BADF);
+                    if (linux.errno(linux.ftruncate(h.fd, @intCast(in.size))) != .SUCCESS) {
+                        if (self.handles.fetchRemove(f)) |removed| {
+                            self.dropHandle(f, removed.value);
+                        }
+                        return self.replyError(header, .IO);
+                    }
+                    h.dirty = true;
+                    break :blk self.handles.fetchRemove(f).?.value;
                 };
-                const removed = self.handles.fetchRemove(f).?;
-                self.dropHandle(removed.value);
+                self.commit(&h_removed) catch |err| {
+                    std.debug.print("fuse: truncate inode {d} failed: {any}\n", .{ h_removed.ino, err });
+                };
+                self.dropHandle(f, h_removed);
             }
         } else if (node.kind != .swarm_file and node.kind != .swarm_dir and in.valid != 0) {
             // Times and modes on read-only parts are accepted and ignored,
             // so cp -p and touch don't fail; nothing is stored for them.
         }
-        try self.replyStruct(header, AttrOut{ .attr_valid = cache_seconds, .attr = self.attr(header.nodeid) });
+        const updated = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
+        try self.replyStruct(header, AttrOut{ .attr_valid = cache_seconds, .attr = self.attrOf(header.nodeid, updated) });
     }
 
     fn opRelease(self: *Mount, header: *const InHeader, body: []const u8) !void {
         const in = readStruct(ReleaseIn, body) orelse return self.replyEmpty(header);
-        if (self.handles.getPtr(in.fh)) |h| {
-            self.commit(h) catch |err| std.debug.print("fuse: saving {s} to the swarm folder failed: {any}\n", .{ h.path, err });
-            const removed = self.handles.fetchRemove(in.fh).?;
-            self.dropHandle(removed.value);
+        const removed = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            break :blk self.handles.fetchRemove(in.fh);
+        };
+        if (removed) |kv| {
+            var h = kv.value;
+            self.commit(&h) catch |err| std.debug.print("fuse: saving inode {d} failed: {any}\n", .{ h.ino, err });
+            self.dropHandle(in.fh, h);
         }
         try self.replyEmpty(header);
     }
@@ -736,24 +1211,32 @@ pub const Mount = struct {
     fn opMkdir(self: *Mount, header: *const InHeader, body: []const u8) !void {
         if (body.len <= @sizeOf(MkdirIn)) return self.replyError(header, .INVAL);
         const name = std.mem.sliceTo(body[@sizeOf(MkdirIn)..], 0);
-        const parent = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
-        _ = self.swarmChildPath(arena_state.allocator(), parent, name) catch |err| return self.replyError(header, errnoFor(err));
-        if (try self.child(header.nodeid, name) != null) return self.replyError(header, .EXIST);
-        self.swarm.?.makeDir(parent.swarm_path, name) catch |err| return self.replyError(header, errnoFor(err));
-        const ino = (try self.child(header.nodeid, name)) orelse return self.replyError(header, .IO);
-        try self.replyStruct(header, EntryOut{ .nodeid = ino, .entry_valid = cache_seconds, .attr_valid = cache_seconds, .attr = self.attr(ino) });
+        const base = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            _ = self.swarmChildPath(arena_state.allocator(), header.nodeid, name) catch |err| return self.replyError(header, errnoFor(err));
+            break :blk try self.swarmPath(arena_state.allocator(), header.nodeid);
+        };
+        if (try self.childEntry(header.nodeid, name) != null) return self.replyError(header, .EXIST);
+        const swarm = self.swarm orelse return self.replyError(header, .ROFS);
+        swarm.makeDir(base, name) catch |err| return self.replyError(header, errnoFor(err));
+        const ino = (try self.lookupChild(header.nodeid, name)) orelse return self.replyError(header, .IO);
+        const node = self.inode(ino) orelse return self.replyError(header, .IO);
+        try self.replyReferenced(header, ino, EntryOut{ .nodeid = ino, .entry_valid = cache_seconds, .attr_valid = cache_seconds, .attr = self.attrOf(ino, node) }, null);
     }
 
     fn opRemove(self: *Mount, header: *const InHeader, name: []const u8, want: enum { file, dir }) !void {
-        const parent = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
-        const path = self.swarmChildPath(arena_state.allocator(), parent, name) catch |err| return self.replyError(header, errnoFor(err));
-        const ino = (try self.child(header.nodeid, name)) orelse return self.replyError(header, .NOENT);
-        const node = self.inodes.items[ino - 1];
-        const folder = self.swarm.?;
+        const path = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            break :blk self.swarmChildPath(arena_state.allocator(), header.nodeid, name) catch |err| return self.replyError(header, errnoFor(err));
+        };
+        const node = (try self.childEntry(header.nodeid, name)) orelse return self.replyError(header, .NOENT);
+        const folder = self.swarm orelse return self.replyError(header, .ROFS);
         switch (want) {
             .file => if (node.kind != .swarm_file) return self.replyError(header, .ISDIR),
             .dir => {
@@ -762,10 +1245,14 @@ pub const Mount = struct {
             },
         }
         folder.remove(path) catch |err| switch (err) {
-            // An empty folder only implied by a pending file, or already gone.
             error.FileNotFound => {},
             else => return self.replyError(header, errnoFor(err)),
         };
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            self.table.detach(header.nodeid, name);
+        }
         try self.replyEmpty(header);
     }
 
@@ -793,64 +1280,66 @@ pub const Mount = struct {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const from = self.swarmChildPath(arena, old_parent, old_name) catch |err| return self.replyError(header, errnoFor(err));
-        const to = self.swarmChildPath(arena, new_parent, new_name) catch |err| return self.replyError(header, errnoFor(err));
-        const moved_ino = try self.child(header.nodeid, old_name);
+        const from = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            break :blk self.swarmChildPath(arena, header.nodeid, old_name) catch |err| return self.replyError(header, errnoFor(err));
+        };
+        const to = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            break :blk self.swarmChildPath(arena, newdir, new_name) catch |err| return self.replyError(header, errnoFor(err));
+        };
+
         // A file still open for writing is saved before it moves.
-        if (moved_ino) |ino| {
-            if (self.writing.get(ino)) |fh| {
-                if (self.handles.getPtr(fh)) |h| self.commit(h) catch {};
+        const maybe_h_copy = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const moved_ino = self.table.find(header.nodeid, old_name);
+            if (moved_ino) |ino| {
+                if (self.writing.get(ino)) |fh| {
+                    if (self.handles.get(fh)) |h| {
+                        break :blk h;
+                    }
+                }
             }
+            break :blk null;
+        };
+        if (maybe_h_copy) |h_const| {
+            var h = h_const;
+            self.commit(&h) catch {};
         }
-        self.swarm.?.move(from, to, .{ .replace = replace }) catch |err| return self.replyError(header, errnoFor(err));
-        // The kernel keeps the moved inode under its new name: point it at
-        // the new path (its children refresh from it on their next lookup).
-        if (moved_ino) |ino| try self.rekey(header.nodeid, old_name, newdir, new_name, ino, to);
-        try self.repath(from, to);
+
+        const folder = self.swarm orelse return self.replyError(header, .ROFS);
+        folder.move(from, to, .{ .replace = replace }) catch |err| return self.replyError(header, errnoFor(err));
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            try self.table.move(header.nodeid, old_name, newdir, new_name);
+        }
         try self.replyEmpty(header);
-    }
-
-    /// Cached swarm inodes below a moved folder take its new path.
-    fn repath(self: *Mount, from: []const u8, to: []const u8) !void {
-        for (self.inodes.items) |*node| {
-            if (node.kind != .swarm_dir and node.kind != .swarm_file) continue;
-            const p = node.swarm_path;
-            if (!(p.len > from.len and std.mem.startsWith(u8, p, from) and p[from.len] == '/')) continue;
-            node.swarm_path = try std.fmt.allocPrint(self.path_arena.allocator(), "{s}{s}", .{ to, p[from.len..] });
-        }
-    }
-
-    fn childKey(buf: *[8 + 256]u8, parent_ino: u64, name: []const u8) []const u8 {
-        std.mem.writeInt(u64, buf[0..8], parent_ino, .little);
-        @memcpy(buf[8..][0..name.len], name);
-        return buf[0 .. 8 + name.len];
-    }
-
-    fn rekey(self: *Mount, old_parent: u64, old_name: []const u8, new_parent: u64, new_name: []const u8, ino: u64, new_path: []const u8) !void {
-        var buf: [8 + 256]u8 = undefined;
-        if (self.children.fetchRemove(childKey(&buf, old_parent, old_name))) |kv| self.allocator.free(kv.key);
-        const key = try self.allocator.dupe(u8, childKey(&buf, new_parent, new_name));
-        errdefer self.allocator.free(key);
-        const gop = try self.children.getOrPut(self.allocator, key);
-        if (gop.found_existing) self.allocator.free(key) else gop.key_ptr.* = key;
-        gop.value_ptr.* = ino;
-        self.inodes.items[ino - 1].swarm_path = try self.path_arena.allocator().dupe(u8, new_path);
     }
 
     // ---- Tree navigation ----
 
     fn inode(self: *Mount, ino: u64) ?Inode {
-        if (ino == 0 or ino > self.inodes.items.len) return null;
-        return self.inodes.items[ino - 1];
+        self.lock.lock();
+        defer self.lock.unlock();
+        return if (self.table.map.get(ino)) |e| e.data else null;
     }
 
     fn attr(self: *Mount, ino: u64) Attr {
-        const node = self.inodes.items[ino - 1];
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.attrOf(ino, if (self.table.map.get(ino)) |e| e.data else .{ .kind = .root });
+    }
+
+    fn attrOf(self: *Mount, ino: u64, node: Inode) Attr {
         const is_file = node.kind.isFile();
         return .{
             .ino = ino,
             .size = node.size,
-            .blocks = (node.size + 511) / 512,
+            .blocks = (node.size +| 511) / 512,
             .atime = node.mtime,
             .mtime = node.mtime,
             .ctime = node.mtime,
@@ -868,7 +1357,7 @@ pub const Mount = struct {
     const Child = struct { name: []const u8, node: Inode };
 
     /// What `parent` contains, in listing order (allocated in `arena`).
-    fn childrenOf(self: *Mount, arena: std.mem.Allocator, parent: Inode) ![]Child {
+    fn childrenOf(self: *Mount, arena: std.mem.Allocator, parent_ino: u64, parent: Inode) ![]Child {
         var out: std.ArrayList(Child) = .empty;
         switch (parent.kind) {
             .file, .swarm_file => return error.NotADirectory,
@@ -876,9 +1365,21 @@ pub const Mount = struct {
                 if (self.swarm != null) {
                     try out.append(arena, .{ .name = "Swarm", .node = .{ .kind = .swarm_dir, .mtime = self.mounted_at } });
                 }
-                self.refreshDevices();
+                if (self.refresh.thread != null) {
+                    self.requestRefresh();
+                    self.refresh.mutex.lock();
+                    if (!self.refresh.first_done and !self.stopping.load(.acquire)) {
+                        self.refresh.cond.timedWait(&self.refresh.mutex, first_refresh_wait_ms * std.time.ns_per_ms);
+                    }
+                    self.refresh.mutex.unlock();
+                } else {
+                    self.refreshAll();
+                }
+                self.lock.lock();
+                defer self.lock.unlock();
                 for (self.devices.items, 0..) |d, i| {
-                    if (!d.online) continue;
+                    // A device without a name yet (naming failed) is not listed.
+                    if (!d.online or d.name.len == 0) continue;
                     try out.append(arena, .{ .name = try arena.dupe(u8, d.name), .node = .{
                         .kind = .device,
                         .device = @intCast(i),
@@ -887,6 +1388,9 @@ pub const Mount = struct {
                 }
             },
             .device => {
+                self.lock.lock();
+                defer self.lock.unlock();
+                if (parent.device >= self.devices.items.len) return out.items;
                 const listing = self.devices.items[parent.device].shares orelse return out.items;
                 for (listing.entries) |e| {
                     try out.append(arena, .{ .name = try arena.dupe(u8, e.name), .node = .{
@@ -900,19 +1404,27 @@ pub const Mount = struct {
             },
             .swarm_dir => {
                 const folder = self.swarm orelse return out.items;
-                const items = try folder.list(arena, parent.swarm_path);
+                const path = blk: {
+                    self.lock.lock();
+                    defer self.lock.unlock();
+                    break :blk try self.swarmPath(arena, parent_ino);
+                };
+                const items = try folder.list(arena, path);
                 // Files still being written aren't in the manifest yet.
-                var hit = self.handles.valueIterator();
-                while (hit.next()) |h| {
-                    const slash = std.mem.lastIndexOfScalar(u8, h.path, '/');
-                    const dir = if (slash) |sl| h.path[0..sl] else "";
-                    if (!std.mem.eql(u8, dir, parent.swarm_path)) continue;
-                    const name = h.path[if (slash) |sl| sl + 1 else 0..];
-                    const listed = for (items) |it| {
-                        if (std.mem.eql(u8, it.name, name)) break true;
-                    } else false;
-                    if (listed) continue;
-                    try out.append(arena, .{ .name = name, .node = self.inodes.items[h.ino - 1] });
+                {
+                    self.lock.lock();
+                    defer self.lock.unlock();
+                    var hit = self.handles.valueIterator();
+                    while (hit.next()) |h| {
+                        const e = self.table.map.get(h.ino) orelse continue;
+                        if (e.parent != parent_ino) continue;
+                        const name = e.key[8..];
+                        const listed = for (items) |it| {
+                            if (std.mem.eql(u8, it.name, name)) break true;
+                        } else false;
+                        if (listed) continue;
+                        try out.append(arena, .{ .name = try arena.dupe(u8, name), .node = e.data });
+                    }
                 }
                 for (items) |it| {
                     try out.append(arena, .{ .name = it.name, .node = .{
@@ -920,15 +1432,20 @@ pub const Mount = struct {
                         .cid = it.cid orelse [_]u8{0} ** 32,
                         .size = it.size,
                         .mtime = it.mtime,
-                        .swarm_path = it.path,
                         .author = it.author_id orelse [_]u8{0} ** 32,
                     } });
                 }
             },
             .dir => {
-                const listing = try tree.listDir(arena, self.devices.items[parent.device].remote.loader(), &parent.cid);
+                const remote = blk: {
+                    self.lock.lock();
+                    defer self.lock.unlock();
+                    if (parent.device >= self.devices.items.len) return error.FileNotFound;
+                    break :blk self.devices.items[parent.device].remote;
+                };
+                const listing = try tree.listDir(arena, remote.loader(), &parent.cid);
                 for (listing.entries) |e| {
-                    try out.append(arena, .{ .name = e.name, .node = .{
+                    try out.append(arena, .{ .name = try arena.dupe(u8, e.name), .node = .{
                         .kind = if (e.kind == .dir) .dir else .file,
                         .device = parent.device,
                         .cid = e.cid,
@@ -941,152 +1458,140 @@ pub const Mount = struct {
         return out.items;
     }
 
-    /// The inode of `name` under `parent_ino` from the parent's current
-    /// listing; null when there is no such entry.
-    fn child(self: *Mount, parent_ino: u64, name: []const u8) !?u64 {
+    /// A listing lookup never allocates a persistent inode.
+    fn childEntry(self: *Mount, parent_ino: u64, name: []const u8) !?Inode {
         const parent = self.inode(parent_ino) orelse return null;
-        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena_state.deinit();
-        const entries = try self.childrenOf(arena_state.allocator(), parent);
-        // Listings are sorted by name except the device list; both are small
-        // or already decoded, so a scan is fine.
-        for (entries) |e| {
-            if (std.mem.eql(u8, e.name, name)) return try self.upsert(parent_ino, name, e.node);
-        }
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const entries = try self.childrenOf(arena.allocator(), parent_ino, parent);
+        for (entries) |e| if (std.mem.eql(u8, e.name, name)) {
+            return e.node;
+        };
         return null;
     }
 
-    /// Records `node` as `name` under `parent_ino`, keeping the inode
-    /// number a path already has (its content may have changed).
-    fn upsert(self: *Mount, parent_ino: u64, name: []const u8, node: Inode) !u64 {
-        var key_buf: [8 + 256]u8 = undefined;
-        if (name.len > 256) return error.NameTooLong;
-        std.mem.writeInt(u64, key_buf[0..8], parent_ino, .little);
-        @memcpy(key_buf[8..][0..name.len], name);
-        const key = key_buf[0 .. 8 + name.len];
-
-        // A swarm path comes from a temporary listing: keep a lasting copy,
-        // reusing the inode's own when it hasn't changed.
-        var stored = node;
-        if (node.swarm_path.len > 0) {
-            const old = if (self.children.get(key)) |ino| self.inodes.items[ino - 1].swarm_path else "";
-            stored.swarm_path = if (std.mem.eql(u8, old, node.swarm_path)) old else try self.path_arena.allocator().dupe(u8, node.swarm_path);
-        }
-        if (self.children.get(key)) |ino| {
-            self.inodes.items[ino - 1] = stored;
-            return ino;
-        }
-        try self.inodes.append(self.allocator, stored);
-        const ino: u64 = self.inodes.items.len;
-        const owned = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(owned);
-        try self.children.put(self.allocator, owned, ino);
-        return ino;
+    fn lookupChild(self: *Mount, parent: u64, name: []const u8) !?u64 {
+        if (try self.childEntry(parent, name)) |node| return try self.upsert(parent, name, node);
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.table.detach(parent, name);
+        return null;
     }
 
-    /// Asks every known peer for its shares (at most every few seconds).
-    /// Devices that do not answer stay listed as offline: their inodes keep
-    /// working for content already cached.
-    fn refreshDevices(self: *Mount) void {
-        const now = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake).nanoseconds;
-        if (self.devices.items.len > 0 and now - self.devices_refreshed_ns < device_refresh_ns) return;
-        self.devices_refreshed_ns = now;
+    fn sameInode(old: Inode, new: Inode) bool {
+        return old.kind.isFile() == new.kind.isFile();
+    }
 
-        const peers = remote_mod.knownPeers(self.block_manager, self.allocator) catch return;
-        defer self.allocator.free(peers);
-        for (self.devices.items) |*d| d.online = false;
-        for (peers) |peer| self.refreshDevice(peer) catch |err| {
-            std.debug.print("fuse: device {x} unavailable: {any}\n", .{ peer.bytes[0..4], err });
+    fn upsert(self: *Mount, parent: u64, name: []const u8, node: Inode) !u64 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.table.getOrCreate(parent, name, node, sameInode);
+    }
+
+    fn opBatchForget(self: *Mount, body: []const u8) void {
+        const in = readStruct(BatchForgetIn, body) orelse return;
+        const n = @min(in.count, (body.len - @sizeOf(BatchForgetIn)) / @sizeOf(ForgetOne));
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (0..n) |i| {
+            const one = readStruct(ForgetOne, body[8 + i * 16 ..]).?;
+            self.table.unref(one.nodeid, one.nlookup);
+        }
+    }
+
+    fn replyReferenced(self: *Mount, header: *const InHeader, ino: u64, value: anytype, fh: ?u64) !void {
+        {
+            self.lock.lock();
+            self.table.ref(ino);
+            self.lock.unlock();
+        }
+        const delivered = self.replyValue(header, value) catch |err| {
+            self.undoReply(ino, fh);
+            return err;
         };
+        if (!delivered) self.undoReply(ino, fh);
     }
 
-    fn refreshDevice(self: *Mount, peer: NodeID) !void {
-        const index = for (self.devices.items, 0..) |d, i| {
-            if (d.remote.peer.eql(peer)) break i;
-        } else blk: {
-            const remote = try self.allocator.create(Remote);
-            errdefer self.allocator.destroy(remote);
-            remote.* = .{ .block_manager = self.block_manager, .store = self.store, .peer = peer };
-            try self.devices.append(self.allocator, .{ .name = try self.allocator.dupe(u8, ""), .remote = remote });
-            break :blk self.devices.items.len - 1;
-        };
-        const device = &self.devices.items[index];
-        const shares = try device.remote.shares(self.allocator);
-        defer self.allocator.free(shares.nickname);
-
-        if (device.shares) |old| old.deinit();
-        device.shares = shares.listing;
-        device.online = true;
-        if (device.name.len == 0) {
-            const name = try self.deviceName(shares.nickname, peer);
-            self.allocator.free(device.name);
-            device.name = name;
+    fn undoReply(self: *Mount, ino: u64, fh: ?u64) void {
+        if (fh) |f| {
+            const removed = blk: {
+                self.lock.lock();
+                defer self.lock.unlock();
+                break :blk self.handles.fetchRemove(f);
+            };
+            if (removed) |kv| {
+                self.dropHandle(f, kv.value);
+            }
         }
-    }
-
-    /// A folder name for a device: its nickname made path-safe, with a
-    /// short ID suffix when empty or already taken.
-    fn deviceName(self: *Mount, nickname: []const u8, peer: NodeID) ![]u8 {
-        var buf: [64]u8 = undefined;
-        var len: usize = 0;
-        for (nickname) |c| {
-            if (len == buf.len) break;
-            buf[len] = if (c == '/' or c == 0 or c == '\\') '_' else c;
-            len += 1;
-        }
-        const base = buf[0..len];
-        var taken = len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..");
-        for (self.devices.items) |d| {
-            if (std.mem.eql(u8, d.name, base)) taken = true;
-        }
-        if (!taken) return self.allocator.dupe(u8, base);
-        const short = std.fmt.bytesToHex(peer.bytes[0..4], .lower);
-        if (len == 0) return self.allocator.dupe(u8, &short);
-        return std.fmt.allocPrint(self.allocator, "{s}-{s}", .{ base, short });
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.table.unref(ino, 1);
     }
 
     // ---- Replies ----
 
     fn replyStruct(self: *Mount, header: *const InHeader, value: anytype) !void {
-        try self.replyBytes(header, std.mem.asBytes(&value));
+        _ = try self.replyValue(header, value);
+    }
+
+    fn replyValue(self: *Mount, header: *const InHeader, value: anytype) !bool {
+        const payload = std.mem.asBytes(&value);
+        try tl_reply.resize(self.allocator, @sizeOf(OutHeader) + payload.len);
+        const out = OutHeader{ .len = @intCast(tl_reply.items.len), .@"error" = 0, .unique = header.unique };
+        @memcpy(tl_reply.items[0..@sizeOf(OutHeader)], std.mem.asBytes(&out));
+        @memcpy(tl_reply.items[@sizeOf(OutHeader)..], payload);
+        return self.send(tl_reply.items);
     }
 
     fn replyEmpty(self: *Mount, header: *const InHeader) !void {
-        try self.replyBytes(header, &.{});
+        const out = OutHeader{ .len = @sizeOf(OutHeader), .@"error" = 0, .unique = header.unique };
+        _ = try self.send(std.mem.asBytes(&out));
     }
 
-    fn replyBytes(self: *Mount, header: *const InHeader, payload: []const u8) !void {
-        try self.reply.resize(self.allocator, @sizeOf(OutHeader) + payload.len);
-        @memcpy(self.reply.items[@sizeOf(OutHeader)..], payload);
-        try self.sendPrepared(header, payload.len);
+    fn replyBytes(self: *Mount, header: *const InHeader, bytes: []const u8) !void {
+        try tl_reply.resize(self.allocator, @sizeOf(OutHeader) + bytes.len);
+        const out = OutHeader{ .len = @intCast(tl_reply.items.len), .@"error" = 0, .unique = header.unique };
+        @memcpy(tl_reply.items[0..@sizeOf(OutHeader)], std.mem.asBytes(&out));
+        @memcpy(tl_reply.items[@sizeOf(OutHeader)..], bytes);
+        _ = try self.send(tl_reply.items);
     }
 
     /// Sends the first `payload_len` bytes after the header slot in `reply`.
     fn sendPrepared(self: *Mount, header: *const InHeader, payload_len: usize) !void {
         const total = @sizeOf(OutHeader) + payload_len;
-        const out = OutHeader{ .len = @intCast(total), .@"error" = 0, .unique = header.unique };
-        @memcpy(self.reply.items[0..@sizeOf(OutHeader)], std.mem.asBytes(&out));
-        try self.send(self.reply.items[0..total]);
+        const out: *OutHeader = @ptrCast(@alignCast(tl_reply.items.ptr));
+        out.* = .{ .len = @intCast(total), .@"error" = 0, .unique = header.unique };
+        _ = try self.send(tl_reply.items[0..total]);
     }
 
     fn replyError(self: *Mount, header: *const InHeader, err: Errno) !void {
         const out = OutHeader{ .len = @sizeOf(OutHeader), .@"error" = -@intFromEnum(err), .unique = header.unique };
-        try self.send(std.mem.asBytes(&out));
+        _ = try self.send(std.mem.asBytes(&out));
     }
 
-    fn send(self: *Mount, bytes: []const u8) !void {
+    fn send(self: *Mount, bytes: []const u8) !bool {
+        if (self.send_hook) |hook| return hook(self, bytes);
         const rc = linux.write(self.fd, bytes.ptr, bytes.len);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             // The request was interrupted and is gone; nothing to answer.
-            .NOENT => {},
+            .NOENT => return false,
             else => |e| {
                 std.debug.print("fuse: reply failed: {s}\n", .{@tagName(e)});
                 return error.FuseWriteFailed;
             },
         }
+        if (rc != bytes.len) return error.FuseWriteFailed;
+        return true;
     }
 };
+
+fn synthIno(parent: u64, name: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(std.mem.asBytes(&parent));
+    h.update(name);
+    return (@as(u64, 1) << 63) | (h.final() >> 1);
+}
 
 fn readStruct(comptime T: type, body: []const u8) ?T {
     if (body.len < @sizeOf(T)) return null;
@@ -1097,13 +1602,14 @@ fn readStruct(comptime T: type, body: []const u8) ?T {
 
 fn errnoFor(err: anyerror) Errno {
     return switch (err) {
+        error.FileNotFound => .NOENT,
         error.NotADirectory => .NOTDIR,
         error.IsDirectory => .ISDIR,
-        error.FileNotFound => .NOENT,
-        error.PathAlreadyExists => .EXIST,
         error.ReadOnly => .ROFS,
         error.InvalidPath, error.InvalidName => .INVAL,
         error.NameTooLong => .NAMETOOLONG,
+        error.DeviceOrResourceBusy => .BUSY,
+        error.PeerDown => .IO,
         else => .IO,
     };
 }
@@ -1206,4 +1712,77 @@ pub fn unmount(mountpoint: [:0]const u8) void {
     if (linux.errno(pid) != .SUCCESS) return;
     var status: u32 = 0;
     _ = linux.wait4(@intCast(pid), &status, 0, null);
+}
+
+// ---- Tests ----
+
+test "fuse: attr size does not overflow on 2^64-1" {
+    var mount = Mount{
+        .table = try InodeTable.init(std.testing.allocator, .{ .kind = .root }),
+        .allocator = std.testing.allocator,
+        .block_manager = undefined,
+        .store = undefined,
+        .uid = 1000,
+        .gid = 1000,
+    };
+    defer mount.table.deinit();
+    mount.table.map.getPtr(root_id).?.data = .{ .kind = .file, .size = std.math.maxInt(u64), .mtime = 0 };
+    const a = mount.attr(1);
+    try std.testing.expectEqual(std.math.maxInt(u64), a.size);
+    try std.testing.expectEqual(std.math.maxInt(u64) / 512, a.blocks);
+}
+
+test "fuse: dispatch skips header shorter than InHeader" {
+    var mount = Mount{
+        .table = try InodeTable.init(std.testing.allocator, .{ .kind = .root }),
+        .allocator = std.testing.allocator,
+        .block_manager = undefined,
+        .store = undefined,
+        .uid = 1000,
+        .gid = 1000,
+    };
+    defer mount.table.deinit();
+    var short_buf align(8) = [_]u8{0} ** 40;
+    const header: *InHeader = @ptrCast(&short_buf);
+    header.len = 20; // less than @sizeOf(InHeader)
+    header.opcode = 1;
+    header.unique = 1;
+    header.nodeid = 1;
+    const done = try mount.dispatch(&short_buf);
+    try std.testing.expect(!done);
+}
+
+test "fuse: dropHandle clears writing entry when fh matches" {
+    var mount = Mount{
+        .table = try InodeTable.init(std.testing.allocator, .{ .kind = .root }),
+        .allocator = std.testing.allocator,
+        .block_manager = undefined,
+        .store = undefined,
+        .uid = 1000,
+        .gid = 1000,
+    };
+    defer mount.table.deinit();
+    defer mount.handles.deinit(std.testing.allocator);
+    defer mount.writing.deinit(std.testing.allocator);
+    try mount.writing.put(std.testing.allocator, 42, 10);
+    const h = Handle{
+        .ino = 42,
+        .staging = try std.testing.allocator.dupeZ(u8, "/dev/null"),
+        .fd = -1,
+        .dirty = false,
+    };
+    mount.dropHandle(10, h);
+    try std.testing.expect(!mount.writing.contains(42));
+}
+
+test "fuse: synthIno has bit 63 set, is stable, and differs for different inputs" {
+    const s1 = synthIno(1, "foo");
+    const s2 = synthIno(1, "foo");
+    const s3 = synthIno(1, "bar");
+    const s4 = synthIno(2, "foo");
+    try std.testing.expect(s1 & (@as(u64, 1) << 63) != 0);
+    try std.testing.expectEqual(s1, s2);
+    try std.testing.expect(s1 != s3);
+    try std.testing.expect(s1 != s4);
+    try std.testing.expect(s1 != 0);
 }

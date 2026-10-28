@@ -44,8 +44,8 @@ casting garbage into the enum.
 *   **`RST` (8)**: abort the stream.
 
 Yamux frames are written into the [Noise stream](./noise.md), which seals
-them in encrypted frames of at most 1024 bytes. A large `DATA` frame spans
-several Noise frames.
+them in encrypted frames of at most 65,535 bytes (with up to 65,519 bytes
+plaintext payload). A large `DATA` frame can span multiple frames.
 
 ## 2. Streams
 
@@ -57,31 +57,42 @@ adds 2, so dialer streams are odd and listener streams are even, and the two
 never collide. `error.StreamIdsExhausted` is returned near `maxInt(u32)`.
 
 ### Opening (`Session.newStream`)
-1. Under the session mutex, refuse if the session is closed or the peer sent
-   `GO_AWAY` (`error.SessionClosed`), or if 64 streams are live
-   (`MaxStreams`, `error.TooManyStreams`).
-2. Register a `YamuxStream` with both windows at `InitialWindowSize`
-   (256 KiB).
-3. Send `DATA` with `SYN` and length 0.
+1. Before allocating, `Session.reapClosed` cleans up any expired half-closed
+   streams.
+2. Under the session mutex, refuse if the session is closed or the peer sent
+   `GO_AWAY` (`error.SessionClosed`), or if active streams reach `MaxStreams = 64`
+   (or total allocated streams reach `MaxStreams * 2`).
+3. Register a `YamuxStream` with both windows at `InitialWindowSize`
+   (1 MiB).
+4. Send `DATA` with `SYN` and length 0.
 
 On the other side, `run()` (`dataTarget`) sees a `SYN` for an unknown ID
-of the peer's parity and, if fewer than `MaxStreams` are live, puts the new
+of the peer's parity and, if active streams are under `MaxStreams`, puts the new
 stream on `accept_queue`. `Session.acceptStream()` blocks until one is there.
 Past the limit, the payload is discarded and the stream is refused with a
 `WINDOW_UPDATE` frame carrying `RST`. Frames for an ID that isn't open
 (without `SYN`, or with the wrong parity) are read and dropped.
 
-### Closing (`streamClose`)
-The local user calls `streamClose` exactly once. It marks `local_closed` and
-sends `FIN` (unless the stream was reset). A `FIN` or `RST` from the peer
-sets `remote_closed` (`RST` also sets `reset`). The session frees a stream
-once both sides have closed it, or on `deinit`. The user must not touch a
-stream after closing it.
+### Closing and Half-Close Maintenance (`streamClose`)
+The local user calls `streamClose` when done sending:
+1. It sets `local_closed = true`, records `closed_at_ms = sync.monotonicMillis()`,
+   and immediately frees unread incoming data (`incoming_data.clearAndFree`),
+   releasing memory promptly.
+2. It sends `FIN` (unless the stream was already reset).
+3. A `FIN` or `RST` from the peer sets `remote_closed` (`RST` also sets `reset`).
+4. **Half-close cleanup**: If the remote peer stops responding or fails to send
+   a closing `FIN`/`RST`, half-closed streams are garbage-collected by
+   `reapClosed` after `close_timeout_ms = 30_000` (30 seconds). Reaped streams
+   are destroyed and a `RST` frame is sent to the peer.
+5. **Reader protection**: While a `DATA` payload is actively being read off the
+   wire, `reader_active` protects the stream from being prematurely destroyed.
+6. The session frees a stream once both sides have closed it and no reader is
+   active, or on `deinit`. The user must not touch a stream after closing it.
 
 ## 3. Flow Control: The Window System
 
-Each `YamuxStream` tracks two windows, both starting at **256 KiB**
-(`InitialWindowSize = 256 * 1024`):
+Each `YamuxStream` tracks two windows, both starting at **1 MiB**
+(`InitialWindowSize = 1024 * 1024`):
 
 1.  **Sending** (`streamWrite`): sends at most `remote_window` bytes per
     `DATA` frame and decrements it. At 0 the writer waits on `write_cond`,
@@ -89,24 +100,26 @@ Each `YamuxStream` tracks two windows, both starting at **256 KiB**
 2.  **Receiving** (`run`): a `DATA` frame longer than the stream's
     `local_window` is a protocol error (`error.WindowExceeded`). This is
     checked *before* the payload is read, so a peer can never make us buffer
-    more than 256 KiB per stream. The payload is appended to `incoming_data`.
+    more than 1 MiB per stream. The payload is appended to `incoming_data`.
 3.  **Crediting** (`streamRead`): after the application reads `n` bytes,
-    `local_window += n` and a `WINDOW_UPDATE` with `length = n` goes out.
+    `local_window += n` and a `WINDOW_UPDATE` with `length = n` goes out
+    (batched in half-window increments).
 4.  **Waking**: a received `WINDOW_UPDATE` adds to `remote_window`
     (`error.WindowOverflow` if that would overflow a u32) and signals waiting
     writers.
 
-With `MaxStreams = 64`, a peer can make one session buffer at most
-64 × 256 KiB = **16 MiB**.
+With `MaxStreams = 64` and a 1 MiB window, a session caps buffered receive
+data at **64 MiB**.
 
 ## 4. The Session Loop: `run()`
 
 `establish()` in `tcp.zig` spawns one thread per connection running
 `Session.run()`. It reads a 12-byte header from the Noise stream, then:
 
-*   **`DATA`**: opens a stream on `SYN`, enforces the window, appends the
-    payload in 4 KiB pieces, wakes readers on `cond`, and handles
-    `FIN`/`RST`. Data for an unknown or closed stream is read and discarded.
+*   **`DATA`**: opens a stream on `SYN`, enforces the window, reads the
+    payload into `incoming_data` while guarding with `reader_active`, wakes
+    readers on `cond`, and handles `FIN`/`RST`. Data for an unknown or closed
+    stream is read and discarded.
 *   **`WINDOW_UPDATE`**: credits `remote_window` and wakes writers; handles
     `FIN`/`RST`.
 *   **`PING`**: if `ACK` isn't set, writes the same header back with `ACK`
@@ -122,9 +135,12 @@ stream is marked reset, and all waiters are woken.
 *   **Lock order**: `Session.mutex` before `YamuxStream.mutex`.
 *   **`Session.write_mutex`** serializes frame writes. It is only taken with no
     other lock held, so a blocked socket write never stalls frame dispatch.
+*   **Dynamic write buffer maintenance**: after serializing large frame writes,
+    the write buffer shrinks if its capacity exceeds 128 KiB to prevent lingering
+    allocation bloat.
 *   Readers and writers wait on per-stream condition variables (`cond`,
     `write_cond`). `streamSetTimeout` bounds each wait.
-*   Received data is copied into `incoming_data` and compacted once more than
+*   Received data is stored in `incoming_data` and compacted once more than
     4 KiB has been consumed.
 
 ## 6. How NomadFS Uses Streams

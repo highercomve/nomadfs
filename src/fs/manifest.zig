@@ -29,6 +29,8 @@ pub const max_path_len = 1024;
 pub const max_depth = 32;
 pub const max_entries = 100_000;
 pub const max_author_len = 64;
+pub const max_bytes = 64 * 1024 * 1024;
+pub const max_remote_clock = std.math.maxInt(u64) / 2;
 
 pub const Version = struct {
     clock: u64,
@@ -117,7 +119,7 @@ pub const Manifest = struct {
     }
 
     fn observe(self: *Manifest, v: Version) void {
-        if (v.clock > self.clock) self.clock = v.clock;
+        if (v.clock <= max_remote_clock and v.clock > self.clock) self.clock = v.clock;
     }
 
     /// A local edit of `path` by `device`: a file (cid/size/mtime), a dir,
@@ -130,7 +132,7 @@ pub const Manifest = struct {
         deleted: bool = false,
     }, device: DeviceId, author: []const u8) !Version {
         if (!validPath(path)) return error.InvalidPath;
-        self.clock += 1;
+        self.clock = std.math.add(u64, self.clock, 1) catch return error.ClockExhausted;
         const version = Version{ .clock = self.clock, .device = device };
 
         var history = [_]?Version{null} ** history_len;
@@ -161,6 +163,7 @@ pub const Manifest = struct {
     /// Stores `entry` at its path and takes ownership, freeing what was
     /// there. On error nothing changes and the caller still owns `entry`.
     fn replace(self: *Manifest, entry: Entry) !void {
+        if (!self.entries.contains(entry.path) and self.entries.count() >= max_entries) return error.ManifestTooLarge;
         const gop = try self.entries.getOrPut(self.allocator, entry.path);
         if (gop.found_existing) gop.value_ptr.deinit(self.allocator);
         gop.key_ptr.* = entry.path;
@@ -176,6 +179,17 @@ pub const Manifest = struct {
 
     /// Merges a peer's entry (borrowed). Returns whether anything changed.
     pub fn merge(self: *Manifest, incoming: Entry) !bool {
+        return self.mergeAt(incoming, 0);
+    }
+
+    fn mergeAt(self: *Manifest, incoming: Entry, depth: usize) anyerror!bool {
+        if (incoming.version.clock > max_remote_clock) return false;
+        for (incoming.history) |maybe_h| {
+            if (maybe_h) |h| {
+                if (h.clock > max_remote_clock) return false;
+            }
+        }
+        if (depth >= max_depth) return error.InvalidPath;
         if (!validPath(incoming.path)) return error.InvalidPath;
         self.observe(incoming.version);
         const local = self.entries.get(incoming.path) orelse {
@@ -216,15 +230,8 @@ pub const Manifest = struct {
         self.allocator.free(moved.path);
         moved.path = conflict_path;
         moved.history = [_]?Version{null} ** history_len;
-        const already = if (self.entries.get(moved.path)) |e| e.version.eql(moved.version) else false;
-        if (already) {
-            moved.deinit(self.allocator);
-        } else {
-            self.replace(moved) catch |err| {
-                moved.deinit(self.allocator);
-                return err;
-            };
-        }
+        defer moved.deinit(self.allocator);
+        _ = try self.mergeAt(moved, depth + 1);
         // `loser` may alias the entry at the path: move it first, then
         // put the winner in place.
         if (incoming_wins) try self.adopt(incoming);
@@ -248,7 +255,7 @@ pub const Manifest = struct {
                 const item = &out.items[idx];
                 if (implied_dir) {
                     item.kind = .dir;
-                    item.size += e.size;
+                    item.size +|= e.size;
                     if (e.mtime > item.mtime) item.mtime = e.mtime;
                 }
                 continue;
@@ -274,6 +281,19 @@ pub const Manifest = struct {
         mtime: u64,
     };
 
+    /// Deletion mtimes are Unix seconds; unknown timestamps must be kept.
+    pub fn pruneTombstones(self: *Manifest, now: u64) void {
+        const horizon = 90 * 24 * 60 * 60;
+        var i: usize = 0;
+        while (i < self.entries.count()) {
+            const e = self.entries.values()[i];
+            if (e.deleted and e.mtime != 0 and now > e.mtime and now - e.mtime > horizon) {
+                self.entries.swapRemoveAt(i);
+                e.deinit(self.allocator);
+            } else i += 1;
+        }
+    }
+
     // ---- Wire / disk format (JSON) ----
 
     const WireVersion = struct { c: u64, d: []const u8 };
@@ -290,6 +310,7 @@ pub const Manifest = struct {
     };
 
     pub fn encode(self: *Manifest, allocator: std.mem.Allocator) ![]u8 {
+        if (self.entries.count() > max_entries) return error.ManifestTooLarge;
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -309,12 +330,18 @@ pub const Manifest = struct {
                 .a = e.author,
             };
         }
-        return std.json.Stringify.valueAlloc(allocator, wire, .{});
+        const bytes = try std.json.Stringify.valueAlloc(allocator, wire, .{});
+        if (bytes.len > max_bytes) {
+            allocator.free(bytes);
+            return error.ManifestTooLarge;
+        }
+        return bytes;
     }
 
     /// Merges every entry of an encoded manifest. Returns how many changed
     /// something. Entries that fail validation are skipped.
     pub fn mergeEncoded(self: *Manifest, bytes: []const u8) !usize {
+        if (bytes.len > max_bytes) return error.ManifestTooLarge;
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -330,6 +357,7 @@ pub const Manifest = struct {
     }
 
     fn fromWire(w: WireEntry) !Entry {
+        if (w.v.c > max_remote_clock) return error.InvalidEntry;
         if (!validPath(w.p)) return error.InvalidPath;
         const kind = std.enums.fromInt(Kind, w.k) orelse return error.InvalidEntry;
         var e = Entry{
@@ -343,6 +371,7 @@ pub const Manifest = struct {
         };
         if (kind == .file and !w.x) e.cid = try parseHex32(w.h);
         for (w.o[0..@min(w.o.len, history_len)], 0..) |h, i| {
+            if (h.c > max_remote_clock) return error.InvalidEntry;
             e.history[i] = .{ .clock = h.c, .device = try parseHex32(h.d) };
         }
         return e;
@@ -373,7 +402,7 @@ pub fn conflictPath(allocator: std.mem.Allocator, path: []const u8, author: []co
     var who_len: usize = 0;
     for (author) |c| {
         if (who_len == who_buf.len) break;
-        who_buf[who_len] = if (c == '/' or c == '\\' or c == 0) '_' else c;
+        who_buf[who_len] = if (c == '/' or c == '\\' or c < 0x20 or c == 0x7f) '_' else c;
         who_len += 1;
     }
     const who = if (who_len == 0) "another device" else who_buf[0..who_len];
@@ -507,4 +536,85 @@ test "manifest: conflict names" {
     const q = try conflictPath(testing.allocator, "README", "Desk");
     defer testing.allocator.free(q);
     try testing.expectEqualStrings("README (conflict from Desk)", q);
+}
+
+test "manifest: reject remote clock > maxInt(u64)/2 and local edit succeeds" {
+    var m = Manifest.init(testing.allocator);
+    defer m.deinit();
+
+    const bad_entry = Entry{
+        .path = try testing.allocator.dupe(u8, "poison.txt"),
+        .kind = .file,
+        .cid = cid1,
+        .size = 10,
+        .mtime = 1,
+        .version = .{ .clock = std.math.maxInt(u64), .device = dev_b },
+        .author = try testing.allocator.dupe(u8, "BadGuy"),
+    };
+    defer bad_entry.deinit(testing.allocator);
+
+    const changed = try m.merge(bad_entry);
+    try testing.expect(!changed);
+    try testing.expectEqual(@as(usize, 0), m.entries.count());
+    try testing.expect(m.clock < max_remote_clock);
+
+    // Hostile clock on wire JSON is skipped as well
+    const hostile_clock =
+        \\[{"p":"poison2.txt","k":0,"h":"0101010101010101010101010101010101010101010101010101010101010101","v":{"c":18446744073709551615,"d":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]
+    ;
+    try testing.expectEqual(@as(usize, 0), try m.mergeEncoded(hostile_clock));
+    try testing.expectEqual(@as(usize, 0), m.entries.count());
+
+    // Local edit succeeds without panic
+    const v = try m.edit("clean.txt", .{ .cid = cid2, .size = 20 }, dev_a, "Desk");
+    try testing.expectEqual(@as(u64, 1), v.clock);
+    try testing.expectEqual(@as(usize, 1), m.entries.count());
+}
+
+test "manifest: conflict copy merge does not overwrite newer local edit of conflict path" {
+    var a = Manifest.init(testing.allocator);
+    defer a.deinit();
+    var b = Manifest.init(testing.allocator);
+    defer b.deinit();
+
+    _ = try a.edit("file.txt", .{ .cid = cid1 }, dev_a, "Desk");
+    _ = try syncInto(&b, &a);
+
+    // Concurrent edits
+    _ = try a.edit("file.txt", .{ .cid = cid2 }, dev_a, "Desk");
+    _ = try b.edit("file.txt", .{ .cid = cid3 }, dev_b, "Phone");
+
+    _ = try syncInto(&a, &b);
+    try testing.expect(a.get("file (conflict from Desk).txt") != null);
+
+    // Local user on A edits the conflict copy
+    _ = try a.edit("file (conflict from Desk).txt", .{ .cid = cid1 }, dev_a, "Desk");
+    const clk = a.get("file (conflict from Desk).txt").?.version.clock;
+
+    // Redundant sync from B must not overwrite A's edit of conflict copy
+    _ = try syncInto(&a, &b);
+    try testing.expectEqual(clk, a.get("file (conflict from Desk).txt").?.version.clock);
+    try testing.expectEqualSlices(u8, &cid1, &a.get("file (conflict from Desk).txt").?.cid);
+}
+
+test "manifest: prune tombstones after 90 days" {
+    var m = Manifest.init(testing.allocator);
+    defer m.deinit();
+
+    _ = try m.edit("keep.txt", .{ .cid = cid1 }, dev_a, "Desk");
+    _ = try m.edit("recent_del.txt", .{ .deleted = true, .mtime = 1_000_000 + 90 * 24 * 60 * 60 }, dev_a, "Desk");
+    _ = try m.edit("old_del.txt", .{ .deleted = true, .mtime = 1_000_000 }, dev_a, "Desk");
+    _ = try m.edit("unknown_del.txt", .{ .deleted = true, .mtime = 0 }, dev_a, "Desk");
+
+    try testing.expectEqual(@as(usize, 4), m.entries.count());
+
+    // 90 days = 7_776_000 seconds
+    const now = 1_000_000 + 90 * 24 * 60 * 60 + 10;
+    m.pruneTombstones(now);
+
+    try testing.expect(m.get("keep.txt") != null);
+    try testing.expect(m.get("recent_del.txt") != null);
+    try testing.expect(m.get("unknown_del.txt") != null); // mtime == 0 kept
+    try testing.expect(m.get("old_del.txt") == null); // pruned!
+    try testing.expectEqual(@as(usize, 3), m.entries.count());
 }

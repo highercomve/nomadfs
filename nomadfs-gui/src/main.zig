@@ -30,7 +30,6 @@ fn initDataDirs() void {
 
 /// Events pushed from Zig to the page.
 pub const Events = struct {
-    node_state: struct { running: bool },
     /// While `updater_install` downloads (updates.zig).
     @"updater://progress": struct { downloaded: u64, total: ?u64 },
 };
@@ -224,20 +223,12 @@ pub const Commands = struct {
 
     /// `invoke("node_open", { config_path })`.
     pub fn node_open(gpa: std.mem.Allocator, args: commands.NodeOpenArgs) !void {
-        commands.dropFailed();
-        commands.nodeOpen(gpa, args) catch |err| {
-            if (err == error.NodeFailedToStart or err == error.ConfigInvalid) {
-                failedSeen();
-            }
-            return err;
-        };
-        if (commands.isRunning()) stateChanged();
+        return commands.nodeOpen(gpa, args);
     }
 
     /// `invoke("node_close")`.
     pub fn node_close() void {
         commands.nodeClose();
-        stateChanged();
     }
 
     /// `invoke("node_state")`.
@@ -348,24 +339,6 @@ fn setup() !void {
     background.setup();
     if (oriel.extensions.get("nomadfs.storage").available())
         oriel.extensions.expose("nomadfs.storage", .{ .methods = &.{ "status", "request", "info" } });
-}
-var g_change_once: std.atomic.Value(bool) = .init(false);
-
-fn stateChanged() void {
-    // Events go through the page's `listen("node_state", ...)` handler; the
-    // boolean payload matches commands.nodeState's fields.
-    _ = g_change_once.swap(true, .monotonic);
-}
-
-fn failedSeen() void {
-    LogPrint();
-}
-
-var failed_notified: bool = false;
-var failed_dirty: bool = false;
-
-fn LogPrint() void {
-    failed_dirty = true;
 }
 
 pub fn main(init: std.process.Init) !u8 {

@@ -27,6 +27,12 @@ fn validateSwarmKey(val: []const u8, allocator: std.mem.Allocator) ![]const u8 {
         _ = try std.fmt.hexToBytes(decoded, val);
         return decoded;
     } else if (val.len == 32) {
+        for (val) |c| {
+            if (!std.ascii.isHex(c)) break;
+        } else {
+            std.debug.print("Invalid swarm_key: expected 64 hex characters\n", .{});
+            return error.InvalidSwarmKey;
+        }
         // Binary key, just duplicate
         return try allocator.dupe(u8, val);
     } else {
@@ -77,6 +83,9 @@ pub const Config = struct {
         /// folder stays readable while the device that added a file is
         /// offline (an always-on desktop or server).
         swarm_backup: bool = false,
+        /// Most block-store space, in MiB, blocks pushed or fetched from
+        /// peers may take. 0 is unlimited.
+        quota_mb: u64 = 0,
     };
 
     pub const SecurityConfig = struct {
@@ -88,7 +97,7 @@ pub const Config = struct {
         port: u16,
         bootstrap_peers: [][]const u8,
         transport: TransportType,
-        upnp_enabled: bool = true,
+        upnp_enabled: bool = false,
         enable_mdns: bool = true,
     };
 
@@ -99,7 +108,10 @@ pub const Config = struct {
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.node.nickname.len > 0) allocator.free(self.node.nickname);
-        if (self.node.swarm_key.len > 0) allocator.free(self.node.swarm_key);
+        if (self.node.swarm_key.len > 0) {
+            std.crypto.secureZero(u8, @constCast(self.node.swarm_key));
+            allocator.free(self.node.swarm_key);
+        }
         if (self.node.key_path) |p| allocator.free(p);
         if (self.storage.storage_path.len > 0) allocator.free(self.storage.storage_path);
         for (self.network.bootstrap_peers) |peer| {
@@ -141,6 +153,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
     std.debug.assert(path.len > 0);
 
     var file_buffer: [16384]u8 = undefined;
+    defer std.crypto.secureZero(u8, &file_buffer);
     const content = try readConfigFile(allocator, path, &file_buffer);
     return parseConfigText(allocator, content);
 }
@@ -164,6 +177,8 @@ fn readConfigFile(allocator: std.mem.Allocator, path: []const u8, buffer: []u8) 
     defer file.close(io);
 
     const n = try file.readPositionalAll(io, buffer, 0);
+    var extra: [1]u8 = undefined;
+    if (n == buffer.len and try file.readPositionalAll(io, &extra, n) != 0) return error.ConfigTooLarge;
     return buffer[0..n];
 }
 
@@ -190,9 +205,9 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
 
         if (std.mem.startsWith(u8, trimmed, "[")) continue; // Skip section headers for now
 
-        var it = std.mem.splitSequence(u8, trimmed, "=");
-        const key = std.mem.trim(u8, it.next() orelse continue, " \t");
-        const val_raw = std.mem.trim(u8, it.next() orelse continue, " \t");
+        const equals = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const key = std.mem.trim(u8, trimmed[0..equals], " \t");
+        const val_raw = std.mem.trim(u8, trimmed[equals + 1 ..], " \t");
 
         // Simple string unquoting
         const val = if (val_raw.len >= 2 and std.mem.startsWith(u8, val_raw, "\"") and std.mem.endsWith(u8, val_raw, "\""))
@@ -235,7 +250,9 @@ fn applyConfigEntry(
     if (std.mem.eql(u8, key, "nickname")) {
         replaceString(allocator, &config.node.nickname, try allocator.dupe(u8, val));
     } else if (std.mem.eql(u8, key, "swarm_key")) {
-        replaceString(allocator, &config.node.swarm_key, try validateSwarmKey(val, allocator));
+        const key_bytes = try validateSwarmKey(val, allocator);
+        if (config.node.swarm_key.len > 0) std.crypto.secureZero(u8, @constCast(config.node.swarm_key));
+        replaceString(allocator, &config.node.swarm_key, key_bytes);
     } else if (std.mem.eql(u8, key, "swarm_epoch")) {
         config.node.swarm_epoch = try std.fmt.parseInt(u64, val, 10);
     } else if (std.mem.eql(u8, key, "key_path")) {
@@ -256,6 +273,10 @@ fn applyConfigEntry(
         config.storage.replicas = n;
     } else if (std.mem.eql(u8, key, "swarm_backup")) {
         config.storage.swarm_backup = std.mem.eql(u8, val, "true");
+    } else if (std.mem.eql(u8, key, "quota_mb")) {
+        const mb = try std.fmt.parseInt(u64, val, 10);
+        _ = std.math.mul(u64, mb, 1024 * 1024) catch return error.QuotaOutOfRange;
+        config.storage.quota_mb = mb;
     } else if (std.mem.eql(u8, key, "port")) {
         config.network.port = try std.fmt.parseInt(u16, val, 10);
     } else if (std.mem.eql(u8, key, "upnp_enabled")) {
@@ -301,7 +322,10 @@ pub fn findAndParseConfig(allocator: std.mem.Allocator) !Config {
     // 1. Current working directory
     if (parseConfig(allocator, "nomadfs.conf")) |cfg| {
         return cfg;
-    } else |_| {}
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
 
     // 2. Home directory: ~/.nomadfs/nomadfs.conf
     const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
@@ -311,13 +335,19 @@ pub fn findAndParseConfig(allocator: std.mem.Allocator) !Config {
         defer allocator.free(path);
         if (parseConfig(allocator, path)) |cfg| {
             return cfg;
-        } else |_| {}
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
     }
 
     // 3. System-wide standard: /etc/nomadfs/nomadfs.conf
     if (parseConfig(allocator, "/etc/nomadfs/nomadfs.conf")) |cfg| {
         return cfg;
-    } else |_| {}
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
 
     // 4. System-wide: /usr/share/nomadfs/nomadfs.conf
     if (parseConfig(allocator, "/usr/share/nomadfs/nomadfs.conf")) |cfg| {
@@ -337,6 +367,7 @@ test "parseConfigText parses all fields" {
         \\[storage]
         \\storage_path = "/tmp/nomad"
         \\replicas = 2
+        \\quota_mb = 512
         \\[network]
         \\port = 9100
         \\transport = "tcp"
@@ -352,6 +383,12 @@ test "parseConfigText parses all fields" {
     try std.testing.expectEqual(@as(usize, 2), cfg.network.bootstrap_peers.len);
     try std.testing.expect(cfg.security.require_trusted_devices);
     try std.testing.expectEqual(@as(u8, 2), cfg.storage.replicas);
+    try std.testing.expectEqual(@as(u64, 512), cfg.storage.quota_mb);
+}
+
+test "config: a quota that overflows bytes is refused" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.QuotaOutOfRange, parseConfigText(a, "nickname = alpha\nswarm_key = " ++ "ab" ** 32 ++ "\nstorage_path = /tmp/a\nquota_mb = 18446744073709551615\n"));
 }
 
 test "parseConfigText releases everything on failure" {
@@ -381,7 +418,7 @@ test "parseConfigText reads repeatable shares" {
     const allocator = std.testing.allocator;
     var config = try parseConfigText(allocator,
         \\nickname = "Desk"
-        \\swarm_key = "0123456789abcdef0123456789abcdef"
+        \\swarm_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         \\storage_path = "/tmp/x"
         \\[shares]
         \\share = "Documents:/home/me/Documents"
@@ -395,4 +432,22 @@ test "parseConfigText reads repeatable shares" {
     try std.testing.expectEqualStrings("Camera", config.shares[1].name);
     try std.testing.expectEqualStrings("/sdcard/DCIM/Camera", config.shares[1].path);
     try std.testing.expectError(error.InvalidShare, Config.Share.parse("no-colon"));
+}
+
+test "config: reject short hex keys and preserve equals in values" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.InvalidSwarmKey, validateSwarmKey("0123456789abcdef0123456789abcdef", a));
+    var cfg = try parseConfigText(a, "nickname = alpha\nswarm_key = " ++ "ab" ** 32 ++ "\nstorage_path = /tmp/a=b=c\n");
+    defer cfg.deinit(a);
+    try std.testing.expectEqualStrings("/tmp/a=b=c", cfg.storage.storage_path);
+}
+
+test "config: reject files larger than the input buffer" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "test_device_oversized.conf";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writePositionalAll(io, ("#" ** 16385), 0);
+    try std.testing.expectError(error.ConfigTooLarge, parseConfig(std.testing.allocator, path));
 }

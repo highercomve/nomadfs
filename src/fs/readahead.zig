@@ -131,6 +131,7 @@ pub const ReadAhead = struct {
         defer self.mutex.unlock();
         const end = offset + len;
         const now = sync.monotonicMillis();
+        self.pruneStaleStreamsLocked(now);
         const entry = self.streams.getOrPut(self.allocator, root) catch return .{ .from = end, .len = 0, .cursor = 0 };
         if (!entry.found_existing) entry.value_ptr.* = .{};
         const st = entry.value_ptr;
@@ -170,6 +171,39 @@ pub const ReadAhead = struct {
         const from = @max(cur.queued_until, cur.next);
         cur.queued_until = want;
         return .{ .from = from, .len = want - from, .cursor = cur.id };
+    }
+
+    /// Evicts streams whose cursors have not been read from for longer than stale_ms.
+    /// Caller holds mutex.
+    fn pruneStaleStreamsLocked(self: *ReadAhead, now: i64) void {
+        while (true) {
+            var to_remove: [16]Cid = undefined;
+            var remove_count: usize = 0;
+            var it = self.streams.iterator();
+            while (it.next()) |entry| {
+                const st = entry.value_ptr;
+                var active = false;
+                for (&st.cursors) |*slot| {
+                    if (slot.*) |c| {
+                        if (now - c.used_at > stale_ms) {
+                            self.dropCursor(c.id);
+                            slot.* = null;
+                        } else {
+                            active = true;
+                        }
+                    }
+                }
+                if (!active) {
+                    to_remove[remove_count] = entry.key_ptr.*;
+                    remove_count += 1;
+                    if (remove_count == to_remove.len) break;
+                }
+            }
+            for (to_remove[0..remove_count]) |root| {
+                _ = self.streams.remove(root);
+            }
+            if (remove_count < to_remove.len) break;
+        }
     }
 
     /// Caller holds mutex.
@@ -321,3 +355,41 @@ pub const ReadAhead = struct {
         }
     };
 };
+
+test "ReadAhead prunes stale streams and drops cursors" {
+    const allocator = std.testing.allocator;
+    var ra = ReadAhead{
+        .allocator = allocator,
+        .block_manager = undefined,
+        .store = undefined,
+    };
+    defer {
+        ra.queue.deinit(allocator);
+        ra.in_flight.deinit(allocator);
+        ra.streams.deinit(allocator);
+    }
+
+    const root1: Cid = [_]u8{1} ** 32;
+    const root2: Cid = [_]u8{2} ** 32;
+
+    _ = ra.track(root1, 0, 1024);
+    _ = ra.track(root2, 0, 1024);
+
+    try std.testing.expectEqual(@as(usize, 2), ra.streams.count());
+
+    // Artificially age root1's cursors beyond stale_ms
+    const now = sync.monotonicMillis();
+    const st1 = ra.streams.getPtr(root1).?;
+    for (&st1.cursors) |*slot| {
+        if (slot.*) |*c| {
+            c.used_at = now - ReadAhead.stale_ms - 1000;
+        }
+    }
+
+    // Next track call triggers pruning
+    _ = ra.track(root2, 1024, 1024);
+
+    try std.testing.expectEqual(@as(usize, 1), ra.streams.count());
+    try std.testing.expect(!ra.streams.contains(root1));
+    try std.testing.expect(ra.streams.contains(root2));
+}

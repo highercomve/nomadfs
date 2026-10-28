@@ -74,6 +74,7 @@ pub const InitialWindowSize: u32 = 1024 * 1024;
 /// the receive window this caps buffered receive data per session at
 /// MaxStreams * InitialWindowSize (64 MiB).
 pub const MaxStreams: u32 = 64;
+pub const close_timeout_ms: i64 = 30_000;
 
 /// A single logical stream within a Yamux session.
 ///
@@ -96,6 +97,8 @@ pub const YamuxStream = struct {
     write_cond: sync.Condition = .{},
     /// The local user called streamClose and no longer references the stream.
     local_closed: bool = false,
+    closed_at_ms: i64 = 0,
+    reader_active: bool = false,
     /// The peer sent FIN or RST; no more data will arrive.
     remote_closed: bool = false,
     /// The peer sent RST or the session shut down; writes fail.
@@ -206,11 +209,51 @@ pub const Session = struct {
         }
     }
 
-    /// Streams still tracked by the session, including ones awaiting accept.
+    /// Active streams exclude locally released streams.
     pub fn streamCount(self: *Session) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.streams.count();
+        return self.activeCountLocked();
+    }
+
+    fn activeCountLocked(self: *Session) usize {
+        var count: usize = 0;
+        var it = self.streams.valueIterator();
+        while (it.next()) |entry| {
+            const stream = entry.*;
+            stream.mutex.lock();
+            if (!stream.local_closed) count += 1;
+            stream.mutex.unlock();
+        }
+        return count;
+    }
+
+    pub fn reapClosed(self: *Session, now_ms: i64) void {
+        // Total tracked streams are bounded, including closed tombstones.
+        var ids: [MaxStreams * 2]u32 = undefined;
+        var count: usize = 0;
+        self.mutex.lock();
+        var it = self.streams.valueIterator();
+        while (it.next()) |entry| {
+            const stream = entry.*;
+            stream.mutex.lock();
+            const expired = stream.local_closed and !stream.reader_active and
+                now_ms - stream.closed_at_ms >= close_timeout_ms;
+            stream.mutex.unlock();
+            if (expired) {
+                ids[count] = stream.id;
+                count += 1;
+            }
+        }
+        for (ids[0..count]) |stream_id| {
+            self.destroyStreamLocked(self.streams.get(stream_id).?);
+        }
+        const closed = self.closed;
+        self.mutex.unlock();
+        if (closed) return;
+        for (ids[0..count]) |stream_id| {
+            self.writeFrame(.{ .type = .WINDOW_UPDATE, .flags = Flags.RST, .stream_id = stream_id, .length = 0 }, &.{}) catch {};
+        }
     }
 
     pub fn isClosed(self: *Session) bool {
@@ -220,6 +263,7 @@ pub const Session = struct {
     }
 
     pub fn newStream(self: *Session) !*YamuxStream {
+        self.reapClosed(sync.monotonicMillis());
         const stream_ptr = try self.allocator.create(YamuxStream);
 
         {
@@ -228,7 +272,7 @@ pub const Session = struct {
             errdefer self.allocator.destroy(stream_ptr);
 
             if (self.closed or self.go_away) return error.SessionClosed;
-            if (self.streams.count() >= MaxStreams) return error.TooManyStreams;
+            if (self.activeCountLocked() >= MaxStreams or self.streams.count() >= MaxStreams * 2) return error.TooManyStreams;
             if (self.next_stream_id > std.math.maxInt(u32) - 2) return error.StreamIdsExhausted;
 
             stream_ptr.* = YamuxStream.init(self.allocator, self.next_stream_id, self);
@@ -332,18 +376,20 @@ pub const Session = struct {
             stream.mutex.lock();
             defer stream.mutex.unlock();
             if (stream.remote_closed) return .discard;
+            stream.reader_active = true;
             return .{ .stream = stream };
         }
 
         const is_incoming = if (self.is_server) (header.stream_id % 2 != 0) else (header.stream_id % 2 == 0);
         if (!is_incoming or header.flags & Flags.SYN == 0) return .discard;
         if (self.closed) return .discard;
-        if (self.streams.count() >= MaxStreams) return .refuse;
+        if (self.activeCountLocked() >= MaxStreams or self.streams.count() >= MaxStreams * 2) return .refuse;
 
         try self.streams.ensureUnusedCapacity(self.allocator, 1);
         try self.accept_queue.ensureUnusedCapacity(self.allocator, 1);
         const new_s = try self.allocator.create(YamuxStream);
         new_s.* = YamuxStream.init(self.allocator, header.stream_id, self);
+        new_s.reader_active = true;
         self.streams.putAssumeCapacity(header.stream_id, new_s);
         self.accept_queue.appendAssumeCapacity(new_s);
         self.accept_cond.signal();
@@ -364,6 +410,8 @@ pub const Session = struct {
                 }, &.{});
             },
         };
+
+        defer self.finishData(stream);
 
         // Enforce the receive window before reading any payload, so a peer
         // can never make us buffer more than InitialWindowSize per stream.
@@ -386,13 +434,23 @@ pub const Session = struct {
 
             stream.mutex.lock();
             defer stream.mutex.unlock();
-            try stream.incoming_data.appendSlice(self.allocator, chunk[0..n]);
+            if (!stream.local_closed) try stream.incoming_data.appendSlice(self.allocator, chunk[0..n]);
             stream.cond.broadcast();
         }
 
         if (header.flags & (Flags.FIN | Flags.RST) != 0) {
             self.remoteClose(header.stream_id, header.flags & Flags.RST != 0);
         }
+    }
+
+    fn finishData(self: *Session, stream: *YamuxStream) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        stream.mutex.lock();
+        stream.reader_active = false;
+        const release = stream.local_closed and stream.remote_closed;
+        stream.mutex.unlock();
+        if (release) self.destroyStreamLocked(stream);
     }
 
     fn handleWindowUpdate(self: *Session, header: Header) !void {
@@ -422,7 +480,7 @@ pub const Session = struct {
             if (is_reset) stream.reset = true;
             stream.cond.broadcast();
             stream.write_cond.broadcast();
-            release = stream.local_closed;
+            release = stream.local_closed and !stream.reader_active;
         }
         if (release) self.destroyStreamLocked(stream);
     }
@@ -442,6 +500,7 @@ pub const Session = struct {
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
         // One transport write per frame: the header doesn't travel alone.
+        defer if (self.write_buffer.capacity > 128 * 1024) self.write_buffer.clearAndFree(self.allocator);
         self.write_buffer.clearRetainingCapacity();
         try self.write_buffer.ensureTotalCapacity(self.allocator, h_buf.len + payload.len);
         self.write_buffer.appendSliceAssumeCapacity(&h_buf);
@@ -598,10 +657,13 @@ pub const Session = struct {
                 defer stream.mutex.unlock();
                 if (stream.local_closed) return;
                 stream.local_closed = true;
+                stream.closed_at_ms = sync.monotonicMillis();
+                stream.incoming_data.clearAndFree(session.allocator);
+                stream.read_index = 0;
                 stream.cond.broadcast();
                 stream.write_cond.broadcast();
                 send_fin = !stream.reset;
-                release = stream.remote_closed;
+                release = stream.remote_closed and !stream.reader_active;
             }
             if (release) session.destroyStreamLocked(stream);
         }
@@ -679,4 +741,42 @@ test "YamuxStream ring buffer" {
 
     try std.testing.expectEqualStrings("ABCDE", stream.incoming_data.items);
     try std.testing.expectEqual(@as(usize, 0), stream.read_index);
+}
+
+test "locally closed streams release buffers and expire without peer FIN" {
+    const Sink = struct {
+        resets: usize = 0,
+        fn read(_: *anyopaque, _: []u8) anyerror!usize {
+            return 0;
+        }
+        fn write(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (bytes.len >= 12 and (try Header.decode(bytes[0..12].*)).flags & Flags.RST != 0) self.resets += 1;
+            return bytes.len;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable: network.Stream.StreamVTable = .{ .read = read, .write = write, .close = close };
+    };
+    var sink: Sink = .{};
+    const session = try Session.init(std.testing.allocator, network.Stream.init(&sink, &Sink.vtable), false);
+    defer session.deinit();
+    const stream = try session.newStream();
+    try stream.incoming_data.appendSlice(std.testing.allocator, "unread payload");
+    Session.streamClose(stream);
+    try std.testing.expectEqual(@as(usize, 0), stream.incoming_data.capacity);
+    try std.testing.expectEqual(@as(usize, 0), session.streamCount());
+    session.reapClosed(stream.closed_at_ms + close_timeout_ms - 1);
+    try std.testing.expectEqual(@as(usize, 1), session.streams.count());
+    // Dispatch pins the stream while a DATA payload is being read.
+    stream.reader_active = true;
+    session.reapClosed(stream.closed_at_ms + close_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), session.streams.count());
+    stream.reader_active = false;
+    session.reapClosed(stream.closed_at_ms + close_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 0), session.streams.count());
+    try std.testing.expectEqual(@as(usize, 1), sink.resets);
+    const large = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(large);
+    try session.writeFrame(.{ .type = .DATA, .flags = 0, .stream_id = 7, .length = @intCast(large.len) }, large);
+    try std.testing.expectEqual(@as(usize, 0), session.write_buffer.capacity);
 }

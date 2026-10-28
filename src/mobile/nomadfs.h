@@ -20,6 +20,9 @@
 extern "C" {
 #endif
 
+/* Maximum reassembled file size: 4 GiB. */
+#define NOMADFS_MAX_FILE_BYTES 4294967296ULL
+
 #define NOMADFS_OK 0
 #define NOMADFS_INVALID_ARGUMENT 1
 #define NOMADFS_STORAGE_DISABLED 2
@@ -36,11 +39,13 @@ const char *nomadfs_version(void);
  * trust stores. Returns NULL on a bad or missing config. */
 NomadNode *nomadfs_node_new(const char *config_path);
 
-/* Frees the node, joins its threads and releases the config. */
+/* Waits for in-flight calls, joins threads and releases the config.
+ * Do not reuse the handle after free; its address may be reused. */
 void nomadfs_node_free(NomadNode *node);
 
-/* Starts the TCP listener on a dedicated thread. Non-blocking; repeat calls
- * are no-ops. */
+/* Binds the TCP listener before returning; accepts run in the background.
+ * Repeat calls while running are no-ops. After stop or a startup failure,
+ * run returns NOMADFS_UNAVAILABLE; create a new node to restart. */
 int nomadfs_node_run(NomadNode *node);
 
 /* Signals the listener to stop and joins its thread. */
@@ -59,7 +64,8 @@ char *nomadfs_put_file(NomadNode *node, const char *in_path);
 
 /* Reassembles the file rooted at the 64-hex-character `cid` into
  * `out_path`, fetching missing blocks from holder records first, then from
- * the peers closest to the CID. Creates or truncates the output. */
+ * the peers closest to the CID. Creates or truncates the output.
+ * Rejects malformed CIDs and files larger than NOMADFS_MAX_FILE_BYTES. */
 int nomadfs_get_file(NomadNode *node, const char *cid, const char *out_path);
 
 /* Writes this node's device ID (64 hex characters + NUL) into `out`. */

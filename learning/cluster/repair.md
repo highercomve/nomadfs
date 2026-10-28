@@ -19,12 +19,12 @@ A depth-first walk from the root:
 ```text
 root ─ have it  → read locally, push children
   ├─ child A ─ missing → GET_BLOCK, verify, store, push its children
-  └─ child B ─ have it → read locally, push its children
+  └─ child B ─ have it → read locally, push children
 ```
 
 Blocks already held are not fetched again, but their children are still checked, so a DAG that was only partly present gets completed. Returns how many blocks were fetched.
 
-Bounds: at most `max_blocks` = 2²⁰ distinct blocks per sync (`error.DagTooLarge`), because a valid DAG from a peer can still be enormous. `syncWhile` checks `keep_going` between blocks and returns `error.Cancelled` once it turns false.
+Bounds: at most `max_blocks` = 2²⁰ distinct blocks per sync (and `blockBudget(max_bytes)` during file walks, returning `error.DagTooLarge`), because a valid DAG from a peer can still be enormous. `syncWhile` checks `keep_going` between blocks and returns `error.Cancelled` once it turns false.
 
 ## 2. `push`: Send a DAG
 
@@ -32,7 +32,9 @@ Bounds: at most `max_blocks` = 2²⁰ distinct blocks per sync (`error.DagTooLar
 pub fn push(allocator, node, store, peer, root_cid) !usize
 ```
 
-Collects every CID under the root (`walk.collectReachable`, which fails if the local DAG is incomplete, so partial content is never replicated) and sends each block with `PUT_BLOCK`. The receiver verifies each block against its CID before storing it and answers with `STORE_ACK`. Used by `BlockManager.replicate`.
+Collects every CID under the root (`walk.collectReachable`, which fails if the local DAG is incomplete, so partial content is never replicated) and sends each block with `PUT_BLOCK`.
+
+Pushed replicas do not require the receiving device to have a trusted-device pairing entry: admission to the swarm (the Noise handshake) is the write authorization. The receiver bounds each pushed block to `max_put_block_len` (`@max((chunker.Params{}).max_size + 1, codec.max_dir_block_len)`), checks the SHA-256 hash against the CID, and verifies that the block does not exceed `quota_mb` (`error.StorageFull`), answering with `STORE_ACK`. Used by `BlockManager.replicate`.
 
 ## 3. Who Calls It
 

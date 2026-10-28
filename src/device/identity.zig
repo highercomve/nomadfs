@@ -108,7 +108,10 @@ pub const Identity = struct {
         }
 
         const created = generate();
-        try created.saveToFile(path);
+        created.saveToFile(path) catch |err| switch (err) {
+            error.PathAlreadyExists => return loadFromFile(path),
+            else => return err,
+        };
         return created;
     }
 
@@ -122,10 +125,12 @@ pub const Identity = struct {
 
         if ((try file.stat(io)).size != file_len) return error.InvalidKeyFile;
         var buf: [file_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buf);
         if (try file.readPositionalAll(io, &buf, 0) != file_len) return error.InvalidKeyFile;
         if (!std.mem.eql(u8, buf[0..magic.len], magic)) return error.InvalidKeyFile;
 
         var seed_bytes: [seed_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed_bytes);
         @memcpy(&seed_bytes, buf[magic.len..]);
         return fromSeed(seed_bytes) catch error.InvalidKeyFile;
     }
@@ -133,16 +138,18 @@ pub const Identity = struct {
     /// Writes a new identity. Never overwrites an existing one.
     pub fn saveToFile(self: Identity, path: []const u8) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        var file = try std.Io.Dir.cwd().createFile(io, path, .{
-            .exclusive = true,
+        var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
             .permissions = key_file_permissions,
         });
-        defer file.close(io);
+        defer atomic.deinit(io);
 
         var buf: [file_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buf);
         @memcpy(buf[0..magic.len], magic);
         buf[magic.len..].* = self.seed();
-        try file.writePositionalAll(io, &buf, 0);
+        try atomic.file.writePositionalAll(io, &buf, 0);
+        try atomic.file.sync(io);
+        try atomic.link(io);
     }
 };
 

@@ -242,6 +242,9 @@ pub const Connection = struct {
         /// Check if the connection is closed
         isClosed: *const fn (ctx: *anyopaque) bool,
 
+        /// Periodic cleanup; may perform I/O, so callers must hold no pool lock.
+        maintain: ?*const fn (ctx: *anyopaque) void = null,
+
         /// Whether anyone besides the manager is using the connection
         /// (holding a reference or an open stream). Used by idle reaping.
         isInUse: *const fn (ctx: *anyopaque) bool,
@@ -322,6 +325,12 @@ pub const Connection = struct {
         v.deinit(p);
     }
 
+    pub fn maintain(self: Connection) void {
+        const p = self.ptr orelse return;
+        const v = self.vtable orelse return;
+        if (v.maintain) |f| f(p);
+    }
+
     pub fn isInUse(self: Connection) bool {
         const p = self.ptr orelse return false;
         const v = self.vtable orelse return false;
@@ -344,10 +353,8 @@ pub fn isPrivate(addr: Address) bool {
 }
 
 /// Dial order, lowest first: loopback, the LAN, Tailscale and other CGNAT
-/// VPN ranges (they work away from home), then public addresses.
+/// VPN ranges (they work away from home), then public addresses. Addresses
+/// that can't be dialed (port 0, multicast, link-local...) sort last.
 pub fn addressPriority(addr: Address) u8 {
-    if (isLoopback(addr)) return 0;
-    if (isPrivate(addr)) return 1;
-    if (@import("../local_addrs.zig").isCgnat(addr)) return 2;
-    return 3;
+    return @import("../local_addrs.zig").addressPriority(addr);
 }

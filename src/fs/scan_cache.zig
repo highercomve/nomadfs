@@ -1,5 +1,5 @@
 //! What the scanner learned about each shared file, kept on disk: its size,
-//! mtime and root CID. A restart then re-reads only files that changed; a
+//! mtime, ctime, inode and root CID. A restart then re-reads only files that changed; a
 //! large share (a media disk) is otherwise hashed again on every start.
 //! The file's leaves are not recorded: its parent blocks in the store
 //! already list them (scan.zig rebuilds them from there).
@@ -10,7 +10,7 @@
 //! ignored and overwritten. The file is rewritten without stale records
 //! once they outnumber the live ones.
 //!
-//!   put:  [u8 1][u16 path_len][path][u64 size][i64 mtime_ns][cid: 32]
+//!   put:  [u8 1][u16 path_len][path][u64 size][i64 mtime_ns][i64 ctime_ns][u64 inode][cid: 32]
 //!   drop: [u8 2][u16 path_len][path]
 //!
 //! Integers are little-endian.
@@ -22,13 +22,16 @@ pub const Cid = codec.Cid;
 
 const file_name = "scan-cache";
 const tmp_name = "scan-cache.tmp";
-const header = "NOMADFS-SCAN-CACHE-1\n";
+const header = "NOMADFS-SCAN-CACHE-2\n";
 const tag_put: u8 = 1;
 const tag_drop: u8 = 2;
+pub const max_cache_bytes = 64 * 1024 * 1024;
 
 pub const Entry = struct {
     size: u64,
     mtime_ns: i64,
+    ctime_ns: i64,
+    inode: u64,
     cid: Cid,
 };
 
@@ -54,13 +57,19 @@ pub const ScanCache = struct {
         var self = ScanCache{ .allocator = allocator, .io = io, .dir = dir, .file = file, .end = 0 };
 
         const size = (try file.stat(io)).size;
+        if (size > max_cache_bytes) {
+            try file.setLength(io, 0);
+            try file.writePositionalAll(io, header, 0);
+            self.end = header.len;
+            return self;
+        }
         const bytes = try allocator.alloc(u8, @intCast(size));
         defer allocator.free(bytes);
         const n = try file.readPositionalAll(io, bytes, 0);
         const data = bytes[0..n];
 
         if (data.len < header.len or !std.mem.eql(u8, data[0..header.len], header)) {
-            // New, or not ours: start over.
+            // New, or not ours (e.g. old cache version): start over.
             try file.setLength(io, 0);
             try file.writePositionalAll(io, header, 0);
             self.end = header.len;
@@ -88,12 +97,14 @@ pub const ScanCache = struct {
     pub fn put(self: *ScanCache, path: []const u8, entry: Entry) !void {
         if (path.len > std.math.maxInt(u16)) return;
         const w = &self.pending;
-        try w.ensureUnusedCapacity(self.allocator, 1 + 2 + path.len + 8 + 8 + 32);
+        try w.ensureUnusedCapacity(self.allocator, 1 + 2 + path.len + 8 + 8 + 8 + 8 + 32);
         w.appendAssumeCapacity(tag_put);
         appendInt(w, u16, @intCast(path.len));
         w.appendSliceAssumeCapacity(path);
         appendInt(w, u64, entry.size);
         appendInt(w, i64, entry.mtime_ns);
+        appendInt(w, i64, entry.ctime_ns);
+        appendInt(w, u64, entry.inode);
         w.appendSliceAssumeCapacity(&entry.cid);
         self.records += 1;
     }
@@ -137,8 +148,9 @@ pub const ScanCache = struct {
             try tmp.writePositionalAll(self.io, out.pending.items, 0);
         }
         try self.dir.rename(tmp_name, self.dir, file_name, self.io);
+        const new_file = try self.dir.createFile(self.io, file_name, .{ .truncate = false, .read = true });
         self.file.close(self.io);
-        self.file = try self.dir.createFile(self.io, file_name, .{ .truncate = false, .read = true });
+        self.file = new_file;
         self.end = out.pending.items.len;
         self.records = out.records;
         self.pending.clearRetainingCapacity();
@@ -169,12 +181,14 @@ fn parse(data: []const u8) ?Parsed {
     switch (data[0]) {
         tag_drop => return .{ .kind = .drop, .path = path, .len = path_end },
         tag_put => {
-            const len = path_end + 8 + 8 + 32;
+            const len = path_end + 8 + 8 + 8 + 8 + 32;
             if (data.len < len) return null;
             return .{ .kind = .put, .path = path, .len = len, .entry = .{
                 .size = std.mem.readInt(u64, data[path_end..][0..8], .little),
                 .mtime_ns = std.mem.readInt(i64, data[path_end + 8 ..][0..8], .little),
-                .cid = data[path_end + 16 ..][0..32].*,
+                .ctime_ns = std.mem.readInt(i64, data[path_end + 16 ..][0..8], .little),
+                .inode = std.mem.readInt(u64, data[path_end + 24 ..][0..8], .little),
+                .cid = data[path_end + 32 ..][0..32].*,
             } };
         },
         else => return null,
@@ -208,8 +222,8 @@ test "scan cache: records survive a reopen, last one wins, torn tail ignored" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const a: Entry = .{ .size = 5, .mtime_ns = 100, .cid = [_]u8{1} ** 32 };
-    const b: Entry = .{ .size = 7, .mtime_ns = 200, .cid = [_]u8{2} ** 32 };
+    const a: Entry = .{ .size = 5, .mtime_ns = 100, .ctime_ns = 100, .inode = 1, .cid = [_]u8{1} ** 32 };
+    const b: Entry = .{ .size = 7, .mtime_ns = 200, .ctime_ns = 200, .inode = 2, .cid = [_]u8{2} ** 32 };
     {
         var empty: TestMap = .{ .allocator = allocator };
         defer empty.deinit();
@@ -251,7 +265,7 @@ test "scan cache: compaction keeps only live entries" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const e: Entry = .{ .size = 1, .mtime_ns = 1, .cid = [_]u8{3} ** 32 };
+    const e: Entry = .{ .size = 1, .mtime_ns = 1, .ctime_ns = 1, .inode = 1, .cid = [_]u8{3} ** 32 };
     var empty: TestMap = .{ .allocator = allocator };
     defer empty.deinit();
     var cache = try ScanCache.open(allocator, io, tmp.dir, &empty);
@@ -279,4 +293,25 @@ test "scan cache: compaction keeps only live entries" {
     defer reopened.close();
     try testing.expectEqual(@as(u32, 2), seen.map.count());
     try testing.expectEqual(@as(u64, 2), reopened.records);
+}
+
+test "scan cache: old cache format version drops old cache cleanly" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Write a v1 cache
+    {
+        var f = try tmp.dir.createFile(io, file_name, .{ .truncate = true });
+        defer f.close(io);
+        try f.writePositionalAll(io, "NOMADFS-SCAN-CACHE-1\n", 0);
+    }
+
+    var seen: TestMap = .{ .allocator = allocator };
+    defer seen.deinit();
+    var cache = try ScanCache.open(allocator, io, tmp.dir, &seen);
+    defer cache.close();
+    try testing.expectEqual(@as(u32, 0), seen.map.count());
 }

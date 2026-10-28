@@ -46,7 +46,16 @@ fn initTmpDir() void {
     }
 }
 var g_mutex: nomadfs.sync.Mutex = .{};
+/// Serialises every read-modify-write of the config file (editConfig and
+/// ensureConfig). Lock order: g_mutex first, then this one. Nothing takes
+/// g_mutex while holding it.
+var g_config_mutex: nomadfs.sync.Mutex = .{};
 var g_tick: u64 = 0;
+
+/// Owner-only, like `device.key` and `trust.store`: the config holds the
+/// swarm key, and the directory holds the keys. Windows keeps its defaults.
+const private_file_perms: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else @enumFromInt(0o600);
+const private_dir_perms: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else @enumFromInt(0o700);
 
 pub const NodeOpenArgs = struct { config_path: []const u8 };
 pub const DeviceEntry = struct {
@@ -54,20 +63,11 @@ pub const DeviceEntry = struct {
     label: []const u8,
     added_at: u64,
 };
-pub var failed_running: bool = false;
-
-pub fn dropFailed() void {
-    failed_running = false;
-}
 
 pub fn isRunning() bool {
     g_mutex.lock();
     defer g_mutex.unlock();
     return g_node != null;
-}
-
-fn setFailed(value: bool) void {
-    failed_running = value;
 }
 
 /// `invoke("node_open", { config_path })`: opens and starts listening.
@@ -126,12 +126,6 @@ pub fn nodeClose() void {
         mobile.nomadfs_node_free(node);
         g_node = null;
     }
-    setFailed(false);
-}
-
-fn requireRunning() *mobile.NodeHandle {
-    if (g_node) |handle| return handle;
-    return error.NotRunning;
 }
 
 /// Callers already hold `g_mutex`; this must not lock again.
@@ -202,40 +196,82 @@ pub const RevokeDeviceArgs = struct { config_path: []const u8, query: []const u8
 /// transport key; it lands in the user's own configuration file.
 pub fn ensureConfig(gpa: std.mem.Allocator) !ConfigResult {
     const path = try defaultConfigPath(gpa);
-    {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const dir = try dataDir(gpa);
-        defer gpa.free(dir);
-        const keys_path = try std.fs.path.join(gpa, &.{ dir, "keys", "node.key" });
-        defer gpa.free(keys_path);
-        const storage_path_abs = try std.fs.path.join(gpa, &.{ dir, "data" });
-        defer gpa.free(storage_path_abs);
-        _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
-            var swarm: [64]u8 = undefined;
-            // The swarm key admits devices to the swarm: from the OS's
-            // secure random source, never a seeded PRNG.
-            var rnd: [32]u8 = undefined;
-            try io.randomSecure(&rnd);
-            defer std.crypto.secureZero(u8, &rnd);
-            const swarm_key = std.fmt.bufPrint(&swarm, "{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch unreachable;
-            try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path) orelse "/");
-            const keys_dir = try std.fs.path.join(gpa, &.{ dir, "keys" });
-            defer gpa.free(keys_dir);
-            try std.Io.Dir.cwd().createDirPath(io, keys_dir);
-            var file = try std.Io.Dir.cwd().createFile(io, path, .{});
-            defer file.close(io);
-            var text: std.Io.Writer.Allocating = .init(gpa);
-            defer text.deinit();
-            var nick_buf: [64]u8 = undefined;
-            try text.writer.print("\n[node]\nnickname = \"{s}\"\nswarm_key = \"{s}\"\nkey_path = \"{s}\"\n" ++
-                "\n[storage]\nenabled = true\nstorage_path = \"{s}\"\n" ++
-                "\n[network]\nport = 14700\ntransport = \"tcp\"\nupnp_enabled = false\n" ++
-                "enable_mdns = false\nwrite_quorum = 0\nreplicas = 1\n", .{ defaultNickname(&nick_buf), swarm_key, keys_path, storage_path_abs });
-            try file.writePositionalAll(io, text.written(), 0);
-            return .{ .path = path, .created = true };
-        };
-    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try dataDir(gpa);
+    defer gpa.free(dir);
+
+    g_config_mutex.lock();
+    defer g_config_mutex.unlock();
+    _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+        try createConfig(gpa, io, dir, path);
+        return .{ .path = path, .created = true };
+    };
+    // A config written before owner-only modes existed holds the swarm key
+    // world-readable: tighten it and its directory.
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    try file.setPermissions(io, private_file_perms);
+    if (std.Io.Dir.cwd().openDir(io, dir, .{})) |d_val| {
+        var d = d_val;
+        defer d.close(io);
+        d.setPermissions(io, private_dir_perms) catch {};
+    } else |_| {}
     return .{ .path = path, .created = false };
+}
+
+/// Writes a new config with a random swarm key, in `dir` (created owner-only
+/// with its keys subdirectory). Caller holds g_config_mutex.
+fn createConfig(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, path: []const u8) !void {
+    const keys_path = try std.fs.path.join(gpa, &.{ dir, "keys", "node.key" });
+    defer gpa.free(keys_path);
+    const storage_path_abs = try std.fs.path.join(gpa, &.{ dir, "data" });
+    defer gpa.free(storage_path_abs);
+
+    var swarm: [64]u8 = undefined;
+    defer std.crypto.secureZero(u8, &swarm);
+    // The swarm key admits devices to the swarm: from the OS's secure
+    // random source, never a seeded PRNG.
+    var rnd: [32]u8 = undefined;
+    try io.randomSecure(&rnd);
+    defer std.crypto.secureZero(u8, &rnd);
+    const swarm_key = std.fmt.bufPrint(&swarm, "{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch unreachable;
+
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, std.fs.path.dirname(path) orelse "/", private_dir_perms);
+    const keys_dir = try std.fs.path.join(gpa, &.{ dir, "keys" });
+    defer gpa.free(keys_dir);
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, keys_dir, private_dir_perms);
+
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    defer {
+        @memset(text.written(), 0);
+        text.deinit();
+    }
+    var nick_buf: [64]u8 = undefined;
+    try text.writer.print("\n[node]\nnickname = \"{s}\"\nswarm_key = \"{s}\"\nkey_path = \"{s}\"\n" ++
+        "\n[storage]\nenabled = true\nstorage_path = \"{s}\"\n" ++
+        "\n[network]\nport = 14700\ntransport = \"tcp\"\nupnp_enabled = false\n" ++
+        "enable_mdns = false\nwrite_quorum = 0\nreplicas = 1\n", .{ defaultNickname(&nick_buf), swarm_key, keys_path, storage_path_abs });
+    try writeConfigAtomic(gpa, io, path, text.written());
+}
+
+/// Replaces the file at `path` with `text`: the text goes to a temp file in
+/// the same directory, which is fsynced and then renamed over `path`. A
+/// crash or a failed write leaves the old file whole, and the new one is
+/// owner-only.
+fn writeConfigAtomic(gpa: std.mem.Allocator, io: std.Io, path: []const u8, text: []const u8) !void {
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
+    defer gpa.free(tmp_path);
+    const cwd = std.Io.Dir.cwd();
+    errdefer cwd.deleteFile(io, tmp_path) catch {};
+    {
+        var file = try cwd.createFile(io, tmp_path, .{ .truncate = true, .permissions = private_file_perms });
+        defer file.close(io);
+        // A temp file left by an earlier run keeps its old mode on truncate.
+        try file.setPermissions(io, private_file_perms);
+        try file.writePositionalAll(io, text, 0);
+        try file.sync(io);
+    }
+    try cwd.rename(tmp_path, cwd, path, io);
 }
 
 /// What other devices call this one until it is renamed: the hostname on
@@ -353,8 +389,15 @@ pub fn devicesList(gpa: std.mem.Allocator, args: ListArgs) ![]DeviceEntry {
     var store = try TrustStore.load(gpa, paths.trust, identity.seed());
     defer store.deinit();
 
-    const entries = try gpa.alloc(DeviceEntry, store.list().len);
-    for (entries, store.list()) |*out, entry| {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const target: *TrustStore = liveTrustStore(paths.trust) orelse &store;
+
+    // A running node's store changes under revocations from peers: copy it.
+    const list = try target.copyEntries(gpa);
+    defer gpa.free(list);
+    const entries = try gpa.alloc(DeviceEntry, list.len);
+    for (entries, list) |*out, entry| {
         var fingerprint_buf: [19]u8 = undefined;
         const fingerprint = Identity.formatFingerprint(entry.fingerprint(), &fingerprint_buf);
         out.* = .{
@@ -366,6 +409,17 @@ pub fn devicesList(gpa: std.mem.Allocator, args: ListArgs) ![]DeviceEntry {
     return entries;
 }
 
+/// The running node's trust store, when the node reads the trust file at
+/// `trust_path`; null otherwise. Caller holds g_mutex. The node keeps its
+/// own copy in memory and rewrites the file from that copy on its next
+/// save, so an edit made to the file behind its back would be lost.
+fn liveTrustStore(trust_path: []const u8) ?*TrustStore {
+    const handle = g_node orelse return null;
+    const live = handle.node.trust_store;
+    if (!std.mem.eql(u8, live.path, trust_path)) return null;
+    return live;
+}
+
 /// `invoke("trust_device", { config_path, uri })`.
 pub fn trustDevice(gpa: std.mem.Allocator, args: TrustDeviceArgs) !void {
     var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
@@ -375,13 +429,32 @@ pub fn trustDevice(gpa: std.mem.Allocator, args: TrustDeviceArgs) !void {
     defer paths.deinit(gpa);
 
     const identity = try Identity.loadOrCreate(paths.identity);
-    var store = try TrustStore.load(gpa, paths.trust, identity.seed());
-    defer store.deinit();
-
     const now = nomadfs.nowSeconds();
     const ticket = Ticket.parseAt(args.uri, now) catch return error.TicketRejected;
-    _ = try store.trustTicket(ticket, now);
+
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    if (liveTrustStore(paths.trust)) |live| {
+        _ = live.trustTicket(ticket, now) catch |err| return staleTicket(err);
+        return live.save();
+    }
+    var store = try TrustStore.load(gpa, paths.trust, identity.seed());
+    defer store.deinit();
+    _ = store.trustTicket(ticket, now) catch |err| return staleTicket(err);
     try store.save();
+}
+
+/// A newer ticket for the device is already pinned: tell the page, which
+/// asks for a fresh ticket instead of overwriting the newer pin.
+fn staleTicket(err: anyerror) anyerror {
+    return if (err == error.StaleTicket) error.TicketStale else err;
+}
+
+/// This device's Ed25519 identity, as the ticket emitter uses it.
+fn deviceIdentity(gpa: std.mem.Allocator, key_path: ?[]const u8) !Identity {
+    var paths = try DevicePaths.resolve(gpa, key_path);
+    defer paths.deinit(gpa);
+    return Identity.loadOrCreate(paths.identity);
 }
 
 /// `invoke("revoke_device", { config_path, query })`.
@@ -401,11 +474,12 @@ pub fn revokeDevice(gpa: std.mem.Allocator, args: RevokeDeviceArgs) !void {
     // older copy on its next save).
     g_mutex.lock();
     defer g_mutex.unlock();
-    const target: *TrustStore = if (g_node) |handle| handle.node.trust_store else &store;
+    const target: *TrustStore = liveTrustStore(paths.trust) orelse &store;
 
     const id = try target.resolve(args.query) orelse return error.DeviceNotFound;
     _ = try target.revokeDevice(id, identity.deviceId(), @intCast(nomadfs.nowSeconds()));
     try target.save();
+    if (g_node) |handle| _ = handle.node.connection_manager.closePeer(id);
 }
 
 // ---- Shared folders ----
@@ -543,7 +617,16 @@ pub fn shareRemove(gpa: std.mem.Allocator, args: ShareRemoveArgs) !void {
 }
 
 pub const RemoteShare = struct { name: []const u8, cid: []const u8, size: u64, mtime: u64 };
-pub const RemoteDevice = struct { peer: []const u8, nickname: []const u8, shares: []RemoteShare };
+pub const RemoteDevice = struct {
+    peer: []const u8, // transport id hex (unchanged: keys browse/download calls)
+    nickname: []const u8, // CLAIMED name, untrusted
+    shares: []RemoteShare,
+    device_id: []const u8, // hex of the authenticated device id ("" if unknown)
+    fingerprint: []const u8, // "aaaa-bbbb-cccc-dddd" (same format as devices_list)
+    trusted: bool,
+    label: []const u8, // trust-store label, "" if not trusted
+    mount_name: []const u8, // exactly what the mount shows (device_names.assign)
+};
 
 /// `invoke("remote_devices")`: every reachable device and what it shares.
 /// Devices that don't answer are left out.
@@ -556,7 +639,33 @@ pub fn remoteDevices(gpa: std.mem.Allocator) ![]RemoteDevice {
 
     const peers = try fs.remote.knownPeers(bm, gpa);
     defer gpa.free(peers);
-    var out: std.ArrayList(RemoteDevice) = .empty;
+
+    const ProbeResult = struct {
+        peer: NodeID,
+        device_id: ?NodeID,
+        nickname: []u8,
+        shares: []RemoteShare,
+        trusted: bool,
+        label: []const u8,
+        added_at: u64,
+    };
+
+    var results: std.ArrayList(ProbeResult) = .empty;
+    defer {
+        for (results.items) |r| {
+            gpa.free(r.nickname);
+            gpa.free(r.label);
+            for (r.shares) |s| {
+                gpa.free(s.name);
+                gpa.free(s.cid);
+            }
+            gpa.free(r.shares);
+        }
+        results.deinit(gpa);
+    }
+
+    const trust_store = handle.node.trust_store;
+
     for (peers) |peer| {
         var remote = fs.Remote{ .block_manager = bm, .store = store, .peer = peer };
         const shares = remote.shares(gpa) catch |err| {
@@ -568,9 +677,79 @@ pub fn remoteDevices(gpa: std.mem.Allocator) ![]RemoteDevice {
         for (shares.listing.entries, list) |e, *o| {
             o.* = .{ .name = try gpa.dupe(u8, e.name), .cid = try hexAlloc(gpa, &e.cid), .size = e.size, .mtime = e.mtime };
         }
-        try out.append(gpa, .{ .peer = try hexAlloc(gpa, &peer.bytes), .nickname = shares.nickname, .shares = list });
+
+        const dev_id_opt = shares.device_id;
+        var is_trusted = false;
+        var label: []const u8 = try gpa.dupe(u8, "");
+        var added_at: u64 = 0;
+
+        if (dev_id_opt) |did| {
+            if (trust_store.lookup(did)) |entry| {
+                is_trusted = true;
+                gpa.free(label);
+                label = try gpa.dupe(u8, entry.labelSlice());
+                added_at = entry.added_at;
+            }
+        }
+
+        try results.append(gpa, .{
+            .peer = peer,
+            .device_id = dev_id_opt,
+            .nickname = shares.nickname,
+            .shares = list,
+            .trusted = is_trusted,
+            .label = label,
+            .added_at = added_at,
+        });
     }
-    return out.items;
+
+    if (results.items.len == 0) {
+        return gpa.alloc(RemoteDevice, 0);
+    }
+
+    const assign_entries = try gpa.alloc(fs.device_names.Entry, results.items.len);
+    defer gpa.free(assign_entries);
+    const mount_names = try gpa.alloc([]u8, results.items.len);
+    defer gpa.free(mount_names);
+
+    for (results.items, 0..) |r, i| {
+        const id_bytes = if (r.device_id) |did| did.bytes else r.peer.bytes;
+        assign_entries[i] = .{
+            .device_id = id_bytes,
+            .trusted = if (r.trusted) .{ .label = r.label, .added_at = r.added_at } else null,
+            .nickname = r.nickname,
+        };
+    }
+
+    try fs.device_names.assign(gpa, assign_entries, mount_names);
+
+    const out = try gpa.alloc(RemoteDevice, results.items.len);
+    for (results.items, 0..) |r, i| {
+        const dev_id_bytes = if (r.device_id) |did| did.bytes else r.peer.bytes;
+        var fp_buf: [19]u8 = undefined;
+        const fp_str = if (r.device_id != null)
+            Identity.formatFingerprint(dev_id_bytes[0..8].*, &fp_buf)
+        else
+            "";
+        const dev_id_hex = if (r.device_id != null)
+            try hexAlloc(gpa, &dev_id_bytes)
+        else
+            try gpa.dupe(u8, "");
+
+        out[i] = .{
+            .peer = try hexAlloc(gpa, &r.peer.bytes),
+            .nickname = r.nickname,
+            .shares = r.shares,
+            .device_id = dev_id_hex,
+            .fingerprint = try gpa.dupe(u8, fp_str),
+            .trusted = r.trusted,
+            .label = r.label,
+            .mount_name = mount_names[i],
+        };
+    }
+
+    results.items.len = 0;
+    return out;
 }
 
 pub const BrowseArgs = struct { peer: []const u8, cid: []const u8 };
@@ -902,12 +1081,29 @@ const can_mount = builtin.os.tag == .linux and !builtin.abi.isAndroid();
 const MountJob = struct {
     mount: if (can_mount) fs.fuse.Mount else void,
     thread: std.Thread,
+    /// Points into `g_mount_path`, never a heap copy.
     path: [:0]u8,
     failed: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
 };
 
 var g_mount: ?*MountJob = null;
+
+/// The mount point of the live job. Static, because emergencyUnmount reads
+/// it without the lock: a heap copy freed with the job would be a
+/// use-after-free from the signal handler.
+var g_mount_path: [std.fs.max_path_bytes:0]u8 = undefined;
+/// True from before the serve thread starts until its job is freed. The
+/// signal handler checks this, never the job.
+var g_mount_active: std.atomic.Value(bool) = .init(false);
+
+/// Copies `path` into g_mount_path. Caller holds g_mutex and no job is live.
+fn setMountPath(path: []const u8) ![:0]u8 {
+    if (path.len >= g_mount_path.len) return error.InvalidPath;
+    @memcpy(g_mount_path[0..path.len], path);
+    g_mount_path[path.len] = 0;
+    return g_mount_path[0..path.len :0];
+}
 
 pub const MountStatus = struct {
     supported: bool,
@@ -979,17 +1175,22 @@ pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
     }
     try std.Io.Dir.cwd().createDirPath(io, args.path);
 
+    const path = try setMountPath(args.path);
     const job = try std.heap.page_allocator.create(MountJob);
     errdefer std.heap.page_allocator.destroy(job);
     job.* = .{
         .mount = try fs.fuse.Mount.init(std.heap.page_allocator, handle.node.block_manager, store),
         .thread = undefined,
-        .path = try std.heap.page_allocator.dupeZ(u8, args.path),
+        .path = path,
     };
+    // Each failure below unwinds what the steps above set up.
+    errdefer if (can_mount) job.mount.deinit();
     if (can_mount) {
         job.mount.swarm = handle.node.swarm;
         job.mount.read_ahead = handle.node.read_ahead;
     }
+    g_mount_active.store(true, .release);
+    errdefer g_mount_active.store(false, .release);
     job.thread = try std.Thread.spawn(.{}, serveMount, .{job});
     g_mount = job;
 
@@ -1020,8 +1221,9 @@ fn serveMount(job: *MountJob) void {
 /// the process: the kernel would otherwise keep a dead mount behind.
 pub fn emergencyUnmount() void {
     if (!can_mount) return;
-    const job = @atomicLoad(?*MountJob, &g_mount, .acquire) orelse return;
-    if (!job.done.load(.acquire)) fs.fuse.unmount(job.path);
+    if (!g_mount_active.load(.acquire)) return;
+    // Unmounting a mount that already ended just fails; harmless here.
+    fs.fuse.unmount(std.mem.sliceTo(&g_mount_path, 0));
 }
 
 /// `invoke("mount_stop")`.
@@ -1052,8 +1254,8 @@ fn reapMountLocked() void {
 }
 
 fn freeMountJob(job: *MountJob) void {
+    g_mount_active.store(false, .release);
     if (can_mount) job.mount.deinit();
-    std.heap.page_allocator.free(job.path);
     std.heap.page_allocator.destroy(job);
 }
 
@@ -1099,13 +1301,19 @@ pub fn openPath(gpa: std.mem.Allocator, args: OpenPathArgs) !void {
     const pid = linux.fork();
     if (linux.errno(pid) != .SUCCESS) return error.ForkFailed;
     if (pid == 0) {
-        // Detach so the opener outlives nothing of ours.
-        _ = linux.setsid();
-        _ = linux.execve(program.ptr, &argv, envp);
-        linux.exit(127);
+        // Double-fork: the grandchild is reparented to init (PID 1) and reaped
+        // by the OS, while the intermediate child exits immediately so the
+        // parent can reap it synchronously without leaving a zombie.
+        const child2 = linux.fork();
+        if (child2 == 0) {
+            _ = linux.setsid();
+            _ = linux.execve(program.ptr, &argv, envp);
+            linux.exit(127);
+        }
+        linux.exit(if (linux.errno(child2) == .SUCCESS) 0 else 127);
     }
     var status: u32 = 0;
-    _ = linux.wait4(@intCast(pid), &status, linux.W.NOHANG, null);
+    _ = linux.wait4(@intCast(pid), &status, 0, null);
 }
 
 // ---- Joining devices ----
@@ -1161,10 +1369,12 @@ pub fn inviteCreate(gpa: std.mem.Allocator, args: ListArgs) !InviteInfo {
     defer g_invite_mutex.unlock();
     cancelInviteLocked();
     const host = try invite.Host.start(std.heap.page_allocator, .{
+        .identity = try deviceIdentity(gpa, config.node.key_path),
         .swarm_key = config.node.swarm_key[0..32].*,
         .node_port = config.network.port,
         .ticket_uri = ticket.uri,
-    }, config.network.port +% 1, invite.default_lifetime_s, nomadfs.nowSeconds());
+    }, try std.math.add(u16, config.network.port, 1), invite.default_lifetime_s, nomadfs.nowSeconds());
+    errdefer host.destroy();
     var buf: [160]u8 = undefined;
     g_invite_code = try std.heap.page_allocator.dupe(u8, try host.code(ip, &buf));
     g_invite = host;
@@ -1226,7 +1436,12 @@ fn inviteInfoLocked(gpa: std.mem.Allocator, config_path: []const u8) !InviteInfo
 /// Trusts a device's pairing ticket and remembers its addresses as
 /// bootstrap peers, dialing them now if the node is running.
 fn adoptPeer(gpa: std.mem.Allocator, config_path: []const u8, ticket_uri: []const u8) !void {
-    try trustDevice(gpa, .{ .config_path = config_path, .uri = ticket_uri });
+    // The invite peer proved it holds this identity; when a newer ticket of
+    // it is already pinned, keep that pin and still learn its addresses.
+    trustDevice(gpa, .{ .config_path = config_path, .uri = ticket_uri }) catch |err| switch (err) {
+        error.TicketStale => {},
+        else => return err,
+    };
     const ticket = try Ticket.parseAt(ticket_uri, nomadfs.nowSeconds());
     var urls: std.ArrayList([]const u8) = .empty;
     defer {
@@ -1283,21 +1498,22 @@ pub const InviteAcceptArgs = struct { config_path: []const u8, code: []const u8 
 pub fn inviteAccept(gpa: std.mem.Allocator, args: InviteAcceptArgs) ![]const u8 {
     var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
     const port = config.network.port;
+    const identity = deviceIdentity(gpa, config.node.key_path) catch |err| {
+        config.deinit(gpa);
+        return err;
+    };
     config.deinit(gpa);
 
     const my_addr = try myAddresses(gpa, port);
     defer gpa.free(my_addr);
     const mine = try pairTicket(gpa, .{ .config_path = args.config_path, .address = my_addr });
 
-    var joined = try invite.join(gpa, args.code, mine.uri);
+    var joined = try invite.join(gpa, args.code, mine.uri, identity);
     defer joined.deinit(gpa);
 
     const was_running = isRunning();
     if (was_running) nodeClose();
-    const key_hex = std.fmt.bytesToHex(joined.swarm_key, .lower);
-    const key_line = try std.fmt.allocPrint(gpa, "swarm_key = \"{s}\"", .{&key_hex});
-    defer gpa.free(key_line);
-    try editConfig(gpa, args.config_path, .{ .drop_keys = &.{"swarm_key"}, .append = &.{key_line} });
+    try writeSwarmKey(gpa, args.config_path, joined.swarm_key, 0);
     const url = try std.fmt.allocPrint(gpa, "tcp://{s}:{d}", .{ joined.host_ip, joined.node_port });
     defer gpa.free(url);
     try addBootstrapPeers(gpa, args.config_path, &.{url});
@@ -1320,6 +1536,8 @@ fn rememberConfigPath(path: []const u8) void {
     g_config_path_len = n;
 }
 
+var g_rotation_mutex: nomadfs.sync.Mutex = .{};
+var g_rotation_worker_active: bool = false;
 const PendingRotation = struct { key: [32]u8 = undefined, epoch: u64 = 0 };
 var g_rotation: PendingRotation = .{};
 
@@ -1327,30 +1545,72 @@ var g_rotation: PendingRotation = .{};
 /// Runs on a request thread: persist and restart from another thread, so
 /// this request can still be answered.
 fn onRotation(ctx: *anyopaque, new_key: [32]u8, epoch: u64) void {
-    const pending: *PendingRotation = @ptrCast(@alignCast(ctx));
-    pending.* = .{ .key = new_key, .epoch = epoch };
-    const t = std.Thread.spawn(.{}, adoptRotation, .{pending.*}) catch return;
-    t.detach();
+    _ = ctx;
+    g_rotation_mutex.lock();
+    defer g_rotation_mutex.unlock();
+    if (epoch <= g_rotation.epoch and g_rotation.epoch != 0) return;
+    g_rotation.key = new_key;
+    g_rotation.epoch = epoch;
+    if (!g_rotation_worker_active) {
+        g_rotation_worker_active = true;
+        if (std.Thread.spawn(.{}, adoptRotationWorker, .{})) |t| {
+            t.detach();
+        } else |err| {
+            g_rotation_worker_active = false;
+            std.crypto.secureZero(u8, &g_rotation.key);
+            g_rotation.epoch = 0;
+            std.debug.print("rotation: failed to spawn worker: {any}\n", .{err});
+        }
+    }
 }
 
-fn adoptRotation(rot: PendingRotation) void {
+fn adoptRotationWorker() void {
     nomadfs.sync.sleep(500 * std.time.ns_per_ms);
     const gpa = std.heap.page_allocator;
-    const path = gpa.dupe(u8, g_config_path_buf[0..g_config_path_len]) catch return;
-    defer gpa.free(path);
-    writeSwarmKey(gpa, path, rot.key, rot.epoch) catch |err| {
-        std.debug.print("rotation: saving the new key failed: {any}\n", .{err});
-        return;
-    };
-    std.debug.print("rotation: adopted swarm key epoch {d}; restarting the node\n", .{rot.epoch});
-    nodeClose();
-    nodeOpen(gpa, .{ .config_path = path }) catch |err| std.debug.print("rotation: restart failed: {any}\n", .{err});
+
+    while (true) {
+        g_rotation_mutex.lock();
+        if (g_rotation.epoch == 0) {
+            g_rotation_worker_active = false;
+            g_rotation_mutex.unlock();
+            break;
+        }
+        var work_key = g_rotation.key;
+        const work_epoch = g_rotation.epoch;
+        std.crypto.secureZero(u8, &g_rotation.key);
+        g_rotation.epoch = 0;
+        g_rotation_mutex.unlock();
+
+        defer std.crypto.secureZero(u8, &work_key);
+
+        const path = blk: {
+            g_mutex.lock();
+            defer g_mutex.unlock();
+            break :blk gpa.dupe(u8, g_config_path_buf[0..g_config_path_len]) catch null;
+        } orelse continue;
+        defer gpa.free(path);
+
+        writeSwarmKey(gpa, path, work_key, work_epoch) catch |err| {
+            std.debug.print("rotation: saving the new key failed: {any}\n", .{err});
+            continue;
+        };
+        std.debug.print("rotation: adopted swarm key epoch {d}; restarting the node\n", .{work_epoch});
+        nodeClose();
+        nodeOpen(gpa, .{ .config_path = path }) catch |err| {
+            std.debug.print("rotation: restart failed: {any}\n", .{err});
+        };
+    }
 }
 
 fn writeSwarmKey(gpa: std.mem.Allocator, path: []const u8, key: [32]u8, epoch: u64) !void {
-    const hex = std.fmt.bytesToHex(key, .lower);
+    var hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&hex, "{s}", .{std.fmt.bytesToHex(key, .lower)}) catch unreachable;
+    defer std.crypto.secureZero(u8, &hex);
     const key_line = try std.fmt.allocPrint(gpa, "swarm_key = \"{s}\"", .{&hex});
-    defer gpa.free(key_line);
+    defer {
+        @memset(key_line, 0);
+        gpa.free(key_line);
+    }
     const epoch_line = try std.fmt.allocPrint(gpa, "swarm_epoch = {d}", .{epoch});
     defer gpa.free(epoch_line);
     try editConfig(gpa, path, .{ .drop_keys = &.{ "swarm_key", "swarm_epoch" }, .append = &.{ key_line, epoch_line } });
@@ -1434,6 +1694,9 @@ const ConfigEdit = struct {
 /// Rewrites the config file line by line: drops matching lines, appends
 /// new ones. Comments and unrelated settings are kept as they are.
 fn editConfig(gpa: std.mem.Allocator, path: []const u8, edit: ConfigEdit) !void {
+    g_config_mutex.lock();
+    defer g_config_mutex.unlock();
+
     const io = std.Io.Threaded.global_single_threaded.io();
     const old = blk: {
         var file = try std.Io.Dir.cwd().openFile(io, path, .{});
@@ -1475,9 +1738,7 @@ fn editConfig(gpa: std.mem.Allocator, path: []const u8, edit: ConfigEdit) !void 
         try out.append(gpa, '\n');
     }
 
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
-    defer file.close(io);
-    try file.writePositionalAll(io, out.items, 0);
+    try writeConfigAtomic(gpa, io, path, out.items);
 }
 
 const testing = std.testing;
@@ -1535,6 +1796,96 @@ test "commands: node put/get text round trip" {
     const fetched = try getText(alloc, .{ .cid = cid });
     defer alloc.free(fetched);
     try testing.expectEqualStrings(text, fetched);
+}
+
+test "commands: editConfig is atomic, serialized, and keeps private perms" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = "/tmp/nomadfs-gui-test-editconfig";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+
+    var conf_buf: [512]u8 = undefined;
+    const conf_path = try std.fmt.bufPrint(&conf_buf, "{s}/nomadfs.conf", .{dir});
+    var file = try std.Io.Dir.cwd().createFile(io, conf_path, .{ .truncate = true, .permissions = private_file_perms });
+    try file.writePositionalAll(io, "nickname = \"alpha\"\nport = 14700\n", 0);
+    file.close(io);
+
+    const alloc = testing.allocator;
+    try editConfig(alloc, conf_path, .{ .drop_keys = &.{"nickname"}, .append = &.{"nickname = \"beta\""} });
+
+    // Verify .tmp was renamed and removed
+    var tmp_buf: [512]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{conf_path});
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, tmp_path, .{}));
+
+    // Verify contents
+    var read_file = try std.Io.Dir.cwd().openFile(io, conf_path, .{});
+    defer read_file.close(io);
+    var content_buf: [512]u8 = undefined;
+    const n = try read_file.readPositionalAll(io, &content_buf, 0);
+    try testing.expectEqualStrings("port = 14700\nnickname = \"beta\"\n", content_buf[0..n]);
+}
+
+test "commands: ensureConfig sets private permissions on dir and file" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const test_dir = "/tmp/nomadfs-gui-test-perms";
+    std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+
+    const alloc = testing.allocator;
+    const conf_path = try std.fs.path.join(alloc, &.{ test_dir, "nomadfs.conf" });
+    defer alloc.free(conf_path);
+
+    try createConfig(alloc, io, test_dir, conf_path);
+
+    if (builtin.os.tag == .linux) {
+        // Verify dir permissions: 0700
+        var dir = try std.Io.Dir.cwd().openDir(io, test_dir, .{});
+        defer dir.close(io);
+        const dir_stat = try dir.stat(io);
+        try testing.expectEqual(@as(std.posix.mode_t, 0o700), @intFromEnum(dir_stat.permissions) & 0o777);
+
+        // Verify config permissions: 0600
+        var file = try std.Io.Dir.cwd().openFile(io, conf_path, .{});
+        defer file.close(io);
+        const file_stat = try file.stat(io);
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), @intFromEnum(file_stat.permissions) & 0o777);
+    }
+}
+
+test "commands: remote device fields populate trust, label and mount_name" {
+    const gpa = testing.allocator;
+    const peer = NodeID{ .bytes = [_]u8{0x12} ** 32 };
+    const dev_id = NodeID{ .bytes = [_]u8{0x34} ** 32 };
+
+    var fp_buf: [19]u8 = undefined;
+    const fp_str = Identity.formatFingerprint(dev_id.bytes[0..8].*, &fp_buf);
+
+    const dev = RemoteDevice{
+        .peer = try hexAlloc(gpa, &peer.bytes),
+        .nickname = try gpa.dupe(u8, "Alpha"),
+        .shares = try gpa.alloc(RemoteShare, 0),
+        .device_id = try hexAlloc(gpa, &dev_id.bytes),
+        .fingerprint = try gpa.dupe(u8, fp_str),
+        .trusted = false,
+        .label = try gpa.dupe(u8, ""),
+        .mount_name = try gpa.dupe(u8, "Alpha-34343434"),
+    };
+    defer {
+        gpa.free(dev.peer);
+        gpa.free(dev.nickname);
+        gpa.free(dev.shares);
+        gpa.free(dev.device_id);
+        gpa.free(dev.fingerprint);
+        gpa.free(dev.label);
+        gpa.free(dev.mount_name);
+    }
+
+    try testing.expect(!dev.trusted);
+    try testing.expectEqualStrings("", dev.label);
+    try testing.expectEqualStrings("Alpha-34343434", dev.mount_name);
+    try testing.expectEqualStrings("3434-3434-3434-3434", dev.fingerprint);
 }
 
 // ---- About ----

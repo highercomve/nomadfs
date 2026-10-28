@@ -24,11 +24,14 @@ const posix = std.posix;
 const system = posix.system;
 
 fn createSocket(domain: u32, sock_type: u32, protocol: u32) !posix.socket_t {
-    const rc = system.socket(domain, sock_type, protocol);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        else => |err| posix.unexpectedErrno(err),
-    };
+    while (true) {
+        const rc = system.socket(domain, sock_type, protocol);
+        if (posix.errno(rc) == .INTR) continue;
+        return switch (posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            else => |err| posix.unexpectedErrno(err),
+        };
+    }
 }
 
 fn closeSocket(s: posix.socket_t) void {
@@ -40,28 +43,37 @@ fn shutdownSocket(s: posix.socket_t, how: i32) void {
 }
 
 fn bindSocket(s: posix.socket_t, addr: *const posix.sockaddr, len: posix.socklen_t) !void {
-    const rc = system.bind(@intCast(s), addr, len);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => {},
-        else => |err| posix.unexpectedErrno(err),
-    };
+    while (true) {
+        const rc = system.bind(@intCast(s), addr, len);
+        if (posix.errno(rc) == .INTR) continue;
+        return switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            else => |err| posix.unexpectedErrno(err),
+        };
+    }
 }
 
 fn sendtoSocket(s: posix.socket_t, buf: []const u8, flags: u32, addr: ?*const posix.sockaddr, alen: posix.socklen_t) !usize {
-    const rc = system.sendto(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        else => |err| posix.unexpectedErrno(err),
-    };
+    while (true) {
+        const rc = system.sendto(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
+        if (posix.errno(rc) == .INTR) continue;
+        return switch (posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            else => |err| posix.unexpectedErrno(err),
+        };
+    }
 }
 
 fn recvfromSocket(s: posix.socket_t, buf: []u8, flags: u32, addr: ?*posix.sockaddr, alen: ?*posix.socklen_t) !usize {
-    const rc = system.recvfrom(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        .AGAIN => error.WouldBlock,
-        else => |err| posix.unexpectedErrno(err),
-    };
+    while (true) {
+        const rc = system.recvfrom(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
+        if (posix.errno(rc) == .INTR) continue;
+        return switch (posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            .AGAIN => error.WouldBlock,
+            else => |err| posix.unexpectedErrno(err),
+        };
+    }
 }
 
 pub const MDNS = struct {
@@ -167,11 +179,11 @@ pub const MDNS = struct {
 
         const addr = Address.parseIp("0.0.0.0", self.mdns_port) catch unreachable;
         const sa = addr.toPosix();
-        try bindSocket(recv_socket, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
+        try bindSocket(recv_socket, @ptrCast(&sa), sa.len());
 
         const mcast_sa = (Address.parseIp(MDNS_MULTICAST_ADDR, 0) catch unreachable).toPosix();
         const mreq = ip_mreq{
-            .imr_multiaddr = mcast_sa.addr,
+            .imr_multiaddr = mcast_sa.ip4.addr,
             .imr_interface = 0,
         };
         const add_membership = if (@hasDecl(posix, "IP_ADD_MEMBERSHIP")) posix.IP_ADD_MEMBERSHIP else 35;
@@ -230,7 +242,7 @@ pub const MDNS = struct {
         const msg = try std.fmt.bufPrint(&msg_buf, "{s}{{\"id\":\"{x}\",\"port\":{d}}}", .{ MAGIC_PREFIX, self.local_peer_id.bytes, self.local_tcp_port });
 
         const dest = (try Address.parseIp(MDNS_MULTICAST_ADDR, self.mdns_port)).toPosix();
-        _ = try sendtoSocket(socket, msg, 0, @ptrCast(&dest), @sizeOf(@TypeOf(dest)));
+        _ = try sendtoSocket(socket, msg, 0, @ptrCast(&dest), dest.len());
     }
 
     fn handlePacket(self: *MDNS, data: []const u8, src: Address) !void {

@@ -74,7 +74,10 @@ pub const SwarmFolder = struct {
         };
         errdefer allocator.free(self.self_name);
         self.file_path = try allocator.dupe(u8, file_path);
-        self.load() catch |err| std.debug.print("swarm: starting with an empty folder ({any})\n", .{err});
+        errdefer allocator.free(self.file_path);
+        errdefer self.manifest.deinit();
+        self.cleanStaging();
+        try self.load();
         return self;
     }
 
@@ -95,17 +98,34 @@ pub const SwarmFolder = struct {
         };
         defer file.close(self.io);
         const size = (try file.stat(self.io)).size;
-        if (size > 64 * 1024 * 1024) return error.ManifestTooLarge;
+        if (size > manifest_mod.max_bytes) {
+            self.moveCorruptAside();
+            return error.ManifestTooLarge;
+        }
         const bytes = try self.allocator.alloc(u8, @intCast(size));
         defer self.allocator.free(bytes);
-        _ = try file.readPositionalAll(self.io, bytes, 0);
-        _ = try self.manifest.mergeEncoded(bytes);
+        if (try file.readPositionalAll(self.io, bytes, 0) != bytes.len) {
+            self.moveCorruptAside();
+            return error.InvalidManifest;
+        }
+        _ = self.manifest.mergeEncoded(bytes) catch |err| {
+            self.moveCorruptAside();
+            return err;
+        };
+    }
+
+    fn moveCorruptAside(self: *SwarmFolder) void {
+        const corrupt_path = std.fmt.allocPrint(self.allocator, "{s}.corrupt-{d}", .{ self.file_path, self.now() }) catch return;
+        defer self.allocator.free(corrupt_path);
+        std.Io.Dir.cwd().rename(self.file_path, std.Io.Dir.cwd(), corrupt_path, self.io) catch {};
     }
 
     /// Caller holds `mutex`. Written to a temp file and renamed into place.
     fn saveLocked(self: *SwarmFolder) !void {
+        self.manifest.pruneTombstones(self.now());
         const bytes = try self.manifest.encode(self.allocator);
         defer self.allocator.free(bytes);
+        if (bytes.len > manifest_mod.max_bytes) return error.ManifestTooLarge;
         const tmp = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.file_path});
         defer self.allocator.free(tmp);
         {
@@ -240,6 +260,20 @@ pub const SwarmFolder = struct {
         errdefer allocator.free(dir);
         try std.Io.Dir.cwd().createDirPath(self.io, dir);
         return dir;
+    }
+
+    /// Empties leftover *.part staging files.
+    pub fn cleanStaging(self: *SwarmFolder) void {
+        const dir_path = self.stagingDir(self.allocator) catch return;
+        defer self.allocator.free(dir_path);
+        var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (std.mem.endsWith(u8, entry.name, ".part")) {
+                dir.deleteFile(self.io, entry.name) catch {};
+            }
+        }
     }
 
     /// Live entries at `path` or below it (owned copies). Caller holds mutex.
@@ -450,7 +484,7 @@ pub const SwarmFolder = struct {
             files += 1;
             if (self.backed_up.contains(e.cid)) {
                 done += 1;
-                bytes += e.size;
+                bytes +|= e.size;
             }
         }
         const out: BackupStatus = .{
@@ -563,7 +597,7 @@ pub const SwarmFolder = struct {
         };
         defer file.close(self.io);
         const size = (try file.stat(self.io)).size;
-        if (size % 32 != 0 or size > 64 * 1024 * 1024) return error.BackupListCorrupt;
+        if (size % 32 != 0 or size > manifest_mod.max_bytes) return error.BackupListCorrupt;
         const bytes = try self.allocator.alloc(u8, @intCast(size));
         defer self.allocator.free(bytes);
         _ = try file.readPositionalAll(self.io, bytes, 0);
@@ -605,3 +639,36 @@ const FileReader = struct {
         return n;
     }
 };
+
+test "swarm: moveCorruptAside moves corrupt manifest aside on load" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = store_path_buf[0..try tmp.dir.realPath(io, &store_path_buf)];
+    const manifest_path = try std.fs.path.join(allocator, &.{ tmp_path, "manifest.json" });
+    defer allocator.free(manifest_path);
+
+    // Write corrupt manifest
+    try tmp.dir.writeFile(io, .{ .sub_path = "manifest.json", .data = "not a valid json manifest {" });
+
+    var store = try storage.engine.StorageEngine.init(allocator, tmp_path);
+    defer store.deinit();
+
+    const dev_id = NodeID{ .bytes = [_]u8{0x11} ** 32 };
+    const res = SwarmFolder.create(allocator, io, &store, dev_id, "test", manifest_path);
+    try testing.expectError(error.InvalidManifest, res);
+
+    // Verify manifest was moved aside
+    var dir = try std.Io.Dir.cwd().openDir(io, tmp_path, .{ .iterate = true });
+    defer dir.close(io);
+    var found_corrupt = false;
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        if (std.mem.startsWith(u8, e.name, "manifest.json.corrupt-")) found_corrupt = true;
+    }
+    try testing.expect(found_corrupt);
+}

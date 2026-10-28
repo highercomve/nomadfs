@@ -81,7 +81,8 @@ pub const RepairManager = struct {
             const block = (try store.get(cid, allocator)) orelse return error.IncompleteDag;
             defer allocator.free(block.data);
             const stored = try node.putBlock(peer, block.cid, block.data);
-            if (stored) sent += 1;
+            if (!stored) return error.Rejected;
+            sent += 1;
         }
         return sent;
     }

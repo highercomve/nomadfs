@@ -62,8 +62,6 @@ pub const Node = struct {
         errdefer allocator.destroy(connection_manager);
         connection_manager.* = try ConnectionManager.init(allocator, cfg.network.transport, cfg.node.key_path);
         errdefer connection_manager.deinit();
-        try connection_manager.start();
-
         var store: ?*storage.engine.StorageEngine = null;
         if (cfg.storage.enabled) {
             const s = try allocator.create(storage.engine.StorageEngine);
@@ -74,6 +72,9 @@ pub const Node = struct {
         errdefer if (store) |s| {
             s.deinit();
             allocator.destroy(s);
+        };
+        if (store) |s| if (cfg.storage.quota_mb > 0) {
+            try s.setQuota(cfg.storage.quota_mb * 1024 * 1024);
         };
 
         const discovery_node = try allocator.create(DiscoveryNode);
@@ -124,25 +125,27 @@ pub const Node = struct {
         });
         errdefer block_manager.deinit();
 
+        // Read-ahead comes before the swarm folder, which points at it: the
+        // errdefers run in reverse, so the folder is destroyed first.
+        var read_ahead: ?*fs.ReadAhead = null;
+        if (store) |s| {
+            read_ahead = try fs.ReadAhead.create(allocator, block_manager, s);
+        }
+        errdefer if (read_ahead) |ra| ra.destroy();
+
         var swarm: ?*fs.SwarmFolder = null;
         if (store) |s| {
             const manifest_path = try std.fmt.allocPrint(allocator, "{s}.swarm.json", .{cfg.storage.storage_path});
             defer allocator.free(manifest_path);
             const folder = try fs.SwarmFolder.create(allocator, std.Io.Threaded.global_single_threaded.io(), s, connection_manager.node_id, cfg.node.nickname, manifest_path);
+            // Set before start(): the sync thread reads it.
+            folder.read_ahead = read_ahead;
             discovery_node.swarm_source = folder.source();
             folder.start(block_manager) catch |err| std.debug.print("swarm: sync thread not started: {any}\n", .{err});
             if (cfg.storage.swarm_backup) folder.setBackup(true) catch |err| std.debug.print("swarm backup: not started: {any}\n", .{err});
             swarm = folder;
         }
         errdefer if (swarm) |f| f.destroy();
-
-        var read_ahead: ?*fs.ReadAhead = null;
-        if (store) |s| {
-            const ra = try fs.ReadAhead.create(allocator, block_manager, s);
-            if (swarm) |f| f.read_ahead = ra;
-            read_ahead = ra;
-        }
-        errdefer if (read_ahead) |ra| ra.destroy();
 
         const ring = try allocator.create(HashRight);
         ring.* = HashRight.init(allocator);
@@ -164,11 +167,11 @@ pub const Node = struct {
         const trust_store = try allocator.create(device.trust.Store);
         errdefer allocator.destroy(trust_store);
         trust_store.* = try device.trust.Store.load(allocator, device_paths.trust, device_identity.seed());
+        errdefer trust_store.deinit();
         const known_peers = try allocator.create(net.discovery.known_peers.KnownPeers);
         errdefer allocator.destroy(known_peers);
         known_peers.* = try net.discovery.known_peers.KnownPeers.load(allocator, std.Io.Threaded.global_single_threaded.io(), device_paths.peers);
         errdefer known_peers.deinit();
-        errdefer trust_store.deinit();
 
         // Revocations are signed with the device identity and recorded in
         // the same trust store the handshake policy reads.
@@ -182,7 +185,12 @@ pub const Node = struct {
         });
 
         const bootstrap_running = try allocator.create(std.atomic.Value(bool));
+        errdefer allocator.destroy(bootstrap_running);
         bootstrap_running.* = std.atomic.Value(bool).init(true);
+
+        // Start only after all fallible allocations: error cleanup cannot
+        // leave manager threads accessing resources already destroyed.
+        try connection_manager.start();
 
         // Devices none of whose addresses answer are reached through
         // another device (net/transport/relay.zig). Last: nothing fails
@@ -215,8 +223,11 @@ pub const Node = struct {
         }
         self.allocator.destroy(self.bootstrap_running);
 
-        // Stop network traffic and callbacks BEFORE destroying handlers
+        // Stop network traffic, then wait for request handlers still running
+        // on detached threads. Everything freed below is reachable from them,
+        // so nothing is freed before this returns.
         self.connection_manager.stop();
+        self.discovery_node.drainHandlers();
         self.connection_manager.relay_dialer = null;
         if (self.shares) |index| index.destroy();
         if (self.swarm) |folder| folder.destroy();
@@ -286,7 +297,9 @@ pub const Node = struct {
             });
         }
         // Paired devices that weren't reachable keep the old key.
-        for (self.trust_store.list()) |e| {
+        const entries = try self.trust_store.copyEntries(allocator);
+        defer allocator.free(entries);
+        for (entries) |e| {
             const dev = net.id.NodeID.fromPublicKey(e.public_key);
             if (!self.trust_store.isTrusted(dev)) continue;
             const seen = for (reached.items) |r| {
@@ -295,17 +308,35 @@ pub const Node = struct {
             if (seen) continue;
             try out.append(allocator, .{ .name = try allocator.dupe(u8, e.labelSlice()), .status = .offline });
         }
-        self.discovery_node.swarm_epoch = epoch;
+        self.discovery_node.setSwarmEpoch(epoch);
         return out.toOwnedSlice(allocator);
     }
 
+    /// Starts the listener, then blocks until `running` is cleared.
     pub fn run(self: *Node, running: *std.atomic.Value(bool), cfg: config.Config) !void {
-        try self.connection_manager.listen(cfg, running);
+        try self.listen(running, cfg);
         while (running.load(.acquire)) {
             sync.sleep(100 * std.time.ns_per_ms);
         }
         // Signal bootstrap thread to stop if main loop stops
         self.bootstrap_running.store(false, .release);
+    }
+
+    /// Binds the listener and returns. The accept and
+    /// maintenance threads run on their own. `running` must stay alive until
+    /// stopListener() returns: the accept loop polls it.
+    pub fn listen(self: *Node, running: *std.atomic.Value(bool), cfg: config.Config) !void {
+        try self.connection_manager.start();
+        try self.connection_manager.listen(cfg, running);
+    }
+
+    /// Stops the listener and closes every session, joining the listener's
+    /// threads. Request handlers may still be finishing; deinit waits for
+    /// them. Stopping is not undone here: a later listen() fails with
+    /// ManagerStopping until the connection manager can restart.
+    pub fn stopListener(self: *Node) void {
+        self.bootstrap_running.store(false, .release);
+        self.connection_manager.stop();
     }
 
     pub fn bootstrap(self: *Node, peer_urls: [][]const u8, swarm_key: []const u8) !void {
@@ -314,9 +345,10 @@ pub const Node = struct {
             self.bootstrap_running.store(false, .release);
             t.join();
             self.bootstrap_thread = null;
-            // Reset flag for new thread
-            self.bootstrap_running.store(true, .release);
         }
+        // Set for the new thread. stopListener() and run() clear it, so this
+        // also covers a node that stopped before its first bootstrap.
+        self.bootstrap_running.store(true, .release);
 
         self.bootstrap_thread = try std.Thread.spawn(.{}, runBootstrap, .{ self, peer_urls, swarm_key });
     }
@@ -338,7 +370,12 @@ pub const Node = struct {
                 std.debug.print("Error during self-lookup: {any}\n", .{err});
             };
             std.debug.print("Initial self-lookup complete. Routing table dump:\n", .{});
-            discovery_node.routing_table.dump();
+            {
+                // Request handlers change the table under this mutex.
+                discovery_node.mutex.lock();
+                defer discovery_node.mutex.unlock();
+                discovery_node.routing_table.dump();
+            }
             self.rememberPeers();
         }
 
@@ -379,6 +416,7 @@ pub const Node = struct {
         const now = sync.monotonicMillis();
         const entries = self.allocator.dupe(net.discovery.known_peers.Entry, self.known_peers.entries.items) catch return;
         defer self.allocator.free(entries);
+        self.pruneRedial(entries);
         for (entries) |e| {
             if (!self.bootstrap_running.load(.acquire)) return;
             if (e.id.eql(self.connection_manager.node_id)) continue;
@@ -393,6 +431,22 @@ pub const Node = struct {
             _ = self.redial.remove(e.id);
             self.discovery_node.ping(conn) catch {};
         }
+    }
+
+    /// Keeps redial state only for devices still in `entries`, so the map
+    /// cannot outgrow the list it is keyed from. On allocation failure the
+    /// old map stays as it is.
+    fn pruneRedial(self: *Node, entries: []const net.discovery.known_peers.Entry) void {
+        var kept: std.AutoHashMapUnmanaged(net.id.NodeID, Redial) = .empty;
+        for (entries) |e| {
+            const r = self.redial.get(e.id) orelse continue;
+            kept.put(self.allocator, e.id, r) catch {
+                kept.deinit(self.allocator);
+                return;
+            };
+        }
+        self.redial.deinit(self.allocator);
+        self.redial = kept;
     }
 
     /// Adds what the routing table knows to the remembered devices.
@@ -477,6 +531,27 @@ pub const Node = struct {
 pub const metrics = @import("metrics.zig");
 pub const errors = @import("errors.zig");
 pub const resilience = @import("net/resilience.zig");
+
+test "Node.pruneRedial keeps state only for remembered devices" {
+    const gpa = std.testing.allocator;
+    var node: Node = undefined;
+    node.allocator = gpa;
+    node.redial = .empty;
+    defer node.redial.deinit(gpa);
+
+    const kept_id = net.id.NodeID{ .bytes = [_]u8{1} ** 32 };
+    const gone_id = net.id.NodeID{ .bytes = [_]u8{2} ** 32 };
+    try node.redial.put(gpa, kept_id, .{ .at_ms = 5, .failures = 2 });
+    try node.redial.put(gpa, gone_id, .{ .at_ms = 9, .failures = 1 });
+
+    const entries = [_]net.discovery.known_peers.Entry{.{ .id = kept_id, .last_seen = 0 }};
+    node.pruneRedial(&entries);
+
+    try std.testing.expectEqual(@as(usize, 1), node.redial.count());
+    const r = node.redial.get(kept_id).?;
+    try std.testing.expectEqual(@as(i64, 5), r.at_ms);
+    try std.testing.expectEqual(@as(u8, 2), r.failures);
+}
 
 test "Node.rotateSwarmKey compiles" {
     std.testing.refAllDecls(Node);

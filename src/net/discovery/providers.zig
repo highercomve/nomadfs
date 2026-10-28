@@ -33,6 +33,8 @@ pub const ProviderStore = struct {
     entries: std.AutoHashMapUnmanaged(NodeID, Entry) = .empty,
     max_keys: usize = 100_000,
     ttl_s: i64 = default_ttl_s,
+    /// Second of the last expiry sweep of the whole table (see sweepExpired).
+    last_sweep: i64 = std.math.minInt(i64),
 
     pub fn deinit(self: *ProviderStore, allocator: std.mem.Allocator) void {
         self.entries.deinit(allocator);
@@ -40,10 +42,11 @@ pub const ProviderStore = struct {
 
     /// Records `provider` for `key`, refreshing it if already present. When a
     /// key is full the stalest provider is replaced. error.StorageFull when a
-    /// new key would exceed max_keys.
+    /// new key would exceed max_keys, even after expired keys are swept.
     pub fn add(self: *ProviderStore, allocator: std.mem.Allocator, key: NodeID, provider: NodeID, now: i64) !void {
         if (!self.entries.contains(key) and self.entries.count() >= self.max_keys) {
-            return error.StorageFull;
+            self.sweepExpired(allocator, now);
+            if (self.entries.count() >= self.max_keys) return error.StorageFull;
         }
         const res = try self.entries.getOrPut(allocator, key);
         if (!res.found_existing) res.value_ptr.* = .{};
@@ -65,6 +68,27 @@ pub const ProviderStore = struct {
         const oldest = std.mem.indexOfMin(i64, &entry.seen);
         entry.ids[oldest] = provider;
         entry.seen[oldest] = now;
+    }
+
+    /// Drops every key whose providers have all expired. Keys that only expire
+    /// when touched would otherwise fill the table for good. Runs at most once
+    /// per second, so a peer that keeps adding new keys to a full table cannot
+    /// make each request scan all of it. Best effort: if the scratch list cannot
+    /// grow, the rest of the sweep is skipped.
+    fn sweepExpired(self: *ProviderStore, allocator: std.mem.Allocator, now: i64) void {
+        if (now == self.last_sweep) return;
+        self.last_sweep = now;
+
+        // The map may not change while it is iterated, so the stale keys are
+        // collected first and removed afterwards.
+        var stale: std.ArrayList(NodeID) = .empty;
+        defer stale.deinit(allocator);
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            kv.value_ptr.expire(now, self.ttl_s);
+            if (kv.value_ptr.len == 0) stale.append(allocator, kv.key_ptr.*) catch break;
+        }
+        for (stale.items) |key| _ = self.entries.remove(key);
     }
 
     /// Copies the live providers of `key` into `out` and returns them.
@@ -109,4 +133,21 @@ test "ProviderStore dedupes, caps and expires" {
     // Expiry: everything is stale long after the TTL, and the key is freed.
     try std.testing.expectEqual(@as(usize, 0), store.get(testId(1), 1000, &out).len);
     try store.add(allocator, testId(3), testId(31), 1000);
+}
+
+test "ProviderStore sweeps stale keys before refusing a new one" {
+    const allocator = std.testing.allocator;
+    var store = ProviderStore{ .max_keys = 2, .ttl_s = 100 };
+    defer store.deinit(allocator);
+
+    try store.add(allocator, testId(1), testId(10), 0);
+    try store.add(allocator, testId(2), testId(20), 0);
+    // Full, but nothing has expired yet.
+    try std.testing.expectError(error.StorageFull, store.add(allocator, testId(3), testId(30), 0));
+
+    // Both keys are now stale and never touched again: the table makes room.
+    try store.add(allocator, testId(3), testId(30), 500);
+    try std.testing.expectEqual(@as(usize, 1), store.entries.count());
+    var out: [max_per_key]NodeID = undefined;
+    try std.testing.expectEqual(@as(usize, 1), store.get(testId(3), 500, &out).len);
 }

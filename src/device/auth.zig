@@ -73,6 +73,7 @@ pub const Authenticator = struct {
 
         const device_id = NodeID.fromPublicKey(public_key);
         if (self.trust) |store| {
+            if (store.isRevoked(device_id)) return Error.UntrustedDevice;
             if (store.lookup(device_id)) |entry| {
                 if (!std.mem.eql(u8, &entry.transport_key, &transport_key) and
                     !std.mem.eql(u8, &entry.transport_key, &trust_mod.no_transport_key))
@@ -200,4 +201,23 @@ test "device auth: trust policy rejects unknown devices" {
     const unknown_auth: Authenticator = .{ .identity = unknown };
     const unknown_hello = try unknown_auth.createHello(transcript);
     try testing.expectError(Error.UntrustedDevice, auth.verifyHello(&unknown_hello, transcript, test_transport));
+}
+
+test "device auth: tombstones reject a device under either policy" {
+    const path = "test_device_auth_revoked.store";
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var store = try trust_mod.Store.load(testing.allocator, path, null);
+    defer store.deinit();
+    const remote = try identityWith(0x71);
+    const local = try identityWith(0x72);
+    _ = try store.revokeDevice(remote.deviceId(), local.deviceId(), 10);
+    const sender: Authenticator = .{ .identity = remote };
+    const transcript = [_]u8{0x55} ** 32;
+    const hello = try sender.createHello(transcript);
+    for ([_]bool{ false, true }) |require_trusted| {
+        const verifier: Authenticator = .{ .identity = local, .trust = &store, .require_trusted = require_trusted };
+        try testing.expectError(Error.UntrustedDevice, verifier.verifyHello(&hello, transcript, test_transport));
+    }
 }

@@ -11,27 +11,14 @@ answers, another device can carry the connection
 
 ## 1. UPnP Port Mapping (`src/net/transport/nat.zig`)
 
-`ConnectionManager.listen` starts a background thread when
-`upnp_enabled = true` (the default). The thread runs three steps on the
-`nat.UPnP` client. Each HTTP step is bounded by `http_timeout_ms = 5_000`, so
-a dead gateway can't block shutdown.
+`ConnectionManager.listen` starts a background thread when `upnp_enabled = true`. It is **off by default**: opening a port on the router publishes the listener to the Internet, and the swarm key is the only gate (see [Security Model](../../security/model.md)). The thread discovers the gateway, maps the port, and then keeps the mapping alive until the node stops.
 
-1.  **`discoverGateway()` (SSDP)**: sends an `M-SEARCH` for
-    `urn:schemas-upnp-org:device:InternetGatewayDevice:1` to
-    `239.255.255.250:1900` and reads replies for up to 2 seconds. The
-    `LOCATION:` header gives the device description URL, which is fetched
-    with `GET` to find the `WANIPConnection:1` control URL.
-2.  **`getLocalIP()`**: "connects" a UDP socket to the gateway and reads the
-    local address the kernel picked. This is the address the mapping should
-    point at.
-3.  **`mapPort(port, "TCP", local_ip)` (SOAP `AddPortMapping`)**: asks the
-    router to forward external TCP `port` to the same port on this device,
-    with description `NomadFS` and `NewLeaseDuration` 0 (no expiry). On
-    success `mapped_port` is recorded.
+1. **`discoverGateway()` (SSDP)**: sends `M-SEARCH` for `InternetGatewayDevice:1` and `:2` to `239.255.255.250:1900` and listens for 3 seconds. A reply is accepted only if it comes from an address on one of this device's own subnets (preferably the default gateway), its `ST` matches, and its `LOCATION` is an `http://` URL whose host is the sender itself. Anything else is ignored.
+2. **Description and control URL**: the thread fetches the description from that host only and takes the `controlURL` of the `WANIPConnection:1/2` or `WANPPPConnection:1` service. URLs containing control characters or naming another host are rejected.
+3. **`getLocalIP()`**: unchanged.
+4. **`AddPortMapping`** with a **3600-second lease**, renewed every 30 minutes. Some older routers answer error 725 ("only permanent leases"); then NomadFS retries with lease 0 and logs a warning. After mapping, `GetExternalIPAddress` is checked: a private or carrier-grade address means no mapping can help and it is removed.
 
-Because the lease never expires, `ConnectionManager.stop()` sends
-`DeletePortMapping` for `mapped_port`. Otherwise the router would keep
-forwarding the port after the node exits.
+`ConnectionManager.stop()` sends `DeletePortMapping` for `mapped_port` using the cached control URL. If the process is killed instead, a finite lease lets the router drop the rule within an hour (not on the 725 fallback, where the entry stays until the router forgets it).
 
 Failures (no gateway, UPnP disabled on the router, `getLocalIP` on Windows)
 are logged and ignored; the node keeps running without a mapping.
@@ -43,7 +30,7 @@ NAT, ISP firewalls, double NAT). `DIAL_BACK` is a request to check.
 
 ### The flow
 1.  `Node.connectBootstrapPeer` (`src/root.zig`) connects to each configured
-    bootstrap peer and sends a `PING`.
+    bootstrap peer and sends a `PING` coherence check.
 2.  It then calls `discovery.Node.checkReachability(conn)`, which opens a
     stream and sends **`DIAL_BACK { port }`** with this node's listening port.
     It doesn't wait for a reply.

@@ -21,6 +21,8 @@
 
 const std = @import("std");
 const sync = @import("../sync.zig");
+const pairing = @import("pairing.zig");
+const Identity = @import("identity.zig").Identity;
 const net = @import("../net/mod.zig");
 const ConnectionManager = net.transport.manager.ConnectionManager;
 const KeyPair = net.transport.noise.KeyPair;
@@ -31,6 +33,8 @@ pub const default_lifetime_s = 10 * 60;
 const max_ticket_len = 2048;
 const io_timeout_ms = 15_000;
 const scheme = "nomadfs://invite?";
+
+pub const Error = error{TicketNotOwned};
 
 /// The transport PSK both sides derive from the invite token.
 pub fn derivePsk(token: [token_len]u8) [32]u8 {
@@ -81,6 +85,7 @@ pub const Code = struct {
 
 /// What the inviter hands to whoever presents the token.
 pub const Offer = struct {
+    identity: Identity,
     swarm_key: [32]u8,
     node_port: u16,
     /// The inviter's own pairing ticket (nomadfs://pair?...).
@@ -117,6 +122,7 @@ pub const Host = struct {
 
         const manager = try ConnectionManager.createExplicit(allocator, .tcp, KeyPair.generate());
         errdefer manager.deinit();
+        manager.setDeviceAuthenticator(.{ .identity = offer.identity });
         try manager.start();
 
         const self = try allocator.create(Host);
@@ -209,17 +215,23 @@ pub const Host = struct {
         stream.setTimeout(io_timeout_ms);
 
         const peer_ticket = try readBlob(self.allocator, stream.reader());
-        errdefer self.allocator.free(peer_ticket);
+        var stored = false;
+        errdefer if (!stored) self.allocator.free(peer_ticket);
+        const now = nowSeconds();
+        const ticket = try pairing.Ticket.parseAt(peer_ticket, now);
+        const remote = conn.getRemoteDeviceID() orelse return Error.TicketNotOwned;
+        if (!ticket.deviceId().eql(remote)) return Error.TicketNotOwned;
 
         self.mutex.lock();
+        if (self.state == .waiting and now >= self.expires_at) self.state = .expired;
         const usable = self.state == .waiting and !self.stopped;
         if (usable) {
             self.state = .joined; // one join per invite
             self.joined_ticket = peer_ticket;
+            stored = true;
         }
         self.mutex.unlock();
         if (!usable) {
-            self.allocator.free(peer_ticket);
             return error.InviteUsed;
         }
 
@@ -247,7 +259,14 @@ pub const Joined = struct {
 
 /// The joining side: presents `my_ticket_uri` to the inviter named by
 /// `code_text` and receives the swarm key, its node port and its ticket.
-pub fn join(allocator: std.mem.Allocator, code_text: []const u8, my_ticket_uri: []const u8) !Joined {
+pub fn join(allocator: std.mem.Allocator, code_text: []const u8, my_ticket_uri: []const u8, identity: Identity) !Joined {
+    const ticket = pairing.Ticket.parseAt(my_ticket_uri, nowSeconds()) catch return error.InviteRejected;
+    if (!ticket.deviceId().eql(identity.deviceId())) return error.InviteRejected;
+    return joinExchange(allocator, code_text, my_ticket_uri, identity);
+}
+
+// Kept separate so tests can exercise a hostile peer presenting another device's ticket.
+fn joinExchange(allocator: std.mem.Allocator, code_text: []const u8, my_ticket_uri: []const u8, identity: Identity) !Joined {
     const code = try Code.parse(code_text);
     const address = try code.address();
     var psk = derivePsk(code.token);
@@ -255,6 +274,7 @@ pub fn join(allocator: std.mem.Allocator, code_text: []const u8, my_ticket_uri: 
 
     const manager = try ConnectionManager.createExplicit(allocator, .tcp, KeyPair.generate());
     defer manager.deinit();
+    manager.setDeviceAuthenticator(.{ .identity = identity });
     try manager.start();
     defer manager.stop();
 
@@ -263,17 +283,21 @@ pub fn join(allocator: std.mem.Allocator, code_text: []const u8, my_ticket_uri: 
         return error.InviteRejected; // wrong or used token, or unreachable
     };
     defer conn.deinit();
-    const stream = try conn.openStream();
+    const stream = conn.openStream() catch return error.InviteRejected;
     defer stream.close();
     stream.setTimeout(io_timeout_ms);
 
     try writeBlob(stream.writer(), my_ticket_uri);
     const r = stream.reader();
     var out: Joined = undefined;
+    errdefer std.crypto.secureZero(u8, &out.swarm_key);
     r.readNoEof(&out.swarm_key) catch return error.InviteRejected;
     out.node_port = try r.readInt(u16, .big);
     out.ticket_uri = try readBlob(allocator, r);
     errdefer allocator.free(out.ticket_uri);
+    const ticket = pairing.Ticket.parseAt(out.ticket_uri, nowSeconds()) catch return error.InviteRejected;
+    const remote = conn.getRemoteDeviceID() orelse return error.InviteRejected;
+    if (!ticket.deviceId().eql(remote)) return error.InviteRejected;
     const colon = std.mem.lastIndexOfScalar(u8, code.addr, ':').?;
     out.host_ip = try allocator.dupe(u8, code.addr[0..colon]);
     return out;
@@ -296,6 +320,11 @@ pub fn lanAddress(buf: *[16]u8) ?[]const u8 {
     if (linux.errno(linux.getsockname(fd, @ptrCast(&local), &len)) != .SUCCESS) return null;
     const a: [4]u8 = @bitCast(local.addr);
     return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ a[0], a[1], a[2], a[3] }) catch null;
+}
+
+fn nowSeconds() u64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
 }
 
 fn writeBlob(w: anytype, bytes: []const u8) !void {
@@ -326,42 +355,112 @@ test "invite: code round trip and rejection" {
     try std.testing.expect(!std.mem.eql(u8, &derivePsk(token), &derivePsk([_]u8{0xAC} ** token_len)));
 }
 
-test "invite: a joiner with the code gets the swarm key once; a wrong token gets nothing" {
+fn testTicket(identity: Identity, buf: []u8) ![]const u8 {
+    const ticket = try pairing.Ticket.init(identity, [_]u8{2} ** 32, "device", "127.0.0.1:14700", nowSeconds() + 60);
+    return ticket.toUri(buf);
+}
+
+test "invite: possession enforced before consuming token, then matching identities succeed" {
     const allocator = std.testing.allocator;
+    const host_identity = Identity.generate();
+    const joiner = Identity.generate();
+    const stranger = Identity.generate();
+    var host_buf: [pairing.max_uri_len]u8 = undefined;
+    var joiner_buf: [pairing.max_uri_len]u8 = undefined;
+    var stranger_buf: [pairing.max_uri_len]u8 = undefined;
+    const host_uri = try testTicket(host_identity, &host_buf);
+    const joiner_uri = try testTicket(joiner, &joiner_buf);
+    const stranger_uri = try testTicket(stranger, &stranger_buf);
     const key = [_]u8{0x5A} ** 32;
-    const host = try Host.start(allocator, .{ .swarm_key = key, .node_port = 14700, .ticket_uri = "nomadfs://pair?host" }, 13141, 60, 1000);
+    const host = try Host.start(allocator, .{ .identity = host_identity, .swarm_key = key, .node_port = 14700, .ticket_uri = host_uri }, 13141, 60, nowSeconds());
     defer host.destroy();
-    sync.sleep(100 * std.time.ns_per_ms);
-
     var buf: [128]u8 = undefined;
-    const text = try host.code("127.0.0.1", &buf);
+    const code = try host.code("127.0.0.1", &buf);
 
-    // A guessed token fails the handshake.
-    var wrong = try Code.parse(text);
+    // A revoked third device's copied ticket cannot clear its tombstone.
+    const trust = @import("trust.zig");
+    const path = "test_invite_tombstone.store";
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var store = try trust.Store.load(allocator, path, null);
+    defer store.deinit();
+    _ = try store.revokeDevice(stranger.deviceId(), host_identity.deviceId(), nowSeconds());
+    try std.testing.expectError(error.InviteRejected, joinExchange(allocator, code, stranger_uri, joiner));
+    try std.testing.expectEqual(Host.State.waiting, host.status(nowSeconds()));
+    try std.testing.expect((try host.joinedTicket(allocator)) == null);
+    try std.testing.expect(store.isRevoked(stranger.deviceId()));
+
+    var wrong = try Code.parse(code);
     wrong.token[0] ^= 1;
     var wrong_buf: [128]u8 = undefined;
-    try std.testing.expectError(error.InviteRejected, join(allocator, try wrong.format(&wrong_buf), "nomadfs://pair?mallory"));
-    try std.testing.expectEqual(Host.State.waiting, host.status(1001));
-
-    var joined = try join(allocator, text, "nomadfs://pair?joiner");
+    try std.testing.expectError(error.InviteRejected, join(allocator, try wrong.format(&wrong_buf), joiner_uri, joiner));
+    try std.testing.expectError(error.InviteRejected, joinExchange(allocator, code, "invalid", joiner));
+    var joined = try join(allocator, code, joiner_uri, joiner);
     defer joined.deinit(allocator);
     try std.testing.expectEqualSlices(u8, &key, &joined.swarm_key);
     try std.testing.expectEqual(@as(u16, 14700), joined.node_port);
-    try std.testing.expectEqualStrings("nomadfs://pair?host", joined.ticket_uri);
+    try std.testing.expectEqualStrings(host_uri, joined.ticket_uri);
     try std.testing.expectEqualStrings("127.0.0.1", joined.host_ip);
-
-    try std.testing.expectEqual(Host.State.joined, host.status(1002));
     const seen = (try host.joinedTicket(allocator)).?;
     defer allocator.free(seen);
-    try std.testing.expectEqualStrings("nomadfs://pair?joiner", seen);
+    try std.testing.expect((try pairing.Ticket.parse(seen)).deviceId().eql(joiner.deviceId()));
+    try std.testing.expectError(error.InviteRejected, join(allocator, code, joiner_uri, joiner));
+    try std.testing.expectEqual(Host.State.joined, host.status(nowSeconds()));
+}
 
-    // The invite is spent: the same code no longer works.
-    try std.testing.expectError(error.InviteRejected, join(allocator, text, "nomadfs://pair?again"));
+test "invite: inviter must own its ticket" {
+    const identity = Identity.generate();
+    const other = Identity.generate();
+    var host_buf: [pairing.max_uri_len]u8 = undefined;
+    var joiner_buf: [pairing.max_uri_len]u8 = undefined;
+    const host = try Host.start(std.testing.allocator, .{ .identity = identity, .swarm_key = [_]u8{1} ** 32, .node_port = 1, .ticket_uri = try testTicket(other, &host_buf) }, 13142, 60, nowSeconds());
+    defer host.destroy();
+    var buf: [128]u8 = undefined;
+    try std.testing.expectError(error.InviteRejected, join(std.testing.allocator, try host.code("127.0.0.1", &buf), try testTicket(other, &joiner_buf), other));
+}
+
+test "invite: connection rejects expiry without status polling" {
+    const identity = Identity.generate();
+    var ticket_buf: [pairing.max_uri_len]u8 = undefined;
+    const uri = try testTicket(identity, &ticket_buf);
+    const host = try Host.start(std.testing.allocator, .{ .identity = identity, .swarm_key = [_]u8{1} ** 32, .node_port = 1, .ticket_uri = uri }, 13143, 0, nowSeconds());
+    defer host.destroy();
+    var buf: [128]u8 = undefined;
+    try std.testing.expectError(error.InviteRejected, join(std.testing.allocator, try host.code("127.0.0.1", &buf), uri, identity));
+    try std.testing.expectEqual(Host.State.expired, host.status(nowSeconds()));
+    try std.testing.expect((try host.joinedTicket(std.testing.allocator)) == null);
+}
+
+test "invite: a peer without the real device authenticator cannot consume an invite" {
+    const allocator = std.testing.allocator;
+    const identity = Identity.generate();
+    var ticket_buf: [pairing.max_uri_len]u8 = undefined;
+    const uri = try testTicket(identity, &ticket_buf);
+    const host = try Host.start(allocator, .{ .identity = identity, .swarm_key = [_]u8{1} ** 32, .node_port = 1, .ticket_uri = uri }, 13243, 60, nowSeconds());
+    defer host.destroy();
+    const manager = try ConnectionManager.createExplicit(allocator, .tcp, KeyPair.generate());
+    defer manager.deinit();
+    try manager.start();
+    defer manager.stop();
+    const conn = try manager.connectToPeer(try net.compat.Address.parseIp("127.0.0.1", 13243), &host.psk, null);
+    defer conn.deinit();
+    const stream = try conn.openStream();
+    defer stream.close();
+    stream.setTimeout(io_timeout_ms);
+    try writeBlob(stream.writer(), uri);
+    var key: [32]u8 = undefined;
+    if (stream.reader().readNoEof(&key)) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expectEqual(Host.State.waiting, host.status(nowSeconds()));
+    try std.testing.expect((try host.joinedTicket(allocator)) == null);
 }
 
 test "invite: expires unused" {
-    const allocator = std.testing.allocator;
-    const host = try Host.start(allocator, .{ .swarm_key = [_]u8{1} ** 32, .node_port = 1, .ticket_uri = "x" }, 13142, 60, 1000);
+    const identity = Identity.generate();
+    var buf: [pairing.max_uri_len]u8 = undefined;
+    const host = try Host.start(std.testing.allocator, .{ .identity = identity, .swarm_key = [_]u8{1} ** 32, .node_port = 1, .ticket_uri = try testTicket(identity, &buf) }, 13244, 60, 1000);
     defer host.destroy();
     try std.testing.expectEqual(Host.State.waiting, host.status(1059));
     try std.testing.expectEqual(Host.State.expired, host.status(1060));
