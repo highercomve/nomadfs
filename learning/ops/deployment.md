@@ -31,8 +31,10 @@ builds this tree; update it before relying on it. No image is published.
 
 The Linux mount additionally needs `fusermount3` (package `fuse3`).
 
-**Making a release.** Bump the version in `build.zig.zon`, `nomadfs-gui/build.zig.zon` and
-`nomadfs-gui/build.zig`, then `scripts/release.sh [out-dir]` builds every asset (both CLIs, the
+**Making a release.** Bump the version in `build.zig.zon`, `nomadfs-gui/build.zig.zon`,
+`nomadfs-gui/build.zig` and `nomadfs-gui/android/app/build.gradle.kts` (`versionName`, and
+`versionCode` = MAJOR×10000 + MINOR×100 + PATCH: Oriel writes these once and doesn't follow
+`.package.version`), then `scripts/release.sh [out-dir]` builds every asset (both CLIs, the
 AppImage, deb, rpm and the APK), signs the update manifest the apps check (`latest.json`: the
 AppImage for `x86_64-linux`, the APK for `aarch64-android` and `x86_64-android`) and writes
 `SHA256SUMS`. It signs with `NOMADFS_UPDATE_KEY` (default

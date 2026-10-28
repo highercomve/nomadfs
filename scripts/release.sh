@@ -24,6 +24,13 @@ version=$(sed -n 's/^ *const version = "\(.*\)";/\1/p' nomadfs-gui/build.zig | h
 for zon in build.zig.zon nomadfs-gui/build.zig.zon; do
   grep -q "\.version = \"$version\"" "$zon" || { echo "$zon isn't at $version" >&2; exit 1; }
 done
+# The APK's version: written by `oriel android init` once, so bumped by
+# hand. versionCode = MAJOR*10000 + MINOR*100 + PATCH (Oriel's rule).
+IFS=. read -r major minor patch <<<"${version%%[-+]*}"
+code=$((major * 10000 + minor * 100 + patch))
+gradle=nomadfs-gui/android/app/build.gradle.kts
+grep -q "versionName = \"$version\"" "$gradle" && grep -q "versionCode = $code\$" "$gradle" ||
+  { echo "$gradle needs versionName = \"$version\" and versionCode = $code" >&2; exit 1; }
 
 key=${NOMADFS_UPDATE_KEY:-$HOME/.config/oriel/keys/nomadfs-update.key}
 [ -r "$key" ] || { echo "No update key at $key (NOMADFS_UPDATE_KEY)" >&2; exit 1; }
