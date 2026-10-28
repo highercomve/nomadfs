@@ -721,6 +721,47 @@ $("preview").addEventListener("click", (e) => { if (e.target === $("preview")) c
 $("pv-prev").addEventListener("click", () => { if (pv && pv.index > 0) { pv.index--; showPreview(); } });
 $("pv-next").addEventListener("click", () => { if (pv && pv.index < pv.files.length - 1) { pv.index++; showPreview(); } });
 $("pv-download").addEventListener("click", () => { if (pv) pv.source.download(pv.files[pv.index], null); });
+
+// Swipe left or right on a touch screen for the next or previous file. The
+// photo follows the finger; a short or mostly vertical drag springs back.
+// Video and audio keep their controls, text its scrolling.
+{
+  const body = $("pv-body");
+  let swipe = null;
+  const springBack = (img) => {
+    if (!img) return;
+    img.style.transition = "transform 0.2s ease";
+    img.style.transform = "";
+    img.addEventListener("transitionend", () => { img.style.transition = ""; }, { once: true });
+  };
+  body.addEventListener("pointerdown", (e) => {
+    if (!pv || e.pointerType === "mouse" || e.target.closest("video, audio, pre")) return;
+    swipe = { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now() };
+  });
+  body.addEventListener("pointermove", (e) => {
+    if (!swipe || e.pointerId !== swipe.id) return;
+    const dx = e.clientX - swipe.x;
+    const img = body.querySelector("img");
+    if (img && Math.abs(dx) > Math.abs(e.clientY - swipe.y)) img.style.transform = `translateX(${dx}px)`;
+  });
+  body.addEventListener("pointerup", (e) => {
+    if (!swipe || e.pointerId !== swipe.id) return;
+    const dx = e.clientX - swipe.x;
+    const dy = e.clientY - swipe.y;
+    const quick = performance.now() - swipe.t < 600;
+    swipe = null;
+    const sideways = Math.abs(dx) > 60 && Math.abs(dx) > 1.5 * Math.abs(dy);
+    if (sideways && (quick || Math.abs(dx) > body.clientWidth / 3)) {
+      const button = dx < 0 ? $("pv-next") : $("pv-prev");
+      if (!button.disabled) return button.click();
+    }
+    springBack(body.querySelector("img"));
+  });
+  body.addEventListener("pointercancel", () => {
+    swipe = null;
+    springBack(body.querySelector("img"));
+  });
+}
 document.addEventListener("keydown", (e) => {
   if (!pv) return;
   if (e.key === "Escape") closePreview();
