@@ -1,0 +1,62 @@
+---
+.title = "Changelog",
+.description = "What changed in each NomadFS release.",
+.date = .date("2026-10-28T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "docs.shtml",
+.custom = { "label": "changelog" },
+---
+
+# 0.1.0 - 2026-10-28
+
+A fresh start. This release breaks compatibility with every earlier build,
+which were all withdrawn: **update every device and join them again**.
+
+## Breaking
+
+- **Handshake v2.** Connections use the standard `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s`,
+  with the prologue and the ephemeral keys mixed in as the Noise spec requires, and
+  checked against the published Cacophony test vector. Earlier builds can't connect.
+- **New trust store (`NMDFSTR2`).** The first start of 0.1.0 moves an old trust store to
+  `trust.store.v1.bak` and starts empty: pair or invite your devices again.
+- **Signed revocation time.** Revocations sign when they were made (`nomadfs-revoke-v2`),
+  so re-pairing a removed device is no longer undone by an older revocation.
+- **UPnP is off by default**, for the command line too (`upnp_enabled = true` turns it on).
+- **On Android**, uninstall the earlier app before installing 0.1.0: its version number is
+  lower, so Android won't install it over the old one.
+
+## Added
+
+- **Notes in the swarm folder.** Text drop stores each note as a `.txt` file in the swarm's
+  `Notes` folder, so every device lists every note; earlier notes move there on their own.
+- **Storage quota.** `quota_mb` under `[storage]` caps the space blocks from other devices
+  can take (0, the default, is unlimited).
+- **Device names you can trust.** Paired devices are named after their pairing label in the
+  app and the mount; unpaired devices always show a device-ID suffix and a "Not paired" badge,
+  so another device can't pass itself off by copying a nickname.
+
+## Security
+
+- Invites: the joining device must prove it holds the identity in its ticket, the inviter
+  checks expiry itself, and an older ticket can't replace a newer one.
+- Revoked devices are refused under every policy, and their open connections are closed.
+- Limits on what unauthenticated and authenticated peers can make a device spend:
+  handshakes in flight (with a total deadline), connections, request threads, memory per
+  request, block sizes, and the DAG a read may walk.
+- The DHT keeps only addresses learned first-hand and drops unusable ones (loopback from
+  others, port 0, multicast, link-local).
+- UPnP, when on, uses a one-hour lease renewed while running and removed on stop, and only
+  trusts a router on the local network.
+- The app writes its configuration atomically and private (`0600`, directory `0700`).
+
+## Fixed
+
+- Crashes: truncating a swarm folder file after closing it; a peer sending a huge file
+  size or version clock; a second invite join (double free).
+- Shutdown: no use of freed memory while requests finish, no hang while discovery dials.
+- The mount serves several requests at once, so one slow device no longer freezes it, and
+  frees what the kernel forgets; long sessions no longer grow without bound.
+- A swarm folder too large to load is moved aside instead of overwritten, and deletions are
+  forgotten after 90 days. A device offline for longer may bring a deleted file back.
+- Many smaller leaks and races in the trust store, the mobile library, the app and the
+  storage engine.

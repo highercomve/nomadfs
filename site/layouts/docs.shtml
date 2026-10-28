@@ -9,6 +9,7 @@
 				<h4>Start</h4>
 				<a href="$site.page('docs').link()">Overview</a>
 				<a href="$site.page('docs/getting-started').link()">Getting started</a>
+				<a href="$site.page('docs/changelog').link()">Changelog</a>
 				<h4>Using NomadFS</h4>
 				<a href="$site.page('docs/shared-folders').link()">Shared folders &amp; mount</a>
 				<a href="$site.page('docs/swarm-folder').link()">Swarm folder</a>
