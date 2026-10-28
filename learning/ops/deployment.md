@@ -7,7 +7,10 @@ how to keep a node running.
 ## 1. Getting the Binary
 
 Releases on GitHub carry the app (Android APK; Linux AppImage, deb, rpm) and
-the `nomadfs` command line for Linux.
+the `nomadfs` command line for Linux. `scripts/install.sh` installs the latest
+one for the current user (AppImage and CLI in `~/.local/bin`, launcher entry
+and icons), checking each file against the release's `SHA256SUMS`;
+`scripts/install-local.sh` does the same from a build of the checkout.
 
 From source, with [Zig 0.16.0](https://ziglang.org/download/):
 

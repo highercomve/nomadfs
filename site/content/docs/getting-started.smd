@@ -12,6 +12,18 @@ the app for Android (an APK) and Linux (AppImage, deb and rpm), and the
 `nomadfs` command line for Linux. On Android, allow installing from your
 browser or file manager when it asks.
 
+On Linux, this installs the latest release for your user (the app's AppImage
+and the command line in `~/.local/bin`, and a launcher entry), checking every
+file against the release's checksums:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/install.sh | bash
+```
+
+`VERSION=0.3.5` installs a given release; `NO_CLI=1`, `NO_DESKTOP=1` and
+`NO_RESTART=1` skip the command line, the launcher entry, or starting the app.
+The app then updates itself ([Updates]($link.ref('updates'))).
+
 To build from source you need [Zig 0.16.0](https://ziglang.org/download/).
 For the Linux mount you also need `fusermount3` (the `fuse3` package on most
 distributions).

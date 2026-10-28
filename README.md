@@ -16,6 +16,12 @@ All core features are verified on real hardware across Linux desktop and Android
 
 **Download:** the [latest release](https://github.com/highercomve/nomadfs/releases/latest) has the app for Android (APK) and Linux (AppImage, deb, rpm), and the `nomadfs` CLI for Linux. Docs: [nomadfs.foreachdeveloper.com](https://nomadfs.foreachdeveloper.com).
 
+**Install on Linux** (the app and the CLI in `~/.local/bin`, with a launcher entry; the app then updates itself):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/install.sh | bash
+```
+
 ---
 
 ## Key Features
