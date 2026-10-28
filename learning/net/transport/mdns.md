@@ -1,53 +1,90 @@
-# Chapter 1.5: Local Discovery with mDNS
+# Chapter 1.5: Local Discovery (LAN Announcements)
 
-In a truly decentralized system, nodes should be able to find each other without relying on a global "phonebook" (the DHT) when they are on the same local network. NomadFS implements **Multicast DNS (mDNS)** style discovery to achieve zero-config connectivity on LANs.
+Devices on the same network should find each other without configuration and
+without the DHT. NomadFS does this with a small UDP multicast beacon in
+`src/net/transport/mdns.zig`. The file and type are called `MDNS`, but the
+protocol is **not** Multicast DNS or DNS-SD: there are no DNS records,
+queries or service names. It reuses the mDNS multicast group and sends its
+own announcement on its own port.
 
-## 1. Why mDNS?
+> Overview: [Learn: TCP, finding and reaching devices](https://nomadfs.foreachdeveloper.com/learn/tcp/#addresses).
 
-Roaming devices like laptops and phones often move between different WiFi networks. If your phone and your laptop are on the same WiFi, it is much faster and more reliable to sync data directly over the local network than to go through the public internet.
+## 1. Why a LAN Beacon?
 
-mDNS allows:
-*   **Speed**: LAN transfers are usually 10x-100x faster than WAN.
-*   **Offline Operation**: You can sync devices even if the building's internet connection is down.
-*   **Efficiency**: Reduces bandwidth usage on your internet plan.
+*   **Speed and cost**: LAN transfers are much faster than going out through
+    the internet, and use no data plan.
+*   **Offline**: two devices on the same Wi-Fi find each other even when the
+    internet connection is down.
+*   **Zero config**: no `bootstrap_peers` needed at home.
 
-## 2. The Implementation
+## 2. The Wire Format
 
-NomadFS uses a simplified mDNS-like protocol over UDP Multicast.
+| | |
+| :--- | :--- |
+| Group | `224.0.0.251` (`MDNS_MULTICAST_ADDR`) |
+| Port | UDP **5354** (`MDNS_PORT`), deliberately not 5353 |
+| Interval | every **2 seconds** (`announce_interval` in `runLoop`) |
+| IP version | IPv4 only |
 
-### The Multicast Group
-Nodes join the multicast group **`239.255.255.250`** on port **`5353`**. This is a standard reserved address for local discovery.
+Each announcement is a magic prefix followed by a small JSON-like object
+(`broadcastAnnouncement`):
 
-### The Announcement
-Every 30 seconds (and immediately upon startup), each node broadcasts a small UDP packet containing its identity and its local listening port.
-
-**Packet Format (JSON):**
-```json
-{
-  "id": "dacd7680...",
-  "port": 9000
-}
+```
+NMFS{"id":"<64 hex chars: node ID>","port":9000}
 ```
 
-### The Discovery Loop
-The `MDNS` struct (`src/network/mdns.zig`) runs a background thread that:
-1.  **Listens** for incoming multicast packets.
-2.  **Parses** the PeerID and Port.
-3.  **Constructs** a full `std.net.Address` using the source IP of the UDP packet.
-4.  **Notifies** the `ConnectionManager` via a callback.
+`id` is the sender's **node ID** (BLAKE2s-256 of its X25519 transport key),
+and `port` is its TCP listening port (`network.port`).
 
-## 3. Security Considerations
+## 3. The Discovery Loop
 
-Even though discovery happens over an unencrypted UDP broadcast, NomadFS remains secure because:
-1.  **Noise Handshake**: After discovering a peer via mDNS, the node still performs a full [Noise XXpsk3 Handshake](./noise.md).
-2.  **Swarm Key**: If the discovered peer doesn't have the correct Swarm Key, the handshake will fail immediately.
-3.  **Untrusted Source**: We only use mDNS to find "potential" peers. We never trust the data they send until the cryptographic handshake is complete.
+`MDNS.start()` opens two sockets on the calling thread: a receive socket
+bound to `0.0.0.0:5354` with `SO_REUSEADDR`/`SO_REUSEPORT` (so several nodes
+on one machine can share the port), joined to the group, with a 1-second
+receive timeout; and a send socket with multicast loopback enabled. It then spawns `runLoop`, which:
 
-## 4. Integration
+1.  **Announces** every 2 seconds.
+2.  **Receives** a datagram (up to 1 KiB). Thanks to the receive timeout,
+    the loop keeps announcing even when nothing arrives.
+3.  **Parses** it in `handlePacket`:
+    *   anything without the `NMFS` prefix is ignored silently;
+    *   the `id` must be exactly 64 hex characters, and `port` must be a
+        non-zero number, or the packet is rejected (`error.InvalidFormat`);
+    *   our own announcements (same node ID) are ignored.
+4.  **Builds the address** from the datagram's *source IP* and the announced
+    port, and calls the callback (`ConnectionManager.onMdnsDiscovery`, which
+    forwards to the discovery handler).
 
-mDNS is integrated directly into the `ConnectionManager`. When a node is configured to listen on a port, it automatically starts the mDNS broadcaster and listener (unless `network.enable_mdns` is set to `false`).
+In a node that handler is `discovery.Node.onDiscovery`
+(`src/net/discovery/node.zig`). If the node ID isn't already in the routing
+table, it dials the address with `connectToPeer(addr, swarm_key, peer_id)`
+and sends a `PING`. The peer enters the routing table only after the `PONG`
+([Chapter 2.4](../discovery/rpc.md)).
+
+## 4. Security Considerations
+
+The beacon is plaintext and unauthenticated. Anyone on the LAN can read a
+node's ID and port, and anyone can send fake announcements. That is
+acceptable because an announcement only suggests an address to try:
+
+1.  The dial runs the full [Noise XXpsk3 handshake](./noise.md). Without the
+    swarm key it fails.
+2.  `connectToPeer` is given the announced node ID. If the handshake proves a
+    different static key, the dial fails with `error.PeerIdMismatch`.
+3.  Malformed packets are rejected before they reach the callback.
+
+## 5. Configuration and Platforms
+
+*   `enable_mdns = true` (the default) in `nomadfs.conf`.
+    `ConnectionManager.listen` starts the beacon only when it is set.
+*   **Windows**: not supported. The socket helpers are POSIX-only, so
+    `start()` prints a message and leaves discovery off.
+*   If the sockets can't be set up (for example, the port is taken), the
+    beacon stays off and `start()` still succeeds.
+*   `stop()` shuts the sockets down to unblock the worker, joins it, and only
+    then closes the descriptors.
 
 ---
 
 **Next Chapters:**
-*   [Chapter 1.6: NAT Traversal & AutoNAT](./nat.md)
+*   [Chapter 1.6: UPnP & DIAL_BACK](./nat.md)

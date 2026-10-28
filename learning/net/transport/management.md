@@ -1,69 +1,130 @@
 # Chapter 1.4: Connection Management & Lifecycle
 
-In a truly decentralized network, your node might interact with hundreds of peers over time. Without careful management, these connections would consume all available system resources (memory, file descriptors, and CPU).
+A node talks to many peers over time. The **`ConnectionManager`**
+(`src/net/transport/manager.zig`) keeps one pooled connection per peer, dials
+addresses in a sensible order, retires dead or idle connections, and hands
+each new connection to whoever serves it.
 
-The **`ConnectionManager`** (`src/network/manager.zig`) is responsible for the health, efficiency, and cleanup of all peer-to-peer pipes.
+## 1. Creating and Starting a Manager
 
-## 1. Connection Pooling (Deduplication)
+*   `ConnectionManager.init` / `create` load the node's X25519 transport key
+    with `loadOrCreateKey`: the configured `key_path` if set, otherwise
+    `node.key` in the current directory, otherwise `~/.nomadfs/node.key`. A
+    key is created only where none exists. An existing key that is corrupt or unreadable is an
+    error: silently replacing it would change the node's identity.
+    `initExplicit` / `createExplicit` take a key directly (tests, invites).
+*   `node_id = NodeID.fromPublicKey(keypair.public_key)`: BLAKE2s-256 of the
+    transport public key.
+*   `setDeviceAuthenticator(auth)` attaches the device identity and trust
+    store, so every handshake carries and checks a
+    [device hello](./noise.md#4-device-identity-the-device-hello-srcdeviceauthzig).
+*   `start()` spawns the **reaper** thread. `listen(cfg, running)` starts the
+    LAN announcer ([Chapter 1.5](./mdns.md)), the UPnP thread
+    ([Chapter 1.6](./nat.md)), and the TCP accept thread.
+*   `setConnectionHandler(ctx, handler)` sets the function that runs, on its
+    own thread, for every connection added to the pool. In a node it is
+    `discovery.Node.serve` (`src/root.zig`), which accepts that connection's
+    Yamux streams. `setDiscoveryHandler` receives peers found on the LAN.
 
-Opening an authenticated Noise connection involves a cryptographic handshake, which is CPU-intensive. To avoid redundant work:
+## 2. Reference Counting
 
-1.  **Lookup before Dial**: When the DHT or another component calls `connectToPeer(address)`, the manager first checks its internal list of active connections.
-2.  **Yamux Re-use**: If a connection to that PeerID or Address already exists, the manager returns the existing **Yamux Session**. Components then open a new logical "Stream" over this session instead of dialing a new TCP connection.
-3.  **Thread Safety**: A global mutex ensures that two components don't accidentally try to dial the same peer simultaneously.
+A `network.Connection` (`TcpConnectionImpl` in `tcp.zig`) is **reference
+counted**:
 
-By using Yamux, NomadFS avoids the high cost of repeated TCP handshakes and Noise cryptographic setups. Multiple concurrent requests (e.g., a DHT lookup and a file transfer) all flow through the same established "Pipe."
+*   `retain()` adds a reference; `deinit()` drops one. The last `deinit()`
+    joins the Yamux reader thread and frees the session, its streams, the
+    Noise buffers and the socket.
+*   `close()` only signals shutdown: it shuts the socket down and wakes every
+    waiter. It is safe while other threads still hold references.
 
-## 2. Multiaddress Priority (LAN vs WAN)
+The manager holds one reference to each pooled connection. Every function
+that returns a connection returns a **new** reference that the caller must
+release:
 
-A single peer might be reachable via multiple paths (e.g., a Local IP and a Public IP). When connecting to a peer with multiple known addresses, NomadFS uses **Priority Sorting**.
+```zig
+const conn = try manager.connectToPeer(addr, swarm_key, expected_node_id);
+defer conn.deinit(); // drops the caller's reference; the pool keeps its own
+```
 
-### Priority Scores
-1.  **Priority 0 (Loopback)**: `127.0.0.1` or `::1`. Used for testing or local IPC.
-2.  **Priority 1 (Private/LAN)**: RFC 1918 ranges (e.g., `192.168.x.x`). These are preferred for speed and zero cost.
-3.  **Priority 2 (Public/WAN)**: Routable internet addresses. Used as a fallback if the peers are not on the same network.
+This applies to `connectToPeer`, `connectToPeerMulti` and `getConnection`.
+`addConnection(conn)` is different: on success the manager takes over the
+caller's reference, and on error the caller still owns it and nothing was
+registered.
 
-The `ConnectionManager` always attempts to dial Priority 0 first, then Priority 1, and finally Priority 2. This ensures that if two devices are on the same WiFi, they will automatically sync over the LAN even if the DHT also reports their public IP.
+## 3. Connection Pooling
 
-## 3. Resource Reaping (The Garbage Collector)
+`connectToPeer(address, swarm_key, remote_node_id)`:
 
-A P2P node can't assume peers will stay online forever. Laptops close, mobile apps enter background mode, and routers reboot.
+1.  **Look up first.** Under the mutex, `findConnectionLocked` looks for a
+    live connection. With an expected node ID only the *authenticated* ID
+    counts, because another node may now sit at a known address. Without
+    one, any matching address counts. A match gets `last_active` refreshed
+    and is returned with `retain()`.
+2.  **Dial.** The mutex is **released** before dialing, so a slow handshake
+    doesn't block other callers. Two threads dialing the same new peer at
+    the same moment can therefore both connect, and the pool briefly holds
+    two connections. The spare one is reaped once idle.
+3.  **Check.** If a node ID was expected and the handshake proved a different
+    one, the call fails with `error.PeerIdMismatch`.
+4.  **Register.** One reference goes to the pool (`addConnection`, which also
+    starts the connection handler thread), one to the caller.
 
-The manager runs a background **Reaper Thread** that periodically (every 10 seconds) scans the connection pool for two conditions:
+Incoming connections take the same `addConnection` path from
+`tcp.handleIncomingConnection`.
 
-### A. Closed Connections
-If a peer abruptly disconnects (e.g., TCP reset), the Yamux session will mark itself as `closed`. The reaper detects this via `conn.isClosed()` and removes the dead object from memory.
+## 4. Address Priority (LAN vs WAN)
 
-### B. Idle Timeouts
-Even if a connection is technically "open", it might be inactive. Keeping an idle connection open prevents other nodes from using that port and wastes resources.
-*   **Last Active Tracking**: Every time a component requests a connection via `connectToPeer`, the `last_active` timestamp is updated.
-*   **Expiration**: If a connection hasn't been used for 5 minutes (the default `idle_timeout`), the reaper closes it gracefully.
+A peer record can hold up to 8 addresses
+([Chapter 2.2](../discovery/kbucket.md)). `connectToPeerMulti` sorts a copy
+by `network.addressPriority` (`src/net/transport/mod.zig`) and tries each in
+turn, returning `error.AllAddressesFailed` if none works:
 
-## 3. Implementation Details: Ownership & Cleanup
+| Priority | Addresses |
+| :--- | :--- |
+| 0 | loopback (`127.0.0.0/8`, `::1`) |
+| 1 | private / LAN (RFC 1918 and similar) |
+| 2 | everything else |
 
-Managing the lifecycle of connections in a threaded environment requires strict ownership rules to avoid double-frees or use-after-free bugs.
+Two devices on the same Wi-Fi therefore connect over the LAN even when the
+DHT also knows a public address. `PeerInfo.getBestAddress` uses the same
+order.
 
-### Separation of Concerns: Close vs. Deinit
-We explicitly separate the concept of "Shutting Down" from "Destroying Memory":
-1.  **`close()`**: Stops I/O, closes sockets, and signals threads to exit. Safe to call multiple times (idempotent).
-2.  **`deinit()`**: Frees the memory allocated for the connection struct. **Must only be called once** by the *owner* of the object.
+## 5. The Reaper
 
-### Ownership Rules
-*   **Connection Manager**: Once you call `manager.addConnection(conn)`, the Manager assumes **full ownership**. It is responsible for calling `deinit()` when the connection is reaped or the manager is stopped.
-*   **Caller Responsibility**: If you pass a connection to the manager, you **MUST NOT** call `deinit()` yourself (e.g., via `defer`). This is a common source of bugs in tests.
+`runReaper` wakes every `reap_interval_ms = 10_000` and walks the pool:
 
-## 4. Why This Matters for Decentralization
+*   **In use counts as active.** If `conn.isInUse()` (someone besides the
+    manager holds a reference, or a stream is open), `last_active` is set to
+    now.
+*   **Closed** (`isClosed()`, for example after a TCP reset) or **idle**
+    (`now - last_active > idle_timeout`, 5 minutes) connections are removed
+    and retired: `close()`, join the handler thread, drop the manager's
+    reference. Anyone else still holding the connection keeps it alive until
+    they release it.
 
-### Resisitance to DOS
-By automatically closing idle or dead connections, NomadFS prevents a common class of "Slowloris" or resource exhaustion attacks where a malicious peer opens many connections and never sends data.
+`last_active` is set when a connection is registered, when
+`findConnectionLocked` hands it out, and by the reaper while it is in use.
 
-### Mobile Optimization
-On mobile devices, every active socket drains the battery. The `idle_timeout` ensures that once a file sync or DHT lookup is finished, the radio can eventually sleep.
+## 6. Shutdown
 
-### Network Agility
-Nodes frequently change IP addresses (roaming). By cleaning up old connections quickly, the node stays "agile" and can reconnect to peers at their new locations without being stuck with stale socket state.
+`stop()` marks the manager as stopping (`addConnection` then returns
+`error.ManagerStopping`), stops the LAN announcer, closes the listening
+socket, joins the accept thread, waits for in-flight handshakes, retires every
+pooled connection, joins the reaper and UPnP threads, and finally removes the
+UPnP port mapping if one was made. Mappings are requested with an infinite
+lease, so leaving one behind would keep the port forwarded.
+
+## 7. Why This Matters
+
+*   **Resource limits**: idle and dead connections don't pile up. A peer that
+    connects and never speaks is cut off by the 10-second handshake timeout.
+*   **Mobile**: idle sockets are closed after 5 minutes, so the radio can
+    sleep.
+*   **Roaming**: a device that changes address shows up as a new connection,
+    and the old one is reaped.
 
 ---
 
 **Next Chapters:**
-*   [Chapter 2.1: DHT Overview: The Phonebook](../discovery/overview.md)
+*   [Chapter 1.5: Local Discovery (LAN announcements)](./mdns.md)
+*   [Chapter 2: Discovery Overview](../discovery/overview.md)

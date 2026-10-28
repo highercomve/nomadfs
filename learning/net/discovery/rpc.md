@@ -1,154 +1,160 @@
 # Chapter 2.4: DHT RPC and Serialization
 
-To communicate between nodes, we need a compact and efficient way to serialize our DHT messages (PING, FIND_NODE, etc.) into raw bytes.
+Every request one NomadFS device makes of another is a message defined in
+`src/net/discovery/rpc.zig`, served by `discovery.Node` in
+`src/net/discovery/node.zig`. Despite the name, these messages carry far more
+than Kademlia: blocks, share listings, the swarm folder manifest,
+revocations and key rotation all use them.
 
-## 1. The Message Protocol
+## 1. One RPC per Yamux Stream
 
-NomadFS uses a simple binary protocol for DHT messages to minimize overhead and avoid the complexity of heavy formats like JSON or XML.
+```
+caller                                   callee (Node.serve)
+conn.openStream()           ──SYN──▶     acceptStream(), spawn handler thread
+stream.setTimeout(10 s)                  stream.setTimeout(10 s)
+Message.serialize(request)  ──────▶      Message.deserialize → handleRequest
+Message.deserialize(reply)  ◀──────      Message.serialize(reply)
+stream.close()              ──FIN──▶     stream.close()
+```
 
-### Message Structure
-Every message consists of:
-1.  **Type (1 byte)**: The `MessageType` enum.
-2.  **Sender ID (32 bytes)**: The `NodeID` of the sender.
-3.  **Payload**: Variable length depending on the message type.
+*   One request and at most one reply per [Yamux stream](../transport/yamux.md),
+    each bounded by `rpc_timeout_ms = 10_000`. `DIAL_BACK` has no reply.
+*   `Node.serve(conn)` is the connection handler set in `src/root.zig`. It
+    loops on `acceptStream()` and runs each request on its own thread, which
+    holds its own reference to the connection.
+*   The sender is the connection's authenticated node ID. Handlers that care
+    (`PING`, `ADD_PROVIDER`, `DIAL_BACK`, `ROTATE_KEY`) use
+    `conn.getRemoteNodeID()` / `getRemoteDeviceID()`, not the `sender_id`
+    field.
 
-## 2. Payload Formats
-
-### PING (0)
-*   **Payload**: 
-    *   **Port (2 bytes)**: Big-endian. The listening port of the sender (to allow callbacks through NAT/Firewalls).
-
-### PONG (1)
-*   **Payload**: Empty (0 bytes).
-
-### FIND_NODE (2)
-*   **Payload**: Target `NodeID` (32 bytes).
-
-### FIND_NODE_RESPONSE (3)
-*   **Payload**: 
-    *   **Count (1 byte)**: Number of peers being returned (max $K=20$).
-    *   **Peers**: Array of Peer records.
-        *   **ID (32 bytes)**.
-        *   **Address Type (1 byte)**: 4 for IPv4, 6 for IPv6.
-        *   **IP Address (4 or 16 bytes)**.
-        *   **Port (2 bytes)**: Big-endian.
-
-### FIND_VALUE (4)
-*   **Payload**: Key `NodeID` (32 bytes).
-
-### FIND_VALUE_RESPONSE (5)
-*   **Payload**:
-    *   **Found (1 byte)**: 1 if value is found, 0 if returning closer peers.
-    *   **If Found**:
-        *   **Length (4 bytes)**: Big-endian length of the value.
-        *   **Value**: The raw bytes of the value.
-    *   **If Not Found** (Closer Peers):
-        *   **Count (1 byte)**: Number of peers.
-        *   **Peers**: Array of Peer records (same format as `FIND_NODE_RESPONSE`).
-
-### STORE (6)
-*   **Payload**:
-    *   **Key**: `NodeID` (32 bytes).
-    *   **Length (4 bytes)**: Big-endian length of the value.
-    *   **Value**: The raw bytes to store.
-
-## 3. Implementation in Zig
-
-The implementation in `src/dht/rpc.zig` uses a `Message` struct with `serialize` and `deserialize` methods.
-
-### Serialization
-We use the `std.io.Writer` interface to write bytes directly to the stream.
+## 2. The Message Format
 
 ```zig
-pub fn serialize(self: Message, writer: anytype) !void {
-    // 1. Write Message Type
-    try writer.writeByte(@intFromEnum(self.payload));
+pub const Message = struct {
+    sender_id: id.NodeID,
+    payload: MessagePayload, // tagged union over MessageType
+};
+```
 
-    // 2. Write Sender ID
-    try writer.writeAll(&self.sender_id.bytes);
+On the wire, all integers big-endian:
 
-    // 3. Write Payload
-    switch (self.payload) {
-        .PING, .PONG => {},
-        .FIND_NODE => |p| {
-            try writer.writeAll(&p.target.bytes);
-        },
-        .FIND_NODE_RESPONSE => |p| {
-            try writer.writeByte(@intCast(p.closer_peers.len));
-            for (p.closer_peers) |peer| {
-                try writer.writeAll(&peer.id.bytes);
-                try serializeAddress(peer.address, writer);
-            }
-        },
-        .FIND_VALUE => |p| {
-            try writer.writeAll(&p.key.bytes);
-        },
-        .FIND_VALUE_RESPONSE => |p| {
-            switch (p) {
-                .value => |val| {
-                    try writer.writeByte(1); // Found
-                    try writer.writeInt(u32, @intCast(val.len), .big);
-                    try writer.writeAll(val);
-                },
-                .closer_peers => |peers| {
-                    try writer.writeByte(0); // Not Found, here are peers
-                    try writer.writeByte(@intCast(peers.len));
-                    for (peers) |peer| {
-                        try writer.writeAll(&peer.id.bytes);
-                        try serializeAddress(peer.address, writer);
-                    }
-                },
-            }
-        },
-        .STORE => |p| {
-            try writer.writeAll(&p.key.bytes);
-            try writer.writeInt(u32, @intCast(p.value.len), .big);
-            try writer.writeAll(p.value);
-        },
+```
+[type: u8][sender_id: 32 bytes][payload ...]
+```
+
+## 3. The 21 Message Types
+
+| # | Type | Payload | Reply |
+| --: | :--- | :--- | :--- |
+| 0 | `PING` | `port: u16` (sender's listening port) | `PONG` |
+| 1 | `PONG` | empty | |
+| 2 | `FIND_NODE` | `target: 32 B` | `FIND_NODE_RESPONSE` |
+| 3 | `FIND_NODE_RESPONSE` | peer list (section 4) | |
+| 4 | `FIND_VALUE` | `key: 32 B` | `FIND_VALUE_RESPONSE` |
+| 5 | `FIND_VALUE_RESPONSE` | `1` + value, or `0` + peer list | |
+| 6 | `STORE` | `key: 32 B`, value | `STORE_ACK` |
+| 7 | `DIAL_BACK` | `port: u16` | none; the callee dials back ([Chapter 1.6](../transport/nat.md)) |
+| 8 | `STORE_ACK` | `stored: u8` (0 or 1) | |
+| 9 | `GET_BLOCK` | `cid: 32 B` | `BLOCK` |
+| 10 | `BLOCK` | `1` + data, or `0` if the block isn't held | |
+| 11 | `ADD_PROVIDER` | `key: 32 B` (the provider is the authenticated sender) | `STORE_ACK` |
+| 12 | `GET_PROVIDERS` | `key: 32 B` | `PROVIDERS` |
+| 13 | `PROVIDERS` | `count: u8` (≤ 20), then `count` × 32-byte node IDs | |
+| 14 | `PUT_BLOCK` | `cid: 32 B`, data | `STORE_ACK` (stored only if the bytes hash to `cid`) |
+| 15 | `REVOKE` | `device_id: 32 B`, `signer_key: 32 B`, `at: u64`, `signature: 64 B` | `STORE_ACK` |
+| 16 | `GET_SHARES` | empty | `SHARES` |
+| 17 | `SHARES` | `nick_len: u8`, nickname (≤ 64 B), listing (a dir block) | |
+| 18 | `GET_SWARM` | empty | `SWARM` |
+| 19 | `SWARM` | the swarm folder manifest (JSON) | |
+| 20 | `ROTATE_KEY` | `epoch: u64`, `new_key: 32 B`, `signer_key: 32 B`, `signature: 64 B` | `STORE_ACK` (accepted or not) |
+
+A "value", "data", "listing" or "manifest" is `[len: u32][bytes]`, and
+`readValue` refuses lengths above `max_value_len` (10 MiB). An unknown type
+byte fails with `error.InvalidMessageType`.
+
+What each handler does:
+
+*   **`GET_BLOCK`** reads the local block store, which also serves shared
+    files' chunks from the original files (see
+    [Shared folders](../../fs/shares.md)). The caller verifies the bytes
+    against the CID ([Blocks](../../storage/block.md)).
+*   **`GET_SHARES`** returns the node's nickname and a dir block whose entries
+    are its shares (an empty dir block, `{2, 0, 0}`, if it shares nothing).
+    **`GET_SWARM`** returns the encoded manifest, or `[]`
+    ([Swarm folder](../../fs/swarm.md)).
+*   **`REVOKE`** is honored only if the signer is trusted locally
+    (`device_trust.applyRevocation`). **`ROTATE_KEY`** is honored only if the
+    signer is trusted, *is* the device on this connection, and the epoch is
+    newer (`device/rotation.zig`). See
+    [Device Identity & Pairing](../../security/pairing.md).
+*   **`STORE`** values are bounded per node by `store_limits`: 64 KiB per
+    value, 64 MiB in total, 100,000 keys.
+*   **`PING`** from the network adds the sender to the routing table under the
+    socket's IP and the port in the payload. After a `PONG`, the pinging
+    side pushes its revocations to the peer (`pushRevocations`) if it has
+    any.
+
+## 4. Peer Records and Addresses
+
+`FIND_NODE_RESPONSE` and the closer-peers form of `FIND_VALUE_RESPONSE`
+carry a peer list:
+
+```
+[count: u8]                     // ≤ K = 20 on read (error.TooManyPeers)
+count × {
+    [node_id: 32 B]
+    [addr_count: u8]            // ≤ 8 on read (error.TooManyAddresses)
+    addr_count × address
+}
+
+address = [4][ipv4: 4 B][port: u16 BE]
+        | [6][ipv6: 16 B][port: u16 BE]
+```
+
+```zig
+fn writePeers(peers: []const kbucket.PeerInfo, writer: anytype) !void {
+    if (peers.len > 255) return error.TooManyPeers;
+    try writer.writeByte(@intCast(peers.len));
+    for (peers) |peer| {
+        try writer.writeAll(&peer.id.bytes);
+        try writer.writeByte(peer.addrs_count);
+        for (0..peer.addrs_count) |i| try serializeAddress(peer.addresses[i], writer);
     }
 }
 ```
 
-### Deserialization
-Deserialization requires an `Allocator` because `FIND_NODE_RESPONSE` contains a slice of peers that must be allocated.
+## 5. Serialization Code
+
+`Message.serialize(writer)` writes the type byte, the sender ID, then switches
+on the payload. `Message.deserialize(allocator, reader)` does the reverse.
+Variable-length parts (peer lists, values, nicknames, provider lists) are
+allocated, and `Message.deinit(allocator)` frees them.
 
 ```zig
 pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Message {
     const type_byte = try reader.readByte();
-    const msg_type = std.meta.intToEnum(MessageType, type_byte) catch return error.InvalidMessageType;
-
+    const msg_type = std.enums.fromInt(MessageType, type_byte) orelse return error.InvalidMessageType;
     var sender_id: id.NodeID = undefined;
     try reader.readNoEof(&sender_id.bytes);
-    
-    // ... switch on msg_type and read payload ...
+    const payload = switch (msg_type) { ... };
+    return .{ .sender_id = sender_id, .payload = payload };
 }
 ```
 
-## 4. Address Handling
+## 6. Safety and Validation
 
-Addresses are handled specifically to ensure cross-platform compatibility. IPv4 and IPv6 addresses are serialized with a leading type byte followed by the raw IP bytes and a 2-byte big-endian port.
-
-```zig
-fn serializeAddress(addr: std.net.Address, writer: anytype) !void {
-    switch (addr.any.family) {
-        std.posix.AF.INET => {
-            try writer.writeByte(4);
-            try writer.writeAll(std.mem.asBytes(&addr.in.sa.addr));
-            try writer.writeAll(std.mem.asBytes(&addr.in.sa.port));
-        },
-        // ...
-    }
-}
-```
-
-## 5. Safety and Validation
-
-Following **TigerStyle**, we perform strict validation during deserialization:
-*   **Bounds Checking**: We ensure the number of peers in a `FIND_NODE_RESPONSE` does not exceed $K=20$.
-*   **Type Validation**: We verify that the `MessageType` is a valid enum value using `std.meta.intToEnum`.
-*   **Memory Management**: The `Message` struct provides a `deinit` method to free any allocated payload data.
+*   **Counts are bounded before allocating**: peers ≤ 20, addresses ≤ 8,
+    providers ≤ 20, values ≤ 10 MiB, nicknames ≤ 255 on the wire (cut to 64
+    when sending).
+*   **Booleans are strict**: `readBool` accepts only 0 or 1
+    (`error.InvalidMessage`).
+*   **Identity comes from the handshake**: a `PING` whose `sender_id` differs
+    from the connection's node ID is refused (`error.PeerIdMismatch`), and the
+    caller of `ping()` checks the `PONG` the same way.
+*   **Content is checked against its name**: `PUT_BLOCK` goes through
+    `StorageEngine.put`, which rejects bytes that don't hash to the CID.
 
 ---
 
 **Next Chapters:**
-*   [Chapter 3: The Storage Layer](../storage/overview.md)
+*   [Chapter 3: The Storage Layer](../../storage/overview.md)

@@ -1,43 +1,102 @@
-# Network Layer Overview: The "Pipe"
+# Chapter 1: Transport Layer Overview: The "Pipe"
 
-In NomadFS, the network layer is responsible for creating a secure, reliable, and multiplexed communication channel between peers. We call this the **"Pipe"**.
+The transport layer turns a plain TCP socket into an encrypted, authenticated
+connection that carries many independent streams. We call that connection the
+**"Pipe"**. Everything above it (DHT requests, block transfers, share
+listings, the swarm folder manifest) is a request/response exchange on one
+stream of a pipe.
 
-## 1. High-Level Architecture
+> For a short, diagram-led introduction see the site's Learn pages:
+> [TCP: finding and reaching devices](https://nomadfs.foreachdeveloper.com/learn/tcp/),
+> [Noise XXpsk3](https://nomadfs.foreachdeveloper.com/learn/noise/) and
+> [Yamux](https://nomadfs.foreachdeveloper.com/learn/yamux/). This chapter is
+> the code-level companion.
 
-The goal is to upgrade a raw, unreliable transport (like TCP) into a sophisticated peer-to-peer connection. We follow a layered approach:
+## 1. The Layers
 
 ```mermaid
 graph TD
-    App[Application Logic] --> Stream[Abstract Stream]
-    Stream --> Yamux[Multiplexing Layer]
-    Yamux --> Noise[Security Layer]
-    Noise --> TCP[Transport Layer]
+    App["RPCs (src/net/discovery/node.zig)"] --> Stream["network.Stream (one Yamux stream per request)"]
+    Stream --> Yamux["Yamux Session (yamux.zig)"]
+    Yamux --> Noise["NoiseStream (noise.zig)"]
+    Noise --> TCP["TcpStream (tcp.zig)"]
 ```
 
-### The Layers
-1.  **Transport (TCP)**: The raw byte-stream provided by the operating system.
-2.  **Security (Noise)**: Wraps TCP to provide mutual authentication and encryption.
-3.  **Multiplexing (Yamux)**: Splits the single encrypted connection into many logical "streams".
-4.  **Interface (Abstract Stream)**: Provides a generic `Read/Write` interface to the rest of the application.
+1. **Transport (TCP)**: the operating system's byte stream (`TcpStream` in
+   `src/net/transport/tcp.zig`). TCP is the only transport: the config parser
+   rejects `transport = "quic"`, and `ConnectionManager` returns
+   `error.QuicNotImplemented` for it.
+2. **Security (Noise)**: `NoiseStream` runs the `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s`
+   handshake and then encrypts every frame. The handshake also carries a
+   signed Ed25519 *device hello* that binds the device identity to the
+   session. See [Chapter 1.1](./noise.md).
+3. **Multiplexing (Yamux)**: a `yamux.Session` splits the encrypted stream
+   into numbered streams with per-stream flow control. See
+   [Chapter 1.2](./yamux.md).
+4. **Interface**: `network.Stream` and `network.Connection` in
+   `src/net/transport/mod.zig` are vtable interfaces, so callers never see the
+   concrete types. `Stream` has `read`, `write`, `close` and an optional
+   `setTimeout`.
 
-## 2. Abstractions (`mod.zig`)
+## 2. Establishing a Connection (`tcp.zig`)
 
-To decouple the application from the underlying network implementation, we use two primary interfaces:
+Both directions end in the same function, `establish()`:
 
-### `ConnectionManager`
-The central registry for all active connections.
-*   **Purpose**: Pooling connections to avoid redundant handshakes and cleaning up idle resources.
-*   **Methods**: `connectToPeer()`, `listen()`, `stop()`.
+```
+dialer:   tcp.connect()  ── tcpConnectToAddressTimeout ──┐
+listener: acceptLoop() → handleIncomingConnection()  ────┤
+                                                         ▼
+          establish(): setTimeout(handshake_timeout_ms)
+                       NoiseStream.handshake(...)
+                       setTimeout(0)          // idle connections are fine
+                       YamuxSession.init(noise, is_server = !initiator)
+                       spawn YamuxSession.run (the frame reader thread)
+```
 
-## 3. The Implementation Glue (`tcp.zig` & `manager.zig`)
+* The Noise handshake (and, for the dialer, the TCP connect) must finish
+  within `default_handshake_timeout_ms = 10_000`. A peer that connects and
+  stays silent cannot pin a handshake thread.
+* Each accepted socket gets its own handshake thread, so one slow peer does
+  not block the accept loop.
+* After the handshake the socket has no read timeout: an established
+  connection may sit idle. Individual streams get their own deadlines
+  (`Stream.setTimeout`); the DHT uses `rpc_timeout_ms = 10_000` per request.
+* A connection (`TcpConnectionImpl`) is **reference counted**. The last
+  `deinit()` joins the Yamux reader thread and frees the session, the Noise
+  buffers and the socket. See [Chapter 1.4](./management.md).
 
-The network layer coordinates several components to provide a seamless experience:
-*   **Listening**: Accepts raw TCP connections and immediately triggers the [Noise Handshake](./noise.md).
-*   **Connecting**: Dials a remote peer and initiates the handshake.
-*   **Session Management**: Once the handshake is complete, it starts the [Yamux Session](./yamux.md) in a dedicated background thread.
-*   **Local Discovery**: The [mDNS](./mdns.md) component broadcasts and listens for peers on the local area network.
-*   **Reachability**: The [NAT & AutoNAT](./nat.md) component handles port forwarding and verifies if the node is reachable from the internet.
-*   **Lifecycle Control**: The [ConnectionManager](./management.md) runs a "Reaper" thread to prune dead or idle connections, ensuring system stability.
+## 3. Identities on a Connection
+
+A finished handshake leaves two identities on the connection:
+
+| Accessor | Value | Derived from |
+| :--- | :--- | :--- |
+| `getRemoteNodeID()` | DHT node ID | BLAKE2s-256 of the peer's X25519 static key (`NodeID.fromPublicKey`, `src/net/id.zig`) |
+| `getRemoteDeviceID()` | device ID | BLAKE2s-256 of the peer's Ed25519 identity key, from the verified device hello (`src/device/auth.zig`) |
+
+The DHT routing table is keyed by node ID. Pairing, the trust store,
+revocation and key rotation use the device ID. See
+[Chapter 2.1](../discovery/id.md).
+
+## 4. The Supporting Pieces
+
+* **[ConnectionManager](./management.md)** (`manager.zig`): pools
+  connections, dials addresses in priority order, runs the reaper thread, and
+  hands every new connection to the connection handler (in a running node,
+  `discovery.Node.serve`).
+* **[LAN announcements](./mdns.md)** (`mdns.zig`): a small UDP multicast
+  beacon that lets devices on the same network find each other.
+* **[UPnP and DIAL_BACK](./nat.md)** (`nat.zig`): asks the router to forward
+  the listening port, and asks a bootstrap peer to dial back.
+* **[Testing](./testing.md)**: in-memory pipes and multi-node tests on
+  loopback.
+
+## 5. Not implemented yet
+
+[ROADMAP.md](../../../ROADMAP.md) plans a relay node that splices two peers'
+encrypted streams when neither can reach the other, and Yamux `PING`
+keep-alives to hold NAT mappings open. Neither exists today. The Yamux
+session answers pings, but nothing sends them.
 
 ---
 

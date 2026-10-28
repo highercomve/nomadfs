@@ -1,4 +1,8 @@
-# Device Identity & Pairing
+# Chapter 6.2: Device Identity & Pairing
+
+User-facing guide: [Connecting devices](https://nomadfs.foreachdeveloper.com/docs/connecting-devices/).
+Most devices pair through a one-time invite, which exchanges these same
+tickets automatically; see [Chapter 6.3](./invites.md).
 
 ## 1. Why Pairing Exists
 
@@ -180,8 +184,8 @@ entries (legacy files, never-paired devices) skip this check.
 
 Trust is an additional policy:
 
-```toml
-[security]
+```ini
+# nomadfs.conf (section headers are optional; the parser skips them)
 require_trusted_devices = true
 ```
 
@@ -223,9 +227,9 @@ without `0x` and with `-`, `:` or spaces ignored. A query that matches nothing
 rejected instead of guessing. Removal is saved atomically like any other
 trust-store write.
 
-Revocation currently affects only the local store. Every node keeps its own
-`trust.store`, so other peers continue to accept the removed device until
-revocation propagation exists.
+`--revoke` only edits the local store and records a tombstone; the CLI
+command does not contact anyone. The tombstone reaches other devices the next
+time a node running with this `trust.store` talks to them (below).
 
 ### Revocation Propagation
 
@@ -249,11 +253,20 @@ nodes' stores.
 
 Tombstones persist in `trust.store` (`@`-prefixed lines, capped at 256), and
 they do not block recovery: pairing again with a fresh, human-scanned ticket
-clears the tombstone. Propagation happens on both paths: out of band, every
-connection we dial hears our tombstones right after its PING; and the
-periodic maintenance loop every minute replays them to a sample of known
-peers even if they never dial us. A missing peer eventually gets the
-tombstones as long as either side can reach the fleet.
+clears the tombstone. Propagation happens on two paths
+(`src/net/discovery/node.zig`):
+
+- **On dial**: after a verified `PING`/`PONG` on a connection this node
+  opened, `pushRevocations` sends every tombstone it holds.
+- **Sweep**: the maintenance loop in `src/root.zig` calls
+  `sweepRevocations(4)` every 60 seconds, which dials the 4 peers closest to
+  this node's ID in the routing table and replays every tombstone, so peers
+  that never dial us still hear them.
+
+A node that honours a `REVOKE` records the tombstone too (signed by the
+original signer's ID) and persists the store at once. When it later pushes
+that tombstone, it signs a fresh `REVOKE` with its *own* identity, so the
+revocation spreads hop by hop through devices that trust each other.
 
 ## 8. Threat Notes & Next Steps
 
@@ -261,13 +274,13 @@ tombstones as long as either side can reach the fleet.
 | :--- | :--- | :--- |
 | Unknown device joining | Handshake binds the Ed25519 identity; `require_trusted_devices` rejects unknown IDs | Policy defaults to off so fresh installs can pair |
 | Tampered ticket | Ed25519 signature over canonical URI | - |
-| Replay of an old ticket | 24-hour expiry, plus handshake identity check | Revocation propagation is opportunistic; offline peers learn tombstones on the next dial |
+| Replay of an old ticket | 24-hour expiry, plus handshake identity check | Revocation reaches a peer only on a dial or a sweep; a peer offline for long learns it late |
 | Stolen ticket | Bearer until expiry | Fingerprint check is manual |
 | Rotated or stolen `node.key` | Trust store pins the ticket's X25519 key and the handshake re-checks it | Re-pairing required after a rotation |
 | Malicious trust file edit | Whole-file Ed25519 signature from the owning device; `0600`; ID/public-key cross-check | - |
 
-Next slice: a periodic sweep so revocation propagation no longer relies on
-one side dialing the other first.
+Not implemented yet: threshold revocation (several trusted signers must
+agree before a device is dropped). Today one trusted signer is enough.
 
 ## 9. Source Map
 
@@ -280,4 +293,12 @@ one side dialing the other first.
 | `src/device/auth.zig` | Signed handshake hello, trust policy |
 | `src/net/transport/noise.zig` | Carries and verifies the hello in messages 2 and 3 |
 | `src/device/paths.zig` | Where `device.key` and `trust.store` live |
-| `src/main.zig` | `--pair`, `--trust`, `--devices`, `--revoke` commands |
+| `src/device/invite.zig` | One-time invites that exchange tickets automatically ([7.3](./invites.md)) |
+| `src/device/rotation.zig` | Signed swarm-key rotation ([7.3](./invites.md)) |
+| `src/net/discovery/node.zig` | `REVOKE` handling, `pushRevocations`, `sweepRevocations` |
+| `src/main.zig` | `--pair`, `--trust`, `--devices`, `--revoke`, `--invite` commands |
+
+---
+
+**Next:** [Chapter 6.3: Invites, Key Rotation & Revocation](./invites.md) ·
+[Back to the Internals Book](../README.md)

@@ -1,52 +1,101 @@
-# Discovery Layer Overview: The "Phonebook"
+# Chapter 2: Discovery Layer Overview: The "Phonebook"
 
-In a decentralized system without a central server, nodes need a way to find each other's IP addresses and locate where specific data is stored. NomadFS uses a **Distributed Hash Table (DHT)** based on the **Kademlia** algorithm.
+Without a central server, devices need a way to learn each other's addresses.
+NomadFS uses a **Distributed Hash Table (DHT)** based on
+[Kademlia](https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf),
+in `src/net/discovery/`. The same module also carries every other
+request a device makes of a peer (blocks, share listings, the swarm folder
+manifest, revocations, key rotation). `discovery.Node` is the RPC server and
+client for the whole system.
 
-## 1. The Core Idea: XOR Metric
+> Overview with diagrams:
+> [Learn: TCP, finding and reaching devices](https://nomadfs.foreachdeveloper.com/learn/tcp/#kademlia).
 
-Every node in the network is assigned a random 256-bit **NodeID**. Kademlia defines the "distance" between two nodes not by geography or IP hops, but by the **XOR** of their IDs.
+## 1. The Core Idea: XOR Distance
+
+Every node has a 256-bit **node ID**: the BLAKE2s-256 hash of its X25519
+transport public key (`NodeID.fromPublicKey`, `src/net/id.zig`). IDs aren't
+random; a node keeps its ID as long as it keeps `node.key`. Kademlia measures
+the distance between two IDs as their XOR:
 
 $$distance(A, B) = A \oplus B$$
 
-This metric has a special property: it is a **metric space**. It allows nodes to route queries by moving "closer" to the target ID in the ID space, similar to how you find a word in a physical dictionary.
+See [Chapter 2.1](./id.md).
 
 ## 2. The Routing Table: k-buckets
 
-To avoid keeping a list of every node in a large network, each node maintains a set of **k-buckets**. 
-*   Each bucket corresponds to a specific range of distances from the local node.
-*   Nodes that are "close" to us are tracked with high precision.
-*   Nodes that are "far" away are tracked with less detail.
+Each node keeps a `RoutingTable` of 256 buckets. Bucket *i* holds peers
+whose ID shares exactly *i* leading bits with our own, up to K = 20 per
+bucket, plus a replacement cache. A node knows many peers near its own ID and
+a few far away. See [Chapter 2.2](./kbucket.md).
 
-This structure ensures that any node can be reached in $O(\log N)$ hops, where $N$ is the total number of nodes in the network.
+A peer enters the table only after it has answered over an authenticated
+connection (a `PING` whose ID matches the handshake, or a reply during a
+lookup). Peers merely *named* in someone's reply ("hearsay") are not added.
 
-## 3. Core RPC Operations
+## 3. Where Peers Come From
 
-The DHT supports four primary operations (RPCs):
+```mermaid
+graph LR
+    BS["bootstrap_peers (config, invites)"] --> Dial
+    LAN["LAN announcement (mdns.zig)"] --> Dial
+    FN["FIND_NODE replies"] --> Dial
+    Dial["connectToPeer + Noise"] --> Ping["PING / PONG"]
+    Ping --> RT["RoutingTable"]
+    In["incoming PING"] --> RT
+```
 
-1.  **`PING`**: Checks if a node is still online.
-2.  **`FIND_NODE`**: Asks a peer for the $k$ nodes it knows that are closest to a target ID.
-3.  **`FIND_VALUE`**: Similar to `FIND_NODE`, but if the peer has the requested data (value), it returns it directly.
-4.  **`STORE`**: Instructs a peer to store a key-value pair.
+*   **Bootstrap** (`Node.bootstrap` in `src/root.zig`): connects to each
+    `bootstrap_peers` entry (up to 5 attempts, 1 s apart), sends `PING` and
+    `DIAL_BACK` ([Chapter 1.6](../transport/nat.md)).
+*   **LAN** (`discovery.Node.onDiscovery`): an announced, unknown node ID is
+    dialed and pinged ([Chapter 1.5](../transport/mdns.md)).
+*   **Incoming `PING`** (`handlePing`): the sender is added under the IP of
+    the socket and the port given in the `PING`.
 
-## 5. Iterative Lookup: The "Crawler"
+## 4. RPCs
 
-The most important part of Kademlia is the iterative lookup process. When a node wants to find a target ID:
-1.  It selects the $\alpha$ (usually 3) closest nodes from its own routing table.
-2.  It sends `FIND_NODE` requests to them in parallel.
-3.  As it receives replies with even closer nodes, it queries those new nodes.
-4.  The process continues until no closer nodes can be found or the target is reached.
+The protocol has **21 message types** (`rpc.MessageType`), one request and
+one reply per Yamux stream. Besides the four classic Kademlia RPCs (`PING`,
+`FIND_NODE`, `FIND_VALUE`, `STORE`), they carry blocks, share listings, the
+swarm manifest, provider records, revocations and key rotation. See
+[Chapter 2.4](./rpc.md).
 
-## 6. Maintenance Strategy
+## 5. Iterative Lookup
 
-NomadFS has evolved its maintenance strategy from an aggressive "MVP" approach to a more standard, scalable Kademlia implementation.
+To find a node, `Node.lookup(target)` asks the closest known peers for peers
+closer still, with up to **α = 3** queries in flight, until nobody closer
+turns up. See [Chapter 2.3](./lookup.md). In practice NomadFS looks up a
+device's node ID when it isn't in the routing table
+(`BlockManager.findPeer`, `src/cluster/block_manager.zig`).
 
-| Feature | Legacy NomadFS (Aggressive) | Standard Kademlia/NomadFS (Current) |
-| :--- | :--- | :--- |
-| **Self-Lookup** | Every **10 seconds** (Infinite Loop). | **Once** at startup (to find closest neighbors). |
-| **Table Maintenance** | **Ping All** peers every 60s. | **Bucket Refresh**: Lookup a random ID in a bucket only if that bucket has been idle for **1 hour**. |
-| **Liveness** | Active Pinging. | **Lazy**: Remove peers only when they fail to respond to a user query. |
+## 6. Maintenance
 
-This shift ensures the network remains quiet when idle and scales efficiently to thousands of nodes without overwhelming low-power devices.
+After bootstrap, `runBootstrap` (`src/root.zig`):
+
+| Task | When |
+| :--- | :--- |
+| Self-lookup (`lookup(own node_id)`) | once, after the bootstrap peers |
+| `refreshBuckets()` | every 60 s; looks up a random ID in each bucket not updated for 1 hour |
+| `sweepRevocations(4)` | every 60 s; pushes revocations to the 4 known peers closest to us |
+| Bucket full | the least recently seen peer is pinged (`pingLruAndEvict`) and removed if it doesn't answer; a replacement is promoted |
+| Failed query | the peer is removed (`markDisconnected`) |
+
+There is no periodic ping of every peer.
+
+## 7. How the Rest of NomadFS Uses the DHT
+
+*   **Reaching a device**: shares and the swarm folder name the device that
+    holds a file by node ID. `BlockManager.connectTo(peer_id)` finds it in
+    the routing table, or with a lookup, and dials its addresses
+    ([Chapter 1.4](../transport/management.md#4-address-priority-lan-vs-wan)).
+*   **Listing peers**: `fs.remote.knownPeers` returns every peer in the
+    table. The swarm folder syncs with all of them every 10 s
+    ([Swarm folder](../../fs/swarm.md)).
+*   **Provider records** (`ADD_PROVIDER` / `GET_PROVIDERS`, `providers.zig`,
+    up to 20 per key, 24 h TTL) and **`STORE`/`FIND_VALUE`** are used by the
+    `BlockManager` put/get path ([Cluster overview](../../cluster/overview.md)),
+    not by shares or the swarm folder.
 
 ---
 
@@ -54,4 +103,4 @@ This shift ensures the network remains quiet when idle and scales efficiently to
 *   [Chapter 2.1: NodeIDs and XOR Math](./id.md)
 *   [Chapter 2.2: K-Bucket Management](./kbucket.md)
 *   [Chapter 2.3: Iterative Search](./lookup.md)
-
+*   [Chapter 2.4: DHT RPC and Serialization](./rpc.md)

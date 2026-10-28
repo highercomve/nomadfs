@@ -1,55 +1,113 @@
-# Deployment Architecture: Storage vs. Client
+# Architecture: The Node, the CLI, the App and the Library
 
-NomadFS recognizes that not all devices are created equal. A rack-mounted server has different capabilities than an Android phone. To handle this, NomadFS supports two distinct operational modes.
+Every way of running NomadFS, whether the command line, the desktop app, the
+Android app or the C library, runs the same core: the `Node` in
+`src/root.zig`. This chapter shows what a `Node` contains, how it starts,
+and who drives it.
 
-## 1. Storage Node (Full Peer)
-*   **Target Devices**: Servers, Desktops, Laptops.
-*   **Configuration**: `storage.enabled = true`.
-*   **Role**:
-    *   **Participates in the DHT**: Helps other nodes find data and peers.
-    *   **Stores Blocks**: Hosts data for the swarm.
-    *   **On the Ring**: Holds "Virtual Nodes" on the Consistent Hash Ring.
-*   **Availability**: Expected to be online frequently.
+## 1. The `Node`
 
-## 2. Client-Only Node (Roaming/Mobile)
-*   **Target Devices**: Android, iOS, low-power IoT.
-*   **Configuration**: `storage.enabled = false`.
-*   **Role**:
-    *   **Gateway**: Acts as an entry point for the user to read/write files.
-    *   **Local Encryption**: Encrypts/Decrypts data locally before sending it to the swarm.
-    *   **No Storage**: Does **not** store blocks for other peers to save battery and disk space.
-    *   **DHT Client**: Issues queries to the DHT but does not store routing table data for others.
-*   **On the Ring**: Holds **0 tokens** (it is never selected as a storage destination).
+`Node.init(allocator, cfg)` builds every part from a parsed `nomadfs.conf`
+(`src/config.zig`) in this order:
 
-## 3. Implementation: The Shared Library
+1.  **Network**: `ConnectionManager` (`src/net/transport/manager.zig`) loads
+    or creates the X25519 transport key (`node.key`). The node ID is
+    BLAKE2s-256 of its public key. Then it starts the connection reaper.
+2.  **Storage**: `StorageEngine` (`src/storage/engine.zig`), only when
+    `storage.enabled`. It is the block store under `storage_path`.
+3.  **Discovery**: the DHT `Node` (`src/net/discovery/node.zig`), which
+    answers every RPC. It is given the block store, the nickname and the
+    swarm-key epoch.
+4.  **Shares**: `fs.ShareIndex` registers each `share = "Name:/path"` and
+    starts the rescan thread (only with storage).
+5.  **Handlers**: the manager hands every new connection to the DHT serve
+    loop, and every LAN-announced peer to `onDiscovery`.
+6.  **Block exchange**: `cluster.BlockManager` with `replicas` and
+    `write_quorum`.
+7.  **Swarm folder**: `fs.SwarmFolder` with its manifest at
+    `<storage_path>.swarm.json`. It starts the 10-second sync thread, and
+    the backup thread if `swarm_backup = true` (only with storage).
+8.  **Hash ring**: `cluster.ring` gets the local node with 10 tokens. Nothing
+    reads it ([Chapter 4.3](../cluster/ring.md)).
+9.  **Devices**: the Ed25519 identity (`device.key`) and the signed trust
+    store (`trust.store`) are loaded. The manager gets a device
+    `Authenticator` so every handshake verifies the peer's identity, and
+    refuses unknown devices if `require_trusted_devices = true`.
 
-To support mobile devices efficiently, the core NomadFS engine is compiled as a C-compatible shared library (`libnomad.so` or `.dylib`). 
+### Lifecycle
 
-This allows us to write the complex distributed logic once in **Zig** and access it from:
-*   **Android** via JNI (Java Native Interface).
-*   **iOS** via Swift/C bindings.
-*   **Desktop** via the Zig CLI.
+*   `init(allocator, cfg)`: builds the parts above.
+*   `run(running, cfg)`: listens on `port` (TCP accept loop, LAN
+    announcements, UPnP mapping), then blocks until `running` turns false.
+*   `bootstrap(peer_urls, swarm_key)`: in a background thread, dials each
+    `bootstrap_peers` entry (up to 5 attempts), sends `PING` and `DIAL_BACK`,
+    looks up its own ID, then refreshes buckets and sweeps revocations every
+    60 seconds.
+*   `rotateSwarmKey(allocator, new_key, epoch)`: sends a new swarm key to
+    every reachable trusted device.
+*   `deinit()`: stops the threads and frees everything.
 
-## 4. Node Orchestration
+### Threads
 
-The central entry point for both modes is the `Node` struct defined in `src/root.zig`. This struct acts as the "Controller" that unifies all layers.
+A running node uses threads, not an event loop: the TCP accept loop, one
+handshake thread per incoming connection, one Yamux reader per connection,
+one handler thread per incoming stream, plus the reaper, the LAN announcer,
+the UPnP worker, the share rescanner, the swarm sync loop, the backup loop
+and the bootstrap/maintenance loop.
 
-### Bottom-Up Initialization
-Initialization follows a strict order to satisfy dependencies:
-1.  **Network**: The `ConnectionManager` starts first.
-2.  **Storage**: The `StorageEngine` initializes (if enabled).
-3.  **Discovery**: The DHT `Node` is created, using the `ConnectionManager`.
-4.  **Coordinator**: The `BlockManager` is linked to Network, DHT, and Storage.
-5.  **Hash Ring**: The `HashRing` is initialized, and the local node adds itself if it provides storage.
+## 2. Nodes With and Without Storage
 
-### Event Handling: The Serve Loop
-The `Node` automatically registers a callback with the `ConnectionManager`. For every new incoming connection:
-1.  The `ConnectionManager` triggers the callback.
-2.  The `Node` spawns a new thread running the `dht.Node.serve` loop.
-3.  This ensures the node is always responsive to `PING` and other DHT queries as soon as it is `start()`ed.
+`storage.enabled` (default `true`) decides whether a node has a block store:
 
-### Lifecycle Methods
-*   `init(allocator, cfg)`: Prepares all internal state.
-*   `start(port, swarm_key, run_flag)`: Spawns the background listener thread.
-*   `bootstrap(peers, swarm_key)`: Connects to initial peers to join the DHT.
-*   `deinit()`: Performs a graceful shutdown of all components.
+| | Storage enabled | Storage disabled |
+| :--- | :--- | :--- |
+| Block store | yes | no |
+| Shares, swarm folder | yes | no (`shares` and `swarm` are `null`) |
+| `BlockManager.put`/`get` | work | fail with `error.StorageDisabled` |
+| Answers `GET_BLOCK` | with its blocks | with no data |
+| Takes part in the DHT | yes | yes: the serve loop is always registered |
+
+There is no client-only mode that reads the swarm without storing anything.
+Reading needs a block store, which doubles as the cache. Both the CLI and the
+app run with storage enabled.
+
+## 3. Who Drives the Node
+
+### The command line (`src/main.zig`)
+
+`nomadfs` reads `nomadfs.conf` from the current folder, `~/.nomadfs/` or
+`/etc/nomadfs/` (or `--config <path>`), starts a node and bootstraps.
+Flags select extra work: `--share Name:/path`, `--mount <dir>` (Linux FUSE),
+`--invite`, `--pair`, `--trust <uri>`, `--devices`, `--revoke <id>`,
+`--swarm-backup`, `--address <ip>`. See [Chapter 8.1](../ops/deployment.md).
+
+### The app (`nomadfs-gui/`)
+
+A GUI for the Linux desktop and Android built with
+[Oriel](https://oriel.foreachdeveloper.com). It imports the core as a Zig
+module and calls it in-process: browse devices, share folders, manage the
+swarm folder, create and join invites, mount, rotate keys. See
+[Chapter 7](../app/gui.md).
+
+### The C library (`src/mobile/`)
+
+`zig build` also produces `libnomadfs`, a C ABI over the node
+(`src/mobile/nomadfs.h`), with Swift bindings in `src/mobile/`
+(`Package.swift`). It covers starting a node and storing and fetching files
+through `BlockManager`. Pairing, invites, shares and the swarm folder are not
+exported; the Android app gets them by linking the Zig module directly. See
+[Chapter 10](../mobile/api.md).
+
+```mermaid
+graph TD
+    CLI[nomadfs CLI<br/>src/main.zig] --> Node
+    GUI[nomadfs-gui<br/>Oriel app] --> Node
+    C[libnomadfs<br/>C ABI + Swift] --> Node
+    Node[Node<br/>src/root.zig] --> Net[ConnectionManager<br/>+ DHT Node]
+    Node --> Store[StorageEngine]
+    Node --> BM[BlockManager]
+    Node --> FS[ShareIndex · SwarmFolder]
+    Node --> Dev[Identity · TrustStore]
+    CLI -. --mount .-> FUSE[fs.fuse Mount]
+    GUI -. Mount tab .-> FUSE
+```

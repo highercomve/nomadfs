@@ -1,66 +1,123 @@
 # Chapter 2.2: K-Bucket Management
 
-The **Routing Table** is the "phonebook" that each node keeps. Because a distributed system might have millions of nodes, we cannot store everyone. Instead, we use **K-Buckets**.
+The **routing table** is the "phonebook" each node keeps. A network can be
+far larger than any one node should track, so Kademlia keeps a few peers at
+every distance, in **k-buckets**. The code is in
+`src/net/discovery/kbucket.zig`.
 
 ## 1. The Structure
 
-The routing table is divided into 256 "buckets" (one for each possible bit position in the 256-bit ID).
+```zig
+pub const K = 20;
+pub const MAX_PEER_ADDRESSES = 8;
 
-*   **Bucket $i$** stores information about nodes whose XOR distance from us is between $2^i$ and $2^{i+1}$.
-*   In practice, this means Bucket $i$ contains nodes that share exactly $255 - i$ prefix bits with our own ID.
+pub const RoutingTable = struct {
+    local_id: NodeID,
+    buckets: [256]Bucket, // Bucket i stores peers with common prefix length i
+    allocator: std.mem.Allocator,
+};
+```
 
-## 2. The Constant $K$
+**Bucket *i* holds peers whose ID shares exactly *i* leading bits with ours**
+(common prefix length = *i*, see [Chapter 2.1](./id.md)). In distance terms,
+bucket *i* covers XOR distances in $[2^{255-i}, 2^{256-i})$. Bucket 0 holds
+the half of the ID space furthest from us; each later bucket covers half the
+range of the one before.
 
-Every bucket has a maximum capacity called **$K$**. In the original Kademlia paper and in NomadFS, **$K = 20$**.
+```
+our ID:   1011 0110 ...
+bucket 0: 0xxx xxxx ...   (differs in bit 0, half of all IDs)
+bucket 1: 11xx xxxx ...   (same bit 0, differs in bit 1)
+bucket 2: 100x xxxx ...
+...
+```
 
-*   If we find a new node and its bucket is not full, we add it.
-*   If the bucket is full, we must decide whether to keep the old nodes or replace them.
+## 2. Peer Records
+
+```zig
+pub const PeerInfo = struct {
+    id: NodeID,
+    addresses: [MAX_PEER_ADDRESSES]network.Address = undefined,
+    addrs_count: u8 = 0,
+    last_seen: i64,
+};
+```
+
+A peer can have up to **8 addresses** (LAN, public, IPv4, IPv6). `addAddress`
+skips duplicates and ignores addresses past the 8th, and `mergeAddresses`
+combines records for the same ID. `getBestAddress` picks the lowest
+`network.addressPriority`: loopback, then private, then public (see
+[Chapter 1.4](../transport/management.md#4-address-priority-lan-vs-wan)).
 
 ## 3. Finding the Right Bucket
 
-To find which bucket a node belongs to, we calculate the Common Prefix Length (CPL) between our ID and the peer's ID.
-
 ```zig
-pub fn addPeer(self: *RoutingTable, peer: PeerInfo) !void {
-    std.debug.assert(!peer.id.eql(self.local_id));
-    const cpl = self.local_id.commonPrefixLen(peer.id);
-    
-    // cpl is 0..256. If cpl is 256, ids are identical (handled by assert).
-    // Index must be < 256.
-    const index = @min(cpl, 255);
-    _ = try self.buckets[index].add(peer);
+fn bucketFor(self: *RoutingTable, peer_id: NodeID) *Bucket {
+    const cpl = self.local_id.commonPrefixLen(peer_id);
+    return &self.buckets[@min(cpl, 255)];
+}
+
+pub fn addPeer(self: *RoutingTable, peer: PeerInfo) !bool {
+    if (peer.id.eql(self.local_id)) return false; // never store ourselves
+    return try self.bucketFor(peer.id).add(peer);
 }
 ```
 
-## 4. Reliability: Churn and the Replacement Cache
+Peer IDs come from the network, so our own ID is rejected with a normal
+`false` rather than an assertion.
 
-Nodes in a P2P network are constantly joining and leaving ("churn"). If we just discarded new nodes when a bucket is full, we might miss out on a stable peer just because our bucket is full of stale ones.
+## 4. The Constant K and the Replacement Cache
 
-To handle this, NomadFS implements a **Replacement Cache** for each bucket.
+Each bucket has a main list (`peers`, at most **K = 20**) and a
+**replacement cache** (`replacements`, also at most 20). Both are ordered
+from least to most recently seen. `Bucket.add(peer)`:
 
-### The Algorithm
-1.  **Bucket Full?** If we find a new node and the main bucket ($K=20$) is full, we don't discard it yet.
-2.  **Cache It:** We check the **Replacement Cache**. If it has space, we add the new node there.
-3.  **Eviction & Promotion:** When a node in the main bucket fails (e.g., fails to respond to a query or disconnects), we remove it.
-4.  **Instant Refill:** Immediately after removal, we look at the Replacement Cache. If it has peers, we **promote** the most recently seen one into the main bucket.
+1.  **Already in the main list**: update `last_seen`, merge addresses, and
+    move it to the tail. Returns `true`.
+2.  **Already a replacement**: the same, inside the cache. Returns `false`.
+3.  **Main list has room**: append. Returns `true`.
+4.  **Main list full**: append to the replacement cache, dropping the oldest
+    replacement if the cache is full too. Returns `false`.
 
-This ensures that our routing table remains "saturated" with live peers, even if many nodes suddenly go offline. This strategy makes the DHT incredibly resilient to network instability.
+`Bucket.remove(id)` (called through `RoutingTable.markDisconnected`) removes
+a peer from the main list and **promotes** the most recently seen
+replacement into it. Removing a replacement just drops it.
 
-## 5. Inspecting the Table
+### Who decides that a peer is dead?
+`discovery.Node` drives this (`src/net/discovery/node.zig`):
 
-NomadFS provides a `dump()` method on the `RoutingTable` to inspect its current state, which is useful for debugging and monitoring the network topology.
+*   **`addVerifiedPeer`**: when `addPeer` returns `false` (the bucket is
+    full), the node pings the bucket's least recently seen peer
+    (`pingLruAndEvict`). If it doesn't answer, it is removed and a
+    replacement is promoted.
+*   **Lookups**: a peer that fails a `FIND_NODE` or `FIND_VALUE` is removed
+    with `markDisconnected` ([Chapter 2.3](./lookup.md)).
 
-```zig
-pub fn dump(self: *RoutingTable) void {
-    std.debug.print("--- Routing Table Dump ---\n", .{});
-    // ... iterates and prints active buckets and peers ...
-}
-```
+Only *verified* peers are added: senders of an authenticated `PING`, peers
+that answered our `PING`, and peers that replied during a lookup. Peers
+merely listed in someone's reply are not.
 
-## 6. Implementation Note: MVP vs. Production
+## 5. Bucket Refresh
 
-When building a DHT, one often starts with a "Minimum Viable Product" (MVP). In NomadFS, our MVP implementation used a simple **Static Bucket Array** without a replacement cache.
+Every bucket records `last_updated`, set whenever `add` runs on it.
+`discovery.Node.refreshBuckets()` (called every 60 s by `runBootstrap` in
+`src/root.zig`) looks up `randomIdInBucket(i)` for every bucket not updated
+for an hour (3600 s). That repopulates quiet regions of the ID space.
 
-*   **MVP Behavior**: If a bucket was full ($K=20$) and a new peer arrived, the new peer was simply **discarded**.
-*   **The Flaw**: This assumes the 20 peers currently in the bucket are "good." In reality, peers often go offline without warning. If we keep stale peers and discard new (live) ones, our routing table slowly "rots," leading to lookup failures.
-*   **The Fix**: The **Replacement Cache** acts as a waiting room. It allows us to hold onto new, live peers and swap them in the moment an old peer dies. This transforms the system from "static and decaying" to "dynamic and self-healing."
+## 6. Other Operations
+
+*   `getClosestPeers(target, count)`: copies every main-list peer, sorts by
+    XOR distance to `target`, and returns the first `count` (the caller frees
+    the slice). This answers `FIND_NODE` and seeds lookups.
+*   `getAllPeers()`: every main-list peer. The swarm folder syncs with these
+    (`fs.remote.knownPeers`).
+*   `contains`, `getPeer`: main list only; replacements don't count.
+*   `dump()`: prints every non-empty bucket with its peers, addresses and
+    replacement count.
+
+The table has no lock of its own. `discovery.Node.mutex` guards it.
+
+---
+
+**Next Chapters:**
+*   [Chapter 2.3: Iterative Search](./lookup.md)

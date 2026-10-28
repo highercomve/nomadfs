@@ -1,48 +1,92 @@
-# Chapter 1.6: NAT Traversal & AutoNAT
+# Chapter 1.6: UPnP & DIAL_BACK (NAT)
 
-Connectivity is the lifeblood of NomadFS. However, most modern devices live behind a **Network Address Translator (NAT)** or Firewall. To ensure nodes can talk to each other, NomadFS employs two key strategies: **UPnP** and **AutoNAT**.
+Most devices sit behind a router that does **Network Address Translation
+(NAT)**. A device behind NAT can dial out, but peers outside can't dial in,
+because its address (for example `192.168.1.5`) isn't routable from the
+internet. NomadFS has two small tools for this: a **UPnP** client that asks
+the router to forward the port, and a **`DIAL_BACK`** request that asks a
+peer to connect back. Neither guarantees reachability, and there is no relay
+yet (see section 4).
 
-## 1. The Challenge of NAT
+## 1. UPnP Port Mapping (`src/net/transport/nat.zig`)
 
-If your node is behind a residential router, it can initiate connections to the outside world, but other peers cannot initiate connections to you because your local IP (e.g., `192.168.1.5`) is not reachable from the internet.
+`ConnectionManager.listen` starts a background thread when
+`upnp_enabled = true` (the default). The thread runs three steps on the
+`nat.UPnP` client. Each HTTP step is bounded by `http_timeout_ms = 5_000`, so
+a dead gateway can't block shutdown.
 
-## 2. UPnP: Automatic Port Forwarding
+1.  **`discoverGateway()` (SSDP)**: sends an `M-SEARCH` for
+    `urn:schemas-upnp-org:device:InternetGatewayDevice:1` to
+    `239.255.255.250:1900` and reads replies for up to 2 seconds. The
+    `LOCATION:` header gives the device description URL, which is fetched
+    with `GET` to find the `WANIPConnection:1` control URL.
+2.  **`getLocalIP()`**: "connects" a UDP socket to the gateway and reads the
+    local address the kernel picked. This is the address the mapping should
+    point at.
+3.  **`mapPort(port, "TCP", local_ip)` (SOAP `AddPortMapping`)**: asks the
+    router to forward external TCP `port` to the same port on this device,
+    with description `NomadFS` and `NewLeaseDuration` 0 (no expiry). On
+    success `mapped_port` is recorded.
 
-NomadFS includes a built-in **UPnP (Universal Plug and Play)** client in `src/network/nat.zig`.
+Because the lease never expires, `ConnectionManager.stop()` sends
+`DeletePortMapping` for `mapped_port`. Otherwise the router would keep
+forwarding the port after the node exits.
 
-1.  **Discovery (SSDP)**: The node broadcasts a search message to find the router's control URL.
-2.  **Negotiation (SOAP)**: The node sends an XML request to the router: "Please forward External Port 9000 to my internal IP on port 9000."
-3.  **Outcome**: If successful, your node becomes "Publicly Reachable" even if it's behind a NAT.
+Failures (no gateway, UPnP disabled on the router, `getLocalIP` on Windows)
+are logged and ignored; the node keeps running without a mapping.
 
-## 3. AutoNAT: Reachability Verification
+## 2. `DIAL_BACK` (a minimal AutoNAT)
 
-Just because a router says it forwarded a port doesn't mean it actually works (due to ISP firewalls or "Double NAT"). NomadFS uses the **AutoNAT** protocol to verify reachability.
+A router that accepted a mapping may still not be reachable (carrier-grade
+NAT, ISP firewalls, double NAT). `DIAL_BACK` is a request to check.
 
-### The Protocol
-1.  **Contact Peer**: Your node connects to a known "Public" peer (Bootstrap Node).
-2.  **Request `DIAL_BACK`**: Your node sends a `DIAL_BACK` RPC request containing its own listening port.
-3.  **Verification**: The remote peer attempts to open a *new* connection to the public IP it observed you coming from.
-4.  **Confirmation**:
-    *   **Success**: If the peer connects back, you are **Public**.
-    *   **Failure**: If the dial-back fails, you are **Private**.
+### The flow
+1.  `Node.connectBootstrapPeer` (`src/root.zig`) connects to each configured
+    bootstrap peer and sends a `PING`.
+2.  It then calls `discovery.Node.checkReachability(conn)`, which opens a
+    stream and sends **`DIAL_BACK { port }`** with this node's listening port.
+    It doesn't wait for a reply.
+3.  The peer (`handleDialBack`) takes the IP it sees the request coming from,
+    sets the announced port, and calls
+    `connectToPeer(address, swarm_key, sender_node_id)`. It always dials the
+    *authenticated* sender, never an ID from the payload. On success it sends
+    a `PING` over that connection.
+4.  The requester's `handlePing` sets `is_public = true` when it receives an
+    incoming `PING`.
 
-## 4. Node Roles based on Reachability
+`DIAL_BACK` is sent **once per bootstrap peer**, when it connects. Nothing
+repeats it later, for example when the network changes.
 
-The result of AutoNAT determines the node's behavior in the DHT layer:
+### What the result is used for
+Nothing, today. `discovery.Node.is_public` is set by **any** incoming `PING`,
+not only by a dial-back, and it is only printed when the serve loop exits.
+There are no "DHT server" and "DHT client" roles: every node serves every RPC
+and joins other nodes' routing tables the same way.
 
-### DHT Server (Public Node)
-*   **Role**: Full participant in the DHT.
-*   **Behavior**: Joins the routing table of others. Accepts `STORE` and `FIND_NODE` requests. Acts as a "anchor" for the swarm.
+### A caveat
+`connectToPeer` first looks in the pool for a connection to the expected node
+ID (see [Chapter 1.4](./management.md#3-connection-pooling)). The connection
+the `DIAL_BACK` arrived on is pooled on both sides, so the dial-back usually
+*reuses* it instead of opening a new TCP connection. The `PING` that follows
+then proves nothing about whether the port is reachable from outside.
 
-### DHT Client (Private/NAT'd Node)
-*   **Role**: Passive participant.
-*   **Behavior**: Queries the DHT to find data, but does **not** join the routing tables of others. 
-*   **Benefit**: This prevents other nodes from trying to connect to an unreachable peer, saving bandwidth and battery.
+## 3. What Happens Without Reachability
 
-## 5. Implementation Notes
+A node that can't be reached can still dial out. Every connection is
+symmetric once open: both sides open Yamux streams and serve RPCs, so a phone
+behind NAT that dials a home server can be asked for blocks over that same
+connection. Two devices that are both unreachable and on different networks
+can't connect today.
 
-*   **`DIAL_BACK` RPC**: Defined in `src/dht/rpc.zig`. It is a simple message that triggers a reverse connection attempt.
-*   **Dynamic Upgrades**: If a node moves from a 4G network (Private) to a Home WiFi with UPnP (Public), it re-runs AutoNAT and upgrades itself to a DHT Server automatically.
+## 4. Not implemented yet
+
+From [ROADMAP.md](../../../ROADMAP.md), Phase 7 ("Persistent Roaming & NAT
+Splicing Relay"):
+
+*   an always-on node that **relays** encrypted streams between two peers
+    that can't reach each other;
+*   Yamux `PING` **keep-alives** to hold NAT mappings open;
+*   using reachability to change how a node takes part in the DHT.
 
 ---
 

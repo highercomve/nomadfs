@@ -1,51 +1,85 @@
 # Chapter 3.3: The Disk Engine
 
-The `StorageEngine` is the component that actually talks to the hardware. It is responsible for persisting and retrieving blocks from the local disk.
+`StorageEngine` (`src/storage/engine.zig`) is the component that writes blocks to disk and reads them back. It is a deliberately simple flat-file store.
 
 ## 1. Flat-File CID Storage
 
-On a storage node, blocks are stored in a dedicated directory (configured in `roaming.conf` as `storage_path`). 
-
-Each block is stored as a file where the **filename is the hex-encoded CID**.
+Blocks live in one directory: `storage_path` in `nomadfs.conf` (a leading `~` is expanded to `$HOME`; the directory is created if missing). Each block is a file whose **name is the lower-case hex CID** and whose content is the encoded block (tag byte + body):
 
 ```text
-nomad_data/
-├── 0a2f1b...
-├── 3e4d9c...
-└── f7a201...
+<storage_path>/
+├── 0a2f1b…   (64 hex characters)
+├── 3e4d9c…
+└── f7a201…
 ```
 
-This simple structure allows for:
-*   **Fast Lookups**: Finding a block is a single `open()` call if you know the CID.
-*   **Implicit Deduplication**: Trying to write a block that already exists just overwrites (or skips) the same file.
+Next to it, other components keep their own files: the swarm folder's manifest `<storage_path>.swarm.json`, its backup record `<storage_path>.swarm.json.backup` and the FUSE staging directory `<storage_path>.swarm.json.staging/` (see [The Swarm Folder](../fs/swarm.md) and [The FUSE Mount](../fs/fuse.md)).
 
-## 2. Implementation
-
-The engine uses Zig's `std.fs.Dir` for directory operations.
+## 2. The API
 
 ```zig
-pub fn put(self: *StorageEngine, block: Block) !void {
-    const hex_cid = try std.fmt.allocPrint(self.allocator, "{s}", .{std.fmt.fmtSliceHexLower(&block.cid)});
-    defer self.allocator.free(hex_cid);
+pub const StorageEngine = struct {
+    root_dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    mutex: sync.Mutex = .{},
+    external: ?External = null,
 
-    const file = try self.root_dir.createFile(hex_cid, .{});
-    defer file.close();
-
-    try file.writeAll(block.data);
-}
+    pub fn init(allocator, path: []const u8) !StorageEngine;
+    pub fn put(self: *StorageEngine, block: Block) !void;
+    pub fn has(self: *StorageEngine, cid: []const u8) bool;
+    pub fn get(self: *StorageEngine, cid: []const u8, allocator) !?Block;
+};
 ```
 
-## 3. Client-Only Nodes
+That is the whole interface: there is **no delete**.
 
-On mobile devices or other client-only nodes, the `StorageEngine` may be disabled or limited to a small temporary cache. This ensures that roaming devices don't consume excessive storage by acting as a repository for other peers' data.
+### `put`
+1.  Hashes `block.data` with SHA-256 and returns `error.HashMismatch` if it isn't `block.cid`. Nothing that doesn't match its name gets in, whether it came from the local builder or from a peer.
+2.  If a file with that CID already exists, returns without writing (content addressing makes `put` idempotent and gives deduplication for free).
+3.  Otherwise writes `<cid>.tmp`, then renames it to `<cid>`. A crash can leave a stray `.tmp` file but never a truncated block under a valid name.
 
-## 4. Future Enhancements
+### `get`
+1.  Opens `<cid>`. If there is no such file and an `External` source is set, asks it instead (below). Returns `null` if neither has the block.
+2.  Re-hashes the bytes and returns `error.CorruptBlock` if they don't match the CID, so disk corruption is reported, not returned as data.
 
-*   **Subdirectories**: To avoid performance issues with thousands of files in a single directory, we plan to shard files into subdirectories (e.g., `ab/cdef...`).
-*   **Garbage Collection**: Identifying and deleting blocks that are no longer part of any file's Merkle DAG.
-*   **Encryption at Rest**: Encrypting the blocks on disk so that even a stolen device doesn't leak data without the swarm key.
+The returned `Block.data` is owned by the caller.
+
+### `has`
+True if the block file exists or the external source has the CID. It does not verify content.
+
+### Concurrency
+One `mutex` guards file operations; hashing in `get` happens after the lock is released.
+
+## 3. External Blocks: the Filestore Hook
+
+```zig
+pub const External = struct {
+    ctx: *anyopaque,
+    getFn: *const fn (ctx, cid: *const [32]u8, allocator) anyerror!?[]u8,
+    hasFn: *const fn (ctx, cid: *const [32]u8) bool,
+};
+```
+
+Shared folders are not copied into the store. The share scanner records where each leaf's bytes are (file, offset, length), and `src/fs/filestore.zig` serves those leaves through this hook, re-hashing the bytes on every read. Peers fetch shared files with the same `GET_BLOCK` as any other block. See [Shared Folders](../fs/shares.md).
+
+## 4. Who Uses the Engine
+
+*   **`GET_BLOCK` / `PUT_BLOCK`** handlers in `src/net/discovery/node.zig` read from and write to the store; `PUT_BLOCK` goes through `put`, so pushed blocks are verified.
+*   **`BlockManager`** stores new files and fetched DAGs ([Chapter 4](../cluster/overview.md)).
+*   **Remote browsing** (`src/fs/remote.zig`) caches every fetched block here, so a file read once reads offline afterwards.
+*   **The swarm folder** stores added files in full here.
+
+## 5. Storage Disabled
+
+`[storage] enabled = false` leaves the node without a `StorageEngine` (`Node.store == null`). Then `BlockManager.put`/`get` return `error.StorageDisabled`, `GET_BLOCK` replies with no data, and there are no shares and no swarm folder. It is not a "client-only" mode that still reads and writes through peers.
+
+## 6. Not Implemented Yet
+
+*   **Garbage collection / delete**: blocks of deleted or replaced files stay until removed by hand.
+*   **Encryption at rest**: blocks are stored as plaintext. Only the transport is encrypted ([Noise](../net/transport/noise.md)); anyone who can read `storage_path` can read the blocks.
+*   **Sharding** the flat directory into subdirectories (e.g. `ab/cdef…`) for very large stores.
 
 ---
 
 **Next Chapters:**
-*   [Chapter 4: The Sync Layer](../dist/overview.md)
+*   [Chapter 4: Block Exchange & Replication](../cluster/overview.md)

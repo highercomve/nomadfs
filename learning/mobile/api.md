@@ -1,36 +1,55 @@
-# Chapter 7.1: The Mobile C ABI
+# Chapter 10: The Mobile C ABI & Bindings
 
-Mobile hosts (Android via JNI, Apple platforms via Swift, or any FFI
-language) talk to NomadFS through a small exported C surface in
-`src/mobile/api.zig`. The same code is the CLI's `nomadfs` binary, so
-behaviour is identical - the bindings only wrap lifecycle, storage I/O and
-pins.
+NomadFS reaches non-Zig hosts through a small C ABI: `src/mobile/api.zig`
+exports it, `src/mobile/nomadfs.h` declares it, and `zig build` (or
+`zig build lib`) produces `libnomadfs.so` / `.dylib` / `nomadfs.dll`. On top
+of it sit a JNI bridge and Java class for Android
+(`src/mobile/android/`) and a SwiftPM package (`src/mobile/`).
+
+**This is not how the NomadFS app works.** The app (`nomadfs-gui`, built
+with Oriel; see [Chapter 7](../app/gui.md)) imports the NomadFS Zig module
+directly and calls these same functions in-process (`mobile.nomadfs_node_new`
+and friends in `nomadfs-gui/src/commands.zig`), next to the rest of the Zig
+API: shares, the swarm folder, pairing, invites, rotation. The C ABI is
+the narrower surface for other hosts.
 
 ## 1. Surface
 
-Declared in `src/mobile/nomadfs.h` (committed, use it for FFI codegen):
+Everything `nomadfs.h` declares (all are `export fn` in `api.zig`):
 
 | Symbol | Purpose |
 | :--- | :--- |
-| `nomadfs_version` | Human-readable library version |
-| `nomadfs_node_new` | Loads config, storage, device identity, trust store |
-| `nomadfs_node_run` / `nomadfs_node_stop` | Start/stop the TCP listener (own thread) |
-| `nomadfs_node_bootstrap` | Dial comma-separated bootstrap peers |
-| `nomadfs_put_file` | Chunk + store + announce, returns 64-hex root CID |
-| `nomadfs_get_file` | Reassemble by CID (holder records, then closest peers) |
-| `nomadfs_node_device_id` | Node's device ID as 64 hex characters |
-| `nomadfs_free` | Release returned CIDs |
+| `nomadfs_version` | Library version string |
+| `nomadfs_node_new(config_path)` | Parse the config and `Node.init`: storage, shares, swarm folder, device identity, trust store. `NULL` on a bad or missing config |
+| `nomadfs_node_free` | Stop the listener, join threads, free everything |
+| `nomadfs_node_run` / `nomadfs_node_stop` | Start/stop `Node.run` on its own thread (non-blocking; repeat `run` is a no-op) |
+| `nomadfs_node_bootstrap(node, urls_csv)` | `Node.bootstrap` with comma-separated `tcp://host:port` peers |
+| `nomadfs_put_file(node, in_path)` | `BlockManager.put`: chunk, store, announce (and replicate if `replicas > 0`); returns a 64-hex root CID |
+| `nomadfs_get_file(node, cid, out_path)` | `BlockManager.get`: fetch missing blocks (holder records, then closest peers) and write the file |
+| `nomadfs_node_device_id(node, out, out_len)` | Device ID as 64 hex characters + NUL |
+| `nomadfs_free` | Release a CID string from `nomadfs_put_file` |
+
+Status codes: `NOMADFS_OK` 0, `INVALID_ARGUMENT` 1, `STORAGE_DISABLED` 2,
+`UNAVAILABLE` 3, `FILE_TOO_LARGE` 4, `NOT_FOUND` 5, `INTERNAL_ERROR` 9.
+
+**Not exported**: pairing (`--pair`/`--trust`), the trust store, invites,
+key rotation, revocation, shares, the swarm folder and the mount. A C host
+gets a running node (which does serve its configured shares and sync its
+swarm folder in the background) plus file put/get; device management goes
+through the Zig API ([Chapter 9](../api/reference.md)) as the app does, or
+through the CLI on desktops.
 
 Contract rules:
 
-- statuses are `c_int`, `0` is ok, unknown failures collapse to
-  `NOMADFS_INTERNAL_ERROR` (9); Zig panics never cross the boundary;
-- calls on one handle are serialized internally (a mutex protects the
-  Node), so background reads are safe from any host thread;
-- strings in are borrowed; strings out are NUL-terminated allocations freed
-  with `nomadfs_free`;
-- `nomadfs_put_file` reports NULL when the provider-record quorum missed -
-  blocks remain local and a retry after connecting announces them.
+- statuses are `c_int`, `0` is ok; unknown failures collapse to
+  `NOMADFS_INTERNAL_ERROR`; Zig errors never cross the boundary;
+- calls on one handle are serialized by a mutex, so any host thread may call;
+- input strings are borrowed; the CID string returned by `nomadfs_put_file`
+  is freed with `nomadfs_free`;
+- `nomadfs_put_file` returns `NULL` when the provider-record quorum missed
+  (e.g. offline with `write_quorum >= 1`) or on any other error. The blocks
+  are stored locally either way; set `write_quorum = 0` on devices that must
+  store while alone.
 
 ## 2. Life Cycle (C)
 
@@ -44,9 +63,8 @@ nomadfs_free(cid);
 nomadfs_node_free(node);                                  // stops listener
 ```
 
-Config files, directory layout and pairing behave exactly like the desktop
-CSS CLI (`--pair`, `--trust`, `--devices`, `--revoke`), so a phone and a
-laptop pair through the same QR ticket flow.
+The config file and the key/trust-store locations are the same as for the
+desktop CLI ([Chapter 8.2](../ops/configuration.md)).
 
 ## 3. Building the Library
 
@@ -163,7 +181,7 @@ NomadFS:
    syscall; the connect-timeout code waits via `ppoll`, which matches what
    bionic uses everywhere. This is verified on-device (see below).
 
-## 6. On-device harness (emulator verdict)
+## 6. On-device harness
 
 `src/mobile/android/emulator/harness.sh` assembles a debug APK from the
 SDK build tools (aapt2 + d8 + apksigner, no Gradle), boots or reuses a
@@ -174,7 +192,8 @@ ART's app namespace through the Java binding:
 - B bootstraps against A, then a 200 KB payload passes B -> A (A fetches
   every missing block from B, verifying each CID), byte-identical;
 
-Verified outcomes so far:
+Outcomes recorded when the harness was written (not re-run for this
+revision of the book):
 
 - `api-35 x86_64` AVD: `NOMADFS-HARNESS: PASS` (ARC VM/Googlebook ABI).
 - A real arm64 phone (Android 12 / MIUI): `NOMADFS-HARNESS: PASS` after
@@ -192,17 +211,17 @@ peers can still store locally and announce its content).
 
 ## 7. Swift (committed sources)
 
-`src/mobile/swift/` is a SwiftPM package rooted at `src/mobile` that wraps
-the same header:
+The SwiftPM package lives directly in `src/mobile/` (`Package.swift`,
+`Sources/`, `Tests/`) and wraps the same header:
 
-- `Sources/CNomadFs/` - header-only C target (shim, module map
-  generated by SwiftPM) linking `libnomadfs.so` from `zig-out/lib`;
+- `Sources/CNomadFs/` - C target (`shim.c`, `include/nomadfs.h` symlinked to
+  the real header) linking `libnomadfs` from `<repo>/zig-out/lib`;
 - `Sources/NomadFs/NomadFs.swift` - the same `open/run/stop/bootstrap/
   put/get/deviceId/close` surface, with `deinit` releasing the handle;
 - `Tests/NomadFsTests/` - a two-node put/get round trip running the real
   library in-process.
 
-Verified locally (Swift 6.4 on Linux):
+Recorded run (Swift 6.4 on Linux):
 
 ```sh
 zig build                     # native lib at ../../zig-out/lib
@@ -216,6 +235,5 @@ inside `swift_retain` on this toolchain.
 
 ---
 
-**Next Chapters:**
-* [Chapter 7.2: Swift Bindings](#) (planned)
-* [Back to Internals](../README.md)
+**Next:** [Chapter 11: Testing](../testing.md) ·
+[Back to the Internals Book](../README.md)

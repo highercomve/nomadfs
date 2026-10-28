@@ -1,79 +1,132 @@
-# Operational & Deployment Guide
+# Chapter 8.1: Installation & Running
 
-## 1. Prerequisites
+User guide: [Getting started](https://nomadfs.foreachdeveloper.com/docs/getting-started/).
+This chapter is the operator's view: what the binary does, flag by flag, and
+how to keep a node running.
 
-NomadFS is designed to run on a wide range of hardware, from Raspberry Pis to high-end servers.
+## 1. Getting the Binary
 
-### Hardware Requirements
-- **CPU**: x86_64 or ARM64 (aarch64)
-- **RAM**: Minimum 512MB
-- **Disk**: Dependent on stored data size. SSD recommended for performance.
+Releases on GitHub carry the app (Android APK; Linux AppImage, deb, rpm) and
+the `nomadfs` command line for Linux.
 
-### OS Requirements
-- Linux (Kernel 5.4+)
-- macOS (12+)
-- Windows (10+, mostly for client mode)
+From source, with [Zig 0.16.0](https://ziglang.org/download/):
 
-## 2. Installation
-
-We provide pre-compiled binaries for common platforms.
-
-### From Source
-```bash
+```sh
 git clone https://github.com/highercomve/nomadfs.git
 cd nomadfs
-zig build -Doptimize=ReleaseSafe
-cp zig-out/bin/nomadfs /usr/local/bin/
+zig build -Doptimize=ReleaseSafe     # zig-out/bin/nomadfs, zig-out/lib/libnomadfs.so
+zig build lib                        # only the C ABI library (mobile bindings)
 ```
 
-### Docker
-```bash
-docker pull highercomve/nomadfs:latest
+`make <target>` (`x86_64-linux`, `aarch64-linux`, `x86_64-macos`,
+`aarch64-macos`, `x86_64-windows`) cross-compiles into `build/<target>/`.
+
+The [`Dockerfile`](../../Dockerfile) builds through that Makefile into an
+Alpine image (`ENTRYPOINT ["nomadfs"]`, `EXPOSE 9000`, `/etc/nomadfs`,
+`/var/lib/nomadfs`). **It still downloads Zig 0.15.2**, which no longer
+builds this tree; update it before relying on it. No image is published.
+
+The Linux mount additionally needs `fusermount3` (package `fuse3`).
+
+## 2. The Command Line (`src/main.zig`)
+
+There are no subcommands. The binary takes at most one command flag, plus
+options and an optional config path:
+
+```
+nomadfs [options] [config_path]
 ```
 
-## 3. Running a Storage Node
+| Flag | What it does |
+| :--- | :--- |
+| *(none)* | Run the node: listen, bootstrap, share, sync the swarm folder, until killed |
+| `--mount <dir>` | Run the node **and** mount `<dir>` (Linux; needs storage enabled). Unmounts on Ctrl-C or `SIGTERM` |
+| `--invite` | Print a one-time invite (QR + code) and wait up to 10 min for one device to join; then trust it |
+| `--pair` | Print this device's signed pairing ticket (24 h) and QR code |
+| `--trust <uri>` | Verify a `nomadfs://pair?...` ticket and add it to `trust.store` |
+| `--devices` | List trusted devices |
+| `--revoke <id>` | Remove a trusted device by device ID or fingerprint, recording a signed tombstone |
 
-A storage node participates in the DHT and stores blocks for the network.
+| Option | Applies to | Meaning |
+| :--- | :--- | :--- |
+| `--config <path>` | all | Config file (same as the positional path; giving both is an error) |
+| `--share Name:/path` | node, mount | Add a shared folder (repeatable) |
+| `--swarm-backup` | node, mount | Keep a copy of every swarm folder file here |
+| `--address <addr>` | `--pair`, `--invite` | Address to publish: `host:port[,host:port…]` for `--pair`, an IP for `--invite` |
+| `--help`, `-h` | | Usage |
 
-### Step 1: Generate Configuration
-```bash
-nomadfs init --name "MyServer" --path /var/lib/nomadfs
-```
-This generates `nomadfs.conf` in the current directory.
+Unknown flags exit with an error. `--pair`, `--trust`, `--devices` and
+`--revoke` only touch local files (`device.key`, `node.key`, `trust.store`);
+they don't start a node. Without `--address`, `--pair` publishes
+`127.0.0.1:<port>`, which only works on the same host, and `--invite` uses
+the LAN address the kernel would route through.
 
-### Step 2: Edit Configuration
-Ensure `storage.enabled = true` and set a secure `swarm_key`.
+Joining with an invite code is done in the app; the CLI can create invites
+but not accept them. Two CLI-only machines are connected by giving both the
+same `swarm_key` and each other's address in `bootstrap_peers`.
 
-### Step 3: Run the Daemon
-```bash
-nomadfs run --config /etc/nomadfs/nomadfs.conf
-```
+## 3. What Starts When the Node Runs
 
-### Systemd Service Example
-Create `/etc/systemd/system/nomadfs.service`:
+`Node.init` (`src/root.zig`) in order:
+
+1. `ConnectionManager` with the transport key (`node.key`, created on first
+   run, mode `0600`), and its reaper thread.
+2. `StorageEngine` at `storage_path`, if `enabled`.
+3. The DHT node; with storage, the `ShareIndex` (registers each `share`,
+   rescans every 30 s) and the `SwarmFolder` (sync every 10 s, plus the
+   backup loop if `swarm_backup`).
+4. `BlockManager`, the (unused) hash ring, the device identity
+   (`device.key`) and trust store, and the device authenticator.
+
+`Node.bootstrap` dials each `bootstrap_peers` entry (5 attempts, 1 s apart),
+PINGs it and sends `DIAL_BACK`; then it looks up its own ID once and every
+60 s refreshes buckets and sweeps revocations. `Node.run` opens the listener,
+starts LAN announcements and UPnP if enabled, and loops until the `running`
+flag clears.
+
+## 4. Running as a Service
+
 ```ini
+# /etc/systemd/system/nomadfs.service
 [Unit]
-Description=NomadFS Storage Node
-After=network.target
+Description=NomadFS node
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/nomadfs run --config /etc/nomadfs/nomadfs.conf
-Restart=always
+ExecStart=/usr/local/bin/nomadfs /etc/nomadfs/nomadfs.conf
+WorkingDirectory=/var/lib/nomadfs
+Restart=on-failure
 User=nomadfs
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-## 4. Running a Client Node
+Set `key_path` (e.g. `/var/lib/nomadfs/keys/node.key`) so the keys and trust
+store land in a known place rather than `~nomadfs/.nomadfs`. An always-on
+machine is the natural place for `swarm_backup = true`.
 
-Client nodes do not store data for others but can read/write to the swarm.
+## 5. Nodes Without Storage
 
-1. Set `storage.enabled = false` in `nomadfs.conf`.
-2. Connect to a known bootstrap peer (e.g., your own Storage Node).
+`enabled = false` gives a node that joins the DHT and answers RPCs but has
+no block store: no shares, no swarm folder, no mount, and
+`BlockManager.put`/`get` (and the C ABI's `nomadfs_put_file`/`get_file`)
+fail with `StorageDisabled`. It is mainly useful as a DHT/bootstrap
+contact.
 
-## 5. Troubleshooting
+## 6. Troubleshooting
 
-- **Check Logs**: Logs are printed to stdout/stderr. Redirect to a file or use journald.
-- **Port Forwarding**: Ensure TCP port 9000 (default) is open.
-- **Connectivity**: Use `telnet` or `nc` to verify connectivity to bootstrap peers.
+- **Output**: everything goes to stderr (see [Chapter 8.3](./observability.md)).
+  `Noise Handshake FAILED` with a decrypt error at message 3 means the two
+  devices have different swarm keys.
+- **Reachability**: the TCP `port` (default 9000; 14700 in the app's
+  generated config) must be reachable; invites use `port + 1`.
+- **LAN discovery**: UDP 5354 multicast to 224.0.0.251 must be allowed; the
+  app's own config turns it off.
+- **Mount**: `FusermountNotFound` means `fuse3` is missing.
+
+---
+
+**Next:** [Chapter 8.2: Configuration Reference](./configuration.md) ·
+[Back to the Internals Book](../README.md)
