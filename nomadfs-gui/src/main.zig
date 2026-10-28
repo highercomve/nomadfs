@@ -348,7 +348,22 @@ fn LogPrint() void {
     failed_dirty = true;
 }
 
+/// Video previews need WebKitGTK's DMABUF renderer: without it frames are
+/// painted through a slow fallback (a 1080p phone video showed ~4 fps).
+/// Oriel turns it off on NVIDIA's driver to avoid busy loops older drivers
+/// had, but only when the variable is unset, so this keeps it on; a user who
+/// does hit the old problem can still start with
+/// WEBKIT_DISABLE_DMABUF_RENDERER=1.
+fn keepDmabufRenderer() void {
+    if (builtin.os.tag != .linux or builtin.abi.isAndroid()) return;
+    const c = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+    };
+    _ = c.setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "0", 0);
+}
+
 pub fn main(init: std.process.Init) !u8 {
+    keepDmabufRenderer();
     initDataDirs();
     return oriel.main(init, .{ .commands = Commands, .events = Events }, .{
         .app = app.build,
