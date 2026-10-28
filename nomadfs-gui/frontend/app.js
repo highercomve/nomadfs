@@ -154,11 +154,12 @@ function setView(view) {
   for (const item of document.querySelectorAll(".nav-item[data-view], .bar-item[data-view]")) {
     item.classList.toggle("active", item.dataset.view === view);
   }
-  $("bar-more").classList.toggle("active", view === "text" || view === "settings");
+  $("bar-more").classList.toggle("active", view === "text" || view === "settings" || view === "about");
   window.scrollTo(0, 0);
   try { localStorage.setItem("view", view); } catch {}
   if (view === "settings") { $("devices-refresh").click(); loadBackup(); }
   if (view === "swarm") loadSwarm();
+  if (view === "about") loadAbout();
   renderNavDevices();
 }
 
@@ -205,7 +206,7 @@ async function refreshState() {
     el.textContent = "Built with Zig & Oriel · foreachdeveloper";
     el.title = build;
     el.classList.add("credit");
-    el.onclick = () => invoke("open_path", { path: "https://www.foreachdeveloper.com/" }).catch(() => {});
+    el.onclick = () => setView("about");
   }
 }
 
@@ -1455,6 +1456,88 @@ $("notes-clear").addEventListener("click", () => {
 
 renderNotes();
 updateComposer();
+
+// ---- About ----
+
+let aboutText = "";
+
+function openLink(url) {
+  invoke("open_path", { path: url }).catch(() => window.open(url, "_blank"));
+}
+
+async function loadAbout() {
+  let a;
+  try {
+    a = await invoke("about_info", { config_path: await ensureConfig() });
+  } catch (err) {
+    $("about-body").textContent = `Couldn't read the details: ${err}`;
+    return;
+  }
+  $("about-version").textContent = a.nomadfs;
+  const groups = [
+    ["Versions", [
+      ["NomadFS", a.nomadfs],
+      ["Oriel", a.oriel],
+      ["Zig", a.zig],
+      ["Commit", a.commit],
+      ["Build", a.mode],
+      ["Platform", a.platform + (a.session ? ` · ${a.session}` : "")],
+      ["App file", a.app_path ? `${formatSize(a.app_size)} · ${a.app_path}` : ""],
+    ]],
+    ["This device", [
+      ["Name", a.nickname],
+      ["Fingerprint", a.fingerprint],
+      ["Node", a.running ? (a.node_id.slice(0, 16) + "…") : "not running"],
+      ["Port", String(a.port)],
+      ["Addresses", a.addresses.split(",").join("\n")],
+      ["Devices", `${a.devices_connected} reachable · ${a.devices_trusted} trusted`],
+    ]],
+    ["Files", [
+      ["Data", `${formatSize(a.data_size)} in ${a.data_files} files`],
+      ["Data folder", a.data_path],
+      ["Config", a.config_path],
+    ]],
+  ];
+  const body = $("about-body");
+  body.replaceChildren();
+  const lines = [];
+  for (const [title, rows] of groups) {
+    const h = document.createElement("h3");
+    h.className = "about-group";
+    h.textContent = title;
+    const dl = document.createElement("dl");
+    dl.className = "about-list";
+    lines.push(`${title}:`);
+    for (const [k, v] of rows) {
+      if (!v) continue;
+      const dt = document.createElement("dt");
+      dt.textContent = k;
+      const dd = document.createElement("dd");
+      dd.textContent = v;
+      dl.append(dt, dd);
+      lines.push(`  ${k}: ${v.replace(/\n/g, ", ")}`);
+    }
+    body.append(h, dl);
+  }
+  aboutText = lines.join("\n");
+}
+
+$("about-copy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(aboutText);
+    snack("Details copied");
+  } catch {
+    // No clipboard access: select the text so it can be copied by hand.
+    const range = document.createRange();
+    range.selectNodeContents($("about-body"));
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+    snack("Selected: copy with Ctrl+C");
+  }
+});
+for (const el of document.querySelectorAll(".about-link")) {
+  el.addEventListener("click", (e) => { e.preventDefault(); openLink(el.dataset.url); });
+}
 
 // ---- Swarm backup (desktop) ----
 

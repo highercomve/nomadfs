@@ -57,6 +57,10 @@
       <p class="nav-heading">Devices</p>
       <div id="nav-devices"></div>
       <div class="nav-spacer"></div>
+      <button class="nav-item" data-view="about">
+        <svg viewBox="0 0 24 24"><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
+        <span>About</span>
+      </button>
       <p id="nav-info" class="nav-info"></p>
     </nav>
 
@@ -374,6 +378,26 @@
       </section>
 
       <footer id="info" data-view="settings"></footer>
+
+      <!-- About: versions, this build, this device -->
+      <section class="card" id="about-section" data-view="about">
+        <div class="card-head about-head">
+          <img class="about-mark" src="mark.svg" alt="" width="48" height="48">
+          <div class="grow">
+            <h2>NomadFS <span id="about-version" class="about-version"></span></h2>
+            <p class="supporting">Your files roam with you. A personal distributed filesystem: share folders across your devices, files travel only when you open them.</p>
+          </div>
+        </div>
+        <div id="about-body" class="about-body"></div>
+        <div class="actions start">
+          <button id="about-copy" class="btn outlined">Copy details</button>
+          <button class="btn text about-link" data-url="https://nomadfs.foreachdeveloper.com">Website</button>
+          <button class="btn text about-link" data-url="https://github.com/highercomve/nomadfs">GitHub</button>
+          <button class="btn text about-link" data-url="https://github.com/highercomve/nomadfs/releases">Releases</button>
+          <button class="btn text about-link" data-url="https://oriel.foreachdeveloper.com">Oriel</button>
+        </div>
+        <p class="about-credit">Built with Zig &amp; Oriel by <a href="#" class="about-link" data-url="https://www.foreachdeveloper.com/">foreachdeveloper</a>.</p>
+      </section>
     </main>
     </div>
 
@@ -451,6 +475,10 @@
         <button class="sheet-item" data-view="settings" role="menuitem">
           <svg viewBox="0 0 24 24"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16l-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z"/></svg>
           <span><strong>Node &amp; trust</strong><small>Start or stop the node, trusted devices, swarm key</small></span>
+        </button>
+        <button class="sheet-item" data-view="about" role="menuitem">
+          <svg viewBox="0 0 24 24"><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
+          <span><strong>About</strong><small>Versions, this device, storage</small></span>
         </button>
       </div>
     </div>

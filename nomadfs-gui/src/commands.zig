@@ -1533,3 +1533,135 @@ test "commands: node put/get text round trip" {
     defer alloc.free(fetched);
     try testing.expectEqualStrings(text, fetched);
 }
+
+// ---- About ----
+
+pub const AboutInfo = struct {
+    // Versions and how this build was made.
+    nomadfs: []const u8,
+    oriel: []const u8,
+    zig: []const u8,
+    commit: []const u8,
+    mode: []const u8,
+    platform: []const u8,
+    /// Wayland or X11 on Linux desktops, "" elsewhere.
+    session: []const u8,
+    /// The running app (the AppImage when it runs from one); size 0 if unknown.
+    app_path: []const u8,
+    app_size: u64,
+    // This device.
+    running: bool,
+    nickname: []const u8,
+    fingerprint: []const u8,
+    node_id: []const u8,
+    port: u16,
+    addresses: []const u8,
+    devices_connected: usize,
+    devices_trusted: usize,
+    // Where its files are.
+    config_path: []const u8,
+    data_path: []const u8,
+    data_size: u64,
+    data_files: u64,
+};
+
+/// `about_info { config_path }`: what the About section shows.
+pub fn aboutInfo(gpa: std.mem.Allocator, args: ListArgs, about: anytype) !AboutInfo {
+    var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
+    defer config.deinit(gpa);
+
+    var paths = try DevicePaths.resolve(gpa, config.node.key_path);
+    defer paths.deinit(gpa);
+    const identity = try Identity.loadOrCreate(paths.identity);
+    var fp_buf: [19]u8 = undefined;
+    const fingerprint = Identity.formatFingerprint(identity.fingerprint(), &fp_buf);
+    var store = try TrustStore.load(gpa, paths.trust, identity.seed());
+    defer store.deinit();
+
+    var running = false;
+    var node_id: []const u8 = "";
+    var connected: usize = 0;
+    {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        if (g_node) |handle| {
+            running = true;
+            node_id = try hexAlloc(gpa, &handle.node.connection_manager.node_id.bytes);
+            const peers = fs.remote.knownPeers(handle.node.block_manager, gpa) catch &.{};
+            connected = peers.len;
+            gpa.free(peers);
+        }
+    }
+
+    var data_size: u64 = 0;
+    var data_files: u64 = 0;
+    dirUsage(config.storage.storage_path, &data_size, &data_files);
+
+    const app = appFile(gpa);
+    return .{
+        .nomadfs = about.version,
+        .oriel = about.oriel_version,
+        .zig = builtin.zig_version_string,
+        .commit = about.commit,
+        .mode = @tagName(builtin.mode),
+        .platform = try std.fmt.allocPrint(gpa, "{s} {s}", .{ if (builtin.abi.isAndroid()) "Android" else @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) }),
+        .session = sessionType(),
+        .app_path = app.path,
+        .app_size = app.size,
+        .running = running,
+        .nickname = try gpa.dupe(u8, config.node.nickname),
+        .fingerprint = try gpa.dupe(u8, fingerprint),
+        .node_id = node_id,
+        .port = config.network.port,
+        .addresses = try myAddresses(gpa, config.network.port),
+        .devices_connected = connected,
+        .devices_trusted = store.list().len,
+        .config_path = try gpa.dupe(u8, args.config_path),
+        .data_path = try gpa.dupe(u8, config.storage.storage_path),
+        .data_size = data_size,
+        .data_files = data_files,
+    };
+}
+
+fn sessionType() []const u8 {
+    if (builtin.os.tag != .linux or builtin.abi.isAndroid()) return "";
+    const t = std.c.getenv("XDG_SESSION_TYPE") orelse return "";
+    return std.mem.span(t);
+}
+
+/// The file the app runs from: the AppImage when it runs from one.
+fn appFile(gpa: std.mem.Allocator) struct { path: []const u8, size: u64 } {
+    if (builtin.abi.isAndroid()) return .{ .path = "", .size = 0 };
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var path: []const u8 = "";
+    if (builtin.os.tag == .linux) {
+        if (std.c.getenv("APPIMAGE")) |p| {
+            path = gpa.dupe(u8, std.mem.span(p)) catch "";
+        } else {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const n = std.os.linux.readlink("/proc/self/exe", &buf, buf.len);
+            if (std.os.linux.errno(n) == .SUCCESS) path = gpa.dupe(u8, buf[0..n]) catch "";
+        }
+    }
+    if (path.len == 0) return .{ .path = "", .size = 0 };
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return .{ .path = path, .size = 0 };
+    return .{ .path = path, .size = st.size };
+}
+
+/// Bytes and files under `path` (stops counting after 500 000 entries).
+fn dirUsage(path: []const u8, size: *u64, files: *u64) void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var walker = dir.walk(std.heap.page_allocator) catch return;
+    defer walker.deinit();
+    var seen: u64 = 0;
+    while (walker.next(io) catch null) |entry| {
+        seen += 1;
+        if (seen > 500_000) break;
+        if (entry.kind != .file) continue;
+        const st = entry.dir.statFile(io, entry.basename, .{}) catch continue;
+        size.* += st.size;
+        files.* += 1;
+    }
+}

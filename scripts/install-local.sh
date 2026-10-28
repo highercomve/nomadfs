@@ -22,7 +22,7 @@ cd "$here"
 fork=()
 [ -n "${ORIEL_FORK:-}" ] && fork=(--fork="$(realpath "$ORIEL_FORK")")
 
-version=$(sed -n 's/^ *\.version = "\(.*\)",/\1/p' nomadfs-gui/build.zig | head -1)
+version=$(sed -n 's/^ *const version = "\(.*\)";/\1/p' nomadfs-gui/build.zig | head -n1)
 appimage="nomadfs-gui/zig-out/package/nomadfs-gui-$version-x86_64.AppImage"
 rm -f "$appimage"
 echo "Building the NomadFS $version app (AppImage)"

@@ -35,6 +35,15 @@ pub fn build(b: *std.Build) void {
     // zig build run      run it
     // zig build check    type-check src/ without building
     // zig build package  installers: deb/rpm/AppImage (Linux), setup.exe (Windows), .app/.dmg (macOS)
+    // What About shows: this app's version, the Oriel it is built with (read
+    // from the package itself, so a local fork reports its own) and the
+    // commit it was built from.
+    const version = "0.3.2";
+    const about = b.addOptions();
+    about.addOption([]const u8, "version", version);
+    about.addOption([]const u8, "oriel_version", zonVersion(b, dep) orelse "unknown");
+    about.addOption([]const u8, "commit", gitCommit(b) orelse "unknown");
+
     // The NomadFS core, shared with the CLI and mobile bindings.
     const nomadfs_mod = b.createModule(.{
         .root_source_file = b.path("../src/root.zig"),
@@ -46,6 +55,7 @@ pub fn build(b: *std.Build) void {
         .name = "nomadfs-gui",
         .imports = &.{
             .{ .name = "nomadfs", .module = nomadfs_mod },
+            .{ .name = "about", .module = about.createModule() },
         },
         .root_source_file = b.path("src/main.zig"),
         .icon = b.path("icon.png"), // High-resolution PNG (1024x1024 recommended)
@@ -63,7 +73,7 @@ pub fn build(b: *std.Build) void {
             .name = "NomadFS",
             // .publisher = "Your Name <you@example.com>", // default: from the app id
             .summary = "Share folders across your devices; files download on demand",
-            .version = "0.3.2",
+            .version = version,
         },
         // The page's camera scans invite QR codes (getUserMedia).
         .permissions = .{
@@ -109,4 +119,24 @@ pub fn build(b: *std.Build) void {
     const run_test = b.addRunArtifact(app_test);
     const test_step = b.step("test", "Run the GUI command tests");
     test_step.dependOn(&run_test.step);
+}
+
+/// The `.version` in a dependency's build.zig.zon.
+fn zonVersion(b: *std.Build, dep: *std.Build.Dependency) ?[]const u8 {
+    const text = dep.builder.build_root.handle.readFileAlloc(b.graph.io, "build.zig.zon", b.allocator, .limited(64 << 10)) catch return null;
+    const key = ".version = \"";
+    const start = (std.mem.indexOf(u8, text, key) orelse return null) + key.len;
+    const end = std.mem.indexOfScalarPos(u8, text, start, '"') orelse return null;
+    return text[start..end];
+}
+
+/// The short commit this checkout is at, "+" when it has local changes.
+fn gitCommit(b: *std.Build) ?[]const u8 {
+    const root = b.build_root.path orelse ".";
+    var code: u8 = 0;
+    const out = b.runAllowFail(&.{ "git", "-C", root, "rev-parse", "--short=10", "HEAD" }, &code, .ignore) catch return null;
+    const commit = std.mem.trim(u8, out, " \n\r");
+    if (commit.len == 0) return null;
+    const status = b.runAllowFail(&.{ "git", "-C", root, "status", "--porcelain", "--untracked-files=no" }, &code, .ignore) catch return commit;
+    return if (std.mem.trim(u8, status, " \n\r").len > 0) b.fmt("{s}+", .{commit}) else commit;
 }

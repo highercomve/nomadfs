@@ -37,7 +37,7 @@ Command groups in `commands.zig` (the page calls them in snake_case, e.g. `node_
 
 | Group | Commands |
 | :--- | :--- |
-| Node | `nodeOpen`, `nodeClose`, `nodeState`, `ensureConfig`, `setNickname` |
+| Node | `nodeOpen`, `nodeClose`, `nodeState`, `ensureConfig`, `setNickname`, `aboutInfo` |
 | Browse | `remoteDevices`, `browse`, `readRange`, `download` |
 | Shared folders | `sharesLocal`, `pickedFolder`, `shareAdd`, `shareRemove` |
 | Swarm folder | `swarmList`, `swarmAddFile`, `swarmMkdir`, `swarmDelete`, `swarmRename`, `swarmReadRange`, `swarmDownload`, `swarmSync`, `swarmBackupStatus`, `swarmBackupSet`, `swarmRotateKey` |
@@ -67,6 +67,13 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
 - **Node & trust**: node state and device ID, nickname, trusted devices and revocation
   ([Device identity & pairing](../security/pairing.md)), swarm key rotation, and the "Back up the swarm folder
   here" switch.
+- **About** (also the "built with" line at the bottom of the drawer): the NomadFS, Oriel and Zig
+  versions and the commit the app was built from, the platform and app size, this device's name,
+  fingerprint, node ID, port and addresses, devices connected and trusted, and the configuration
+  and data paths with the data's size. **Copy** puts it all on the clipboard for bug reports.
+  `build.zig` passes the versions in an `about` options module: NomadFS's from its own
+  `version`, Oriel's read from the Oriel package's `build.zig.zon`, the commit from `git` (with
+  a `+` when the checkout has local changes).
 
 ## 3. Configuration the app writes
 
