@@ -134,13 +134,66 @@ function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = false, on
   return li;
 }
 
+// ---- Back (Android's back button and gesture, a mouse's back button) ----
+
+// Back goes up one level from wherever the app is: closes the open file or
+// the More sheet, then the parent folder, then Browse; at the top it's
+// Android's (the app goes to the background). The WebView's Back follows
+// the page history, so the page keeps one history entry per level it can
+// go up. They're added as the app goes deeper, right after the tap that
+// took it there: the WebView skips entries a page adds on its own.
+function upTarget() {
+  if (pv) return closePreview;
+  if (!$("more-sheet").hidden) return closeMore;
+  const view = document.body.dataset.view || "browse";
+  if (view === "swarm" && swarmDir) return () => { swarmDir = swarmDir.split("/").slice(0, -1).join("/"); loadSwarm(); };
+  if (view !== "browse") return () => { setView("browse"); if (path.length) showLocation(); };
+  if (path.length) return () => { path.pop(); path.length ? showLocation() : showDevices(); };
+  return null;
+}
+
+/** How many Back presses lead to the top of Browse (upTarget's chain). */
+function upLevels() {
+  const view = document.body.dataset.view || "browse";
+  let n = path.length;
+  if (view !== "browse") n += 1;
+  if (view === "swarm" && swarmDir) n += swarmDir.split("/").length;
+  if (!$("more-sheet").hidden) n += 1;
+  if (pv) n += 1;
+  return n;
+}
+
+let backDepth = 0; // our history entries above the page's own
+let ignorePops = 0; // history.go() calls of ours still to arrive
+
+/** Matches the history entries to the levels after any move. */
+function syncBack() {
+  const want = upLevels();
+  while (backDepth < want) history.pushState({ nomadfsBack: ++backDepth }, "");
+  if (backDepth > want) {
+    // Went up through the app (a breadcrumb, the close button).
+    ignorePops++;
+    const n = backDepth - want;
+    backDepth = want;
+    history.go(-n);
+  }
+}
+
+window.addEventListener("popstate", () => {
+  if (ignorePops > 0) { ignorePops--; return; }
+  backDepth = Math.max(0, backDepth - 1);
+  upTarget()?.();
+  syncBack();
+});
+
 // ---- Phones: the "More" sheet holds sections without a bar slot ----
 
-function closeMore() { $("more-sheet").hidden = true; }
+function closeMore() { $("more-sheet").hidden = true; syncBack(); }
 $("bar-more").addEventListener("click", () => {
   const sheet = $("more-sheet");
   for (const it of sheet.querySelectorAll(".sheet-item")) it.classList.toggle("active", it.dataset.view === document.body.dataset.view);
   sheet.hidden = !sheet.hidden;
+  syncBack();
 });
 $("more-sheet").addEventListener("click", (e) => { if (e.target === $("more-sheet")) closeMore(); });
 for (const it of document.querySelectorAll("#more-sheet .sheet-item")) {
@@ -161,6 +214,7 @@ function setView(view) {
   if (view === "swarm") loadSwarm();
   if (view === "about") loadAbout();
   renderNavDevices();
+  syncBack();
 }
 
 for (const item of document.querySelectorAll(".nav-item[data-view], .bar-item[data-view]")) {
@@ -285,6 +339,7 @@ function renderCrumbs() {
     if (i < parts.length - 1) b.addEventListener("click", () => { path = path.slice(0, i); showLocation(); });
     nav.appendChild(b);
   });
+  syncBack();
 }
 
 function setEmpty(text) {
@@ -569,6 +624,7 @@ function openPreview(source, files, index) {
   pv = { source, files, index, token: 0, url: null };
   $("preview").hidden = false;
   showPreview();
+  syncBack();
 }
 
 /** Stops a streaming player so it stops fetching ranges. */
@@ -589,6 +645,7 @@ function closePreview() {
   pv = null;
   $("pv-body").replaceChildren();
   $("preview").hidden = true;
+  syncBack();
 }
 
 // The native player: GPU rendering and every format the system plays,
@@ -855,6 +912,7 @@ function swarmCrumbs() {
     if (i < all.length - 1) b.addEventListener("click", () => { swarmDir = c.dir; loadSwarm(); });
     nav.appendChild(b);
   });
+  syncBack();
 }
 
 function swarmStatusText(st) {
