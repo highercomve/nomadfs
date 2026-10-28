@@ -133,6 +133,19 @@ With the `oriel` CLI installed, `oriel run`, `oriel build` and `oriel package`
 do the same as the `zig build` steps. On Android the app asks for access to all
 files so it can read the folders you share.
 
+# [Updates]($heading.id('updates'))
+
+The app checks the GitHub releases shortly after it starts and every few hours
+(**About** has the switch, and a **Check for updates** button). Every release
+is signed, and the app only accepts updates signed with the NomadFS release key.
+
+- **AppImage**: **Update** downloads the new version, checks it, replaces the
+  AppImage and restarts the app.
+- **Android**: **Download** opens the new APK in the browser; open it to
+  install it over the current one.
+- **deb or rpm**: update with your package manager, or download the new package
+  from the release page the app links.
+
 # [Keep the phone reachable (Android)]($heading.id('background'))
 
 Android stops apps you aren't using, and a stopped phone drops out of the

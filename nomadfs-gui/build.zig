@@ -20,7 +20,9 @@ pub fn build(b: *std.Build) void {
         .store = false,
         .dialog = true, // native folder picker for shared folders
         .notification = false,
-        .updater = false,
+        // Updates from the GitHub releases (src/updates.zig). On Android it
+        // only checks: the browser downloads the new APK.
+        .updater = true,
         .sql = false,
         .fs_watch = false,
         .media_server = true, // streams video/audio previews with range requests
@@ -59,6 +61,9 @@ pub fn build(b: *std.Build) void {
         },
         .root_source_file = b.path("src/main.zig"),
         .icon = b.path("icon.png"), // High-resolution PNG (1024x1024 recommended)
+        // Release manifests (latest.json) are signed with the matching
+        // private key, kept out of the repository (scripts/release.sh).
+        .update_public_key = "fVWa5YivLO9rnCOY27zfM7wBASax5JcA/ZnwAImSSB8=",
         .frontend = .{
             // A static page: embedded as-is, no npm and no dev server.
             .dir = "frontend",

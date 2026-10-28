@@ -388,6 +388,21 @@
             <p class="supporting">Your files roam with you. A personal distributed filesystem: share folders across your devices, files travel only when you open them.</p>
           </div>
         </div>
+        <div id="update-box" class="update-box">
+          <div class="grow">
+            <p class="about-group">Updates</p>
+            <p id="update-status" class="update-status">Not checked yet.</p>
+            <div id="update-progress" class="progress determinate" hidden></div>
+          </div>
+          <div class="update-buttons">
+            <button id="update-action" class="btn filled" hidden>Update</button>
+            <button id="update-check" class="btn outlined">Check for updates</button>
+          </div>
+        </div>
+        <label class="toggle-row">
+          <span>Check for updates automatically</span>
+          <input type="checkbox" id="update-auto" role="switch">
+        </label>
         <div id="about-body" class="about-body"></div>
         <div class="actions start">
           <button id="about-copy" class="btn outlined">Copy details</button>

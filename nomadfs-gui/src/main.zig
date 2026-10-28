@@ -13,6 +13,7 @@ const commands = @import("commands.zig");
 const tray = @import("tray.zig");
 const background = @import("background.zig");
 const media = @import("media.zig");
+const updates = @import("updates.zig");
 
 pub const std_options: std.Options = .{ .logFn = oriel.log.logFn };
 
@@ -30,6 +31,8 @@ fn initDataDirs() void {
 /// Events pushed from Zig to the page.
 pub const Events = struct {
     node_state: struct { running: bool },
+    /// While `updater_install` downloads (updates.zig).
+    @"updater://progress": struct { downloaded: u64, total: ?u64 },
 };
 
 pub const Commands = struct {
@@ -39,7 +42,7 @@ pub const Commands = struct {
     /// worker thread: they share one lock, and a command waiting on it on
     /// the UI thread would freeze the window (node_open behind a share scan
     /// did, for 20 s on a phone). Only quick config-file reads stay inline.
-    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_read_range", "swarm_download", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set", "media_url", "about_info" };
+    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_read_range", "swarm_download", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set", "media_url", "about_info", "update_info" } ++ updates.Updater.async_commands;
 
     /// `invoke("invite_create", { config_path })`: one-time invite code.
     pub fn invite_create(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.InviteInfo {
@@ -143,6 +146,17 @@ pub const Commands = struct {
     pub fn about_info(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.AboutInfo {
         return commands.aboutInfo(gpa, args, @import("about"));
     }
+
+    /// `invoke("update_info")`: how this copy updates (updates.zig).
+    pub fn update_info(gpa: std.mem.Allocator, io: std.Io) updates.Info {
+        return updates.info(gpa, io);
+    }
+    /// `invoke("updater_check")`: { available, version }.
+    pub const updater_check = updates.Updater.updater_check;
+    /// `invoke("updater_install")`: downloads and swaps in the update.
+    pub const updater_install = updates.Updater.updater_install;
+    /// `invoke("updater_restart")`: restarts as the new version.
+    pub const updater_restart = updates.Updater.updater_restart;
 
     /// `invoke("media_url", { kind, id, cid, size, name })`: where a
     /// `<video>`/`<audio>` streams a file from another device.

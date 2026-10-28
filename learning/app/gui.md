@@ -133,6 +133,18 @@ so the two devices find each other again after a restart. `nodeOpen` dials those
 - **Android storage** (`android-src/StorageExtension.kt`): "All files access"
   (`MANAGE_EXTERNAL_STORAGE`) so folders such as `DCIM/Camera` can be shared and downloads saved to
   `Download/`. Staging files go to the app's cache directory, since Android has no `/tmp`.
+- **Updates** (`src/updates.zig`, Oriel's `oriel.updater`): each GitHub release carries a
+  `latest.json` signed with the release key (Ed25519), whose public half is `update_public_key` in
+  `build.zig`. The app checks it 15 s after starting and every 6 hours (About has the switch and a
+  "Check for updates" button; a dot on About marks a new release). How it updates depends on the
+  install (`update_info`):
+  - **AppImage** (`install`): downloads the new AppImage, checks its size and SHA-256, swaps it
+    in atomically and restarts (`updater_install`, `updater_restart`).
+  - **Android** (`download`): Oriel can only check there; the page opens the new APK in the
+    browser, which installs it. Android reports its OS as Linux, so its manifest entries are
+    `aarch64-android` and `x86_64-android`, apart from the desktop's `x86_64-linux`.
+  - **deb, rpm, a build from source** (`manual`): the page links the release; the package manager
+    updates it.
 
 ## 5. Building
 

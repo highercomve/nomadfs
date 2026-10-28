@@ -1401,3 +1401,40 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
   .about-list { grid-template-columns: 1fr; gap: 2px; }
   .about-list dd { margin-bottom: 8px; }
 }
+
+/* ---- Updates (About) ---- */
+.update-box {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 10px 14px 14px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--plate-2);
+}
+.update-box .about-group { margin-top: 4px; }
+.update-status { margin: 0; color: var(--sand); font-size: 14px; }
+.update-box .progress { margin-top: 10px; }
+.update-box .progress.determinate::after { animation: none; width: var(--p, 0%); transition: width .2s; }
+.update-buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+/* A dot on About (drawer, bar's More) when an update is out. */
+.nav-item[data-view="about"].has-update::after {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--amber);
+  margin-left: auto;
+}
+#bar-more.has-update { position: relative; }
+#bar-more.has-update::after {
+  content: "";
+  position: absolute;
+  top: 8px;
+  right: calc(50% - 18px);
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--amber);
+}

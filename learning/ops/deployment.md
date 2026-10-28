@@ -28,6 +28,15 @@ builds this tree; update it before relying on it. No image is published.
 
 The Linux mount additionally needs `fusermount3` (package `fuse3`).
 
+**Making a release.** Bump the version in `build.zig.zon`, `nomadfs-gui/build.zig.zon` and
+`nomadfs-gui/build.zig`, then `scripts/release.sh [out-dir]` builds every asset (both CLIs, the
+AppImage, deb, rpm and the APK), signs the update manifest the apps check (`latest.json`: the
+AppImage for `x86_64-linux`, the APK for `aarch64-android` and `x86_64-android`) and writes
+`SHA256SUMS`. It signs with `NOMADFS_UPDATE_KEY` (default
+`~/.config/oriel/keys/nomadfs-update.key`); the apps only accept manifests signed with it, so keep
+a backup of that file and never commit it. Upload everything, `latest.json` included, to the
+GitHub release: the apps read `releases/latest/download/latest.json`.
+
 ## 2. The Command Line (`src/main.zig`)
 
 There are no subcommands. The binary takes at most one command flag, plus
