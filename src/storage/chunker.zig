@@ -72,6 +72,8 @@ pub const Chunker = struct {
     start: usize = 0,
     end: usize = 0,
     eof: bool = false,
+    /// False when the buffer was lent by the caller (initBuffer).
+    owns_buffer: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, params: Params) !Chunker {
         params.validate();
@@ -86,8 +88,21 @@ pub const Chunker = struct {
         };
     }
 
+    /// A chunker over `buffer` (at least `params.max_size` bytes), which
+    /// stays the caller's: callers chunking many files reuse one buffer.
+    pub fn initBuffer(allocator: std.mem.Allocator, params: Params, buffer: []u8) Chunker {
+        params.validate();
+        std.debug.assert(buffer.len >= params.max_size);
+        return .{
+            .allocator = allocator,
+            .params = params,
+            .buffer = buffer[0..params.max_size],
+            .owns_buffer = false,
+        };
+    }
+
     pub fn deinit(self: *Chunker) void {
-        self.allocator.free(self.buffer);
+        if (self.owns_buffer) self.allocator.free(self.buffer);
     }
 
     /// Returns the next chunk as a slice into the internal buffer,

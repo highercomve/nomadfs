@@ -24,6 +24,26 @@ pub const DagBuilder = struct {
     /// where each leaf's bytes sit in the input instead (shared folders keep
     /// file bytes in the files themselves). Parents are always stored.
     leaf_sink: ?LeafSink = null,
+    /// Buffers reused across builds. Without it each build allocates two
+    /// chunk-sized buffers, which dominates the cost of small files.
+    scratch: ?*Scratch = null,
+
+    pub const Scratch = struct {
+        chunk: []u8,
+        /// The leaf encoding: tag byte, then the chunk.
+        leaf: []u8,
+
+        pub fn init(allocator: std.mem.Allocator) !Scratch {
+            const chunk = try allocator.alloc(u8, chunk_params.max_size);
+            errdefer allocator.free(chunk);
+            return .{ .chunk = chunk, .leaf = try allocator.alloc(u8, 1 + chunk_params.max_size) };
+        }
+
+        pub fn deinit(self: *Scratch, allocator: std.mem.Allocator) void {
+            allocator.free(self.chunk);
+            allocator.free(self.leaf);
+        }
+    };
 
     pub const LeafSink = struct {
         ctx: *anyopaque,
@@ -38,15 +58,18 @@ pub const DagBuilder = struct {
         var leaf_metadata: std.ArrayList(DagLink) = .empty;
         defer self.freeLinks(&leaf_metadata);
 
-        var chk = try chunker.Chunker.init(self.allocator, chunk_params);
+        var chk = if (self.scratch) |sc|
+            chunker.Chunker.initBuffer(self.allocator, chunk_params, sc.chunk)
+        else
+            try chunker.Chunker.init(self.allocator, chunk_params);
         defer chk.deinit();
 
         // Reused encoding buffer: byte 0 holds the leaf tag, so a chunk is
         // copied once into place and persisted straight from there. Chunk
         // slices returned by the chunker alias its own buffer, which is why
         // the copy is needed.
-        const leaf_buf = try self.allocator.alloc(u8, 1 + chunk_params.max_size);
-        defer self.allocator.free(leaf_buf);
+        const leaf_buf = if (self.scratch) |sc| sc.leaf else try self.allocator.alloc(u8, 1 + chunk_params.max_size);
+        defer if (self.scratch == null) self.allocator.free(leaf_buf);
         leaf_buf[0] = @intFromEnum(codec.Tag.leaf);
 
         var offset: u64 = 0;

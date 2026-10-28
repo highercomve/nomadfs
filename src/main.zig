@@ -28,7 +28,10 @@ const Options = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    // A long-running node: outside Debug, the general-purpose allocator.
+    // (Static ReleaseSafe builds would otherwise get std's DebugAllocator,
+    // which records a stack trace for every allocation.)
+    const allocator = if (@import("builtin").mode == .Debug) init.gpa else std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var options: Options = .{};

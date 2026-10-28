@@ -417,9 +417,12 @@ pub const ShareInfo = struct {
     path: []const u8,
     files: u64,
     size: u64,
-    /// False until the first scan finished; unscanned shares aren't listed
-    /// to other devices yet.
+    /// False until the first scan has something to list; other devices
+    /// don't see the share before that.
     ready: bool,
+    /// The first scan is still running: other devices see what it has
+    /// done so far.
+    indexing: bool,
 };
 
 fn shareIndex(handle: *mobile.NodeHandle) !*fs.ShareIndex {
@@ -435,7 +438,7 @@ pub fn sharesLocal(gpa: std.mem.Allocator) ![]ShareInfo {
     defer gpa.free(snapshot);
     const out = try gpa.alloc(ShareInfo, snapshot.len);
     for (snapshot, out) |s, *o| {
-        o.* = .{ .name = s.name, .path = s.path, .files = s.files, .size = s.size, .ready = s.root != null };
+        o.* = .{ .name = s.name, .path = s.path, .files = s.files, .size = s.size, .ready = s.root != null, .indexing = s.indexing };
     }
     return out;
 }

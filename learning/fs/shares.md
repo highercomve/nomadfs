@@ -11,7 +11,8 @@ Usage: [Shared folders & mount](https://nomadfs.foreachdeveloper.com/docs/shared
 pub const Share = struct {
     name: []const u8,
     path: []const u8,
-    root: ?codec.Cid = null, // null until the first scan finishes
+    root: ?codec.Cid = null, // null until the first scan has something to list
+    indexing: bool = false,   // the first scan is still running: `root` is partial
     size: u64 = 0,
     files: u64 = 0,
     scanned_at: u64 = 0,
@@ -25,8 +26,21 @@ pub const Share = struct {
 - A background thread (`start`/`stop`) calls `rescanAll` every `rescan_interval_ns` = **30 s**.
 - `listing()` encodes the current shares as a **dir block** (tag `0x02`, see
   [DAGs](../storage/dag.md)): one entry per scanned share, `kind = .dir`, `cid` = the share's
-  root, `size` = total bytes, `mtime` = `scanned_at`. Shares that haven't finished their first scan
-  are left out.
+  root, `size` = total bytes, `mtime` = `scanned_at`. A share is listed as soon as its first scan
+  has something to show (below).
+
+### The first scan lists as it goes
+
+A large folder (a media disk) takes hours to hash the first time. Rather than hide it until then,
+the first scan of a share reports progress (`scan.Progress`): after `progress_first_ns` = **1 s**
+and then every `progress_interval_ns` = **10 s**, the scanner builds a root from what it has done so
+far (the directories still being scanned, each holding what it has, stored as dir blocks) and the
+share lists that root with `indexing = true`. Other devices see the share fill in.
+
+Every partial root has to be readable, so each report also hands the files scanned since the last
+one to the filestore as a **segment** of their own (`Filestore.append`) and the scanner starts a new
+table. The scanner never writes to a table a reader can see. Later rescans build one whole table and
+`replace` all the segments.
 
 ### `GET_SHARES`
 
@@ -47,7 +61,31 @@ directory (`tree.decodeListing`).
   `/`, `\` or NUL, longer than 255 bytes); entries that can't be read (logged as
   `share: skipping …`); and subtrees deeper than `max_depth` = **32**.
 - **Reuse:** the scanner remembers each file's size, mtime (ns), CID and leaf locations. A file whose
-  size and mtime match the previous scan is not read again.
+  size and mtime match the previous scan is not read again. Files no longer found under a share
+  are forgotten at the end of its scan.
+- **One set of buffers:** the chunker's buffer and the leaf buffer (`DagBuilder.Scratch`, 1 MiB
+  each) are allocated once per `Scanner` and reused for every file. Allocating them per file made
+  small files cost about 1 ms each (15 ms on a Rockchip RK3399), 70 times the hashing itself.
+
+### The scan cache (`src/fs/scan_cache.zig`)
+
+What the scanner remembers is also kept on disk, in `scan-cache` in the store directory, so a
+restart doesn't re-read every shared file. It is an append-only log after a header:
+
+```
+put:  [u8 1][u16 path_len][path][u64 size][i64 mtime_ns][cid: 32]
+drop: [u8 2][u16 path_len][path]
+```
+
+The last record for a path wins; a torn record at the end (a crash mid-write) is ignored and
+overwritten; the file is rewritten without stale records once they outnumber the live ones. New
+records are written at every progress report and at the end of each scan.
+
+Leaves are not recorded: a file's parent blocks are already in the store and list them. When a
+cached file is needed, `Scanner.leavesFromStore` walks them with `StorageEngine.getLocal` (the
+store's own block files only, never a shared file). A balanced DAG keeps every leaf at one depth,
+so the first child of a parent tells whether its links are leaves (not stored) or more parents. A
+file with one leaf has no parent: its root is that leaf.
 
 An unchanged rescan reproduces the same root CID; any change below the folder changes it.
 

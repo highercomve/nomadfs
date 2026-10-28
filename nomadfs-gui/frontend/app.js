@@ -1021,7 +1021,9 @@ async function loadShares() {
       icon: "folder",
       iconClass: "folder",
       headline: s.name,
-      meta: s.ready ? `${s.files} files · ${formatSize(s.size)} · ${s.path}` : `Scanning… ${s.path}`,
+      meta: !s.ready ? `Scanning… ${s.path}`
+        : s.indexing ? `Indexing… ${s.files} files so far · ${formatSize(s.size)} · ${s.path}`
+        : `${s.files} files · ${formatSize(s.size)} · ${s.path}`,
       action: { icon: "remove", label: `Stop sharing ${s.name}`, run: () => removeShare(s.name) },
     }));
   }

@@ -17,6 +17,7 @@ code-level companion: files, types and functions.
 | :--- | :--- |
 | `shares.zig` | `ShareIndex`: the folders this device shares, rescanned every 30 s. Answers `GET_SHARES`. |
 | `scan.zig` | `Scanner`: turns a local folder into a Merkle tree (file DAGs + dir blocks). |
+| `scan_cache.zig` | `ScanCache`: what the scanner learned about each file, kept on disk across restarts. |
 | `filestore.zig` | `Filestore`: serves shared files' leaf blocks from the files themselves. |
 | `tree.zig` | `Loader`, `listDir`, `resolve`, `readAt`: reads a tree one block at a time. |
 | `remote.zig` | `Remote`, `MultiRemote`: Loaders that fetch missing blocks from peers and cache them. |

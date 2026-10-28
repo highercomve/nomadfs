@@ -17,8 +17,12 @@ const filestore = @import("filestore.zig");
 pub const Share = struct {
     name: []const u8,
     path: []const u8,
-    /// Null until the first scan finishes; unscanned shares are not listed.
+    /// Null until the first scan has something to show: a first scan
+    /// publishes what it has scanned so far as it goes, so a large folder
+    /// is listed (and filling in) within seconds.
     root: ?codec.Cid = null,
+    /// The first scan is still running: `root` is partial.
+    indexing: bool = false,
     size: u64 = 0,
     files: u64 = 0,
     scanned_at: u64 = 0,
@@ -37,6 +41,9 @@ pub const ShareIndex = struct {
     /// Serializes scans (the scanner's file cache is not shared).
     scan_mutex: sync.Mutex = .{},
     rescan_interval_ns: u64 = 30 * std.time.ns_per_s,
+    /// How soon a first scan lists what it has, then how often it updates.
+    progress_first_ns: u64 = 1 * std.time.ns_per_s,
+    progress_interval_ns: u64 = 10 * std.time.ns_per_s,
     running: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
@@ -50,6 +57,8 @@ pub const ShareIndex = struct {
             .store = store,
         };
         store.external = self.files.external();
+        // Remembered files are not re-read after a restart.
+        self.scanner.loadCache() catch |err| std.debug.print("share: no scan cache: {any}\n", .{err});
         return self;
     }
 
@@ -165,15 +174,32 @@ pub const ShareIndex = struct {
         };
         defer self.allocator.free(path);
 
-        const table = self.allocator.create(filestore.Table) catch return;
-        table.* = filestore.Table.init(self.allocator);
-        var installed = false;
-        defer if (!installed) {
-            table.deinit();
-            self.allocator.destroy(table);
+        // A first scan publishes as it goes (onProgress): the files done
+        // so far are handed to the filestore in segments, so the partial
+        // roots it lists can be read. Later scans swap a whole table in.
+        const first = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const at = self.indexOf(name);
+            if (!at.found) return;
+            break :blk self.shares.items[at.index].root == null;
         };
-        self.scanner.table = table;
-        defer self.scanner.table = null;
+        // Segments left by an earlier share of this name.
+        if (first) self.files.remove(name);
+        self.scanner.table = newTable(self.allocator) catch return;
+        defer if (self.scanner.table) |t| {
+            t.deinit();
+            self.allocator.destroy(t);
+            self.scanner.table = null;
+        };
+        var progress: ProgressCtx = .{ .index = self, .name = name };
+        if (first) self.scanner.progress = .{
+            .ctx = &progress,
+            .reportFn = ProgressCtx.report,
+            .first_ns = self.progress_first_ns,
+            .interval_ns = self.progress_interval_ns,
+        };
+        const started = std.Io.Timestamp.now(self.io, .awake);
         const result = self.scanner.scan(path) catch |err| {
             std.debug.print("share '{s}': scan of {s} failed: {any}\n", .{ name, path, err });
             return;
@@ -183,14 +209,55 @@ pub const ShareIndex = struct {
         defer self.mutex.unlock();
         const at = self.indexOf(name);
         if (!at.found) return; // removed while scanning
-        self.files.replace(name, table) catch return;
-        installed = true;
+        const table = self.scanner.table.?;
+        (if (first) self.files.append(name, table) else self.files.replace(name, table)) catch return;
+        self.scanner.table = null;
         const share = &self.shares.items[at.index];
+        if (first) {
+            const ms = @divFloor(started.durationTo(std.Io.Timestamp.now(self.io, .awake)).nanoseconds, std.time.ns_per_ms);
+            std.debug.print("share '{s}': indexed {d} files ({d} MiB) in {d} ms\n", .{ name, result.files, result.size >> 20, ms });
+        }
         share.root = result.root;
         share.size = result.size;
         share.files = result.files;
+        share.indexing = false;
         share.scanned_at = nowSeconds(self.io);
     }
+
+    fn newTable(allocator: std.mem.Allocator) !*filestore.Table {
+        const table = try allocator.create(filestore.Table);
+        table.* = filestore.Table.init(allocator);
+        return table;
+    }
+
+    /// A first scan's progress: the share lists what is done so far.
+    const ProgressCtx = struct {
+        index: *ShareIndex,
+        name: []const u8,
+
+        fn report(ctx: *anyopaque, partial: scan.Result) anyerror!void {
+            const self: *ProgressCtx = @ptrCast(@alignCast(ctx));
+            const index = self.index;
+            const next = try newTable(index.allocator);
+            errdefer {
+                next.deinit();
+                index.allocator.destroy(next);
+            }
+            index.mutex.lock();
+            defer index.mutex.unlock();
+            const at = index.indexOf(self.name);
+            if (!at.found) return error.ScanCancelled; // removed meanwhile
+            // Hand over the files scanned since the last report.
+            try index.files.append(self.name, index.scanner.table.?);
+            index.scanner.table = next;
+            const share = &index.shares.items[at.index];
+            share.root = partial.root;
+            share.size = partial.size;
+            share.files = partial.files;
+            share.indexing = true;
+            share.scanned_at = nowSeconds(index.io);
+        }
+    };
 
     /// A snapshot of the shares (names and paths owned by the caller; free
     /// with freeSnapshot).
@@ -338,4 +405,118 @@ test "shares: listing follows add, rescan and remove" {
     const none = try tree.decodeListing(allocator, empty);
     defer none.deinit();
     try testing.expectEqual(@as(usize, 0), none.entries.len);
+}
+
+test "shares: a first scan lists its progress, and every file reads back" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = testing.io;
+    const tree = @import("tree.zig");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "media/a");
+    try tmp.dir.createDirPath(io, "media/b");
+    try tmp.dir.createDirPath(io, "blocks");
+    var big: [3 << 20]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(7);
+    prng.random().bytes(&big);
+    try tmp.dir.writeFile(io, .{ .sub_path = "media/a/one.txt", .data = "first" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "media/a/two.txt", .data = "second" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "media/b/big.bin", .data = &big });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const blocks = try std.fs.path.join(allocator, &.{ base, "blocks" });
+    defer allocator.free(blocks);
+    const media = try std.fs.path.join(allocator, &.{ base, "media" });
+    defer allocator.free(media);
+
+    var store = try storage.engine.StorageEngine.init(allocator, blocks);
+    defer store.deinit();
+    const index = try ShareIndex.create(allocator, io, &store);
+    defer index.destroy();
+    // Report after every file.
+    index.progress_first_ns = 0;
+    index.progress_interval_ns = 0;
+    try index.add("media", media);
+
+    // Each report handed its files over as a segment of their own.
+    {
+        index.files.mutex.lock();
+        defer index.files.mutex.unlock();
+        try testing.expect(index.files.tables.get("media").?.items.len >= 3);
+    }
+    const snap = try index.snapshot(allocator);
+    defer ShareIndex.freeSnapshot(allocator, snap);
+    try testing.expectEqual(@as(u64, 3), snap[0].files);
+    try testing.expect(!snap[0].indexing);
+
+    const loader = tree.Loader.local(&store);
+    const file = try tree.resolve(allocator, loader, snap[0].root.?, "b/big.bin");
+    const out = try allocator.alloc(u8, big.len);
+    defer allocator.free(out);
+    try testing.expectEqual(big.len, try tree.readAt(allocator, loader, file.cid, 0, out));
+    try testing.expectEqualSlices(u8, &big, out);
+}
+
+test "shares: a restart reuses the scan cache instead of re-reading files" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = testing.io;
+    const tree = @import("tree.zig");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "docs");
+    try tmp.dir.createDirPath(io, "blocks");
+    var big: [3 << 20]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(11);
+    prng.random().bytes(&big);
+    try tmp.dir.writeFile(io, .{ .sub_path = "docs/small.txt", .data = "tiny" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "docs/big.bin", .data = &big });
+    try tmp.dir.writeFile(io, .{ .sub_path = "docs/gone.txt", .data = "bye" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const blocks = try std.fs.path.join(allocator, &.{ base, "blocks" });
+    defer allocator.free(blocks);
+    const docs = try std.fs.path.join(allocator, &.{ base, "docs" });
+    defer allocator.free(docs);
+
+    var store = try storage.engine.StorageEngine.init(allocator, blocks);
+    defer store.deinit();
+    var first_root: codec.Cid = undefined;
+    {
+        const index = try ShareIndex.create(allocator, io, &store);
+        defer index.destroy();
+        try index.add("docs", docs);
+        try testing.expectEqual(@as(u64, 3), index.scanner.files_hashed);
+        // Deleted between runs: forgotten by the next scan.
+        try tmp.dir.deleteFile(io, "docs/gone.txt");
+        try index.add("docs", docs);
+        const snap = try index.snapshot(allocator);
+        defer ShareIndex.freeSnapshot(allocator, snap);
+        first_root = snap[0].root.?;
+    }
+
+    const index = try ShareIndex.create(allocator, io, &store);
+    defer index.destroy();
+    try testing.expectEqual(@as(u32, 2), index.scanner.remembered.count());
+    try index.add("docs", docs);
+    try testing.expectEqual(@as(u64, 0), index.scanner.files_hashed);
+    const snap = try index.snapshot(allocator);
+    defer ShareIndex.freeSnapshot(allocator, snap);
+    try testing.expectEqualSlices(u8, &first_root, &snap[0].root.?);
+
+    // The leaves rebuilt from the store serve the bytes.
+    const loader = tree.Loader.local(&store);
+    const file = try tree.resolve(allocator, loader, snap[0].root.?, "big.bin");
+    const out = try allocator.alloc(u8, big.len);
+    defer allocator.free(out);
+    try testing.expectEqual(big.len, try tree.readAt(allocator, loader, file.cid, 0, out));
+    try testing.expectEqualSlices(u8, &big, out);
+    const small = try tree.resolve(allocator, loader, snap[0].root.?, "small.txt");
+    var buf: [8]u8 = undefined;
+    try testing.expectEqualStrings("tiny", buf[0..try tree.readAt(allocator, loader, small.cid, 0, &buf)]);
 }

@@ -97,6 +97,26 @@ pub const StorageEngine = struct {
 
     /// Returns the block, or null if it is not stored. The data is verified
     /// against the CID so on-disk corruption is reported, not returned.
+    /// The bytes of a block stored here (not `external`), unverified, or
+    /// null. For walking this device's own parent blocks cheaply: a shared
+    /// file's leaves are never read.
+    pub fn getLocal(self: *StorageEngine, cid: *const [32]u8, allocator: std.mem.Allocator) !?[]u8 {
+        const hex_cid = std.fmt.bytesToHex(cid.*, .lower);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var file = self.root_dir.openFile(io, &hex_cid, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer file.close(io);
+        const size = (try file.stat(io)).size;
+        const buffer = try allocator.alloc(u8, size);
+        errdefer allocator.free(buffer);
+        if (try file.readPositionalAll(io, buffer, 0) != size) return error.ReadError;
+        return buffer;
+    }
+
     pub fn get(self: *StorageEngine, cid: []const u8, allocator: std.mem.Allocator) !?Block {
         if (cid.len != 32) return error.InvalidBlock;
         const hex_cid = std.fmt.bytesToHex(cid[0..32], .lower);

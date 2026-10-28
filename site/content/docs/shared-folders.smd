@@ -35,10 +35,14 @@ folder into a Merkle tree:
   Only the directory blocks and the blocks that index a file's chunks are
   stored.
 - The scan reuses unchanged files by size and modification time, and runs again
-  every 30 seconds, so the share follows the folder.
+  every 30 seconds, so the share follows the folder. What it learned is kept in
+  `scan-cache` in the storage folder, so a restart doesn't read every file
+  again.
 
-A new share is listed as soon as its first scan finishes; until then the app
-shows it as scanning.
+A large folder takes a while to scan the first time (every file is read and
+hashed once). It shows up on your other devices within seconds anyway and fills
+in as the scan goes: what has been scanned so far can already be browsed and
+opened. The app shows it as indexing until the first scan finishes.
 
 # [Browsing another device]($heading.id('browsing'))
 

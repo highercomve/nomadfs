@@ -64,8 +64,9 @@ pub const Table = struct {
 pub const Filestore = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    /// Share name -> its table. Guarded by `mutex`.
-    tables: std.StringHashMapUnmanaged(*Table) = .empty,
+    /// Share name -> its tables: one after a scan, or the segments a first
+    /// scan hands over as it goes (append). Guarded by `mutex`.
+    tables: std.StringHashMapUnmanaged(Segments) = .empty,
     mutex: sync.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Filestore {
@@ -76,37 +77,63 @@ pub const Filestore = struct {
         var it = self.tables.iterator();
         while (it.next()) |e| {
             self.allocator.free(e.key_ptr.*);
-            e.value_ptr.*.deinit();
-            self.allocator.destroy(e.value_ptr.*);
+            self.freeSegments(e.value_ptr);
         }
         self.tables.deinit(self.allocator);
     }
 
+    const Segments = std.ArrayList(*Table);
+
+    fn freeSegments(self: *Filestore, segments: *Segments) void {
+        for (segments.items) |t| {
+            t.deinit();
+            self.allocator.destroy(t);
+        }
+        segments.deinit(self.allocator);
+    }
+
     /// Installs `table` (heap-allocated with this allocator) as `share`'s,
-    /// replacing and freeing the previous one.
+    /// replacing and freeing the previous ones.
     pub fn replace(self: *Filestore, share: []const u8, table: *Table) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        const segments = try self.segmentsLocked(share);
+        try segments.ensureUnusedCapacity(self.allocator, 1);
+        for (segments.items) |t| {
+            t.deinit();
+            self.allocator.destroy(t);
+        }
+        segments.clearRetainingCapacity();
+        segments.appendAssumeCapacity(table);
+    }
+
+    /// Adds `table` to `share`'s, keeping the others: a first scan hands
+    /// over the files it has done so far, then starts a new table.
+    pub fn append(self: *Filestore, share: []const u8, table: *Table) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const segments = try self.segmentsLocked(share);
+        try segments.append(self.allocator, table);
+    }
+
+    fn segmentsLocked(self: *Filestore, share: []const u8) !*Segments {
         const gop = try self.tables.getOrPut(self.allocator, share);
-        if (gop.found_existing) {
-            gop.value_ptr.*.deinit();
-            self.allocator.destroy(gop.value_ptr.*);
-        } else {
+        if (!gop.found_existing) {
             gop.key_ptr.* = self.allocator.dupe(u8, share) catch |err| {
                 self.tables.removeByPtr(gop.key_ptr);
                 return err;
             };
+            gop.value_ptr.* = .empty;
         }
-        gop.value_ptr.* = table;
+        return gop.value_ptr;
     }
 
     pub fn remove(self: *Filestore, share: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const kv = self.tables.fetchRemove(share) orelse return;
+        var kv = self.tables.fetchRemove(share) orelse return;
         self.allocator.free(kv.key);
-        kv.value.deinit();
-        self.allocator.destroy(kv.value);
+        self.freeSegments(&kv.value);
     }
 
     /// Adapter for StorageEngine.external.
@@ -120,14 +147,14 @@ pub const Filestore = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         var it = self.tables.valueIterator();
-        while (it.next()) |table| {
-            const ref = table.*.refs.get(cid.*) orelse continue;
-            const path = table.*.paths.items[ref.file];
+        while (it.next()) |segments| for (segments.items) |table| {
+            const ref = table.refs.get(cid.*) orelse continue;
+            const path = table.paths.items[ref.file];
             var out = Located{ .path_buf = undefined, .path_len = path.len, .ref = ref };
             if (path.len > out.path_buf.len) return null;
             @memcpy(out.path_buf[0..path.len], path);
             return out;
-        }
+        };
         return null;
     }
 

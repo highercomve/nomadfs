@@ -23,6 +23,7 @@ pub const ReadAhead = readahead.ReadAhead;
 
 test {
     _ = scan;
+    _ = @import("scan_cache.zig");
     _ = shares;
     _ = tree;
     _ = remote;

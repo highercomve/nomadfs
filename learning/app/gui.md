@@ -56,7 +56,9 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
 - **Swarm folder**: the shared folder every device writes ([Chapter 5.2](../fs/swarm.md)), with
   add, new folder, rename, delete, the author of each file, and the last sync.
 - **Shared folders**: pick a folder with the system picker (GTK on Linux, the Storage Access
-  Framework on Android), name it, share it. Shares are saved in the app's configuration.
+  Framework on Android), name it, share it. Shares are saved in the app's configuration. A new
+  share reads "Indexing… N files so far" while its first scan runs; other devices already see what
+  it has done ([Chapter 5.1](../fs/shares.md)).
 - **Mount** (Linux only): mounts at `~/NomadFS` by default ([Chapter 5.3](../fs/fuse.md)). The
   tray menu has the same switch.
 - **Connect devices**: create a one-time invite (code + QR), or join with a code or a QR scan (the
