@@ -93,3 +93,20 @@ Devices can also share a swarm by configuration: the same `swarm_key` in each
 `nomadfs.conf`, and each other's address in `bootstrap_peers`
 (`"tcp://192.168.1.20:9000"`). This is the way to connect two machines that
 only run the command line, since joining with an invite is done from the app.
+
+# [Devices on different networks]($heading.id('relay'))
+
+Each device tells the others every address it has: the home network,
+Tailscale or another VPN. Devices remember them, so a phone that met the
+desktop at home reaches it over Tailscale when it's away.
+
+When none of a device's addresses answers (a home server that is only on the
+home network, seen from a phone on mobile data), a device both can reach
+carries the connection, for example the desktop that is on both. Nothing needs
+setting up: the phone asks the devices it is connected to, and the first that
+can reach the server pipes the connection through. It stays encrypted end to
+end between the phone and the server; the device in the middle only passes
+bytes along. All the traffic then goes through that device, so a direct path
+(both on Tailscale) is still faster.
+
+Every device involved needs NomadFS 0.3.4 or later.

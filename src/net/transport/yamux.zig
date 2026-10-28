@@ -557,6 +557,29 @@ pub const Session = struct {
         stream.timeout_ms = timeout_ms;
     }
 
+    /// Ends the stream locally: blocked reads return what's left then end,
+    /// writes fail, and the peer gets FIN (so it closes its side, which
+    /// frees ours as usual). The stream stays allocated until streamClose,
+    /// so other threads may still be inside read or write.
+    pub fn streamShutdown(ctx: *anyopaque) void {
+        const stream: *YamuxStream = @ptrCast(@alignCast(ctx));
+        const session = stream.session;
+        {
+            stream.mutex.lock();
+            defer stream.mutex.unlock();
+            if (stream.reset or stream.local_closed) return;
+            stream.reset = true;
+            stream.cond.broadcast();
+            stream.write_cond.broadcast();
+        }
+        session.writeFrame(.{
+            .type = .DATA,
+            .flags = Flags.FIN,
+            .stream_id = stream.id,
+            .length = 0,
+        }, &.{}) catch {};
+    }
+
     /// Half-closes the stream and releases the caller's hold on it. The stream
     /// must not be used after this returns.
     pub fn streamClose(ctx: *anyopaque) void {

@@ -44,6 +44,15 @@ pub const ConnectionManager = struct {
     tcp_server: ?network.Server = null,
     heap_allocated: bool = false,
     device_auth: ?device_auth.Authenticator = null,
+    /// Reaches a device through another one when none of its addresses
+    /// answers (discovery/node.zig sets it; transport/relay.zig).
+    relay_dialer: ?RelayDialer = null,
+
+    pub const RelayDialer = struct {
+        ctx: *anyopaque,
+        /// A connection reference the caller must deinit().
+        dialFn: *const fn (ctx: *anyopaque, target: id.NodeID) anyerror!network.Connection,
+    };
 
     pub fn init(allocator: std.mem.Allocator, transport_type: config.Config.TransportType, key_path: ?[]const u8) !ConnectionManager {
         const keypair = try loadOrGenerateKey(allocator, key_path);
@@ -92,7 +101,7 @@ pub const ConnectionManager = struct {
         self.device_auth = auth;
     }
 
-    fn deviceAuthPtr(self: *ConnectionManager) ?*const device_auth.Authenticator {
+    pub fn deviceAuthPtr(self: *ConnectionManager) ?*const device_auth.Authenticator {
         if (self.device_auth) |*auth| return auth;
         return null;
     }
@@ -469,8 +478,50 @@ pub const ConnectionManager = struct {
         }
     }
 
-    /// Returns a connection reference the caller must deinit().
+    /// Returns a connection reference the caller must deinit(). When no
+    /// address answers and the device is known by ID, tries to reach it
+    /// through another device (relay_dialer).
     pub fn connectToPeerMulti(self: *ConnectionManager, addresses: []const network.Address, swarm_key: []const u8, remote_node_id: ?id.NodeID) !network.Connection {
+        const direct_err = if (self.connectDirect(addresses, swarm_key, remote_node_id)) |conn| return conn else |err| err;
+        const target = remote_node_id orelse return direct_err;
+        const dialer = self.relay_dialer orelse return direct_err;
+        if (target.eql(self.node_id)) return direct_err;
+        return dialer.dialFn(dialer.ctx, target) catch |err| {
+            std.debug.print("ConnectionManager: no relay reaches {x}: {any}\n", .{ target.bytes[0..4], err });
+            return direct_err;
+        };
+    }
+
+    /// The live connection to `node_id`, or null; a reference the caller
+    /// must deinit().
+    pub fn existingConnection(self: *ConnectionManager, node_id: id.NodeID) ?network.Connection {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.findConnectionLocked(&.{}, node_id);
+    }
+
+    /// References to every live connection; deinit each, then free the
+    /// slice.
+    pub fn liveConnections(self: *ConnectionManager, allocator: std.mem.Allocator) ![]network.Connection {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var out: std.ArrayList(network.Connection) = .empty;
+        errdefer {
+            for (out.items) |c| c.deinit();
+            out.deinit(allocator);
+        }
+        for (self.connections.items) |mc| {
+            if (mc.conn.isClosed()) continue;
+            try out.ensureUnusedCapacity(allocator, 1);
+            mc.conn.retain();
+            out.appendAssumeCapacity(mc.conn);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// connectToPeerMulti without the relay: only the addresses given (a
+    /// relay dialing on another device's behalf, so relays never chain).
+    pub fn connectDirect(self: *ConnectionManager, addresses: []const network.Address, swarm_key: []const u8, remote_node_id: ?id.NodeID) !network.Connection {
         // 1. Check existing connections first
         {
             self.mutex.lock();

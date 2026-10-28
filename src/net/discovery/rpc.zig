@@ -60,6 +60,14 @@ pub const MessageType = enum(u8) {
     /// A new swarm key from a trusted device (device/rotation.zig).
     /// Answered with STORE_ACK.
     ROTATE_KEY = 20,
+    /// Ask a device to pipe this stream to `target` (transport/relay.zig).
+    /// Answered with RELAY_ACK; if ok, the stream then carries the
+    /// connection to `target`.
+    RELAY_CONNECT = 21,
+    /// From a relay: `from` is connecting through this stream. Answered
+    /// with RELAY_ACK; then the stream carries that connection.
+    RELAY_INCOMING = 22,
+    RELAY_ACK = 23,
 };
 
 pub const FindValueResult = union(enum) {
@@ -118,6 +126,9 @@ pub const MessagePayload = union(MessageType) {
     GET_SWARM: void,
     SWARM: struct { manifest: []const u8 },
     ROTATE_KEY: struct { epoch: u64, new_key: [32]u8, signer_key: [32]u8, signature: [64]u8 },
+    RELAY_CONNECT: struct { target: id.NodeID },
+    RELAY_INCOMING: struct { from: id.NodeID },
+    RELAY_ACK: struct { ok: bool },
 };
 
 pub const Message = struct {
@@ -179,6 +190,9 @@ pub const Message = struct {
                 try writer.writeInt(u16, p.port, .big);
             },
             .STORE_ACK => |p| try writer.writeByte(@intFromBool(p.stored)),
+            .RELAY_CONNECT => |p| try writer.writeAll(&p.target.bytes),
+            .RELAY_INCOMING => |p| try writer.writeAll(&p.from.bytes),
+            .RELAY_ACK => |p| try writer.writeByte(@intFromBool(p.ok)),
             .GET_BLOCK => |p| try writer.writeAll(&p.cid),
             .ADD_PROVIDER => |p| try writer.writeAll(&p.key.bytes),
             .GET_PROVIDERS => |p| try writer.writeAll(&p.key.bytes),
@@ -328,6 +342,17 @@ pub const Message = struct {
                 break :blk MessagePayload{ .ROTATE_KEY = .{ .epoch = epoch, .new_key = new_key, .signer_key = signer_key, .signature = signature } };
             },
             .SWARM => MessagePayload{ .SWARM = .{ .manifest = try readValue(allocator, reader) } },
+            .RELAY_CONNECT => blk: {
+                var target: id.NodeID = undefined;
+                try reader.readNoEof(&target.bytes);
+                break :blk MessagePayload{ .RELAY_CONNECT = .{ .target = target } };
+            },
+            .RELAY_INCOMING => blk: {
+                var from: id.NodeID = undefined;
+                try reader.readNoEof(&from.bytes);
+                break :blk MessagePayload{ .RELAY_INCOMING = .{ .from = from } };
+            },
+            .RELAY_ACK => MessagePayload{ .RELAY_ACK = .{ .ok = try readBool(reader) } },
         };
 
         return Message{

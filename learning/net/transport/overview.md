@@ -88,15 +88,16 @@ revocation and key rotation use the device ID. See
   beacon that lets devices on the same network find each other.
 * **[UPnP and DIAL_BACK](./nat.md)** (`nat.zig`): asks the router to forward
   the listening port, and asks a bootstrap peer to dial back.
+* **[Relaying](./relay.md)** (`relay.zig`): reaches a device none of whose
+  addresses answers through another device both can reach, end-to-end
+  encrypted.
 * **[Testing](./testing.md)**: in-memory pipes and multi-node tests on
   loopback.
 
 ## 5. Not implemented yet
 
-[ROADMAP.md](../../../ROADMAP.md) plans a relay node that splices two peers'
-encrypted streams when neither can reach the other, and Yamux `PING`
-keep-alives to hold NAT mappings open. Neither exists today. The Yamux
-session answers pings, but nothing sends them.
+[ROADMAP.md](../../../ROADMAP.md) plans Yamux `PING` keep-alives to hold
+NAT mappings open. The Yamux session answers pings, but nothing sends them.
 
 ---
 

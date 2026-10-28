@@ -9,6 +9,7 @@ pub const noise = @import("noise.zig");
 pub const manager = @import("manager.zig");
 pub const yamux = @import("yamux.zig");
 pub const mdns = @import("mdns.zig");
+pub const relay = @import("relay.zig");
 
 const id = @import("../id.zig");
 
@@ -120,6 +121,10 @@ pub const Stream = struct {
         close: *const fn (ctx: *anyopaque) void,
         /// Optional: bound each blocking read/write; 0 removes the bound.
         setTimeout: ?*const fn (ctx: *anyopaque, timeout_ms: u32) void = null,
+        /// Optional: wakes blocked reads and writes (reads then end, writes
+        /// fail) without releasing the stream; close() is still needed.
+        /// For tearing down a stream another thread is reading.
+        shutdown: ?*const fn (ctx: *anyopaque) void = null,
     };
 
     // Generic wrappers for easy calling
@@ -147,6 +152,14 @@ pub const Stream = struct {
         const p = self.ptr orelse return;
         const v = self.vtable orelse return;
         v.close(p);
+    }
+
+    /// Wakes blocked reads and writes; see StreamVTable.shutdown. A no-op
+    /// for streams without it.
+    pub fn shutdown(self: Stream) void {
+        const p = self.ptr orelse return;
+        const v = self.vtable orelse return;
+        if (v.shutdown) |f| f(p);
     }
 
     /// Bounds each blocking read/write; expiry returns error.Timeout.

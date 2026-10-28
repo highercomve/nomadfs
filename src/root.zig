@@ -184,6 +184,11 @@ pub const Node = struct {
         const bootstrap_running = try allocator.create(std.atomic.Value(bool));
         bootstrap_running.* = std.atomic.Value(bool).init(true);
 
+        // Devices none of whose addresses answer are reached through
+        // another device (net/transport/relay.zig). Last: nothing fails
+        // after this, so the manager never outlives the node it points to.
+        discovery_node.enableRelay();
+
         return Node{
             .allocator = allocator,
             .connection_manager = connection_manager,
@@ -212,6 +217,7 @@ pub const Node = struct {
 
         // Stop network traffic and callbacks BEFORE destroying handlers
         self.connection_manager.stop();
+        self.connection_manager.relay_dialer = null;
         if (self.shares) |index| index.destroy();
         if (self.swarm) |folder| folder.destroy();
         if (self.read_ahead) |ra| ra.destroy();

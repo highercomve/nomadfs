@@ -32,6 +32,15 @@ pub const Address = struct {
         return self.ip.eql(&other.ip);
     }
 
+    /// 0.0.0.0:0 / [::]:0: no address (a relayed connection's peer).
+    pub fn isUnspecified(self: Address) bool {
+        if (self.getPort() != 0) return false;
+        return switch (self.ip) {
+            .ip4 => |ip4| std.mem.allEqual(u8, &ip4.bytes, 0),
+            .ip6 => |ip6| std.mem.allEqual(u8, &ip6.bytes, 0),
+        };
+    }
+
     pub fn isLoopback(self: Address) bool {
         switch (self.ip) {
             .ip4 => |ip4| return ip4.bytes[0] == 127,

@@ -80,6 +80,7 @@ no TLS or crypto libraries. The app adds Oriel.
     *   [1.4: Connection Management](./net/transport/management.md)
     *   [1.5: Local Discovery (LAN Announcements)](./net/transport/mdns.md)
     *   [1.6: UPnP & DIAL_BACK](./net/transport/nat.md)
+    *   [1.7: Relaying Through Another Device](./net/transport/relay.md)
 5.  **[Chapter 2: Discovery Layer (DHT)](./net/discovery/overview.md)**
     *   [2.1: NodeIDs and XOR Math](./net/discovery/id.md)
     *   [2.2: K-Bucket Management](./net/discovery/kbucket.md)

@@ -5,8 +5,9 @@ Most devices sit behind a router that does **Network Address Translation
 because its address (for example `192.168.1.5`) isn't routable from the
 internet. NomadFS has two small tools for this: a **UPnP** client that asks
 the router to forward the port, and a **`DIAL_BACK`** request that asks a
-peer to connect back. Neither guarantees reachability, and there is no relay
-yet (see section 4).
+peer to connect back. Neither guarantees reachability; when no address
+answers, another device can carry the connection
+([Chapter 1.7](./relay.md)).
 
 ## 1. UPnP Port Mapping (`src/net/transport/nat.zig`)
 
@@ -83,8 +84,6 @@ can't connect today.
 From [ROADMAP.md](../../../ROADMAP.md), Phase 7 ("Persistent Roaming & NAT
 Splicing Relay"):
 
-*   an always-on node that **relays** encrypted streams between two peers
-    that can't reach each other;
 *   Yamux `PING` **keep-alives** to hold NAT mappings open;
 *   using reachability to change how a node takes part in the DHT.
 

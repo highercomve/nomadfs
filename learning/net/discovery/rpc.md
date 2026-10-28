@@ -42,7 +42,7 @@ On the wire, all integers big-endian:
 [type: u8][sender_id: 32 bytes][payload ...]
 ```
 
-## 3. The 21 Message Types
+## 3. The 24 Message Types
 
 | # | Type | Payload | Reply |
 | --: | :--- | :--- | :--- |
@@ -67,6 +67,9 @@ On the wire, all integers big-endian:
 | 18 | `GET_SWARM` | empty | `SWARM` |
 | 19 | `SWARM` | the swarm folder manifest (JSON) | |
 | 20 | `ROTATE_KEY` | `epoch: u64`, `new_key: 32 B`, `signer_key: 32 B`, `signature: 64 B` | `STORE_ACK` (accepted or not) |
+| 21 | `RELAY_CONNECT` | `target: 32 B` | `RELAY_ACK`; if ok, the stream then carries the connection to `target` ([Chapter 1.7](../transport/relay.md)) |
+| 22 | `RELAY_INCOMING` | `from: 32 B` | `RELAY_ACK`; then the stream carries the connection from `from` |
+| 23 | `RELAY_ACK` | `ok: u8` (0 or 1) | |
 
 A "value", "data", "listing" or "manifest" is `[len: u32][bytes]`, and
 `readValue` refuses lengths above `max_value_len` (10 MiB). An unknown type

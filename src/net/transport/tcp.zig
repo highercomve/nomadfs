@@ -120,6 +120,7 @@ const yamux_stream_vtable = network.Stream.StreamVTable{
     .write = YamuxSession.streamWrite,
     .close = YamuxSession.streamClose,
     .setTimeout = YamuxSession.streamSetTimeout,
+    .shutdown = YamuxSession.streamShutdown,
 };
 
 pub const TcpStream = struct {
