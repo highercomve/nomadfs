@@ -184,7 +184,11 @@ pub const Node = struct {
             .id = peer_id,
             .last_seen = sync.timestamp(),
         };
-        _ = info.addAddress(conn.getPeerAddress());
+        // The socket's IP with the port the peer listens on: when the peer
+        // opened this connection, its source port is a random one.
+        var address = conn.getPeerAddress();
+        if (response.payload.PONG.port) |port| address.setPort(port);
+        _ = info.addAddress(address);
         for (response.payload.PONG.announced.slice()) |addr| _ = info.addAddress(addr);
         _ = try self.routing_table.addPeer(info);
 
@@ -951,7 +955,7 @@ pub const Node = struct {
 
         const response = rpc.Message{
             .sender_id = self.manager.node_id,
-            .payload = .{ .PONG = .{ .announced = self.announced() } },
+            .payload = .{ .PONG = .{ .port = self.manager.bound_port, .announced = self.announced() } },
         };
         try response.send(self.allocator, stream);
     }

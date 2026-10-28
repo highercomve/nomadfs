@@ -46,8 +46,8 @@ On the wire, all integers big-endian:
 
 | # | Type | Payload | Reply |
 | --: | :--- | :--- | :--- |
-| 0 | `PING` | `port: u16` (sender's listening port) | `PONG` |
-| 1 | `PONG` | empty | |
+| 0 | `PING` | `port: u16` (sender's listening port), then `announced` | `PONG` |
+| 1 | `PONG` | `announced`, then `port: u16` (the responder's listening port) | |
 | 2 | `FIND_NODE` | `target: 32 B` | `FIND_NODE_RESPONSE` |
 | 3 | `FIND_NODE_RESPONSE` | peer list (section 4) | |
 | 4 | `FIND_VALUE` | `key: 32 B` | `FIND_VALUE_RESPONSE` |
@@ -90,9 +90,13 @@ What each handler does:
 *   **`STORE`** values are bounded per node by `store_limits`: 64 KiB per
     value, 64 MiB in total, 100,000 keys.
 *   **`PING`** from the network adds the sender to the routing table under the
-    socket's IP and the port in the payload. After a `PONG`, the pinging
-    side pushes its revocations to the peer (`pushRevocations`) if it has
-    any.
+    socket's IP and the port in the payload. The `PONG` does the same the
+    other way: a `PING` can travel over a connection the responder opened,
+    whose source port is a random one, so the pinging side records the
+    socket's IP with the port the `PONG` names. The port comes last, so
+    0.3.2 and older nodes read the rest and ignore it, and their `PONG`
+    (without it) still decodes. After a `PONG`, the pinging side pushes its
+    revocations to the peer (`pushRevocations`) if it has any.
 
 ## 4. Peer Records and Addresses
 

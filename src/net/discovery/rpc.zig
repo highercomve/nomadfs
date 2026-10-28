@@ -83,7 +83,11 @@ pub const Announced = struct {
 
 pub const MessagePayload = union(MessageType) {
     PING: struct { port: u16, announced: Announced = .{} },
-    PONG: struct { announced: Announced = .{} },
+    /// `port`: where the responder listens. A PING can travel over a
+    /// connection the responder opened, whose source port is not that.
+    /// Sent last, so 0.3.2 and older read the rest and ignore it; null
+    /// from them.
+    PONG: struct { announced: Announced = .{}, port: ?u16 = null },
     FIND_NODE: struct { target: id.NodeID },
     FIND_NODE_RESPONSE: struct { closer_peers: []kbucket.PeerInfo },
     FIND_VALUE: struct { key: id.NodeID },
@@ -142,7 +146,10 @@ pub const Message = struct {
                 try writer.writeInt(u16, p.port, .big);
                 try writeAnnounced(p.announced, writer);
             },
-            .PONG => |p| try writeAnnounced(p.announced, writer),
+            .PONG => |p| {
+                try writeAnnounced(p.announced, writer);
+                if (p.port) |port| try writer.writeInt(u16, port, .big);
+            },
             .FIND_NODE => |p| {
                 try writer.writeAll(&p.target.bytes);
             },
@@ -231,7 +238,12 @@ pub const Message = struct {
                 const port = try reader.readInt(u16, .big);
                 break :blk MessagePayload{ .PING = .{ .port = port, .announced = try readAnnounced(reader) } };
             },
-            .PONG => MessagePayload{ .PONG = .{ .announced = try readAnnounced(reader) } },
+            .PONG => blk: {
+                const announced = try readAnnounced(reader);
+                // Older nodes end the reply here and close the stream.
+                const port: ?u16 = reader.readInt(u16, .big) catch null;
+                break :blk MessagePayload{ .PONG = .{ .announced = announced, .port = port } };
+            },
             .FIND_NODE => blk: {
                 var target: id.NodeID = undefined;
                 try reader.readNoEof(&target.bytes);
@@ -550,4 +562,29 @@ test "rpc: malformed bool is rejected" {
     try buf.list.appendSlice(std.testing.allocator, &([_]u8{0} ** 32));
     try buf.list.append(std.testing.allocator, 7);
     try std.testing.expectError(error.InvalidMessage, Message.deserialize(std.testing.allocator, buf.reader()));
+}
+
+test "rpc: PONG carries the listening port, and reads without it from older nodes" {
+    const allocator = std.testing.allocator;
+    const sender = id.NodeID{ .bytes = [_]u8{4} ** 32 };
+    var announced: Announced = .{};
+    announced.addrs[0] = Address.initIp4(.{ 100, 123, 189, 53 }, 7865);
+    announced.count = 1;
+
+    var buf = TestBuffer{ .allocator = allocator };
+    defer buf.list.deinit(allocator);
+    try (Message{ .sender_id = sender, .payload = .{ .PONG = .{ .announced = announced, .port = 7865 } } }).serialize(buf.writer());
+    const pong = try Message.deserialize(allocator, buf.reader());
+    defer pong.deinit(allocator);
+    try std.testing.expectEqual(@as(?u16, 7865), pong.payload.PONG.port);
+    try std.testing.expectEqual(@as(u8, 1), pong.payload.PONG.announced.count);
+
+    // 0.3.2 and older: the addresses, then the stream ends.
+    var old = TestBuffer{ .allocator = allocator };
+    defer old.list.deinit(allocator);
+    try (Message{ .sender_id = sender, .payload = .{ .PONG = .{ .announced = announced } } }).serialize(old.writer());
+    const old_pong = try Message.deserialize(allocator, old.reader());
+    defer old_pong.deinit(allocator);
+    try std.testing.expectEqual(@as(?u16, null), old_pong.payload.PONG.port);
+    try std.testing.expectEqual(@as(u8, 1), old_pong.payload.PONG.announced.count);
 }

@@ -129,8 +129,55 @@ fn parseLine(line: []const u8) ?Entry {
         const a = Address.parseIp(tok[0..colon], port) catch continue;
         addAddr(&e, a);
     }
+    dropStrayPorts(&e);
     if (e.count == 0) return null;
     return e;
+}
+
+/// Older versions saved the random source port of connections a device
+/// opened as if it were an address (`192.168.1.5:52738` next to the real
+/// `192.168.1.5:7865`); dialing those always fails. A device listens on
+/// one port, announced on every network it's on, so where one IP has
+/// several ports only the port the entry uses most is kept (ties: one
+/// outside the range Linux and Android pick source ports from, then the
+/// first listed, the most recent).
+fn dropStrayPorts(e: *Entry) void {
+    var kept: Entry = .{ .id = e.id, .last_seen = e.last_seen };
+    for (e.slice(), 0..) |a, i| {
+        var best = a;
+        var best_uses = portUses(e.*, a.getPort());
+        for (e.slice()[i + 1 ..]) |b| {
+            if (!sameHost(a, b)) continue;
+            const uses = portUses(e.*, b.getPort());
+            if (uses > best_uses or (uses == best_uses and isSourcePort(best.getPort()) and !isSourcePort(b.getPort()))) {
+                best = b;
+                best_uses = uses;
+            }
+        }
+        if (!sameHost(a, best) or a.getPort() != best.getPort()) continue;
+        var seen = false;
+        for (kept.slice()) |k| seen = seen or sameHost(k, a);
+        if (!seen) addAddr(&kept, a);
+    }
+    e.* = kept;
+}
+
+fn isSourcePort(port: u16) bool {
+    return port >= 32768 and port <= 60999;
+}
+
+fn portUses(e: Entry, port: u16) usize {
+    var n: usize = 0;
+    for (e.slice()) |a| {
+        if (a.getPort() == port) n += 1;
+    }
+    return n;
+}
+
+fn sameHost(a: Address, b: Address) bool {
+    var x = a;
+    x.setPort(b.getPort());
+    return x.eql(b);
 }
 
 test "known peers: merge keeps every address and survives a reload" {
@@ -163,4 +210,35 @@ test "known peers: merge keeps every address and survives a reload" {
     try std.testing.expectEqual(@as(u8, 2), e.count);
     try std.testing.expect(e.addrs[0].eql(Address.initIp4(.{ 100, 114, 119, 39 }, 7865)));
     try std.testing.expect(e.addrs[1].eql(Address.initIp4(.{ 192, 168, 68, 128 }, 7865)));
+}
+
+test "known peers: a stray source port saved by older versions is dropped" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const id_hex = "51d647593011e46b8a907f94c331a941a64a8538c9f6d86b91c051fdd1667df9";
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "known_peers",
+        .data = id_hex ++ " 100 192.168.68.114:52738 192.168.68.114:7865 100.123.189.53:7865 192.168.68.114:40000\n",
+    });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    const path = try std.fs.path.join(allocator, &.{ dir, "known_peers" });
+    defer allocator.free(path);
+
+    var kp = try KnownPeers.load(allocator, io, path);
+    defer kp.deinit();
+    const e = kp.entries.items[0];
+    try std.testing.expectEqual(@as(u8, 2), e.count);
+    try std.testing.expect(e.addrs[0].eql(Address.initIp4(.{ 192, 168, 68, 114 }, 7865)));
+    try std.testing.expect(e.addrs[1].eql(Address.initIp4(.{ 100, 123, 189, 53 }, 7865)));
+
+    // One real port and one stray, each once: the stray is the source port.
+    var tie: Entry = .{ .id = e.id, .last_seen = 1 };
+    addAddr(&tie, Address.initIp4(.{ 192, 168, 68, 111 }, 46538));
+    addAddr(&tie, Address.initIp4(.{ 192, 168, 68, 111 }, 14700));
+    dropStrayPorts(&tie);
+    try std.testing.expectEqual(@as(u8, 1), tie.count);
+    try std.testing.expectEqual(@as(u16, 14700), tie.addrs[0].getPort());
 }
