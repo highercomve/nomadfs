@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
             .name = "NomadFS",
             // .publisher = "Your Name <you@example.com>", // default: from the app id
             .summary = "Share folders across your devices; files download on demand",
-            .version = "0.3.1",
+            .version = "0.3.2",
         },
         // The page's camera scans invite QR codes (getUserMedia).
         .permissions = .{
