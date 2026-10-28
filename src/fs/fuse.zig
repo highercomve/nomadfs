@@ -325,6 +325,8 @@ pub const Mount = struct {
     mounted_at: u64 = 0,
     /// The swarm folder, shown as <mount>/Swarm when set.
     swarm: ?*swarm_mod.SwarmFolder = null,
+    /// Fetches ahead of sequential reads (video players read in order).
+    read_ahead: ?*@import("readahead.zig").ReadAhead = null,
     /// Swarm paths held by inodes.
     path_arena: std.heap.ArenaAllocator,
     /// Open write handles on swarm files: fh -> handle.
@@ -516,6 +518,7 @@ pub const Mount = struct {
             return folder.readAt(self.allocator, node.cid, node.author, offset, dest);
         }
         const remote = self.devices.items[node.device].remote;
+        if (self.read_ahead) |ra| return ra.readAt(self.allocator, &.{remote.peer}, node.cid, offset, dest);
         return tree.readAt(self.allocator, remote.loader(), node.cid, offset, dest);
     }
 

@@ -44,6 +44,9 @@ pub const Node = struct {
     /// The swarm-wide folder every device reads and writes; null without
     /// block storage.
     swarm: ?*fs.SwarmFolder,
+    /// Fetches ahead of reads of other devices' files (the mount, the app's
+    /// previews, the swarm folder); null without block storage.
+    read_ahead: ?*fs.ReadAhead,
     bootstrap_thread: ?std.Thread = null,
     bootstrap_running: *std.atomic.Value(bool),
 
@@ -126,6 +129,14 @@ pub const Node = struct {
         }
         errdefer if (swarm) |f| f.destroy();
 
+        var read_ahead: ?*fs.ReadAhead = null;
+        if (store) |s| {
+            const ra = try fs.ReadAhead.create(allocator, block_manager, s);
+            if (swarm) |f| f.read_ahead = ra;
+            read_ahead = ra;
+        }
+        errdefer if (read_ahead) |ra| ra.destroy();
+
         const ring = try allocator.create(HashRight);
         ring.* = HashRight.init(allocator);
         errdefer {
@@ -174,6 +185,7 @@ pub const Node = struct {
             .trust_store = trust_store,
             .shares = shares,
             .swarm = swarm,
+            .read_ahead = read_ahead,
             .bootstrap_running = bootstrap_running,
             .bootstrap_thread = null,
         };
@@ -190,6 +202,7 @@ pub const Node = struct {
         self.connection_manager.stop();
         if (self.shares) |index| index.destroy();
         if (self.swarm) |folder| folder.destroy();
+        if (self.read_ahead) |ra| ra.destroy();
 
         self.trust_store.deinit();
         self.allocator.destroy(self.trust_store);

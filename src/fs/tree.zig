@@ -131,6 +131,58 @@ pub fn readAt(allocator: std.mem.Allocator, loader: Loader, root: Cid, offset: u
 /// Bound on parent levels between a file root and its leaves.
 const max_tree_depth = 64;
 
+/// Appends to `out`, in file order and at most `max` of them, the CIDs of the
+/// leaves of file DAG `root` holding bytes in [start, start + len). Only
+/// parent blocks are loaded: the leaves are what a caller wants to fetch
+/// ahead. A Balanced tree keeps every leaf at the same depth, which the path
+/// to `known` (a byte whose blocks are already at hand) tells.
+pub fn leavesIn(allocator: std.mem.Allocator, loader: Loader, root: Cid, known: u64, start: u64, len: u64, out: *std.ArrayList(Cid), max: usize) !void {
+    var depth: usize = 0;
+    var cid = root;
+    var rel = known;
+    while (depth < max_tree_depth) {
+        const bytes = try loader.load(&cid, allocator);
+        defer allocator.free(bytes);
+        switch (try codec.decode(bytes)) {
+            .leaf => break,
+            .parent => |links| {
+                var it = links;
+                cid = while (it.next()) |link| {
+                    if (rel < link.size) break link.cid.*;
+                    rel -= link.size;
+                } else return;
+                depth += 1;
+            },
+            .dir => return error.IsDirectory,
+        }
+    } else return error.DagTooDeep;
+    // A one-block file has nothing ahead.
+    if (depth == 0 or len == 0) return;
+    try collectLeaves(allocator, loader, root, depth, start, start +| len, 0, out, max);
+}
+
+/// `cid` is a parent `levels` above the leaves, its first byte at `base`.
+fn collectLeaves(allocator: std.mem.Allocator, loader: Loader, cid: Cid, levels: usize, start: u64, end: u64, base: u64, out: *std.ArrayList(Cid), max: usize) !void {
+    const bytes = try loader.load(&cid, allocator);
+    defer allocator.free(bytes);
+    var links = switch (try codec.decode(bytes)) {
+        .parent => |l| l,
+        else => return,
+    };
+    var pos = base;
+    while (links.next()) |link| {
+        const lo = pos;
+        pos += link.size;
+        if (pos <= start) continue;
+        if (lo >= end or out.items.len >= max) return;
+        if (levels == 1) {
+            try out.append(allocator, link.cid.*);
+        } else {
+            try collectLeaves(allocator, loader, link.cid.*, levels - 1, start, end, lo, out, max);
+        }
+    }
+}
+
 /// Copies from the single leaf holding byte `pos`; 0 past end of file.
 fn readLeafAt(allocator: std.mem.Allocator, loader: Loader, root: Cid, pos: u64, dest: []u8) !usize {
     var cid = root;

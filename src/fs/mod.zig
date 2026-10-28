@@ -12,12 +12,14 @@ pub const remote = @import("remote.zig");
 pub const filestore = @import("filestore.zig");
 pub const manifest = @import("manifest.zig");
 pub const swarm = @import("swarm.zig");
+pub const readahead = @import("readahead.zig");
 /// Read-only FUSE mount of every device's shares (desktop Linux only).
 pub const fuse = if (builtin.os.tag == .linux and !builtin.abi.isAndroid()) @import("fuse.zig") else struct {};
 
 pub const ShareIndex = shares.ShareIndex;
 pub const Remote = remote.Remote;
 pub const SwarmFolder = swarm.SwarmFolder;
+pub const ReadAhead = readahead.ReadAhead;
 
 test {
     _ = scan;

@@ -15,6 +15,7 @@ const ShareSource = @import("../net/discovery/node.zig").Node.ShareSource;
 const manifest_mod = @import("manifest.zig");
 const remote_mod = @import("remote.zig");
 const tree = @import("tree.zig");
+const readahead_mod = @import("readahead.zig");
 
 pub const Manifest = manifest_mod.Manifest;
 pub const Entry = manifest_mod.Entry;
@@ -25,6 +26,8 @@ pub const SwarmFolder = struct {
     io: std.Io,
     store: *storage.engine.StorageEngine,
     block_manager: ?*cluster.BlockManager = null,
+    /// Fetches ahead of sequential reads; without it reads go block by block.
+    read_ahead: ?*readahead_mod.ReadAhead = null,
     /// This device as authors are recorded: its transport node ID, the key
     /// peers dial to fetch what it added.
     self_id: NodeID,
@@ -307,6 +310,7 @@ pub const SwarmFolder = struct {
         defer peers.deinit(allocator);
         try peers.append(allocator, .{ .bytes = author });
         for (known) |p| if (!std.mem.eql(u8, &p.bytes, &author)) try peers.append(allocator, p);
+        if (self.read_ahead) |ra| return ra.readAt(allocator, peers.items, cid, offset, dest);
         var multi = remote_mod.MultiRemote{ .block_manager = bm, .store = self.store, .peers = peers.items };
         return tree.readAt(allocator, multi.loader(), cid, offset, dest);
     }
