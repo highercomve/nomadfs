@@ -99,10 +99,30 @@ pub fn nodeOpen(gpa: std.mem.Allocator, args: NodeOpenArgs) !void {
 }
 
 /// `invoke("node_close")`.
+/// Media reads in progress (media.zig). They read through the node without
+/// holding g_mutex, so a slow fetch doesn't stall every other command;
+/// nodeClose waits for them before freeing the node.
+var g_media_users: std.atomic.Value(u32) = .init(0);
+
+/// The running node for one media read, or null; pair with mediaRelease.
+pub fn mediaAcquire() ?*mobile.NodeHandle {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const handle = g_node orelse return null;
+    _ = g_media_users.fetchAdd(1, .acq_rel);
+    return handle;
+}
+
+pub fn mediaRelease() void {
+    _ = g_media_users.fetchSub(1, .acq_rel);
+}
+
 pub fn nodeClose() void {
     g_mutex.lock();
     defer g_mutex.unlock();
     stopMountLocked(); // the mount reads through this node
+    // No new media reads can start (they need g_mutex); let current ones end.
+    while (g_media_users.load(.acquire) > 0) nomadfs.sync.sleep(10 * std.time.ns_per_ms);
     if (g_node) |node| {
         mobile.nomadfs_node_free(node);
         g_node = null;
@@ -668,7 +688,10 @@ pub fn readRange(gpa: std.mem.Allocator, args: ReadRangeArgs) ![]const u8 {
     const cid = try parseHex32(args.cid);
     const buf = try gpa.alloc(u8, args.len);
     defer gpa.free(buf);
-    const n = try fs.tree.readAt(gpa, remote.loader(), cid, args.offset, buf);
+    const n = if (g_node.?.node.read_ahead) |ra|
+        try ra.readAt(gpa, &.{remote.peer}, cid, args.offset, buf)
+    else
+        try fs.tree.readAt(gpa, remote.loader(), cid, args.offset, buf);
     const encoder = std.base64.standard.Encoder;
     const out = try gpa.alloc(u8, encoder.calcSize(n));
     return encoder.encode(out, buf[0..n]);
@@ -961,7 +984,10 @@ pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
         .thread = undefined,
         .path = try std.heap.page_allocator.dupeZ(u8, args.path),
     };
-    if (can_mount) job.mount.swarm = handle.node.swarm;
+    if (can_mount) {
+        job.mount.swarm = handle.node.swarm;
+        job.mount.read_ahead = handle.node.read_ahead;
+    }
     job.thread = try std.Thread.spawn(.{}, serveMount, .{job});
     g_mount = job;
 

@@ -12,6 +12,7 @@ const app = @import("oriel_app");
 const commands = @import("commands.zig");
 const tray = @import("tray.zig");
 const background = @import("background.zig");
+const media = @import("media.zig");
 
 pub const std_options: std.Options = .{ .logFn = oriel.log.logFn };
 
@@ -38,7 +39,7 @@ pub const Commands = struct {
     /// worker thread: they share one lock, and a command waiting on it on
     /// the UI thread would freeze the window (node_open behind a share scan
     /// did, for 20 s on a phone). Only quick config-file reads stay inline.
-    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_read_range", "swarm_download", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set" };
+    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_read_range", "swarm_download", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set", "media_url" };
 
     /// `invoke("invite_create", { config_path })`: one-time invite code.
     pub fn invite_create(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.InviteInfo {
@@ -135,6 +136,12 @@ pub const Commands = struct {
     /// `invoke("open_path", { path })`: open in the file manager.
     pub fn open_path(gpa: std.mem.Allocator, args: commands.OpenPathArgs) !void {
         return commands.openPath(gpa, args);
+    }
+
+    /// `invoke("media_url", { kind, id, cid, size, name })`: where a
+    /// `<video>`/`<audio>` streams a file from another device.
+    pub fn media_url(gpa: std.mem.Allocator, args: media.UrlArgs) ![]const u8 {
+        return media.url(gpa, args);
     }
 
     /// `invoke("swarm_backup_status", { config_path })`.

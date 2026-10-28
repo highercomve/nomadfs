@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
         .updater = false,
         .sql = false,
         .fs_watch = false,
-        .media_server = false,
+        .media_server = true, // streams video/audio previews with range requests
         .global_shortcut = false,
         .input = false,
         .clipboard = false,
@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
             .name = "NomadFS",
             // .publisher = "Your Name <you@example.com>", // default: from the app id
             .summary = "Share folders across your devices; files download on demand",
-            .version = "0.2.0",
+            .version = "0.3.0",
         },
         // The page's camera scans invite QR codes (getUserMedia).
         .permissions = .{

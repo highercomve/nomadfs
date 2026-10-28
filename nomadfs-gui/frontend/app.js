@@ -460,12 +460,14 @@ let pv = null; // { source, files, index, token, url }
 function deviceSource(device) {
   return {
     read: (e, offset, len) => invoke("read_range", { peer: device.peer, cid: e.cid, offset, len }),
+    mediaUrl: (e) => invoke("media_url", { kind: "device", id: device.peer, cid: e.cid, size: e.size, name: e.name }),
     download: (e, btn) => downloadFile(device, e, btn),
   };
 }
 /** ...or the swarm folder (the device that added it, then anyone). */
 const swarmSource = {
   read: (e, offset, len) => invoke("swarm_read_range", { cid: e.cid, author_id: e.author_id, offset, len }),
+  mediaUrl: (e) => invoke("media_url", { kind: "swarm", id: e.author_id, cid: e.cid, size: e.size, name: e.name }),
   download: (e, btn) => swarmDownload(e, btn),
 };
 
@@ -494,8 +496,18 @@ function openPreview(source, files, index) {
   showPreview();
 }
 
+/** Stops a streaming player so it stops fetching ranges. */
+function stopMedia() {
+  for (const m of $("pv-body").querySelectorAll("video, audio")) {
+    m.pause();
+    m.removeAttribute("src");
+    m.load();
+  }
+}
+
 function closePreview() {
   if (!pv) return;
+  stopMedia();
   pv.token++;
   if (pv.url) URL.revokeObjectURL(pv.url);
   pv = null;
@@ -503,7 +515,30 @@ function closePreview() {
   $("preview").hidden = true;
 }
 
+async function streamPreview(entry, kind, token) {
+  let url;
+  try {
+    url = await pv.source.mediaUrl(entry);
+  } catch (err) {
+    if (pv && token === pv.token) previewMessage("file", `Preview failed: ${err}`);
+    return;
+  }
+  if (!pv || token !== pv.token) return;
+  const el = document.createElement(kind);
+  el.controls = true;
+  el.autoplay = true;
+  el.preload = "auto";
+  el.src = url;
+  el.addEventListener("error", () => {
+    if (!pv || token !== pv.token) return;
+    previewMessage(kind === "video" ? "video" : "file",
+      `This ${kind === "video" ? "video" : "audio file"} can't play here (its format may not be supported). Download it to open it in another app.`);
+  });
+  $("pv-body").replaceChildren(el);
+}
+
 async function showPreview() {
+  stopMedia();
   const token = ++pv.token;
   if (pv.url) { URL.revokeObjectURL(pv.url); pv.url = null; }
   const entry = pv.files[pv.index];
@@ -514,6 +549,10 @@ async function showPreview() {
 
   const { kind, ext } = kindOf(entry.name);
   if (!kind) return previewMessage("file", "No preview for this kind of file.");
+  // Video and audio stream: the player asks for byte ranges as it plays
+  // and seeks, so it starts at once and size doesn't matter.
+  if (kind === "video" || kind === "audio") return streamPreview(entry, kind, token);
+
   const limit = KINDS[kind].max;
   if (kind !== "text" && entry.size > limit) {
     return previewMessage(kind === "image" ? "image" : "video", `Too large to preview here (${formatSize(entry.size)}). Download it or open it from the mount.`);
