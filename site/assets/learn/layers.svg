@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 668" role="img" aria-labelledby="t">
+<title id="t">The NomadFS stack, from TCP at the bottom to the app and the FUSE mount at the top</title>
+<defs>
+<style>
+text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; fill: #f2e8d8; }
+.h { font-size: 19px; font-weight: 600; fill: #f5efe6; }
+.b { font-size: 16.5px; }
+.s { font-size: 15px; fill: #a99f8f; }
+.k { font-size: 13px; letter-spacing: 1.6px; fill: #f6b042; }
+.ko { font-size: 13px; letter-spacing: 1.6px; fill: #5ce1e6; }
+.am { fill: #f6b042; } .oa { fill: #5ce1e6; } .di { fill: #a99f8f; } .du { fill: #6f6a63; } .cr { fill: #f5efe6; }
+.box { fill: #1a2131; stroke: #f2e8d8; stroke-opacity: .22; stroke-width: 1.5; }
+.boxa { fill: #f6b042; fill-opacity: .1; stroke: #f6b042; stroke-width: 1.6; }
+.boxo { fill: #2ec4b6; fill-opacity: .1; stroke: #5ce1e6; stroke-width: 1.6; }
+.boxt { fill: #e8833a; fill-opacity: .14; stroke: #e8833a; stroke-width: 1.6; }
+.boxd { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .16; stroke-width: 1.3; stroke-dasharray: 5 5; }
+.ln { stroke: #a99f8f; stroke-width: 1.6; fill: none; }
+.lna { stroke: #f6b042; stroke-width: 1.8; fill: none; }
+.lno { stroke: #5ce1e6; stroke-width: 1.8; fill: none; }
+.lnf { stroke: #f2e8d8; stroke-opacity: .18; stroke-width: 1.3; fill: none; }
+.dash { stroke-dasharray: 5 5; }
+.dot { stroke-dasharray: 1.5 5; stroke-linecap: round; }
+</style>
+<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#a99f8f"/></marker>
+<marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#f6b042"/></marker>
+<marker id="aro" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5ce1e6"/></marker>
+</defs>
+<text class="k" x="20" y="24">WHAT YOU USE</text>
+<rect class="boxa" x="20" y="36" width="560" height="62" rx="6"/>
+<text class="h" x="40" y="63">The app · the CLI · the mount</text>
+<text class="s" x="40" y="85">&lt;mount&gt;/&lt;device&gt;/&lt;share&gt; and &lt;mount&gt;/Swarm</text>
+<text class="k" x="20" y="132">WHAT IS SHARED AND STORED</text>
+<rect class="box" x="20" y="144" width="560" height="62" rx="6"/>
+<text class="h" x="40" y="171">Shared folders · swarm folder</text>
+<text class="s" x="40" y="193">scanned into trees · a merged manifest</text>
+<rect class="box" x="20" y="216" width="560" height="62" rx="6"/>
+<text class="h" x="40" y="243">Blocks and Merkle DAGs</text>
+<text class="s" x="40" y="265">FastCDC chunks named by SHA-256 hashes</text>
+<text class="k" x="20" y="312">HOW DEVICES TALK</text>
+<rect class="box" x="20" y="324" width="560" height="62" rx="6"/>
+<text class="h" x="40" y="351">RPCs and the Kademlia DHT</text>
+<text class="s" x="40" y="373">GET_BLOCK · GET_SHARES · GET_SWARM · FIND_NODE</text>
+<rect class="box" x="20" y="396" width="560" height="62" rx="6"/>
+<text class="h" x="40" y="423">Yamux</text>
+<text class="s" x="40" y="445">one stream per request, many at once</text>
+<rect class="boxo" x="20" y="468" width="560" height="62" rx="6"/>
+<text class="h" x="40" y="495">Noise XXpsk3</text>
+<text class="s" x="40" y="517">encryption · the swarm key · device identity</text>
+<rect class="box" x="20" y="540" width="560" height="62" rx="6"/>
+<text class="h" x="40" y="567">TCP</text>
+<text class="s" x="40" y="589">one connection between two devices</text>
+<path class="ln dash" d="M300 602 L300 636" marker-end="url(#ar)"/>
+<text class="s" x="300" y="658" text-anchor="middle">the same stack, mirrored, on the other device</text>
+</svg>

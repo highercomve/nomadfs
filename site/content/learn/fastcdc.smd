@@ -1,0 +1,90 @@
+---
+.title = "FastCDC",
+.description = "NomadFS cuts files into chunks at places chosen by their content, not at fixed offsets. An edit then changes only the chunk it lands in, and every other chunk keeps its name.",
+.date = .date("2026-10-27T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "learn.shtml",
+.custom = { "label": "learn · storage · 05", "prev": "learn/sha-256", "next": "learn/merkle-dag" },
+---
+
+# [Why chunk at all]($heading.id('why'))
+
+NomadFS doesn't move whole files. A file is split into chunks, each chunk
+becomes a block [named by its hash]($link.page('learn/sha-256')), and a reader
+fetches only the chunks that cover the bytes it wants. Opening a photo
+fetches the photo, and seeking into the middle of a film fetches the middle.
+
+The question is where to cut.
+
+# [Fixed-size chunks and the shift problem]($heading.id('fixed'))
+
+The obvious answer is every N bytes. That works until someone inserts a few
+bytes near the start of a file. Every byte after the insertion moves, every
+boundary now falls on different content, and every chunk after the edit gets
+a new hash. A one-line change to a large document makes almost the whole file
+new again.
+
+[An insertion shifts every fixed-size chunk after it, but changes only one content-defined chunk.](<$image.siteAsset('learn/fastcdc.svg').alt('Fixed-size chunks: before, six equal chunks A to F; after inserting bytes inside B, chunk A is unchanged but B, C, D, E and F all change and a small extra chunk appears: 5 of 6 chunks change. Content-defined chunks (FastCDC): before, six chunks of different sizes A to F; after the same insertion only B changes and grows, while A, C, D, E and F keep their names. A box explains where FastCDC cuts: a 64-bit gear hash rolls over the bytes, and the file is cut where hash AND mask equals zero; minimum 64 KiB, aim 256 KiB, maximum 1 MiB.')>)
+
+# [Content-defined chunking]($heading.id('cdc'))
+
+Content-defined chunking (CDC) puts boundaries where the *bytes* say so. A
+hash rolls over the data, and wherever the hash of the last few bytes
+matches a pattern, the chunker cuts. A boundary depends only on the bytes
+just before it. Insert something, and the chunker reaches the same content
+further on, hits the same pattern, and cuts in the same place again. Only
+the chunk with the insertion changes (sometimes its neighbour too, if the
+edit creates or destroys a cut point). After that, every chunk has the same
+bytes as before, so the same CID.
+
+That is what makes [deduplication]($link.page('learn/sha-256').ref('dedup'))
+work across versions of a file. An edited file shares almost all of its
+blocks with the old one, so a device that cached the old version fetches only
+the chunk that changed.
+
+# [FastCDC]($heading.id('fastcdc'))
+
+[FastCDC](https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia)
+(Xia et al., USENIX ATC 2016) is a fast CDC algorithm. NomadFS has its own
+small implementation, with these parameters:
+
+| | |
+| --- | --- |
+| minimum chunk | 64 KiB |
+| normal (target) size | 256 KiB |
+| maximum chunk | 1 MiB |
+
+For each chunk, starting at the current position:
+
+1. **Skip the minimum.** The first 64 KiB are never a cut point, so no chunk
+   is smaller than that (except a file's last chunk, or a whole small file).
+2. **Roll a gear hash.** For each byte, `hash = (hash << 1) + gear[byte]`,
+   where `gear` is a table of 256 random 64-bit numbers. The shift pushes old
+   bytes out of the 64-bit hash, so the hash depends only on the last 64
+   bytes, which is what a rolling hash needs. It costs one shift, one add and
+   one table lookup per byte.
+3. **Two masks.** Before the 256 KiB mark the chunker cuts where
+   `hash & mask_s == 0`. That mask has 20 bits, so a match is rare (about 1 in
+   2²⁰ per byte). After the mark it uses `mask_l` with 16 bits, which matches
+   much more often. FastCDC calls this *normalized chunking*: chunk sizes
+   bunch up near the target instead of spreading out.
+4. **Cap at the maximum.** If no cut is found by 1 MiB, cut there.
+
+The gear table is generated at compile time from a fixed seed (SplitMix64).
+The table and the parameters are part of the storage format: change either
+and the same file chunks differently, and every CID changes. That is why they
+are constants in the code, not settings.
+
+# [Where chunking runs]($heading.id('where'))
+
+- **Scanning a share.** Every file in a shared folder is chunked on its first
+  scan. Later scans skip files whose size and modification time haven't
+  changed and reuse the CIDs from the last scan.
+- **Adding to the swarm folder.** A file added in the app, or written through
+  the mount and closed, is chunked and its blocks are stored on the device
+  that added it.
+
+The chunker streams: it reads through a 1 MiB buffer, so files of any size
+are chunked in constant memory.
+
+Source: `src/storage/chunker.zig`, `src/storage/dag/builder.zig`.

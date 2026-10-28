@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 700" role="img" aria-labelledby="t">
+<title id="t">Content addressing: a block is named by the SHA-256 of its bytes; a block from a peer is hashed again and kept only if it matches; identical chunks get one name and are stored once</title>
+<defs>
+<style>
+text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; fill: #f2e8d8; }
+.h { font-size: 19px; font-weight: 600; fill: #f5efe6; }
+.b { font-size: 16.5px; }
+.s { font-size: 15px; fill: #a99f8f; }
+.k { font-size: 13px; letter-spacing: 1.6px; fill: #f6b042; }
+.ko { font-size: 13px; letter-spacing: 1.6px; fill: #5ce1e6; }
+.am { fill: #f6b042; } .oa { fill: #5ce1e6; } .di { fill: #a99f8f; } .du { fill: #6f6a63; } .cr { fill: #f5efe6; }
+.box { fill: #1a2131; stroke: #f2e8d8; stroke-opacity: .22; stroke-width: 1.5; }
+.boxa { fill: #f6b042; fill-opacity: .1; stroke: #f6b042; stroke-width: 1.6; }
+.boxo { fill: #2ec4b6; fill-opacity: .1; stroke: #5ce1e6; stroke-width: 1.6; }
+.boxt { fill: #e8833a; fill-opacity: .14; stroke: #e8833a; stroke-width: 1.6; }
+.boxd { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .16; stroke-width: 1.3; stroke-dasharray: 5 5; }
+.ln { stroke: #a99f8f; stroke-width: 1.6; fill: none; }
+.lna { stroke: #f6b042; stroke-width: 1.8; fill: none; }
+.lno { stroke: #5ce1e6; stroke-width: 1.8; fill: none; }
+.lnf { stroke: #f2e8d8; stroke-opacity: .18; stroke-width: 1.3; fill: none; }
+.dash { stroke-dasharray: 5 5; }
+.dot { stroke-dasharray: 1.5 5; stroke-linecap: round; }
+</style>
+<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#a99f8f"/></marker>
+<marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#f6b042"/></marker>
+<marker id="aro" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5ce1e6"/></marker>
+</defs>
+<text class="k" x="20" y="30">1 · NAMING A BLOCK</text>
+<rect class="boxa" x="20" y="44" width="84" height="48" rx="6"/>
+<text class="b" x="62" y="74" text-anchor="middle">0x00</text>
+<rect class="box" x="110" y="44" width="470" height="48" rx="6"/>
+<text class="b" x="345" y="74" text-anchor="middle">chunk bytes (64 KiB – 1 MiB)</text>
+<path class="ln" d="M300 92 L300 116" marker-end="url(#ar)"/>
+<rect class="box" x="220" y="120" width="160" height="42" rx="6"/>
+<text class="h" x="300" y="147" text-anchor="middle">SHA-256</text>
+<path class="ln" d="M300 162 L300 186" marker-end="url(#ar)"/>
+<rect class="boxa" x="20" y="190" width="560" height="48" rx="6"/>
+<text class="b" x="300" y="220" text-anchor="middle">CID  3f9a07…c21e  (32 bytes)</text>
+<text class="k" x="20" y="290">2 · CHECKING A BLOCK</text>
+<rect class="box" x="20" y="304" width="270" height="64" rx="6"/>
+<text class="b" x="155" y="332" text-anchor="middle">want CID X</text>
+<text class="s" x="155" y="356" text-anchor="middle">GET_BLOCK X</text>
+<rect class="boxo" x="310" y="304" width="270" height="64" rx="6"/>
+<text class="b" x="445" y="332" text-anchor="middle">a peer sends</text>
+<text class="s" x="445" y="356" text-anchor="middle">some bytes</text>
+<path class="ln" d="M445 368 L340 394" marker-end="url(#ar)"/>
+<rect class="box" x="220" y="396" width="160" height="42" rx="6"/>
+<text class="h" x="300" y="423" text-anchor="middle">SHA-256</text>
+<path class="ln" d="M260 438 L155 466" marker-end="url(#ar)"/>
+<path class="ln" d="M340 438 L445 466" marker-end="url(#ar)"/>
+<rect class="boxo" x="20" y="470" width="270" height="64" rx="6"/>
+<text class="h" x="155" y="498" text-anchor="middle">= X</text>
+<text class="s" x="155" y="522" text-anchor="middle">keep and cache it</text>
+<rect class="boxt" x="310" y="470" width="270" height="64" rx="6"/>
+<text class="h" x="445" y="498" text-anchor="middle">≠ X</text>
+<text class="s" x="445" y="522" text-anchor="middle">refuse it</text>
+<text class="k" x="20" y="586">3 · SAME BYTES, SAME NAME</text>
+<text class="b" x="20" y="628">a.mov</text>
+<rect class="boxa" x="100" y="600" width="56" height="40" rx="4"/>
+<text class="b" x="128" y="627" text-anchor="middle">A</text>
+<rect class="boxa" x="162" y="600" width="56" height="40" rx="4"/>
+<text class="b" x="190" y="627" text-anchor="middle">B</text>
+<rect class="box" x="224" y="600" width="56" height="40" rx="4"/>
+<text class="b" x="252" y="627" text-anchor="middle">C</text>
+<text class="b" x="20" y="674">b.mov</text>
+<rect class="boxa" x="100" y="646" width="56" height="40" rx="4"/>
+<text class="b" x="128" y="673" text-anchor="middle">A</text>
+<rect class="boxa" x="162" y="646" width="56" height="40" rx="4"/>
+<text class="b" x="190" y="673" text-anchor="middle">B</text>
+<rect class="box" x="224" y="646" width="56" height="40" rx="4"/>
+<text class="b" x="252" y="673" text-anchor="middle">D</text>
+<path class="ln" d="M300 646 L336 646" marker-end="url(#ar)"/>
+<rect class="box" x="344" y="612" width="236" height="68" rx="6"/>
+<text class="b" x="462" y="640" text-anchor="middle">store: A B C D</text>
+<text class="s" x="462" y="664" text-anchor="middle">4 blocks, not 6</text>
+</svg>

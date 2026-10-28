@@ -1,0 +1,126 @@
+---
+.title = "Noise XXpsk3",
+.description = "Every NomadFS connection starts with a three-message Noise handshake. It encrypts the connection, checks that both sides hold the swarm key, and proves each device's identity.",
+.date = .date("2026-10-27T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "learn.shtml",
+.custom = { "label": "learn · transport · 02", "prev": "learn/tcp", "next": "learn/yamux" },
+---
+
+# [What Noise is]($heading.id('what'))
+
+The [Noise Protocol Framework](https://noiseprotocol.org/noise.html) is a
+recipe for handshakes. It works without certificates or a certificate
+authority. A *pattern* says which keys each side sends and which
+Diffie-Hellman (DH) operations it mixes in. Every DH result goes into a
+running *chaining key*, and every message goes into a running *handshake
+hash*, so each step depends on everything before it. WireGuard and the
+Lightning Network use Noise too.
+
+NomadFS uses one fixed suite, `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s`:
+
+- **XX**: both sides send their static (long-lived) public key during the
+  handshake, encrypted. Neither has to know the other's key in advance.
+- **psk3**: a 32-byte pre-shared key is mixed in at the end of message 3. In
+  NomadFS that key is the **swarm key**.
+- **25519**: X25519 for the DH operations.
+- **ChaChaPoly**: ChaCha20-Poly1305 encryption, which also authenticates.
+- **BLAKE2s**: the hash used for the handshake hash and for key derivation
+  (HKDF).
+
+# [The handshake]($heading.id('handshake'))
+
+[Three messages. The tokens are Noise notation: e and s are ephemeral and static public keys; ee, es and se are DH operations; psk mixes in the swarm key.](<$image.siteAsset('learn/noise-xxpsk3.svg').alt('Sequence diagram between the dialer (initiator) and the listener (responder). Message 1, dialer to listener: e, the ephemeral key, in the clear. Message 2, listener to dialer: e, ee, s, es, with the static key encrypted and a signed device hello. Message 3, dialer to listener: s, se, psk, with the static key and a signed hello, sealed with the swarm key; with the wrong key the tag check fails. Then both sides split two keys, one per direction; each frame is ChaCha20-Poly1305 and at most 1024 bytes, and Yamux runs inside.')>)
+
+1. **`-> e`.** The dialer creates a fresh ephemeral X25519 key pair and sends
+   the public half. It isn't encrypted yet, but it goes into the handshake
+   hash.
+2. **`<- e, ee, s, es`.** The listener sends its own ephemeral key. Both sides
+   compute `ee` (DH of the two ephemerals), which gives the first encryption
+   key. The listener sends its static key encrypted under it, then both mix
+   in `es` (dialer's ephemeral with listener's static).
+3. **`-> s, se, psk`.** The dialer sends its static key encrypted, both mix in
+   `se`, and then the swarm key.
+
+Each message is sent with a 2-byte length in front, and the whole handshake
+has 10 seconds to finish. After message 3 both sides derive two keys from the
+chaining key, one per direction. From then on every frame on the connection
+carries at most 1024 bytes of data, is encrypted with ChaCha20-Poly1305 and a
+counter nonce, and is checked on arrival.
+
+Because each connection uses new ephemeral keys, someone who steals a
+device's keys later can't decrypt traffic they recorded earlier.
+
+# [What the swarm key proves]($heading.id('psk'))
+
+The swarm key is mixed in just before message 3's payload is encrypted. A
+dialer with a different key derives different encryption keys, so the
+listener's tag check on that payload fails and the connection is closed.
+Only devices with the same swarm key complete a handshake, and the key itself
+never crosses the network.
+
+The order matters in one way. The listener's static key and device hello in
+message 2 are encrypted before the swarm key is mixed in. The dialer reads
+them, so it learns who the listener is before either side has proven it holds
+the swarm key. The dialer's own device hello comes after the swarm key is
+mixed in, so the listener learns the dialer's identity only once the swarm
+key checks out.
+
+# [Binding the device identity]($heading.id('identity'))
+
+The X25519 key in the handshake is the *transport* key. The device's lasting
+identity is a separate Ed25519 key (`device.key`), the key that pairing, the
+trust store and revocations refer to. NomadFS ties the two together inside
+the handshake.
+
+Messages 2 and 3 each carry an encrypted **device hello** of 97 bytes:
+
+```
+version (1) ‖ Ed25519 public key (32) ‖ signature (64)
+signature = Ed25519-sign("nomadfs-device-auth-v1" ‖ handshake hash)
+```
+
+The signature covers the handshake hash at that moment: both ephemeral keys,
+both static keys, and in message 3 the swarm key too. A hello captured from
+one connection is worthless in any other. The receiver verifies the
+signature, and the device ID is BLAKE2s-256 of the Ed25519 public key. Then:
+
+- if the device is in the trust store, its pinned transport key must equal
+  the static key in this handshake, so a stolen `node.key` can't pose as the
+  device;
+- with `require_trusted_devices = true`, devices that aren't in the trust
+  store are refused outright. By default any holder of the swarm key may
+  connect.
+
+# [Invites: the same handshake, a different key]($heading.id('invites'))
+
+A one-time invite has to get the swarm key to a new device that doesn't have
+it yet. It runs the same XXpsk3 handshake with a different pre-shared key:
+
+```
+nomadfs://invite?addr=192.168.1.20:9001&token=<32 hex characters>
+psk = SHA-256("nomadfs-invite-v1:" ‖ token)
+```
+
+The inviting device opens a separate listener (on its node port + 1) that
+takes one join within 10 minutes. Both sides use throwaway transport keys and
+derive the PSK from the 128-bit token. Only someone holding the code can
+finish the handshake, and 128 random bits can't be guessed offline the way a
+short PIN could. Inside that channel the two devices exchange signed pairing
+tickets (identity key, transport key, addresses), and the inviter sends the
+swarm key and its node port. The swarm key never appears in the code or on
+screen.
+
+# [Rotating the swarm key]($heading.id('rotation'))
+
+If a swarm key may have leaked, a device can generate a new one and send it
+to every trusted device it can reach, over these encrypted connections. The
+message is signed with the sender's Ed25519 key over
+`"nomadfs-rotate-v1:" ‖ epoch ‖ new key`. A receiver accepts it only if the
+signer is in its own trust store, the signer is the device on this
+connection, and the epoch is newer than its own. Devices that had the old key
+but were never paired don't get the new one. Shutting them out is the reason
+to rotate.
+
+Source: `src/net/transport/noise.zig`, `src/device/auth.zig`,
+`src/device/invite.zig`, `src/device/rotation.zig`.

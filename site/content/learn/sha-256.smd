@@ -1,0 +1,83 @@
+---
+.title = "SHA-256 and content addressing",
+.description = "In NomadFS a block's name is the SHA-256 hash of its bytes. That one rule lets a device check every block a peer sends it, and store identical data once.",
+.date = .date("2026-10-27T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "learn.shtml",
+.custom = { "label": "learn · storage · 04", "prev": "learn/yamux", "next": "learn/fastcdc" },
+---
+
+# [What SHA-256 is]($heading.id('what'))
+
+SHA-256 is a cryptographic hash function from the SHA-2 family. It turns any
+input into a 32-byte digest. Changing one bit of the input changes about half
+the bits of the digest. No one knows how to find two different inputs with
+the same digest, or an input that produces a chosen digest. For practical
+purposes the digest identifies the input.
+
+# [Naming blocks by their content]($heading.id('cids'))
+
+NomadFS stores everything as **blocks**: chunks of files, the blocks that
+link chunks into a file, and directory listings. A block's name, its
+**CID** (content identifier), is the SHA-256 hash of the block's bytes. Most
+storage names data by *where* it is (a path, a disk offset). Content
+addressing names it by *what* it is.
+
+[Naming, checking and deduplicating blocks.](<$image.siteAsset('learn/content-addressing.svg').alt('Three panels. 1, naming a block: a tag byte 0x00 followed by the chunk bytes, 64 KiB to 1 MiB, goes through SHA-256 to give a 32-byte CID. 2, checking a block: a device wants CID X and sends GET_BLOCK X; a peer sends some bytes; they are hashed with SHA-256; if the result equals X the block is kept and cached, otherwise it is refused. 3, same bytes, same name: a.mov has chunks A, B, C and b.mov has A, B, D; the store holds A, B, C, D, four blocks rather than six.')>)
+
+Every block starts with a one-byte tag that says what kind it is: `0x00` a
+leaf (raw file bytes), `0x01` a parent (links to other blocks), `0x02` a
+directory. The tag is covered by the hash, so a CID is the hash of the tag
+and the content together. A chunk's CID is therefore *not* what `sha256sum`
+prints for the chunk alone. Because every block carries its tag, a block
+received from a peer can be decoded without any outside information.
+
+On disk, the block store is a folder with one file per block, named by the
+CID in hex. A block is written to `<cid>.tmp` and renamed into place, so a
+crash never leaves a cut-off block under a valid name.
+
+# [Checking every block]($heading.id('verify'))
+
+The name doubles as a checksum. When a device asks a peer for block `X`
+(`GET_BLOCK`), whatever comes back is hashed again before it is used:
+
+- If the hash is `X`, the bytes are exactly the ones that were asked for.
+  They go into the local block store and serve as a cache from then on.
+- If not, the block is refused. A damaged or forged block can't get in
+  under someone else's name. When reading the swarm folder NomadFS then asks
+  the next device that might have the block.
+
+The same check runs at other points: a block read from the local store is
+re-hashed, so corruption on disk shows up as an error, not as wrong data.
+Blocks pushed by a peer (`PUT_BLOCK`) are checked before they are stored.
+Shared files are re-hashed as they are read from the original file (see the
+[filestore]($link.page('learn/merkle-dag').ref('filestore'))). A file that
+changed since its last scan reads as missing until the next scan.
+
+This is why NomadFS can fetch a block from any device that has it, not only
+the one that created it. You don't need to trust the source, because you can
+check the bytes.
+
+# [Storing data once]($heading.id('dedup'))
+
+Two identical chunks have the same CID. Wherever they come from, the block
+store keeps one copy: writing a block that already exists does nothing. Two
+copies of a video in the swarm folder take the space of one. A file edited in
+the middle shares every unchanged chunk with its earlier version, as long as
+chunk boundaries don't move. Making sure they don't is the job of
+[FastCDC]($link.page('learn/fastcdc')).
+
+# [Names that commit to whole trees]($heading.id('trees'))
+
+A parent block contains its children's CIDs, so its own CID depends on all of
+them. The same is true one level up. The CID at the top of a folder pins down
+every byte below it: if anything changes, the top CID changes. That is how a
+share is published: one CID per share, recomputed on each scan. Comparing two
+CIDs tells you whether two trees are identical, without reading them. The
+[Merkle DAG]($link.page('learn/merkle-dag')) page shows the trees.
+
+The DHT uses hashes too, but a different one: node and device IDs are
+BLAKE2s-256 hashes of public keys (see [TCP]($link.page('learn/tcp').ref('ids'))).
+
+Source: `src/storage/block.zig`, `src/storage/engine.zig`,
+`src/storage/dag/codec.zig`, `src/fs/remote.zig`.

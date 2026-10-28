@@ -1,0 +1,104 @@
+---
+.title = "FUSE, no libfuse",
+.description = "On Linux NomadFS mounts every device's shares and the swarm folder as an ordinary folder. It speaks the kernel's FUSE protocol itself, on /dev/fuse, with no library in between.",
+.date = .date("2026-10-27T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "learn.shtml",
+.custom = { "label": "learn · folders · 08", "prev": "learn/swarm-crdt" },
+---
+
+# [What FUSE is]($heading.id('what'))
+
+FUSE (Filesystem in Userspace) lets an ordinary program implement a
+filesystem. The kernel's FUSE module turns every operation on the mounted
+folder (look up a name, list a folder, read some bytes at an offset) into a
+request message. A user-space process reads that message from the device file
+`/dev/fuse`, does the work, and writes back a reply. The program that issued
+the call sees an ordinary filesystem. sshfs, rclone mount and many others
+work this way.
+
+Most FUSE filesystems use **libfuse**, a C library that hides the protocol
+behind callbacks. NomadFS doesn't. Its driver (`src/fs/fuse.zig`) reads and
+writes the kernel's binary protocol directly: fixed C-layout structs from
+`linux/fuse.h`, protocol version 7.31. It needs neither libfuse nor libc,
+and the whole driver is one Zig file you can read.
+
+# [Mounting without root]($heading.id('mounting'))
+
+Mounting normally takes root. FUSE's standard way around this is the setuid
+helper `fusermount3`, from the `fuse3` package:
+
+1. NomadFS creates a Unix socket pair and runs `fusermount3` with one end in
+   the environment variable `_FUSE_COMMFD`.
+2. `fusermount3` opens `/dev/fuse`, mounts it on your folder (options
+   `nosuid,nodev,default_permissions`, `fsname=nomadfs`), and sends the open
+   file descriptor back over the socket (`SCM_RIGHTS`).
+3. NomadFS receives the descriptor and starts serving requests on it.
+
+To unmount, NomadFS runs `fusermount3 -u -z` (a lazy unmount: the kernel
+detaches the folder once nothing is using it). It does this on Ctrl-C, on
+`SIGTERM`, or when you switch the mount off in the app.
+
+# [The read path]($heading.id('read'))
+
+[A read on the mount goes through the kernel to NomadFS, which loads only the blocks that cover it.](<$image.siteAsset('learn/fuse-read.svg').alt('A program runs cat on a file under ~/NomadFS/Laptop/Photos. Its read call goes to the Linux kernel, VFS then the fuse module, which sends a request over /dev/fuse to NomadFS. NomadFS runs one loop: read a request, handle it, write the reply, for operations such as LOOKUP, GETATTR, READDIR and READ. tree.readAt gets the blocks from the local store of cached blocks, or with GET_BLOCK to the device. Mounting happens once: fusermount3 opens /dev/fuse and mounts it, then hands the file descriptor back over a socketpair (_FUSE_COMMFD); no libfuse.')>)
+
+The mount shows `<mount>/<device>/<share>/…` for every reachable device, and
+`<mount>/Swarm`. NomadFS runs one loop: read a request from `/dev/fuse`,
+handle it, write the reply.
+
+- **LOOKUP / GETATTR** turn a name into an inode and its attributes. Each
+  path keeps its inode number for the life of the mount. Device folders come
+  from the devices NomadFS can reach, and share folders from their
+  `GET_SHARES` listing.
+- **READDIR** on a share folder is one directory block from the
+  [Merkle DAG]($link.page('learn/merkle-dag').ref('folders')), fetched with
+  `GET_BLOCK` the first time and from the local store after that.
+- **READ** calls `tree.readAt` for the requested range. Only the blocks that
+  cover those bytes are loaded, [each checked against its hash]($link.page('learn/sha-256').ref('verify')).
+  `cat`, a video player that seeks, or `cp` all work the same way.
+
+Shares are read-only: files show as `0444`, folders as `0555`, and writes
+fail with `EROFS`. The kernel is told to cache attributes and names for one
+second, so changes on other devices show up quickly.
+
+# [The write path: the swarm folder]($heading.id('write'))
+
+`<mount>/Swarm` is writable. But a swarm file is a tree of hashed blocks,
+and you can't change one byte of it in place. NomadFS stages writes in an
+ordinary file and turns the result into blocks when the file is closed.
+
+[Writes go to a staging file; closing the file turns it into one swarm edit.](<$image.siteAsset('learn/fuse-write.svg').alt('Four steps. 1, open or create: NomadFS makes a staging file, copying the old content in. 2, write: bytes go to the staging file, and reads see them at once. 3, release, the last close: FastCDC and the DAG builder put the file into the block store, and one manifest edit is made with the clock plus one. 4, peers pull the manifest with GET_SWARM and fetch blocks when the file is opened.')>)
+
+1. **OPEN for writing, or CREATE.** NomadFS makes a staging file next to the
+   manifest (`<storage_path>.swarm.json.staging/`). Opening an existing file
+   without `O_TRUNC` first copies its current content in, fetching blocks
+   from other devices if needed, so appends and in-place edits work.
+2. **WRITE** goes straight into the staging file with `pwrite`. While the file
+   is open, **READ** is served from the staging file too, so a program sees
+   what it just wrote.
+3. **RELEASE** (the last close) commits. The staging file is chunked with
+   [FastCDC]($link.page('learn/fastcdc')), its blocks go into the local store,
+   and the manifest gets **one** new version of the path. Other devices
+   never see half a write, however many `write` calls it took.
+4. Within about 10 seconds the other devices pull the new manifest
+   ([`GET_SWARM`]($link.page('learn/swarm-crdt').ref('sync'))) and see the
+   new version. They fetch its blocks only when someone opens it.
+
+The other operations become manifest edits directly: `mkdir` adds a folder
+entry; `unlink` and `rmdir` write tombstones (`rmdir` is refused while the
+folder has anything in it); `rename` is a move. That covers the editor trick
+of writing a temporary file and renaming it over the original. A truncate
+without an open file is staged and committed at once. Moving a file between
+the swarm folder and a device's share fails with `EXDEV`, as a move between
+two filesystems does.
+
+# [Limits]($heading.id('limits'))
+
+- Linux only. The mount uses Linux's `/dev/fuse` and `fusermount3`; other
+  platforms use the app.
+- Requests are handled one at a time, in order. A read that has to fetch a
+  block from a slow device holds up the requests behind it.
+- Extended attributes are not supported (`ENOSYS`).
+
+Source: `src/fs/fuse.zig`, `src/fs/tree.zig`, `src/fs/swarm.zig`.

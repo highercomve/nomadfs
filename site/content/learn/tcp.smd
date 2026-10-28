@@ -1,0 +1,105 @@
+---
+.title = "TCP: finding and reaching devices",
+.description = "NomadFS runs on plain TCP. The hard part is knowing where your other devices are. Configuration, invites, LAN announcements and a Kademlia DHT each supply addresses.",
+.date = .date("2026-10-27T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "learn.shtml",
+.custom = { "label": "learn · transport · 01", "prev": "learn", "next": "learn/noise" },
+---
+
+# [What TCP is]($heading.id('what'))
+
+TCP gives two programs a reliable, ordered stream of bytes over IP. Bytes
+arrive in the order they were sent, and lost packets are sent again. TCP
+doesn't encrypt anything, doesn't know who is on the other end, and carries
+only one stream per connection. NomadFS adds those on top, with
+[Noise]($link.page('learn/noise')) and [Yamux]($link.page('learn/yamux')).
+
+A NomadFS node listens on one TCP port: `port` in `nomadfs.conf`, 9000 by
+default. Every connection to it starts with a Noise handshake that must
+finish within 10 seconds; a peer that connects and stays silent is dropped.
+Connections are pooled: a device keeps one connection per peer and reuses it
+for every request. A reaper thread closes connections that have been idle
+for five minutes.
+
+# [Where addresses come from]($heading.id('addresses'))
+
+[Three sources of addresses lead to one routing table.](<$image.siteAsset('learn/reach.svg').alt('Three sources at the top: bootstrap_peers in nomadfs.conf (written by an invite or by hand), LAN announcements sent by UDP multicast every 2 seconds, and peers named in FIND_NODE replies from the DHT. Each leads to dialing TCP, the Noise handshake and Yamux; then a PING and PONG, where the node ID must match the handshake; then the routing table, with buckets 0 to 255 holding up to 20 peers each. To reach a device by ID: dial its address if the table has it, otherwise run FIND_NODE three peers at a time.')>)
+
+**Bootstrap peers.** `bootstrap_peers = ["tcp://192.168.1.20:9000"]` lists
+addresses to dial at start-up. Each one gets up to five attempts, a second
+apart. When you join a swarm with a one-time invite, the app adds the
+inviter's address to this list, so the two devices find each other again
+after a restart.
+
+**LAN announcements.** Every 2 seconds each node sends a small UDP datagram
+to the multicast group `224.0.0.251` on port 5354. It holds the node's ID and
+TCP port: `NMFS{"id":"…","port":9000}`. A node that hears an announcement
+from an ID it doesn't know dials the sender's address on that port. The group
+address is the one mDNS uses, but the message is not DNS: it is NomadFS's
+own announcement, on its own port. Set `enable_mdns = false` to turn it off.
+
+**The DHT.** Peers also learn about each other from the
+[Kademlia](https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf)
+distributed hash table described below.
+
+**Getting through a router.** With `upnp_enabled = true` (the default) the
+node asks the local router over UPnP to forward its TCP port, and removes the
+mapping when it stops. After it connects to a bootstrap peer, it sends a
+`DIAL_BACK` request asking that peer to connect back to it, which shows
+whether the port can be reached from outside.
+
+# [Two kinds of ID]($heading.id('ids'))
+
+A device has two key pairs, so it has two IDs:
+
+| Key | Used for | ID |
+| --- | --- | --- |
+| X25519 transport key (`node.key`) | the Noise handshake | node ID = BLAKE2s-256 of the public key |
+| Ed25519 identity key (`device.key`) | pairing, trust, revocation | device ID = BLAKE2s-256 of the public key |
+
+The routing table is keyed by node ID. A node only adds a peer to it after a
+`PING` on a live connection, and the ID in the `PONG` must equal the one the
+handshake authenticated. A peer can't plant a false entry by claiming
+someone else's ID.
+
+# [The Kademlia DHT]($heading.id('kademlia'))
+
+Kademlia arranges nodes by the *XOR distance* between their IDs: the
+distance between `a` and `b` is `a XOR b`, read as a 256-bit number. IDs
+that start with the same bits are close.
+
+- **Buckets.** The routing table has 256 buckets. Bucket *i* holds peers
+  whose ID shares exactly *i* leading bits with ours, up to K = 20 per
+  bucket. Every bucket covers half the remaining ID space, so a node knows
+  many peers close to it and a few far away.
+- **Lookup.** To find a node, ask the closest peers you know for the peers
+  *they* know closest to the target (`FIND_NODE`). NomadFS keeps up to 3
+  queries in flight and repeats with the closer peers each round, until no
+  one closer turns up. Peers named in replies are not added to the routing
+  table until they answer a `PING` themselves.
+- **Upkeep.** After bootstrap, a node looks up its own ID once, which fills
+  its buckets. Every 60 seconds it refreshes the buckets.
+
+The same protocol carries provider records (`ADD_PROVIDER`,
+`GET_PROVIDERS`): a node can announce that it holds a file, so others can
+find it by content. Shares and the swarm folder don't need this. They already
+know which device holds a file: the one that shares it, or the one that added
+it to the swarm folder.
+
+# [Reaching a device]($heading.id('reaching'))
+
+When NomadFS needs a particular device, for example to fetch a block of a
+share it is browsing:
+
+1. If the routing table has the device's node ID, it dials the addresses
+   stored there (up to 8 per peer), or reuses the open connection.
+2. If not, it runs a `FIND_NODE` lookup for that ID and then dials.
+
+Every request after that is a message on a Yamux stream: one byte for the
+message type, the sender's 32-byte node ID, then the payload. Requests
+include `PING`, `FIND_NODE`, `GET_BLOCK`, `GET_SHARES`, `GET_SWARM`,
+`REVOKE` and `ROTATE_KEY`.
+
+Source: `src/net/transport/tcp.zig`, `manager.zig`, `mdns.zig`, `nat.zig`,
+and `src/net/discovery/`.

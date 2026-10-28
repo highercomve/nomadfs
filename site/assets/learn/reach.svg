@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 656" role="img" aria-labelledby="t">
+<title id="t">How a device learns its peers&#x27; addresses: bootstrap peers, LAN announcements and DHT replies lead to a connection, a PING, and an entry in the routing table</title>
+<defs>
+<style>
+text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; fill: #f2e8d8; }
+.h { font-size: 19px; font-weight: 600; fill: #f5efe6; }
+.b { font-size: 16.5px; }
+.s { font-size: 15px; fill: #a99f8f; }
+.k { font-size: 13px; letter-spacing: 1.6px; fill: #f6b042; }
+.ko { font-size: 13px; letter-spacing: 1.6px; fill: #5ce1e6; }
+.am { fill: #f6b042; } .oa { fill: #5ce1e6; } .di { fill: #a99f8f; } .du { fill: #6f6a63; } .cr { fill: #f5efe6; }
+.box { fill: #1a2131; stroke: #f2e8d8; stroke-opacity: .22; stroke-width: 1.5; }
+.boxa { fill: #f6b042; fill-opacity: .1; stroke: #f6b042; stroke-width: 1.6; }
+.boxo { fill: #2ec4b6; fill-opacity: .1; stroke: #5ce1e6; stroke-width: 1.6; }
+.boxt { fill: #e8833a; fill-opacity: .14; stroke: #e8833a; stroke-width: 1.6; }
+.boxd { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .16; stroke-width: 1.3; stroke-dasharray: 5 5; }
+.ln { stroke: #a99f8f; stroke-width: 1.6; fill: none; }
+.lna { stroke: #f6b042; stroke-width: 1.8; fill: none; }
+.lno { stroke: #5ce1e6; stroke-width: 1.8; fill: none; }
+.lnf { stroke: #f2e8d8; stroke-opacity: .18; stroke-width: 1.3; fill: none; }
+.dash { stroke-dasharray: 5 5; }
+.dot { stroke-dasharray: 1.5 5; stroke-linecap: round; }
+</style>
+<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#a99f8f"/></marker>
+<marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#f6b042"/></marker>
+<marker id="aro" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5ce1e6"/></marker>
+</defs>
+<rect class="box" x="14" y="20" width="184" height="112" rx="6"/>
+<text class="k" x="28" y="44">CONFIG · INVITE</text>
+<text class="h" x="28" y="70">bootstrap</text>
+<text class="s" x="28" y="96">bootstrap_peers</text>
+<text class="s" x="28" y="118">in nomadfs.conf</text>
+<path class="ln" d="M106 132 L300 176" marker-end="url(#ar)"/>
+<rect class="box" x="208" y="20" width="184" height="112" rx="6"/>
+<text class="k" x="222" y="44">LAN</text>
+<text class="h" x="222" y="70">announce</text>
+<text class="s" x="222" y="96">UDP multicast</text>
+<text class="s" x="222" y="118">every 2 s</text>
+<path class="ln" d="M300 132 L300 176" marker-end="url(#ar)"/>
+<rect class="box" x="402" y="20" width="184" height="112" rx="6"/>
+<text class="k" x="416" y="44">THE DHT</text>
+<text class="h" x="416" y="70">FIND_NODE</text>
+<text class="s" x="416" y="96">peers named</text>
+<text class="s" x="416" y="118">in replies</text>
+<path class="ln" d="M494 132 L300 176" marker-end="url(#ar)"/>
+<rect class="boxo" x="40" y="180" width="520" height="56" rx="6"/>
+<text class="b" x="300" y="214" text-anchor="middle">dial TCP · Noise handshake · Yamux</text>
+<path class="ln" d="M300 236 L300 266" marker-end="url(#ar)"/>
+<rect class="box" x="40" y="270" width="520" height="70" rx="6"/>
+<text class="h" x="300" y="300" text-anchor="middle">PING  →  PONG</text>
+<text class="s" x="300" y="326" text-anchor="middle">the node ID must match the handshake</text>
+<path class="ln" d="M300 340 L300 370" marker-end="url(#ar)"/>
+<rect class="boxa" x="20" y="374" width="560" height="144" rx="6"/>
+<text class="k" x="40" y="400">ROUTING TABLE</text>
+<rect class="box" x="40" y="414" width="80" height="40" rx="4"/>
+<text class="b" x="80" y="440" text-anchor="middle">0</text>
+<rect class="box" x="128" y="414" width="80" height="40" rx="4"/>
+<text class="b" x="168" y="440" text-anchor="middle">1</text>
+<rect class="box" x="216" y="414" width="80" height="40" rx="4"/>
+<text class="b" x="256" y="440" text-anchor="middle">2</text>
+<rect class="box" x="304" y="414" width="80" height="40" rx="4"/>
+<text class="b" x="344" y="440" text-anchor="middle">…</text>
+<rect class="box" x="392" y="414" width="80" height="40" rx="4"/>
+<text class="b" x="432" y="440" text-anchor="middle">254</text>
+<rect class="box" x="480" y="414" width="80" height="40" rx="4"/>
+<text class="b" x="520" y="440" text-anchor="middle">255</text>
+<text class="s" x="40" y="484">bucket i: peers sharing i leading bits</text>
+<text class="s" x="40" y="506">with this device&#x27;s ID · up to K = 20 each</text>
+<rect class="box" x="20" y="538" width="560" height="102" rx="6"/>
+<text class="k" x="40" y="564">TO REACH A DEVICE BY ID</text>
+<text class="b" x="40" y="593">1. in the table: dial its address</text>
+<text class="b" x="40" y="621">2. if not: FIND_NODE, 3 peers at a time</text>
+</svg>

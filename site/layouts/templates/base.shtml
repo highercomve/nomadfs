@@ -12,8 +12,8 @@
 		<link rel="icon" type="image/svg+xml" href="$site.asset('brand/nomadfs-icon.svg').link()">
 		<link rel="preload" as="font" type="font/woff2" href="$site.asset('fonts/bricolage-grotesque.woff2').link()" crossorigin>
 		<link rel="preload" as="font" type="font/woff2" href="$site.asset('fonts/figtree.woff2').link()" crossorigin>
-		<link type="text/css" rel="stylesheet" href="$site.asset('style.css').link().suffix('?v=20261027a')">
-		<link type="text/css" rel="stylesheet" href="$site.asset('highlight.css').link().suffix('?v=20261027a')">
+		<link type="text/css" rel="stylesheet" href="$site.asset('style.css').link().suffix('?v=20261027d')">
+		<link type="text/css" rel="stylesheet" href="$site.asset('highlight.css').link().suffix('?v=20261027d')">
 		<style>[hidden] { display: none !important; }</style>
 		<super>
 	</head>
@@ -29,6 +29,7 @@
 				</button>
 				<nav class="topnav">
 					<a href="$site.page('docs').link()">Docs</a>
+					<a href="$site.page('learn').link()">Learn</a>
 					<a href="$site.page('docs/getting-started').link()">Get started</a>
 					<a href="$site.page('docs/swarm-folder').link()">Swarm folder</a>
 					<a class="topnav-gh" href="https://github.com/highercomve/nomadfs">GitHub</a>
@@ -50,6 +51,7 @@
 						<a href="$site.page('docs/shared-folders').link()" target="_blank" rel="noopener">Shared folders &amp; mount</a>
 						<a href="$site.page('docs/swarm-folder').link()" target="_blank" rel="noopener">Swarm folder</a>
 						<a href="$site.page('docs/connecting-devices').link()" target="_blank" rel="noopener">Connecting devices</a>
+						<a href="$site.page('learn').link()" target="_blank" rel="noopener">How it works</a>
 					</div>
 					<div>
 						<h4>Project</h4>
@@ -62,6 +64,6 @@
 			</div>
 			<p class="footer-legal">Built with <a href="https://ziglang.org/" target="_blank" rel="noopener">Zig</a> &amp; <a href="https://oriel.foreachdeveloper.com" target="_blank" rel="noopener">Oriel</a> by <a href="https://www.foreachdeveloper.com/" target="_blank" rel="noopener">foreachdeveloper</a> · Site made with <a href="https://zine-ssg.io" target="_blank" rel="noopener">Zine</a> · Fonts under the SIL Open Font License</p>
 		</footer>
-		<script src="$site.asset('site.js').link().suffix('?v=20261027a')" defer></script>
+		<script src="$site.asset('site.js').link().suffix('?v=20261027d')" defer></script>
 	</body>
 </html>

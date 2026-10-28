@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 640" role="img" aria-labelledby="t">
+<title id="t">The Noise XXpsk3 handshake: the dialer sends e; the listener answers e, ee, s, es with a signed device hello; the dialer sends s, se, psk with its own signed hello; both then split two transport keys</title>
+<defs>
+<style>
+text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; fill: #f2e8d8; }
+.h { font-size: 19px; font-weight: 600; fill: #f5efe6; }
+.b { font-size: 16.5px; }
+.s { font-size: 15px; fill: #a99f8f; }
+.k { font-size: 13px; letter-spacing: 1.6px; fill: #f6b042; }
+.ko { font-size: 13px; letter-spacing: 1.6px; fill: #5ce1e6; }
+.am { fill: #f6b042; } .oa { fill: #5ce1e6; } .di { fill: #a99f8f; } .du { fill: #6f6a63; } .cr { fill: #f5efe6; }
+.box { fill: #1a2131; stroke: #f2e8d8; stroke-opacity: .22; stroke-width: 1.5; }
+.boxa { fill: #f6b042; fill-opacity: .1; stroke: #f6b042; stroke-width: 1.6; }
+.boxo { fill: #2ec4b6; fill-opacity: .1; stroke: #5ce1e6; stroke-width: 1.6; }
+.boxt { fill: #e8833a; fill-opacity: .14; stroke: #e8833a; stroke-width: 1.6; }
+.boxd { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .16; stroke-width: 1.3; stroke-dasharray: 5 5; }
+.ln { stroke: #a99f8f; stroke-width: 1.6; fill: none; }
+.lna { stroke: #f6b042; stroke-width: 1.8; fill: none; }
+.lno { stroke: #5ce1e6; stroke-width: 1.8; fill: none; }
+.lnf { stroke: #f2e8d8; stroke-opacity: .18; stroke-width: 1.3; fill: none; }
+.dash { stroke-dasharray: 5 5; }
+.dot { stroke-dasharray: 1.5 5; stroke-linecap: round; }
+</style>
+<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#a99f8f"/></marker>
+<marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#f6b042"/></marker>
+<marker id="aro" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5ce1e6"/></marker>
+</defs>
+<rect class="box" x="20" y="18" width="210" height="66" rx="6"/>
+<text class="h" x="125" y="46" text-anchor="middle">dialer</text>
+<text class="s" x="125" y="70" text-anchor="middle">initiator</text>
+<rect class="box" x="370" y="18" width="210" height="66" rx="6"/>
+<text class="h" x="475" y="46" text-anchor="middle">listener</text>
+<text class="s" x="475" y="70" text-anchor="middle">responder</text>
+<path class="lnf dash" d="M125 84 L125 470"/>
+<path class="lnf dash" d="M475 84 L475 470"/>
+<text class="k" x="30" y="132">1</text>
+<text class="h" x="300" y="126" text-anchor="middle">e</text>
+<path class="lna" d="M129 140 L469 140" marker-end="url(#ara)"/>
+<text class="s" x="300" y="166" text-anchor="middle">ephemeral key, in the clear</text>
+<text class="k" x="30" y="232">2</text>
+<text class="h" x="300" y="226" text-anchor="middle">e, ee, s, es</text>
+<path class="lna" d="M471 240 L131 240" marker-end="url(#ara)"/>
+<text class="s" x="300" y="266" text-anchor="middle">static key, encrypted</text>
+<text class="s" x="300" y="287" text-anchor="middle">+ signed device hello</text>
+<text class="k" x="30" y="352">3</text>
+<text class="h" x="300" y="346" text-anchor="middle">s, se, psk</text>
+<path class="lna" d="M129 360 L469 360" marker-end="url(#ara)"/>
+<text class="s" x="300" y="386" text-anchor="middle">static key + signed hello,</text>
+<text class="s" x="300" y="407" text-anchor="middle">sealed with the swarm key</text>
+<text class="s am" x="300" y="428" text-anchor="middle">wrong key: the tag check fails</text>
+<rect class="boxo" x="20" y="482" width="560" height="72" rx="6"/>
+<text class="b" x="300" y="512" text-anchor="middle">split: two keys, one per direction</text>
+<text class="s" x="300" y="538" text-anchor="middle">each frame: ChaCha20-Poly1305, ≤ 1024 B</text>
+<path class="ln" d="M300 554 L300 580" marker-end="url(#ar)"/>
+<rect class="boxd" x="150" y="584" width="300" height="44" rx="6"/>
+<text class="b" x="300" y="612" text-anchor="middle">Yamux runs inside</text>
+</svg>

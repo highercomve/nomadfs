@@ -1,0 +1,44 @@
+<extend template="base.shtml">
+<head id="head">
+	<title :text="$page.title.suffix(' · Learn NomadFS')"></title>
+</head>
+<body id="body">
+	<div class="docs learn">
+		<aside class="sidebar">
+			<nav>
+				<h4>Start</h4>
+				<a href="$site.page('learn').link()">How NomadFS works</a>
+				<h4>Transport</h4>
+				<a href="$site.page('learn/tcp').link()">TCP: finding devices</a>
+				<a href="$site.page('learn/noise').link()">Noise XXpsk3</a>
+				<a href="$site.page('learn/yamux').link()">Yamux</a>
+				<h4>Storage</h4>
+				<a href="$site.page('learn/sha-256').link()">SHA-256 &amp; CIDs</a>
+				<a href="$site.page('learn/fastcdc').link()">FastCDC</a>
+				<a href="$site.page('learn/merkle-dag').link()">Merkle DAG</a>
+				<h4>Folders</h4>
+				<a href="$site.page('learn/swarm-crdt').link()">Swarm folder CRDT</a>
+				<a href="$site.page('learn/fuse').link()">FUSE, no libfuse</a>
+			</nav>
+		</aside>
+		<main class="doc">
+			<article class="prose">
+				<p class="plate-label" :text="$page.custom.getOr('label', 'learn')"></p>
+				<h1 :text="$page.title"></h1>
+				<p class="doc-lead" :if="$page.description.len().gt(0)" :text="$page.description"></p>
+				<div class="content" :html="$page.content()"></div>
+			</article>
+			<nav class="pager" aria-label="Learn pages">
+				<ctx :if="$page.custom.getOr('prev', '').len().gt(0)"><a class="pager-prev" href="$site.page($page.custom.getOr('prev', '')).link()"><span>Previous</span><strong :text="$site.page($page.custom.getOr('prev', '')).title"></strong></a></ctx>
+				<ctx :if="$page.custom.getOr('next', '').len().gt(0)"><a class="pager-next" href="$site.page($page.custom.getOr('next', '')).link()"><span>Next</span><strong :text="$site.page($page.custom.getOr('next', '')).title"></strong></a></ctx>
+			</nav>
+			<div class="doc-foot">
+				<a class="edit-link" href="https://github.com/highercomve/nomadfs/tree/main/site/content/learn">Improve these pages on GitHub</a>
+			</div>
+		</main>
+		<aside class="toc">
+			<h4>On this page</h4>
+			<div :html="$page.toc()"></div>
+		</aside>
+	</div>
+</body>

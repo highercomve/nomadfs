@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 520" role="img" aria-labelledby="t">
+<title id="t">Yamux: three streams, for GET_BLOCK, GET_SHARES and GET_SWARM, share one connection as interleaved frames, each with a 12-byte header</title>
+<defs>
+<style>
+text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; fill: #f2e8d8; }
+.h { font-size: 19px; font-weight: 600; fill: #f5efe6; }
+.b { font-size: 16.5px; }
+.s { font-size: 15px; fill: #a99f8f; }
+.k { font-size: 13px; letter-spacing: 1.6px; fill: #f6b042; }
+.ko { font-size: 13px; letter-spacing: 1.6px; fill: #5ce1e6; }
+.am { fill: #f6b042; } .oa { fill: #5ce1e6; } .di { fill: #a99f8f; } .du { fill: #6f6a63; } .cr { fill: #f5efe6; }
+.box { fill: #1a2131; stroke: #f2e8d8; stroke-opacity: .22; stroke-width: 1.5; }
+.boxa { fill: #f6b042; fill-opacity: .1; stroke: #f6b042; stroke-width: 1.6; }
+.boxo { fill: #2ec4b6; fill-opacity: .1; stroke: #5ce1e6; stroke-width: 1.6; }
+.boxt { fill: #e8833a; fill-opacity: .14; stroke: #e8833a; stroke-width: 1.6; }
+.boxd { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .16; stroke-width: 1.3; stroke-dasharray: 5 5; }
+.ln { stroke: #a99f8f; stroke-width: 1.6; fill: none; }
+.lna { stroke: #f6b042; stroke-width: 1.8; fill: none; }
+.lno { stroke: #5ce1e6; stroke-width: 1.8; fill: none; }
+.lnf { stroke: #f2e8d8; stroke-opacity: .18; stroke-width: 1.3; fill: none; }
+.dash { stroke-dasharray: 5 5; }
+.dot { stroke-dasharray: 1.5 5; stroke-linecap: round; }
+</style>
+<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#a99f8f"/></marker>
+<marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#f6b042"/></marker>
+<marker id="aro" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5ce1e6"/></marker>
+</defs>
+<rect class="boxa" x="14" y="20" width="184" height="70" rx="6"/>
+<text class="k" x="106" y="46" text-anchor="middle">STREAM 1</text>
+<text class="b" x="106" y="74" text-anchor="middle">GET_BLOCK</text>
+<path class="lna" d="M106 90 L106 112 L270 138"/>
+<rect class="boxo" x="208" y="20" width="184" height="70" rx="6"/>
+<text class="k" x="300" y="46" text-anchor="middle">STREAM 3</text>
+<text class="b" x="300" y="74" text-anchor="middle">GET_SHARES</text>
+<path class="lno" d="M300 90 L300 112 L300 138"/>
+<rect class="boxt" x="402" y="20" width="184" height="70" rx="6"/>
+<text class="k" x="494" y="46" text-anchor="middle">STREAM 5</text>
+<text class="b" x="494" y="74" text-anchor="middle">GET_SWARM</text>
+<path class="ln" d="M494 90 L494 112 L330 138"/>
+<rect class="box" x="14" y="140" width="572" height="82" rx="10"/>
+<rect class="boxa" x="26" y="152" width="85" height="58" rx="4"/>
+<text class="b" x="68" y="176" text-anchor="middle">#1</text>
+<text class="s" x="68" y="199" text-anchor="middle">SYN</text>
+<rect class="boxo" x="119" y="152" width="85" height="58" rx="4"/>
+<text class="b" x="161" y="176" text-anchor="middle">#3</text>
+<text class="s" x="161" y="199" text-anchor="middle">SYN</text>
+<rect class="boxa" x="212" y="152" width="85" height="58" rx="4"/>
+<text class="b" x="254" y="176" text-anchor="middle">#1</text>
+<text class="s" x="254" y="199" text-anchor="middle">DATA</text>
+<rect class="boxt" x="305" y="152" width="85" height="58" rx="4"/>
+<text class="b" x="347" y="176" text-anchor="middle">#5</text>
+<text class="s" x="347" y="199" text-anchor="middle">SYN</text>
+<rect class="boxo" x="398" y="152" width="85" height="58" rx="4"/>
+<text class="b" x="440" y="176" text-anchor="middle">#3</text>
+<text class="s" x="440" y="199" text-anchor="middle">DATA</text>
+<rect class="boxa" x="491" y="152" width="85" height="58" rx="4"/>
+<text class="b" x="533" y="176" text-anchor="middle">#1</text>
+<text class="s" x="533" y="199" text-anchor="middle">FIN</text>
+<text class="s" x="300" y="246" text-anchor="middle">one Noise session · one TCP connection</text>
+<text class="k" x="20" y="294">EVERY FRAME: A 12-BYTE HEADER</text>
+<rect class="box" x="20" y="306" width="46.7" height="52" rx="0"/>
+<text class="s" x="43.3" y="338" text-anchor="middle">ver</text>
+<text class="s" x="43.3" y="382" text-anchor="middle">1 B</text>
+<rect class="box" x="66.7" y="306" width="46.7" height="52" rx="0"/>
+<text class="s" x="90.0" y="338" text-anchor="middle">type</text>
+<text class="s" x="90.0" y="382" text-anchor="middle">1 B</text>
+<rect class="box" x="113.3" y="306" width="93.3" height="52" rx="0"/>
+<text class="b" x="160.0" y="338" text-anchor="middle">flags</text>
+<text class="s" x="160.0" y="382" text-anchor="middle">2 B</text>
+<rect class="box" x="206.7" y="306" width="186.7" height="52" rx="0"/>
+<text class="b" x="300.0" y="338" text-anchor="middle">stream ID</text>
+<text class="s" x="300.0" y="382" text-anchor="middle">4 B</text>
+<rect class="box" x="393.3" y="306" width="186.7" height="52" rx="0"/>
+<text class="b" x="486.7" y="338" text-anchor="middle">length</text>
+<text class="s" x="486.7" y="382" text-anchor="middle">4 B</text>
+<text class="s" x="20" y="422">type   DATA · WINDOW_UPDATE · PING · GO_AWAY</text>
+<text class="s" x="20" y="448">flags  SYN opens · FIN ends · RST resets</text>
+<text class="s" x="20" y="474">length payload bytes, or window credit</text>
+<text class="s am" x="20" y="500">256 KiB window per stream · 64 streams max</text>
+</svg>

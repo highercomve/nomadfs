@@ -16,9 +16,9 @@
 						<a class="btn btn-ghost" href="https://github.com/highercomve/nomadfs">View on GitHub</a>
 					</div>
 					<dl class="readouts">
-						<div><dt>transport</dt><dd>Noise XXpsk3 · Yamux · TCP</dd></div>
-						<div><dt>storage</dt><dd>Merkle DAG · FastCDC · SHA-256</dd></div>
-						<div><dt>mount</dt><dd>FUSE, no libfuse</dd></div>
+						<div><dt>transport</dt><dd><a href="$site.page('learn/noise').link()">Noise XXpsk3</a> · <a href="$site.page('learn/yamux').link()">Yamux</a> · <a href="$site.page('learn/tcp').link()">TCP</a></dd></div>
+						<div><dt>storage</dt><dd><a href="$site.page('learn/merkle-dag').link()">Merkle DAG</a> · <a href="$site.page('learn/fastcdc').link()">FastCDC</a> · <a href="$site.page('learn/sha-256').link()">SHA-256</a></dd></div>
+						<div><dt>mount</dt><dd><a href="$site.page('learn/fuse').link()">FUSE, no libfuse</a></dd></div>
 					</dl>
 				</div>
 				<div class="hero-shots">
@@ -146,6 +146,7 @@
 					</div>
 				</li>
 			</ol>
+			<p class="how-more">Each step uses a technology you may want to look into: content-defined chunking, Merkle DAGs, the Noise handshake, a CRDT. <a href="$site.page('learn').link()">Learn how NomadFS works</a>, one diagram-led page each.</p>
 		</section>
 
 		<section class="section" id="start">

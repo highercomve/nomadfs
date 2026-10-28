@@ -1,0 +1,79 @@
+---
+.title = "Yamux",
+.description = "One encrypted connection between two devices carries many independent conversations at once. Yamux splits it into streams, and NomadFS opens one for every request.",
+.date = .date("2026-10-27T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "learn.shtml",
+.custom = { "label": "learn · transport · 03", "prev": "learn/noise", "next": "learn/sha-256" },
+---
+
+# [What Yamux is]($heading.id('what'))
+
+[Yamux](https://github.com/hashicorp/yamux/blob/master/spec.md) ("yet
+another multiplexer") is a small protocol from HashiCorp that carries many
+logical streams over one ordered byte stream. libp2p uses it too. Each piece
+of data is sent as a *frame* with a 12-byte header that names its stream, so
+frames from different streams can be interleaved and sorted out at the other
+end.
+
+Without it, two devices would need one TCP connection and one Noise handshake
+for each request in flight, or would have to wait for one request to finish
+before starting the next. With it, a large block transfer and a directory
+listing can share the connection without one waiting for the other.
+
+# [Frames on the wire]($heading.id('frames'))
+
+[Streams for three requests, interleaved as frames on one connection, and the header every frame starts with.](<$image.siteAsset('learn/yamux.svg').alt('Three streams at the top, stream 1 for GET_BLOCK, stream 3 for GET_SHARES and stream 5 for GET_SWARM, feed one pipe where their frames are interleaved: stream 1 SYN, stream 3 SYN, stream 1 DATA, stream 5 SYN, stream 3 DATA, stream 1 FIN, all on one Noise session over one TCP connection. Below, the 12-byte frame header: version 1 byte, type 1 byte, flags 2 bytes, stream ID 4 bytes, length 4 bytes. Types are DATA, WINDOW_UPDATE, PING and GO_AWAY; flags SYN opens, FIN ends, RST resets; length is payload bytes or window credit. 256 KiB window per stream, 64 streams at most.')>)
+
+Every frame starts with the same header, integers big-endian:
+
+| Field | Size | Meaning |
+| --- | --- | --- |
+| version | 1 B | always 0 |
+| type | 1 B | `DATA`, `WINDOW_UPDATE`, `PING` or `GO_AWAY` |
+| flags | 2 B | `SYN` opens a stream, `FIN` ends one side, `RST` aborts, `ACK` marks a ping reply |
+| stream ID | 4 B | which stream the frame belongs to |
+| length | 4 B | bytes of payload after the header, or the window credit granted |
+
+Yamux sits inside [Noise]($link.page('learn/noise')): a Yamux frame is
+written to the Noise stream, which seals it in encrypted frames of at most
+1024 bytes. The other side decrypts, reads the header, and appends the
+payload to the right stream's buffer. Unknown versions or frame types are
+rejected.
+
+# [Opening and closing streams]($heading.id('streams'))
+
+Both sides can open streams. To keep their IDs from colliding, the side that
+dialed the connection uses odd IDs (1, 3, 5, …) and the side that accepted it
+uses even IDs (2, 4, …). A stream opens with a `DATA` frame carrying `SYN`
+and no payload. The other side queues it until something accepts it.
+
+Closing is per direction. `FIN` means "I won't send more", and the stream is
+freed once both sides have closed it. `RST` drops it at once. `GO_AWAY` asks
+the peer to open no new streams; streams already open keep working.
+
+# [Flow control]($heading.id('flow'))
+
+Each stream has a receive *window* of 256 KiB: the most the sender may send
+before the receiver has read it. A writer that has used up the window waits.
+When the application reads from a stream, the receiver sends a
+`WINDOW_UPDATE` frame granting that many bytes back. A slow reader on one
+stream holds back only that stream's sender.
+
+A session allows at most 64 live streams. Together with the window, that
+limits the data a peer can make a device buffer for it to 16 MiB per
+connection.
+
+# [How NomadFS uses streams]($heading.id('nomadfs'))
+
+Every request gets its own stream: open, send one message, read one reply,
+close. A `PING`, a `GET_BLOCK` for one chunk, a `GET_SHARES` or a `GET_SWARM`
+each run on their own stream with their own timeout. On the receiving side,
+one thread accepts streams and hands each to a handler thread. A request that
+takes long, such as reading a megabyte from disk, doesn't hold up the others.
+
+Each connection also runs one reader thread that pulls frames off the Noise
+stream and sorts them into streams.
+
+Source: `src/net/transport/yamux.zig`, `src/net/transport/tcp.zig`,
+`src/net/discovery/node.zig`.

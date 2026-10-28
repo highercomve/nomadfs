@@ -1,0 +1,72 @@
+---
+.title = "How NomadFS works",
+.description = "The technologies under NomadFS, one page each: what each one is, and what NomadFS does with it.",
+.date = .date("2026-10-27T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "learn.shtml",
+.custom = { "label": "learn · overview", "next": "learn/tcp" },
+---
+
+NomadFS is built as a stack. Each layer uses the one below it and knows little
+about the ones above. TCP carries bytes between two devices. Noise encrypts
+them and proves who is on the other end. Yamux runs many conversations over
+that one connection. Requests travel on those conversations, and what they
+carry are blocks: pieces of files, named by their hash and linked into trees.
+Shared folders, the swarm folder and the Linux mount are built from those
+trees.
+
+[The stack, bottom to top. Each page below covers one layer.](<$image.siteAsset('learn/layers.svg').alt('The NomadFS stack as seven boxes, bottom to top: TCP, one connection between two devices; Noise XXpsk3, encryption, the swarm key and device identity; Yamux, one stream per request; RPCs and the Kademlia DHT, such as GET_BLOCK, GET_SHARES, GET_SWARM and FIND_NODE; blocks and Merkle DAGs, FastCDC chunks named by SHA-256 hashes; shared folders and the swarm folder; and at the top the app, the CLI and the mount. The other device runs the same stack.')>)
+
+# [Transport: how devices talk]($heading.id('transport'))
+
+- [TCP: finding and reaching devices]($link.page('learn/tcp')). Where a
+  device gets its peers' addresses (configuration, invites, LAN
+  announcements, the Kademlia DHT) and how it reaches one.
+- [Noise XXpsk3]($link.page('learn/noise')). The three-message handshake that
+  encrypts every connection, checks the swarm key, and binds each device's
+  Ed25519 identity to the session.
+- [Yamux]($link.page('learn/yamux')). Many independent streams over one
+  encrypted connection, so a slow file transfer doesn't block a directory
+  listing.
+
+# [Storage: how files become blocks]($heading.id('storage'))
+
+- [SHA-256 and content addressing]($link.page('learn/sha-256')). Every block
+  is named by its hash. That is what lets a device check every block it
+  receives, and store identical data only once.
+- [FastCDC]($link.page('learn/fastcdc')). How files are cut into chunks
+  so that an edit changes only a chunk or two.
+- [Merkle DAG]($link.page('learn/merkle-dag')). How chunks are linked into
+  file trees and directory blocks, and how a read finds the one block it
+  needs.
+
+# [Folders: what you see]($heading.id('folders'))
+
+- [The swarm folder CRDT]($link.page('learn/swarm-crdt')). The folder every
+  device writes to, merged without a server. Concurrent edits are both
+  kept.
+- [FUSE, no libfuse]($link.page('learn/fuse')). The Linux mount: NomadFS
+  speaks the kernel's FUSE protocol itself, with no library in between.
+
+# [One file, end to end]($heading.id('end-to-end'))
+
+Your laptop shares `Photos` and your phone opens `beach.jpg` from it:
+
+1. The laptop scans the folder. FastCDC splits `beach.jpg` into chunks, and
+   each chunk gets a name: the SHA-256 hash of its bytes. A small parent block
+   lists those names, and the `Photos` directory block lists the parent. The
+   photo's bytes stay in the photo; NomadFS only notes where each chunk is.
+2. The phone already knows the laptop's address, from an invite or from the
+   LAN. It opens a TCP connection and runs the Noise handshake. Both sides
+   prove they hold the swarm key, and each sees the other's device identity.
+3. Over a Yamux stream the phone sends `GET_SHARES` and receives the root of
+   `Photos`. On new streams it sends `GET_BLOCK` for the directory block,
+   then for the photo's parent block.
+4. To show the photo, the phone asks for the chunks it covers. It hashes each
+   one as it arrives and keeps it only if the hash matches the name it asked
+   for. The checked chunks stay in its block store, so the photo opens again
+   offline.
+
+Code references on these pages point at the
+[NomadFS source](https://github.com/highercomve/nomadfs/tree/main/src), for
+readers who want to check the details.
