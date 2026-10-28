@@ -5,11 +5,11 @@
     .fingerprint = 0x5f521d4994d41c7c,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // Oriel v0.19.7. To build against a local checkout instead:
+        // Oriel v0.20.0. To build against a local checkout instead:
         // zig build --fork=../../oriel
         .oriel = .{
-            .url = "https://github.com/highercomve/Oriel/archive/refs/tags/v0.19.7.tar.gz",
-            .hash = "oriel-0.19.7-K1NO5dHT_AA68oQ4vjPWP9ovVmim0FeDh_b4wfL-F02f",
+            .url = "https://github.com/highercomve/Oriel/archive/refs/tags/v0.20.0.tar.gz",
+            .hash = "oriel-0.20.0-K1NO5cmz_QCcSreZ76kLSUfaH7MmTaX2llc5vgztChrI",
         },
         // The NomadFS core: same sources the CLI, the C ABI and the mobile
         // bindings build from.

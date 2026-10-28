@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
         .sql = false,
         .fs_watch = false,
         .media_server = true, // streams video/audio previews with range requests
+        .video = true, // native player for video previews (more formats, GPU)
         .global_shortcut = false,
         .input = false,
         .clipboard = false,

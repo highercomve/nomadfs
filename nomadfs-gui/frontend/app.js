@@ -507,7 +507,9 @@ async function downloadFile(device, entry, btn) {
 
 const KINDS = {
   image: { ext: ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif", "heic"], max: 64 << 20 },
-  video: { ext: ["mp4", "webm", "mov", "m4v", "mkv", "3gp"], max: 512 << 20 },
+  // Camcorder MPEG-TS (.mts/.m2ts), WMV, MXF and the rest play in the native
+  // player (oriel.video), which takes what the system's media stack plays.
+  video: { ext: ["mp4", "webm", "mov", "m4v", "mkv", "3gp", "mts", "m2ts", "avi", "wmv", "flv", "mpg", "mpeg", "mxf", "ogv", "vob"], max: 512 << 20 },
   audio: { ext: ["mp3", "m4a", "aac", "ogg", "opus", "wav", "flac"], max: 256 << 20 },
   pdf: { ext: ["pdf"], max: 64 << 20 },
   text: { ext: ["txt", "md", "json", "log", "csv", "xml", "yaml", "yml", "toml", "ini", "conf", "zig", "c", "h", "js", "ts", "py", "rs", "go", "sh", "html", "css"], max: 1 << 20 },
@@ -580,12 +582,17 @@ function stopMedia() {
 function closePreview() {
   if (!pv) return;
   stopMedia();
+  nativeVideo?.close().catch(() => {});
   pv.token++;
   if (pv.url) URL.revokeObjectURL(pv.url);
   pv = null;
   $("pv-body").replaceChildren();
   $("preview").hidden = true;
 }
+
+// The native player: GPU rendering and every format the system plays,
+// shown over the whole window. Null where the platform has none.
+const nativeVideo = window.oriel.video?.available ? window.oriel.video : null;
 
 async function streamPreview(entry, kind, token) {
   let url;
@@ -596,6 +603,30 @@ async function streamPreview(entry, kind, token) {
     return;
   }
   if (!pv || token !== pv.token) return;
+  if (kind === "video" && nativeVideo) return playNative(entry, url, token);
+  inPagePlayer(kind, url, token);
+}
+
+/** Plays in the native player; the preview offers to play it again once
+ * it's closed. Falls back to the page's player if the native one fails. */
+async function playNative(entry, url, token) {
+  const again = document.createElement("button");
+  again.className = "btn filled";
+  again.textContent = "Play again";
+  again.addEventListener("click", () => playNative(entry, url, token));
+  previewMessage("video", "Playing in the video player. Esc or its close button comes back here.", again);
+  try {
+    await nativeVideo.play({ url, title: entry.name });
+  } catch (err) {
+    if (pv && token === pv.token) inPagePlayer("video", url, token);
+  }
+}
+
+window.oriel.listen?.("video:error", ({ message }) => {
+  if (pv) snack(`This video can't play: ${message || "unsupported format"}. Download it to open it in another app.`, 6000);
+});
+
+function inPagePlayer(kind, url, token) {
   const el = document.createElement(kind);
   el.controls = true;
   el.autoplay = true;
