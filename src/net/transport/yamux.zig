@@ -66,11 +66,13 @@ fn writeExactly(stream: network.Stream, buffer: []const u8) !void {
     }
 }
 
-pub const InitialWindowSize: u32 = 256 * 1024;
+/// 1 MiB: the largest block (FastCDC's maximum chunk) fits in one window,
+/// so a block reply never stalls waiting for a window update.
+pub const InitialWindowSize: u32 = 1024 * 1024;
 
 /// Upper bound on live streams per session, in both directions. Together with
 /// the receive window this caps buffered receive data per session at
-/// MaxStreams * InitialWindowSize (16 MiB).
+/// MaxStreams * InitialWindowSize (64 MiB).
 pub const MaxStreams: u32 = 64;
 
 /// A single logical stream within a Yamux session.
@@ -86,6 +88,9 @@ pub const YamuxStream = struct {
     read_index: usize = 0,
     remote_window: u32, // How much we can send to peer
     local_window: u32, // How much peer can send to us
+    /// Read but not yet returned to the peer as window: updates go out in
+    /// batches of half a window instead of one per read.
+    unacked: u32 = 0,
     mutex: sync.Mutex = .{},
     cond: sync.Condition = .{},
     write_cond: sync.Condition = .{},
@@ -140,6 +145,9 @@ pub const Session = struct {
     accept_queue: std.ArrayListUnmanaged(*YamuxStream),
     mutex: sync.Mutex = .{},
     write_mutex: sync.Mutex = .{},
+    /// A frame's header and payload, assembled for one transport write
+    /// (guarded by write_mutex).
+    write_buffer: std.ArrayListUnmanaged(u8) = .empty,
     accept_cond: sync.Condition = .{},
     accept_waiters: usize = 0,
     is_server: bool,
@@ -174,6 +182,7 @@ pub const Session = struct {
         }
         self.streams.deinit(self.allocator);
         self.accept_queue.deinit(self.allocator);
+        self.write_buffer.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -367,7 +376,7 @@ pub const Session = struct {
             keep_data = !stream.local_closed;
         }
 
-        var chunk: [4096]u8 = undefined;
+        var chunk: [64 * 1024]u8 = undefined;
         var remaining: u32 = header.length;
         while (remaining > 0) {
             const n: u32 = @min(remaining, @as(u32, chunk.len));
@@ -432,8 +441,12 @@ pub const Session = struct {
 
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
-        try writeExactly(self.transport, &h_buf);
-        if (payload.len > 0) try writeExactly(self.transport, payload);
+        // One transport write per frame: the header doesn't travel alone.
+        self.write_buffer.clearRetainingCapacity();
+        try self.write_buffer.ensureTotalCapacity(self.allocator, h_buf.len + payload.len);
+        self.write_buffer.appendSliceAssumeCapacity(&h_buf);
+        self.write_buffer.appendSliceAssumeCapacity(payload);
+        try writeExactly(self.transport, self.write_buffer.items);
     }
 
     fn discardBytes(self: *Session, len: u32) !void {
@@ -451,6 +464,7 @@ pub const Session = struct {
         const session = stream.session;
 
         var to_read: usize = 0;
+        var update: u32 = 0;
         {
             stream.mutex.lock();
             defer stream.mutex.unlock();
@@ -479,17 +493,24 @@ pub const Session = struct {
                 stream.read_index = 0;
             }
 
+            // Give the window back in halves: the peer still has at least
+            // half a window to send into, and the update costs one frame.
             // to_read <= available <= InitialWindowSize, so this cannot overflow.
-            stream.local_window += @intCast(to_read);
-            std.debug.assert(stream.local_window <= InitialWindowSize);
+            stream.unacked += @intCast(to_read);
+            if (stream.unacked >= InitialWindowSize / 2) {
+                update = stream.unacked;
+                stream.local_window += update;
+                stream.unacked = 0;
+                std.debug.assert(stream.local_window <= InitialWindowSize);
+            }
         }
 
-        if (to_read > 0) {
+        if (update > 0) {
             try session.writeFrame(.{
                 .type = .WINDOW_UPDATE,
                 .flags = 0,
                 .stream_id = stream.id,
-                .length = @intCast(to_read),
+                .length = update,
             }, &.{});
         }
 

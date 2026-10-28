@@ -6,6 +6,21 @@ const id = @import("../id.zig");
 const kbucket = @import("kbucket.zig");
 const providers_mod = @import("providers.zig");
 
+/// In-memory target for Message.serialize (Message.send).
+const MessageBuffer = struct {
+    allocator: std.mem.Allocator,
+    list: std.ArrayList(u8) = .empty,
+
+    fn append(self: *MessageBuffer, bytes: []const u8) error{OutOfMemory}!usize {
+        try self.list.appendSlice(self.allocator, bytes);
+        return bytes.len;
+    }
+
+    fn writer(self: *MessageBuffer) network.Stream.GenericWriter(*MessageBuffer, error{OutOfMemory}, append) {
+        return .{ .context = self };
+    }
+};
+
 pub const MessageType = enum(u8) {
     PING = 0,
     PONG = 1,
@@ -90,6 +105,15 @@ pub const MessagePayload = union(MessageType) {
 pub const Message = struct {
     sender_id: id.NodeID,
     payload: MessagePayload,
+
+    /// Serializes the whole message in memory and hands it to `stream` in
+    /// one write: one Yamux frame instead of one per field.
+    pub fn send(self: Message, allocator: std.mem.Allocator, stream: network.Stream) !void {
+        var buf: MessageBuffer = .{ .allocator = allocator };
+        defer buf.list.deinit(allocator);
+        try self.serialize(buf.writer());
+        try stream.writer().writeAll(buf.list.items);
+    }
 
     pub fn serialize(self: Message, writer: anytype) !void {
         // 1. Write Message Type

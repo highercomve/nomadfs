@@ -229,7 +229,14 @@ pub const NoiseStream = struct {
     read_buffer: []u8,
     read_pos: usize = 0,
     read_end: usize = 0,
+    /// One outgoing packet: the length prefix and the ciphertext, sent in a
+    /// single write. Writers are serialized by the Yamux session.
+    write_buffer: []u8,
     allocator: std.mem.Allocator,
+
+    /// Largest plaintext in one transport message: Noise caps a message at
+    /// 65535 bytes, the AEAD tag takes 16.
+    pub const max_payload = 65535 - 16;
 
     pub fn handshake(
         allocator: std.mem.Allocator,
@@ -280,6 +287,8 @@ pub const NoiseStream = struct {
         const ciphers = hs.symmetric.split();
         const read_buf = try allocator.alloc(u8, 65535 + 16);
         errdefer allocator.free(read_buf);
+        const write_buf = try allocator.alloc(u8, 2 + 65535);
+        errdefer allocator.free(write_buf);
 
         return NoiseStream{
             .inner = inner,
@@ -290,6 +299,7 @@ pub const NoiseStream = struct {
             .read_buffer = read_buf,
             .read_pos = 0,
             .read_end = 0,
+            .write_buffer = write_buf,
             .allocator = allocator,
         };
     }
@@ -504,20 +514,15 @@ pub const NoiseStream = struct {
     fn write(ptr: *anyopaque, buffer: []const u8) anyerror!usize {
         const self: *NoiseStream = @ptrCast(@alignCast(ptr));
 
-        const max_payload = 1024;
         var i: usize = 0;
         while (i < buffer.len) {
-            const chunk_len = @min(buffer.len - i, max_payload);
-            const packet_len = chunk_len + 16;
-
-            var temp: [max_payload + 16]u8 = undefined;
-            try self.send_cipher.encryptWithAd(&[_]u8{}, buffer[i .. i + chunk_len], &temp);
-
-            var len_buf: [2]u8 = undefined;
-            std.mem.writeInt(u16, &len_buf, @intCast(packet_len), .big);
-            try writeFull(self.inner, &len_buf);
-            try writeFull(self.inner, temp[0..packet_len]);
-
+            // usize: @min with the constant would narrow it to u16.
+            const chunk_len: usize = @min(buffer.len - i, max_payload);
+            const packet_len: usize = chunk_len + 16;
+            const packet = self.write_buffer[0 .. 2 + packet_len];
+            std.mem.writeInt(u16, packet[0..2], @intCast(packet_len), .big);
+            try self.send_cipher.encryptWithAd(&[_]u8{}, buffer[i .. i + chunk_len], packet[2..]);
+            try writeFull(self.inner, packet);
             i += chunk_len;
         }
 
@@ -527,6 +532,7 @@ pub const NoiseStream = struct {
     pub fn deinit(self: *NoiseStream) void {
         self.close();
         self.allocator.free(self.read_buffer);
+        self.allocator.free(self.write_buffer);
     }
 
     pub fn close(self: *NoiseStream) void {

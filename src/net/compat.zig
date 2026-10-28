@@ -90,6 +90,15 @@ pub const Address = struct {
 pub const Stream = struct {
     inner: std.Io.net.Stream,
 
+    /// Sends small writes at once instead of holding them for the peer's
+    /// ACK (Nagle). Without it a request or a frame header can wait out
+    /// the peer's delayed ACK, tens of milliseconds per round trip.
+    pub fn setNoDelay(self: Stream) void {
+        if (builtin.os.tag == .windows) return;
+        const one: c_int = 1;
+        std.posix.setsockopt(self.inner.socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+    }
+
     pub fn read(self: Stream, buffer: []u8) !usize {
         if (builtin.os.tag == .linux) {
             const rc = std.posix.system.read(@intCast(self.inner.socket.handle), buffer.ptr, buffer.len);

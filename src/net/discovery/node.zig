@@ -128,7 +128,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .DIAL_BACK = .{ .port = self.manager.bound_port } },
         };
-        try msg.serialize(stream.writer());
+        try msg.send(self.allocator, stream);
         // We don't wait for a response on this stream.
         // We wait for an INCOMING connection on our listen port.
     }
@@ -159,7 +159,7 @@ pub const Node = struct {
             .payload = .{ .PING = .{ .port = self.manager.bound_port } },
         };
 
-        try msg.serialize(stream.writer());
+        try msg.send(self.allocator, stream);
 
         // Wait for PONG
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
@@ -325,7 +325,7 @@ pub const Node = struct {
         stream.setTimeout(self.rpc_timeout_ms);
 
         const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .ADD_PROVIDER = .{ .key = key } } };
-        try msg.serialize(stream.writer());
+        try msg.send(self.allocator, stream);
 
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         defer response.deinit(self.allocator);
@@ -344,7 +344,7 @@ pub const Node = struct {
         stream.setTimeout(self.rpc_timeout_ms);
 
         const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .GET_PROVIDERS = .{ .key = key } } };
-        try msg.serialize(stream.writer());
+        try msg.send(self.allocator, stream);
 
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         switch (response.payload) {
@@ -473,7 +473,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .STORE = .{ .key = key, .value = value } },
         };
-        try msg.serialize(stream.writer());
+        try msg.send(self.allocator, stream);
 
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         defer response.deinit(self.allocator);
@@ -495,7 +495,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .GET_BLOCK = .{ .cid = cid } },
         };
-        try msg.serialize(stream.writer());
+        try msg.send(self.allocator, stream);
 
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         switch (response.payload) {
@@ -525,7 +525,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .GET_SHARES = {} },
         };
-        try msg.serialize(stream.writer());
+        try msg.send(self.allocator, stream);
 
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         switch (response.payload) {
@@ -552,7 +552,7 @@ pub const Node = struct {
             .signer_key = identity.publicKey(),
             .signature = signature,
         } } };
-        try msg.serialize(stream.writer());
+        try msg.send(self.allocator, stream);
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         defer response.deinit(self.allocator);
         return switch (response.payload) {
@@ -568,7 +568,7 @@ pub const Node = struct {
         defer stream.close();
         stream.setTimeout(self.rpc_timeout_ms);
         const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .GET_SWARM = {} } };
-        try msg.serialize(stream.writer());
+        try msg.send(self.allocator, stream);
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         switch (response.payload) {
             .SWARM => |p| return @constCast(p.manifest),
@@ -590,7 +590,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .PUT_BLOCK = .{ .cid = cid, .data = data } },
         };
-        try msg.serialize(stream.writer());
+        try msg.send(self.allocator, stream);
 
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         defer response.deinit(self.allocator);
@@ -615,7 +615,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .REVOKE = .{ .device_id = device_id, .signer_key = identity.publicKey(), .at = @intCast(sync.timestamp()), .signature = signature } },
         };
-        try msg.serialize(stream.writer());
+        try msg.send(self.allocator, stream);
 
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         defer response.deinit(self.allocator);
@@ -706,7 +706,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .FIND_VALUE = .{ .key = key } },
         };
-        try msg.serialize(stream.writer());
+        try msg.send(self.allocator, stream);
 
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         defer response.deinit(self.allocator);
@@ -812,7 +812,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .FIND_NODE = .{ .target = target } },
         };
-        try msg.serialize(stream.writer());
+        try msg.send(self.allocator, stream);
 
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         defer response.deinit(self.allocator);
@@ -942,7 +942,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .PONG = {} },
         };
-        try response.serialize(stream.writer());
+        try response.send(self.allocator, stream);
     }
 
     /// Replies with the K closest known peers to `target`.
@@ -961,7 +961,7 @@ pub const Node = struct {
                 .find_value => .{ .FIND_VALUE_RESPONSE = .{ .closer_peers = closer } },
             },
         };
-        try response.serialize(stream.writer());
+        try response.send(self.allocator, stream);
     }
 
     fn handleStore(self: *Node, stream: network.Stream, key: id.NodeID, value: []const u8) !void {
@@ -974,7 +974,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .STORE_ACK = .{ .stored = stored } },
         };
-        try response.serialize(stream.writer());
+        try response.send(self.allocator, stream);
     }
 
     fn handleAddProvider(self: *Node, stream: network.Stream, conn: network.Connection, key: id.NodeID) !void {
@@ -992,7 +992,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .STORE_ACK = .{ .stored = stored } },
         };
-        try response.serialize(stream.writer());
+        try response.send(self.allocator, stream);
     }
 
     fn handleGetProviders(self: *Node, stream: network.Stream, key: id.NodeID) !void {
@@ -1006,7 +1006,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .PROVIDERS = .{ .providers = list } },
         };
-        try response.serialize(stream.writer());
+        try response.send(self.allocator, stream);
     }
 
     fn handleGetBlock(self: *Node, stream: network.Stream, cid: [32]u8) !void {
@@ -1019,7 +1019,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .BLOCK = .{ .data = data } },
         };
-        try response.serialize(stream.writer());
+        try response.send(self.allocator, stream);
     }
 
     fn handleGetShares(self: *Node, stream: network.Stream) !void {
@@ -1033,7 +1033,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .SHARES = .{ .nickname = self.nickname, .listing = listing } },
         };
-        try response.serialize(stream.writer());
+        try response.send(self.allocator, stream);
     }
 
     fn handleRotateKey(self: *Node, stream: network.Stream, conn: network.Connection, epoch: u64, new_key: [32]u8, signer_key: [32]u8, signature: [64]u8) !void {
@@ -1048,7 +1048,7 @@ pub const Node = struct {
             }
         };
         const response = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .STORE_ACK = .{ .stored = accepted } } };
-        try response.serialize(stream.writer());
+        try response.send(self.allocator, stream);
     }
 
     fn handleGetSwarm(self: *Node, stream: network.Stream) !void {
@@ -1058,7 +1058,7 @@ pub const Node = struct {
             try self.allocator.dupe(u8, "[]");
         defer self.allocator.free(manifest);
         const response = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .SWARM = .{ .manifest = manifest } } };
-        try response.serialize(stream.writer());
+        try response.send(self.allocator, stream);
     }
 
     /// PUT_BLOCK: verify the bytes against their CID, then keep the block.
@@ -1078,7 +1078,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .STORE_ACK = .{ .stored = stored } },
         };
-        try response.serialize(stream.writer());
+        try response.send(self.allocator, stream);
     }
 
     /// REVOKE: only honored when the signature verifies, the signer is not
@@ -1104,7 +1104,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .STORE_ACK = .{ .stored = honored } },
         };
-        try response.serialize(stream.writer());
+        try response.send(self.allocator, stream);
     }
 
     fn handleFindValue(self: *Node, stream: network.Stream, key: id.NodeID) !void {
@@ -1123,7 +1123,7 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .FIND_VALUE_RESPONSE = .{ .value = val } },
         };
-        try response.serialize(stream.writer());
+        try response.send(self.allocator, stream);
     }
 
     fn handleDialBack(self: *Node, conn: network.Connection, port: u16) !void {

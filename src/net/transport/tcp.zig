@@ -283,6 +283,7 @@ fn establish(
     device_auth_opt: ?*const device_auth.Authenticator,
 ) !network.Connection {
     std.debug.assert(handshake_timeout_ms > 0);
+    net_stream.setNoDelay();
     const impl = allocator.create(TcpConnectionImpl) catch |err| {
         net_stream.close();
         return err;
