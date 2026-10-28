@@ -117,6 +117,16 @@ zig build
 zig build test
 ```
 
+### Install from source (Linux)
+```bash
+# Build the app's AppImage and the CLI, install them to ~/.local/bin with a
+# launcher entry, and restart the app
+scripts/install-local.sh
+
+NO_RESTART=1 scripts/install-local.sh     # leave the app stopped
+ORIEL_FORK=../oriel scripts/install-local.sh  # build against a local Oriel
+```
+
 ### Desktop App (`nomadfs-gui`)
 The app uses [Oriel](https://oriel.foreachdeveloper.com) v0.19.7, which `zig build` fetches.
 
