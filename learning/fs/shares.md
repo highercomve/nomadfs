@@ -37,6 +37,11 @@ and then every `progress_interval_ns` = **10 s**, the scanner builds a root from
 far (the directories still being scanned, each holding what it has, stored as dir blocks) and the
 share lists that root with `indexing = true`. Other devices see the share fill in.
 
+A folder's whole listing is read before any of it is scanned, its own files are hashed before its
+subfolders, and a report lists the subfolders not reached yet as **empty dirs with mtime 0** (real
+folders carry their modification time). So every top-level folder of a large disk shows up at once,
+and the app shows the unreached ones as "Indexing…".
+
 Every partial root has to be readable, so each report also hands the files scanned since the last
 one to the filestore as a **segment** of their own (`Filestore.append`) and the scanner starts a new
 table. The scanner never writes to a table a reader can see. Later rescans build one whole table and

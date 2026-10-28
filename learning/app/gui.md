@@ -52,7 +52,9 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
 - **Browse**: every reachable device and its shares, walked one dir block at a time
   ([Chapter 5.1](../fs/shares.md)). The viewer previews images, video, audio, PDF and text, reading
   in pieces with `readRange`; **Download** saves to `~/Downloads/NomadFS` (Android:
-  `Download/NomadFS`).
+  `Download/NomadFS`). On touch screens a sideways swipe in the viewer opens the next or previous
+  file. Refresh walks the open path again by name from the device's current share list, since a
+  share's root changes with every edit.
 - **Swarm folder**: the shared folder every device writes ([Chapter 5.2](../fs/swarm.md)), with
   add, new folder, rename, delete, the author of each file, and the last sync.
 - **Shared folders**: pick a folder with the system picker (GTK on Linux, the Storage Access
@@ -76,6 +78,12 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
   `build.zig` passes the versions in an `about` options module: NomadFS's from its own
   `version`, Oriel's read from the Oriel package's `build.zig.zon`, the commit from `git` (with
   a `+` when the checkout has local changes).
+
+**Back** (Android's back button and gesture, a mouse's back button) goes up one level: it closes
+the open file or the More sheet, then goes to the parent folder, then back to Browse; at the top
+the app goes to the background. The WebView follows the page history, so the page keeps one history
+entry per level it can go up (`syncBack`), added right after the tap that went deeper: the WebView
+skips entries a page adds without a user gesture.
 
 ## 3. Configuration the app writes
 
