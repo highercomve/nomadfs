@@ -256,6 +256,9 @@ fn handleIncomingConnection(
     };
 }
 
+/// Bound on a TCP connect; the Noise handshake keeps its own, longer one.
+pub const connect_timeout_ms: u32 = 3000;
+
 pub fn connect(
     allocator: std.mem.Allocator,
     address: network.Address,
@@ -264,8 +267,10 @@ pub fn connect(
     handshake_timeout_ms: u32,
     device_auth_opt: ?*const device_auth.Authenticator,
 ) !network.Connection {
-    // The handshake bound doubles as the connect bound.
-    const stream = try network.compat.tcpConnectToAddressTimeout(address, handshake_timeout_ms);
+    // A device has several addresses (LAN, Tailscale, ...) and the caller
+    // tries them in turn: away from home the LAN one can hang until the
+    // timeout, so the TCP connect gets a short bound of its own.
+    const stream = try network.compat.tcpConnectToAddressTimeout(address, @min(handshake_timeout_ms, connect_timeout_ms));
     return establish(allocator, stream, address, swarm_key, static_key, true, handshake_timeout_ms, device_auth_opt);
 }
 

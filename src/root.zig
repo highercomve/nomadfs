@@ -49,6 +49,13 @@ pub const Node = struct {
     read_ahead: ?*fs.ReadAhead,
     bootstrap_thread: ?std.Thread = null,
     bootstrap_running: *std.atomic.Value(bool),
+    /// Devices met before, with all their addresses; re-dialed to rejoin
+    /// the swarm from any network (Tailscale away from home). Used only by
+    /// the bootstrap thread.
+    known_peers: *net.discovery.known_peers.KnownPeers,
+    /// When to try an unreachable known device again (ms), and how many
+    /// tries failed in a row. Bootstrap thread only.
+    redial: std.AutoHashMapUnmanaged(net.id.NodeID, Redial) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !Node {
         const connection_manager = try allocator.create(ConnectionManager);
@@ -157,6 +164,10 @@ pub const Node = struct {
         const trust_store = try allocator.create(device.trust.Store);
         errdefer allocator.destroy(trust_store);
         trust_store.* = try device.trust.Store.load(allocator, device_paths.trust, device_identity.seed());
+        const known_peers = try allocator.create(net.discovery.known_peers.KnownPeers);
+        errdefer allocator.destroy(known_peers);
+        known_peers.* = try net.discovery.known_peers.KnownPeers.load(allocator, std.Io.Threaded.global_single_threaded.io(), device_paths.peers);
+        errdefer known_peers.deinit();
         errdefer trust_store.deinit();
 
         // Revocations are signed with the device identity and recorded in
@@ -183,6 +194,7 @@ pub const Node = struct {
             .device_paths = device_paths,
             .device_identity = device_identity,
             .trust_store = trust_store,
+            .known_peers = known_peers,
             .shares = shares,
             .swarm = swarm,
             .read_ahead = read_ahead,
@@ -204,6 +216,9 @@ pub const Node = struct {
         if (self.swarm) |folder| folder.destroy();
         if (self.read_ahead) |ra| ra.destroy();
 
+        self.known_peers.deinit();
+        self.allocator.destroy(self.known_peers);
+        self.redial.deinit(self.allocator);
         self.trust_store.deinit();
         self.allocator.destroy(self.trust_store);
         self.device_paths.deinit(self.allocator);
@@ -305,6 +320,7 @@ pub const Node = struct {
             if (!self.bootstrap_running.load(.acquire)) return;
             self.connectBootstrapPeer(peer_url, swarm_key);
         }
+        self.dialKnownPeers(swarm_key);
 
         std.debug.print("Bootstrap connections complete. Starting periodic peer discovery and maintenance...\n", .{});
         const discovery_node = self.discovery_node;
@@ -317,10 +333,24 @@ pub const Node = struct {
             };
             std.debug.print("Initial self-lookup complete. Routing table dump:\n", .{});
             discovery_node.routing_table.dump();
+            self.rememberPeers();
         }
 
-        // 2. Periodic Bucket Refresh (Standard Kademlia Maintenance)
-        while (self.sleepWhileBootstrapping(60 * std.time.ns_per_s)) {
+        // 2. Keep finding devices. A personal swarm is a handful of devices
+        // that come and go (a phone joins after this one started, a laptop
+        // wakes up), and the one-time lookup above only saw who was there
+        // then: look again every 30 s, which costs a few small requests.
+        // Then the standard refresh of buckets nobody touched for an hour.
+        var round: u32 = 0;
+        while (self.sleepWhileBootstrapping(30 * std.time.ns_per_s)) : (round +%= 1) {
+            // Back in touch with devices we lost (we changed networks, they
+            // woke up), then ask around for new ones, then remember them all.
+            self.dialKnownPeers(swarm_key);
+            discovery_node.lookup(self.connection_manager.node_id) catch |err| {
+                std.debug.print("Peer lookup error: {any}\n", .{err});
+            };
+            self.rememberPeers();
+            if (round % 2 != 1) continue;
             discovery_node.refreshBuckets() catch |err| {
                 std.debug.print("Bucket refresh error: {any}\n", .{err});
             };
@@ -330,6 +360,45 @@ pub const Node = struct {
                 std.debug.print("Revocation sweep error: {any}\n", .{err});
             };
         }
+    }
+
+    const Redial = struct { at_ms: i64, failures: u8 };
+
+    /// Connects to every remembered device (all its addresses, LAN first,
+    /// then Tailscale, then public) and pings it, which refreshes both
+    /// sides' routing tables and addresses. A connected device costs one
+    /// ping; one that doesn't answer is tried again later and later (30 s
+    /// up to 5 min).
+    fn dialKnownPeers(self: *Node, swarm_key: []const u8) void {
+        const now = sync.monotonicMillis();
+        const entries = self.allocator.dupe(net.discovery.known_peers.Entry, self.known_peers.entries.items) catch return;
+        defer self.allocator.free(entries);
+        for (entries) |e| {
+            if (!self.bootstrap_running.load(.acquire)) return;
+            if (e.id.eql(self.connection_manager.node_id)) continue;
+            if (self.redial.get(e.id)) |r| if (r.at_ms > now) continue;
+            const conn = self.connection_manager.connectToPeerMulti(e.slice(), swarm_key, e.id) catch {
+                const failures = if (self.redial.get(e.id)) |r| r.failures +| 1 else 1;
+                const wait_ms = @min(@as(i64, 30_000) << @intCast(@min(failures - 1, 4)), 5 * 60_000);
+                self.redial.put(self.allocator, e.id, .{ .at_ms = now + wait_ms, .failures = failures }) catch {};
+                continue;
+            };
+            defer conn.deinit();
+            _ = self.redial.remove(e.id);
+            self.discovery_node.ping(conn) catch {};
+        }
+    }
+
+    /// Adds what the routing table knows to the remembered devices.
+    fn rememberPeers(self: *Node) void {
+        const peers = blk: {
+            self.discovery_node.mutex.lock();
+            defer self.discovery_node.mutex.unlock();
+            break :blk self.discovery_node.routing_table.getAllPeers() catch return;
+        };
+        defer self.discovery_node.routing_table.allocator.free(peers);
+        const changed = self.known_peers.merge(peers) catch return;
+        if (changed) self.known_peers.save() catch |err| std.debug.print("Saving known devices failed: {any}\n", .{err});
     }
 
     /// Sleeps up to `total_ns`, waking early when bootstrapping is cancelled.

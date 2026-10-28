@@ -67,9 +67,23 @@ pub const FindValueResult = union(enum) {
     closer_peers: []kbucket.PeerInfo,
 };
 
+/// Addresses a device announces about itself (local_addrs.zig).
+pub const max_announced = 6;
+
+/// A device's own addresses, sent with PING and PONG so the other side can
+/// reach it on every network it is on, not only the one it saw.
+pub const Announced = struct {
+    addrs: [max_announced]Address = undefined,
+    count: u8 = 0,
+
+    pub fn slice(self: *const Announced) []const Address {
+        return self.addrs[0..self.count];
+    }
+};
+
 pub const MessagePayload = union(MessageType) {
-    PING: struct { port: u16 },
-    PONG: void,
+    PING: struct { port: u16, announced: Announced = .{} },
+    PONG: struct { announced: Announced = .{} },
     FIND_NODE: struct { target: id.NodeID },
     FIND_NODE_RESPONSE: struct { closer_peers: []kbucket.PeerInfo },
     FIND_VALUE: struct { key: id.NodeID },
@@ -126,8 +140,9 @@ pub const Message = struct {
         switch (self.payload) {
             .PING => |p| {
                 try writer.writeInt(u16, p.port, .big);
+                try writeAnnounced(p.announced, writer);
             },
-            .PONG => {},
+            .PONG => |p| try writeAnnounced(p.announced, writer),
             .FIND_NODE => |p| {
                 try writer.writeAll(&p.target.bytes);
             },
@@ -214,9 +229,9 @@ pub const Message = struct {
         const payload = switch (msg_type) {
             .PING => blk: {
                 const port = try reader.readInt(u16, .big);
-                break :blk MessagePayload{ .PING = .{ .port = port } };
+                break :blk MessagePayload{ .PING = .{ .port = port, .announced = try readAnnounced(reader) } };
             },
-            .PONG => MessagePayload{ .PONG = {} },
+            .PONG => MessagePayload{ .PONG = .{ .announced = try readAnnounced(reader) } },
             .FIND_NODE => blk: {
                 var target: id.NodeID = undefined;
                 try reader.readNoEof(&target.bytes);
@@ -400,6 +415,20 @@ pub const Message = struct {
         }
     }
 };
+
+fn writeAnnounced(a: Announced, writer: anytype) !void {
+    try writer.writeByte(a.count);
+    for (a.slice()) |addr| try serializeAddress(addr, writer);
+}
+
+fn readAnnounced(reader: anytype) !Announced {
+    var a: Announced = .{};
+    const count = try reader.readByte();
+    if (count > max_announced) return error.TooManyAddresses;
+    for (0..count) |i| a.addrs[i] = try deserializeAddress(reader);
+    a.count = count;
+    return a;
+}
 
 fn serializeAddress(addr: Address, writer: anytype) !void {
     switch (addr.ip) {

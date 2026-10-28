@@ -4,3 +4,4 @@ pub const rpc = @import("rpc.zig");
 pub const lookup = @import("lookup.zig");
 pub const providers = @import("providers.zig");
 pub const Node = @import("node.zig").Node;
+pub const known_peers = @import("known_peers.zig");

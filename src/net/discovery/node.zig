@@ -4,6 +4,7 @@ const id = @import("../id.zig");
 const kbucket = @import("kbucket.zig");
 const rpc = @import("rpc.zig");
 const network = @import("../transport/mod.zig");
+const local_addrs = @import("../local_addrs.zig");
 const lookup_mod = @import("lookup.zig");
 const StorageEngine = @import("../../storage/engine.zig").StorageEngine;
 const providers_mod = @import("providers.zig");
@@ -149,6 +150,13 @@ pub const Node = struct {
         self.providers.deinit(self.allocator);
     }
 
+    /// This device's addresses on every network it's on, to announce.
+    fn announced(self: *Node) rpc.Announced {
+        var a: rpc.Announced = .{};
+        a.count = @intCast(local_addrs.list(&a.addrs, self.manager.bound_port));
+        return a;
+    }
+
     pub fn ping(self: *Node, conn: network.Connection) !void {
         const stream = try conn.openStream();
         defer stream.close();
@@ -156,7 +164,7 @@ pub const Node = struct {
 
         const msg = rpc.Message{
             .sender_id = self.manager.node_id,
-            .payload = .{ .PING = .{ .port = self.manager.bound_port } },
+            .payload = .{ .PING = .{ .port = self.manager.bound_port, .announced = self.announced() } },
         };
 
         try msg.send(self.allocator, stream);
@@ -177,6 +185,7 @@ pub const Node = struct {
             .last_seen = sync.timestamp(),
         };
         _ = info.addAddress(conn.getPeerAddress());
+        for (response.payload.PONG.announced.slice()) |addr| _ = info.addAddress(addr);
         _ = try self.routing_table.addPeer(info);
 
         // Outbound connections are the natural propagation point: every
@@ -896,7 +905,7 @@ pub const Node = struct {
         // NOTE: We do NOT add the peer here anymore. We wait for PING to get the correct port.
 
         switch (msg.payload) {
-            .PING => |p| try self.handlePing(stream, conn, msg.sender_id, p.port),
+            .PING => |p| try self.handlePing(stream, conn, msg.sender_id, p.port, p.announced.slice()),
             .FIND_NODE => |p| try self.respondCloserPeers(stream, p.target, .find_node),
             .FIND_VALUE => |p| try self.handleFindValue(stream, p.key),
             .STORE => |p| try self.handleStore(stream, p.key, p.value),
@@ -915,7 +924,7 @@ pub const Node = struct {
         }
     }
 
-    fn handlePing(self: *Node, stream: network.Stream, conn: network.Connection, claimed_id: id.NodeID, port: u16) !void {
+    fn handlePing(self: *Node, stream: network.Stream, conn: network.Connection, claimed_id: id.NodeID, port: u16, announced_addrs: []const network.Address) !void {
         // The handshake authenticated the connection; a PING may not claim
         // another node's identity (or ours) to plant it in the routing table.
         const sender_id = conn.getRemoteNodeID();
@@ -935,12 +944,14 @@ pub const Node = struct {
             .last_seen = sync.timestamp(),
         };
         _ = info.addAddress(address);
+        // And every other way it says it can be reached (Tailscale, ...).
+        for (announced_addrs) |addr| _ = info.addAddress(addr);
         self.addVerifiedPeer(info);
-        std.debug.print("Added peer {f} to routing table.\n", .{address});
+        std.debug.print("Added peer {f} ({d} addresses) to routing table.\n", .{ address, info.addrs_count });
 
         const response = rpc.Message{
             .sender_id = self.manager.node_id,
-            .payload = .{ .PONG = {} },
+            .payload = .{ .PONG = .{ .announced = self.announced() } },
         };
         try response.send(self.allocator, stream);
     }

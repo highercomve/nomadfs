@@ -330,9 +330,11 @@ pub fn isPrivate(addr: Address) bool {
     return addr.isPrivate();
 }
 
-/// Returns a priority score: 0 (Best/Loopback) -> 1 (Private LAN) -> 2 (Public WAN)
+/// Dial order, lowest first: loopback, the LAN, Tailscale and other CGNAT
+/// VPN ranges (they work away from home), then public addresses.
 pub fn addressPriority(addr: Address) u8 {
     if (isLoopback(addr)) return 0;
     if (isPrivate(addr)) return 1;
-    return 2;
+    if (@import("../local_addrs.zig").isCgnat(addr)) return 2;
+    return 3;
 }

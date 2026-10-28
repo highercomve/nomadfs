@@ -11,10 +11,13 @@ const env_mod = @import("../env.zig");
 
 pub const identity_filename = "device.key";
 pub const trust_filename = "trust.store";
+pub const peers_filename = "known_peers";
 
 pub const Paths = struct {
     identity: []u8,
     trust: []u8,
+    /// Devices met and their addresses (net/discovery/known_peers.zig).
+    peers: []u8,
 
     pub fn resolve(allocator: std.mem.Allocator, key_path: ?[]const u8) !Paths {
         if (key_path) |path| {
@@ -40,6 +43,7 @@ pub const Paths = struct {
     pub fn deinit(self: *Paths, allocator: std.mem.Allocator) void {
         allocator.free(self.identity);
         allocator.free(self.trust);
+        allocator.free(self.peers);
         self.* = undefined;
     }
 };
@@ -55,7 +59,12 @@ fn joinPaths(allocator: std.mem.Allocator, dir: []const u8) !Paths {
         try std.fs.path.join(allocator, &.{ dir, trust_filename })
     else
         try allocator.dupe(u8, trust_filename);
-    return .{ .identity = identity, .trust = trust };
+    errdefer allocator.free(trust);
+    const peers = if (use_dir)
+        try std.fs.path.join(allocator, &.{ dir, peers_filename })
+    else
+        try allocator.dupe(u8, peers_filename);
+    return .{ .identity = identity, .trust = trust, .peers = peers };
 }
 
 fn fileExists(io: std.Io, path: []const u8) bool {

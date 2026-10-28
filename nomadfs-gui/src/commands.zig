@@ -89,13 +89,12 @@ pub fn nodeOpen(gpa: std.mem.Allocator, args: NodeOpenArgs) !void {
     }
     g_node = node;
 
-    // Reach the devices this one joined (config bootstrap_peers).
-    const peers = node.config.network.bootstrap_peers;
-    if (peers.len > 0) {
-        const csv = try std.mem.joinZ(gpa, ",", peers);
-        defer gpa.free(csv);
-        _ = mobile.nomadfs_node_bootstrap(node, csv.ptr);
-    }
+    // Reach the devices this one joined (config bootstrap_peers), and keep
+    // finding devices: the same thread re-dials remembered ones and looks
+    // for new ones, so it runs even with no bootstrap peers.
+    const csv = try std.mem.joinZ(gpa, ",", node.config.network.bootstrap_peers);
+    defer gpa.free(csv);
+    _ = mobile.nomadfs_node_bootstrap(node, csv.ptr);
 }
 
 /// `invoke("node_close")`.
@@ -1116,11 +1115,9 @@ pub const JoinInfo = struct { nickname: []const u8, addresses: []const u8 };
 pub fn joinInfo(gpa: std.mem.Allocator, args: ListArgs) !JoinInfo {
     var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
     defer config.deinit(gpa);
-    var ip_buf: [16]u8 = undefined;
-    const ip = primaryIp(&ip_buf) orelse "127.0.0.1";
     return .{
         .nickname = try gpa.dupe(u8, config.node.nickname),
-        .addresses = try std.fmt.allocPrint(gpa, "{s}:{d}", .{ ip, config.network.port }),
+        .addresses = try myAddresses(gpa, config.network.port),
     };
 }
 
@@ -1153,7 +1150,7 @@ pub fn inviteCreate(gpa: std.mem.Allocator, args: ListArgs) !InviteInfo {
     defer config.deinit(gpa);
     var ip_buf: [16]u8 = undefined;
     const ip = primaryIp(&ip_buf) orelse return error.NoNetwork;
-    const my_addr = try std.fmt.allocPrint(gpa, "{s}:{d}", .{ ip, config.network.port });
+    const my_addr = try myAddresses(gpa, config.network.port);
     defer gpa.free(my_addr);
     const ticket = try pairTicket(gpa, .{ .config_path = args.config_path, .address = my_addr });
 
@@ -1285,9 +1282,7 @@ pub fn inviteAccept(gpa: std.mem.Allocator, args: InviteAcceptArgs) ![]const u8 
     const port = config.network.port;
     config.deinit(gpa);
 
-    var ip_buf: [16]u8 = undefined;
-    const ip = primaryIp(&ip_buf) orelse "127.0.0.1";
-    const my_addr = try std.fmt.allocPrint(gpa, "{s}:{d}", .{ ip, port });
+    const my_addr = try myAddresses(gpa, port);
     defer gpa.free(my_addr);
     const mine = try pairTicket(gpa, .{ .config_path = args.config_path, .address = my_addr });
 
@@ -1402,6 +1397,27 @@ pub fn setNickname(gpa: std.mem.Allocator, args: NicknameArgs) !void {
 
 fn primaryIp(buf: *[16]u8) ?[]const u8 {
     return nomadfs.device.invite.lanAddress(buf);
+}
+
+/// Every address this device is reachable at, with `port`, comma
+/// separated: the LAN one first, then the others (Tailscale and other
+/// VPNs), so a device that joins can also reach this one away from home.
+fn myAddresses(gpa: std.mem.Allocator, port: u16) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var ip_buf: [16]u8 = undefined;
+    if (primaryIp(&ip_buf)) |ip| try out.print(gpa, "{s}:{d}", .{ ip, port });
+    var addrs: [8]nomadfs.net.compat.Address = undefined;
+    const n = nomadfs.net.local_addrs.list(&addrs, port);
+    for (addrs[0..n]) |a| {
+        var text_buf: [64]u8 = undefined;
+        const text = std.fmt.bufPrint(&text_buf, "{f}", .{a}) catch continue;
+        if (std.mem.indexOf(u8, out.items, text) != null) continue;
+        if (out.items.len > 0) try out.append(gpa, ',');
+        try out.appendSlice(gpa, text);
+    }
+    if (out.items.len == 0) try out.print(gpa, "127.0.0.1:{d}", .{port});
+    return out.toOwnedSlice(gpa);
 }
 
 const ConfigEdit = struct {
