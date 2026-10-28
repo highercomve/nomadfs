@@ -118,7 +118,7 @@ zig build test
 ```
 
 ### Desktop App (`nomadfs-gui`)
-The app uses [Oriel](https://oriel.foreachdeveloper.com) v0.19.6, which `zig build` fetches.
+The app uses [Oriel](https://oriel.foreachdeveloper.com) v0.19.7, which `zig build` fetches.
 
 ```bash
 cd nomadfs-gui
