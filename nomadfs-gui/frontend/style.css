@@ -1281,3 +1281,73 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 .supporting.small { font-size: 13px; margin: 0; }
 .supporting.small:empty { display: none; }
 #background-section[hidden], #backup-section[hidden] { display: none; }
+
+/* ---- Browse: search and sort ---- */
+.browse-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0 10px;
+}
+.browse-tools[hidden] { display: none; }
+.search-field {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 8px;
+  background: var(--plate-2);
+  cursor: text;
+}
+.search-field:focus-within { border-color: rgb(246 176 66 / .55); }
+.search-field svg { flex: none; width: 18px; height: 18px; fill: var(--sand); opacity: .55; }
+.search-field input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--sand);
+  font-family: var(--font);
+  font-size: 14px;
+}
+.search-field input::placeholder { color: var(--sand); opacity: .45; }
+#browse-sort {
+  flex: none;
+  height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 8px;
+  background: var(--plate-2);
+  color: var(--sand);
+  font-family: var(--font);
+  font-size: 13px;
+  cursor: pointer;
+}
+#browse-dir svg { transition: transform .15s; }
+#browse-dir.desc svg { transform: rotate(180deg); }
+/* Column headers that sort: they look like the other headings. */
+.table-head .th-sort {
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  text-align: inherit;
+  cursor: pointer;
+}
+.table-head .th-sort:hover { color: var(--amber); }
+.table-head .th-sort.sorted { color: var(--amber); }
+.table-head .th-sort.sorted::after { content: " ▲"; font-size: 8px; vertical-align: 1px; }
+.table-head .th-sort.sorted.desc::after { content: " ▼"; }
+/* Wide windows sort from the column headers; keep only the search there. */
+@media (min-width: 840px) {
+  #browse-sort, #browse-dir { display: none; }
+  .search-field { flex: 0 1 360px; }
+}

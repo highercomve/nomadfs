@@ -266,6 +266,7 @@ let path = [];
 
 function renderCrumbs() {
   $("remote-head").hidden = path.length === 0;
+  $("browse-tools").hidden = path.length === 0;
   renderNavDevices();
   const nav = $("crumbs");
   nav.replaceChildren();
@@ -343,51 +344,94 @@ async function showDevices() {
   }
 }
 
-async function showLocation() {
-  if (path.length === 0) return showDevices();
-  renderCrumbs();
+// ---- Browse: search and sort ----
+
+// What the open location lists: { device, entries, shares } (shares: a
+// device's top level, whose entries are its shared folders).
+let browse = null;
+// Sort order, remembered across locations and runs; the filter isn't.
+let browseSort = { key: "name", dir: 1 };
+try { Object.assign(browseSort, JSON.parse(localStorage.getItem("browseSort") || "{}")); } catch {}
+
+function setBrowseSort(key, dir) {
+  browseSort = { key, dir };
+  try { localStorage.setItem("browseSort", JSON.stringify(browseSort)); } catch {}
+  renderBrowse();
+}
+
+$("browse-search").addEventListener("input", () => renderBrowse());
+$("browse-search").addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && e.target.value) { e.target.value = ""; renderBrowse(); e.stopPropagation(); }
+});
+// "/" or Ctrl+F searches the open folder (not while typing elsewhere).
+document.addEventListener("keydown", (e) => {
+  if (document.body.dataset.view !== "browse" || $("browse-tools").hidden) return;
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "");
+  if ((e.key === "/" && !typing) || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f")) {
+    e.preventDefault();
+    $("browse-search").focus();
+    $("browse-search").select();
+  }
+});
+$("browse-sort").addEventListener("change", (e) => setBrowseSort(e.target.value, browseSort.dir));
+$("browse-dir").addEventListener("click", () => setBrowseSort(browseSort.key, -browseSort.dir));
+// Wide windows: the column headers sort too; a second click reverses.
+for (const th of document.querySelectorAll("#remote-head .th-sort")) {
+  th.addEventListener("click", () => {
+    const key = th.dataset.sort;
+    // Sizes and dates read best biggest/newest first.
+    const first = key === "name" ? 1 : -1;
+    setBrowseSort(key, browseSort.key === key ? -browseSort.dir : first);
+  });
+}
+
+function compareEntries(a, b) {
+  // Folders stay above files whatever the order.
+  if (a.dir !== b.dir) return b.dir - a.dir;
+  const { key, dir } = browseSort;
+  let c = 0;
+  if (key === "size") c = a.size - b.size;
+  else if (key === "mtime") c = a.mtime - b.mtime;
+  if (c === 0) c = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+  return c * dir;
+}
+
+function renderSortControls() {
+  $("browse-sort").value = browseSort.key;
+  const btn = $("browse-dir");
+  btn.title = browseSort.dir > 0 ? "Ascending" : "Descending";
+  btn.classList.toggle("desc", browseSort.dir < 0);
+  for (const th of document.querySelectorAll("#remote-head .th-sort")) {
+    th.classList.toggle("sorted", th.dataset.sort === browseSort.key);
+    th.classList.toggle("desc", browseSort.dir < 0);
+  }
+}
+
+function renderBrowse() {
+  if (!browse) return;
+  renderSortControls();
+  const { device, entries, shares } = browse;
+  const query = $("browse-search").value.trim().toLocaleLowerCase();
+  const shown = entries
+    .filter((e) => !query || e.name.toLocaleLowerCase().includes(query))
+    .sort(compareEntries);
   const list = $("remote-list");
-  const device = path[0].device;
-
-  if (path.length === 1) {
-    list.replaceChildren();
-    setEmpty(device.shares.length ? "" : "This device shares nothing yet.");
-    for (const s of device.shares) {
-      list.appendChild(row({
-        icon: "folder",
-        iconClass: "folder",
-        headline: s.name,
-        meta: `${formatSize(s.size)} · updated ${formatDate(s.mtime)}`,
-        cols: { size: formatSize(s.size), date: formatDate(s.mtime) },
-        onClick: () => { path.push({ name: s.name, cid: s.cid }); showLocation(); },
-      }));
-    }
-    return;
-  }
-
-  const here = path[path.length - 1];
-  busy(true);
-  let entries;
-  try {
-    entries = await invoke("browse", { peer: device.peer, cid: here.cid });
-  } catch (err) {
-    busy(false);
-    snack(`Could not open ${here.name}: ${err}`);
-    return;
-  }
-  busy(false);
-  // Folders first, then files, each by name.
-  entries.sort((a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
-  const files = entries.filter((x) => !x.dir);
   list.replaceChildren();
-  setEmpty(entries.length ? "" : "Empty folder.");
-  for (const e of entries) {
+  if (!shown.length) {
+    setEmpty(query ? `Nothing here matches "${$("browse-search").value.trim()}".`
+      : shares ? "This device shares nothing yet." : "Empty folder.");
+    return;
+  }
+  setEmpty("");
+  // Previews step through the files in the order shown.
+  const files = shown.filter((x) => !x.dir);
+  for (const e of shown) {
     if (e.dir) {
       list.appendChild(row({
         icon: "folder",
         iconClass: "folder",
         headline: e.name,
-        meta: formatSize(e.size),
+        meta: shares ? `${formatSize(e.size)} · updated ${formatDate(e.mtime)}` : formatSize(e.size),
         cols: { size: formatSize(e.size), date: formatDate(e.mtime) },
         onClick: () => { path.push({ name: e.name, cid: e.cid }); showLocation(); },
       }));
@@ -403,6 +447,34 @@ async function showLocation() {
       }));
     }
   }
+}
+
+async function showLocation() {
+  if (path.length === 0) return showDevices();
+  renderCrumbs();
+  // A new place starts unfiltered.
+  $("browse-search").value = "";
+  const device = path[0].device;
+
+  if (path.length === 1) {
+    browse = { device, shares: true, entries: device.shares.map((sh) => ({ ...sh, dir: true })) };
+    renderBrowse();
+    return;
+  }
+
+  const here = path[path.length - 1];
+  busy(true);
+  let entries;
+  try {
+    entries = await invoke("browse", { peer: device.peer, cid: here.cid });
+  } catch (err) {
+    busy(false);
+    snack(`Could not open ${here.name}: ${err}`);
+    return;
+  }
+  busy(false);
+  browse = { device, shares: false, entries };
+  renderBrowse();
 }
 
 const downloading = new Set();
