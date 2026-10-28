@@ -1167,19 +1167,24 @@ pub const Mount = struct {
             } else {
                 // Truncate without an open file: stage, cut, add at once.
                 const f = self.newHandle(header.nodeid, if (in.size == 0) null else node) catch |err| return self.replyError(header, errnoFor(err));
+                var cut_failed = false;
                 var h_removed = blk: {
                     self.lock.lock();
                     defer self.lock.unlock();
                     const h = self.handles.getPtr(f) orelse return self.replyError(header, .BADF);
                     if (linux.errno(linux.ftruncate(h.fd, @intCast(in.size))) != .SUCCESS) {
-                        if (self.handles.fetchRemove(f)) |removed| {
-                            self.dropHandle(f, removed.value);
-                        }
-                        return self.replyError(header, .IO);
+                        cut_failed = true;
+                    } else {
+                        h.dirty = true;
                     }
-                    h.dirty = true;
                     break :blk self.handles.fetchRemove(f).?.value;
                 };
+                // dropHandle takes the lock itself, so it runs after the
+                // block above has released it.
+                if (cut_failed) {
+                    self.dropHandle(f, h_removed);
+                    return self.replyError(header, .IO);
+                }
                 self.commit(&h_removed) catch |err| {
                     std.debug.print("fuse: truncate inode {d} failed: {any}\n", .{ h_removed.ino, err });
                 };
@@ -1195,16 +1200,23 @@ pub const Mount = struct {
 
     fn opRelease(self: *Mount, header: *const InHeader, body: []const u8) !void {
         const in = readStruct(ReleaseIn, body) orelse return self.replyEmpty(header);
-        const removed = blk: {
+        // The kernel sends RELEASE after close() has returned, so other
+        // workers may already serve a fresh open, read or unlink of this
+        // file. The handle stays registered (reads use its staging copy)
+        // until the commit has stored the blocks and updated the inode;
+        // only then is it removed. No other request uses this fh any more.
+        var h = blk: {
             self.lock.lock();
             defer self.lock.unlock();
-            break :blk self.handles.fetchRemove(in.fh);
+            break :blk self.handles.get(in.fh) orelse return self.replyEmpty(header);
         };
-        if (removed) |kv| {
-            var h = kv.value;
-            self.commit(&h) catch |err| std.debug.print("fuse: saving inode {d} failed: {any}\n", .{ h.ino, err });
-            self.dropHandle(in.fh, h);
+        self.commit(&h) catch |err| std.debug.print("fuse: saving inode {d} failed: {any}\n", .{ h.ino, err });
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            _ = self.handles.remove(in.fh);
         }
+        self.dropHandle(in.fh, h);
         try self.replyEmpty(header);
     }
 
