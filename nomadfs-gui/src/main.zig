@@ -41,7 +41,7 @@ pub const Commands = struct {
     /// worker thread: they share one lock, and a command waiting on it on
     /// the UI thread would freeze the window (node_open behind a share scan
     /// did, for 20 s on a phone). Only quick config-file reads stay inline.
-    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_read_range", "swarm_download", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set", "media_url", "about_info", "update_info" } ++ updates.Updater.async_commands;
+    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_read_range", "swarm_download", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set", "media_url", "about_info", "update_info", "note_store" } ++ updates.Updater.async_commands;
 
     /// `invoke("invite_create", { config_path })`: one-time invite code.
     pub fn invite_create(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.InviteInfo {
@@ -239,6 +239,12 @@ pub const Commands = struct {
     /// `invoke("put_text", { text })` returns the CID.
     pub fn put_text(gpa: std.mem.Allocator, args: commands.PutTextArgs) ![]const u8 {
         return @import("commands.zig").putText(gpa, args);
+    }
+
+    /// `invoke("note_store", { text })`: a note in the swarm folder's
+    /// Notes, for every device.
+    pub fn note_store(gpa: std.mem.Allocator, args: commands.PutTextArgs) !commands.NoteStored {
+        return commands.noteStore(gpa, args);
     }
 
     /// `invoke("get_text", { cid })` returns the file contents.

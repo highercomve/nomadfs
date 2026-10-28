@@ -312,6 +312,89 @@ pub fn putText(gpa: std.mem.Allocator, args: PutTextArgs) ![]const u8 {
     return gpa.dupe(u8, cid[0..64]);
 }
 
+/// Where text drop notes go in the swarm folder: every device lists and
+/// syncs them, and swarm backup devices keep a copy.
+pub const notes_dir = "Notes";
+
+pub const NoteStored = struct { path: []const u8, name: []const u8, cid: []const u8 };
+
+/// `invoke("note_store", { text })`: saves the text as
+/// `Notes/<UTC date and time> <first line>.txt` in the swarm folder and
+/// returns where, and its CID (the note's code).
+pub fn noteStore(gpa: std.mem.Allocator, args: PutTextArgs) !NoteStored {
+    if (args.text.len == 0 or args.text.len > max_text_len) return error.InvalidArgument;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+    const name = try noteName(gpa, args.text, @intCast(@max(0, @divFloor(now, std.time.ns_per_s))));
+    errdefer gpa.free(name);
+
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const folder = try swarmFolder();
+
+    var buf: [64]u8 = undefined;
+    const tmp_path = try nextTickPath(&buf, ".txt");
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writePositionalAll(io, args.text, 0);
+    }
+    try folder.addFile(notes_dir, name, tmp_path);
+
+    const path = try std.fmt.allocPrint(gpa, notes_dir ++ "/{s}", .{name});
+    errdefer gpa.free(path);
+    const info = folder.fileInfo(path) orelse return error.PutFailed;
+    return .{ .path = path, .name = name, .cid = try hexAlloc(gpa, &info.cid) };
+}
+
+/// `2026-10-28 17-49-03 Shopping list.txt`: sorts by time, and the first
+/// line says what it is. Characters a file name can't hold become spaces.
+fn noteName(gpa: std.mem.Allocator, text: []const u8, unix_s: u64) ![]u8 {
+    const max_title = 48;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const first = while (lines.next()) |l| {
+        const t = std.mem.trim(u8, l, " \t\r");
+        if (t.len > 0) break t;
+    } else "";
+    var title: std.ArrayList(u8) = .empty;
+    defer title.deinit(gpa);
+    var view = std.unicode.Utf8View.init(first) catch std.unicode.Utf8View.initUnchecked("note");
+    var it = view.iterator();
+    while (it.nextCodepointSlice()) |cp| {
+        if (title.items.len + cp.len > max_title) break;
+        const bad = cp.len == 1 and (cp[0] < 0x20 or cp[0] == 0x7f or cp[0] == '/' or cp[0] == '\\');
+        try title.appendSlice(gpa, if (bad) " " else cp);
+    }
+    const trimmed = std.mem.trim(u8, title.items, " .");
+    const es = std.time.epoch.EpochSeconds{ .secs = unix_s };
+    const day = es.getEpochDay().calculateYearDay();
+    const md = day.calculateMonthDay();
+    const secs = es.getDaySeconds();
+    return std.fmt.allocPrint(gpa, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}-{d:0>2}-{d:0>2} {s}.txt", .{
+        day.year,                   md.month.numeric(),           md.day_index + 1,
+        secs.getHoursIntoDay(),     secs.getMinutesIntoHour(),    secs.getSecondsIntoMinute(),
+        if (trimmed.len > 0) trimmed else "note",
+    });
+}
+
+test "commands: note names sort by time and start with the first line" {
+    const gpa = std.testing.allocator;
+    const a = try noteName(gpa, "\n  Shopping list \nmilk\n", 1793210943);
+    defer gpa.free(a);
+    try std.testing.expectEqualStrings("2026-10-28 18-09-03 Shopping list.txt", a);
+    const b = try noteName(gpa, "a/b\\c\x01d", 0);
+    defer gpa.free(b);
+    try std.testing.expectEqualStrings("1970-01-01 00-00-00 a b c d.txt", b);
+    const c = try noteName(gpa, "   \n\t", 0);
+    defer gpa.free(c);
+    try std.testing.expectEqualStrings("1970-01-01 00-00-00 note.txt", c);
+    const d = try noteName(gpa, "ñ" ** 40, 0);
+    defer gpa.free(d);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(d));
+    try std.testing.expect(nomadfs.storage.dag.codec.isValidName(d));
+}
+
 /// `invoke("get_text", { cid })`: reassembles the file and returns text.
 pub fn getText(gpa: std.mem.Allocator, args: GetTextArgs) ![]const u8 {
     if (args.cid.len != 64) return error.InvalidArgument;

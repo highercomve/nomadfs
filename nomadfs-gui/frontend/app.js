@@ -212,6 +212,7 @@ function setView(view) {
   try { localStorage.setItem("view", view); } catch {}
   if (view === "settings") { $("devices-refresh").click(); loadBackup(); }
   if (view === "swarm") loadSwarm();
+  if (view === "text") loadSwarmNotes();
   if (view === "about") loadAbout();
   renderNavDevices();
   syncBack();
@@ -274,7 +275,10 @@ let running = false;
 async function nodeState() {
   try {
     const state = await invoke("node_state", null);
+    const started = state.running && !running;
     running = state.running;
+    // The swarm's notes, and moving this device's old ones there.
+    if (started) loadSwarmNotes();
     $("node-state").textContent = state.running
       ? `Running · device ${state.device_id.slice(0, 12)}…`
       : "Not running";
@@ -1452,10 +1456,12 @@ $("nick-form").addEventListener("submit", async (e) => {
   }
 });
 
-// ---- Text drop ----
+// ---- Text drop: notes in the swarm folder's Notes, on every device ----
 
-const NOTES_KEY = "notes";
-const MAX_NOTES = 30;
+const NOTES_DIR = "Notes";
+// Before 0.3.6 each device kept its own list of notes it had stored or
+// opened here; the ones it stored move into the swarm (migrateOldNotes).
+const OLD_NOTES_KEY = "notes";
 
 function shortCid(cid) {
   return cid.length > 16 ? `${cid.slice(0, 8)}…${cid.slice(-6)}` : cid;
@@ -1471,34 +1477,108 @@ function timeAgo(ms) {
   return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-/** Recent notes live on this device only: code, a preview and when. */
-function loadNotes() {
-  try { return JSON.parse(localStorage.getItem(NOTES_KEY) || "[]"); } catch { return []; }
+let swarmNotes = []; // swarm_list items of Notes, newest first
+
+/** "2026-10-28 17-49-03 Shopping list.txt" -> "Shopping list". */
+function noteTitle(name) {
+  return name.replace(/^\d{4}-\d\d-\d\d \d\d-\d\d-\d\d /, "").replace(/\.txt$/i, "") || name;
 }
 
-function rememberNote(cid, text, kind) {
-  const notes = loadNotes().filter((n) => n.cid !== cid);
-  notes.unshift({ cid, preview: text.slice(0, 140), size: new TextEncoder().encode(text).length, at: Date.now(), kind });
-  try { localStorage.setItem(NOTES_KEY, JSON.stringify(notes.slice(0, MAX_NOTES))); } catch {}
+async function loadSwarmNotes() {
+  if (!running) {
+    swarmNotes = [];
+    renderNotes();
+    return;
+  }
+  try {
+    const res = await invoke("swarm_list", { dir: NOTES_DIR });
+    swarmNotes = res.items.filter((it) => !it.dir).sort((a, b) => b.mtime - a.mtime);
+  } catch {
+    swarmNotes = [];
+  }
   renderNotes();
+  migrateOldNotes();
 }
 
 function renderNotes() {
-  const notes = loadNotes();
   const list = $("notes-list");
   list.replaceChildren();
-  $("notes-empty").hidden = notes.length > 0;
-  $("notes-clear").hidden = notes.length === 0;
-  for (const n of notes) {
-    const firstLine = n.preview.split("\n").find((l) => l.trim()) || "(empty note)";
+  $("notes-empty").hidden = swarmNotes.length > 0;
+  for (const n of swarmNotes) {
     list.appendChild(row({
       icon: "file",
-      headline: firstLine,
-      meta: `${n.kind === "stored" ? "Stored" : "Opened"} ${timeAgo(n.at)} · ${formatSize(n.size)} · ${shortCid(n.cid)}`,
-      onClick: () => { $("cid-in").value = n.cid; openNote(n.cid); },
+      headline: noteTitle(n.name),
+      meta: `${n.author || "A device"} · ${timeAgo(n.mtime * 1000)} · ${formatSize(n.size)}`,
+      onClick: () => showNote(n),
       action: { icon: "copy", label: "Copy code", run: () => copyText(n.cid, "Code copied") },
     }));
   }
+}
+
+/** A note's text, from its author or any device that has it. */
+async function readSwarmNote(n) {
+  const parts = [];
+  for (let offset = 0; offset < n.size;) {
+    const len = Math.min(RANGE, n.size - offset);
+    const bytes = decodeBase64(await invoke("swarm_read_range", { cid: n.cid, author_id: n.author_id, offset, len }));
+    if (bytes.length === 0) break;
+    parts.push(bytes);
+    offset += bytes.length;
+  }
+  return new TextDecoder().decode(concat(parts));
+}
+
+/** Shows a note in the viewer: `load` resolves to its text. */
+async function viewNote(label, cid, load) {
+  const view = $("note-view");
+  view.hidden = false;
+  view.classList.remove("error");
+  $("note-meta").textContent = `Opening ${label}…`;
+  $("text-out").textContent = "";
+  $("note-copy").hidden = true;
+  try {
+    const text = await load();
+    $("text-out").textContent = text;
+    $("note-meta").textContent = `${label} · ${formatSize(new TextEncoder().encode(text).length)} · ${shortCid(cid)}`;
+    $("note-copy").hidden = false;
+    $("note-copy").onclick = () => copyText(text, "Text copied");
+    view.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  } catch (err) {
+    view.classList.add("error");
+    $("note-meta").textContent = label;
+    $("text-out").textContent = `Couldn't open this note: ${err}. The devices that have it may be offline.`;
+  }
+}
+
+function showNote(n) {
+  $("cid-in").value = n.cid;
+  return viewNote(noteTitle(n.name), n.cid, () => readSwarmNote(n));
+}
+
+/** Notes this device stored before they went into the swarm: copied into
+ *  Notes once, then dropped from the old list. */
+let migrating = false;
+async function migrateOldNotes() {
+  if (migrating || !running) return;
+  let old;
+  try { old = JSON.parse(localStorage.getItem(OLD_NOTES_KEY) || "[]"); } catch { old = []; }
+  if (!old.length) return;
+  migrating = true;
+  const keep = [];
+  for (const n of old) {
+    if (n.kind !== "stored" || swarmNotes.some((x) => x.cid === n.cid)) continue;
+    try {
+      await invoke("note_store", { text: await invoke("get_text", { cid: n.cid }) });
+    } catch {
+      keep.push(n); // try again next time
+    }
+  }
+  try {
+    if (keep.length) localStorage.setItem(OLD_NOTES_KEY, JSON.stringify(keep));
+    else localStorage.removeItem(OLD_NOTES_KEY);
+  } catch {}
+  migrating = false;
+  if (keep.length < old.length) loadSwarmNotes();
 }
 
 async function copyText(text, done) {
@@ -1537,42 +1617,29 @@ $("put-form").addEventListener("submit", async (e) => {
   }
   $("put-submit").disabled = true;
   try {
-    const cid = await invoke("put_text", { text });
-    $("cid-output").textContent = shortCid(cid);
-    $("cid-output").title = cid;
-    $("cid-copy").onclick = () => copyText(cid, "Code copied: open it on another device");
+    const note = await invoke("note_store", { text });
+    $("cid-output").textContent = `${NOTES_DIR}/${note.name}`;
+    $("cid-output").title = note.cid;
+    $("cid-copy").onclick = () => copyText(note.cid, "Code copied");
     $("cid-box").hidden = false;
-    rememberNote(cid, text, "stored");
     $("text-in").value = "";
+    loadSwarmNotes();
   } catch (err) {
     snack(`Store failed: ${err}`);
   }
   updateComposer();
 });
 
+/** By code: a note in the swarm's Notes, else any file with that CID. */
 async function openNote(cid) {
   if (!/^[0-9a-fA-F]{64}$/.test(cid)) {
     snack("A note code is 64 hex characters");
     return;
   }
-  const view = $("note-view");
-  view.hidden = false;
-  view.classList.remove("error");
-  $("note-meta").textContent = `Opening ${shortCid(cid)}…`;
-  $("text-out").textContent = "";
-  $("note-copy").hidden = true;
-  try {
-    const text = await invoke("get_text", { cid: cid.toLowerCase() });
-    $("text-out").textContent = text;
-    $("note-meta").textContent = `${formatSize(new TextEncoder().encode(text).length)} · ${shortCid(cid)}`;
-    $("note-copy").hidden = false;
-    $("note-copy").onclick = () => copyText(text, "Text copied");
-    rememberNote(cid.toLowerCase(), text, "opened");
-  } catch (err) {
-    view.classList.add("error");
-    $("note-meta").textContent = shortCid(cid);
-    $("text-out").textContent = `Couldn't open this note: ${err}. The device that stored it may be offline.`;
-  }
+  cid = cid.toLowerCase();
+  const known = swarmNotes.find((n) => n.cid === cid);
+  if (known) return showNote(known);
+  return viewNote(shortCid(cid), cid, () => invoke("get_text", { cid }));
 }
 
 $("fetch-form").addEventListener("submit", (e) => {
@@ -1589,11 +1656,6 @@ $("cid-paste").addEventListener("click", async () => {
     snack("Clipboard unavailable: paste with Ctrl+V");
     $("cid-in").focus();
   }
-});
-
-$("notes-clear").addEventListener("click", () => {
-  try { localStorage.removeItem(NOTES_KEY); } catch {}
-  renderNotes();
 });
 
 renderNotes();
