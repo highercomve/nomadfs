@@ -79,6 +79,8 @@ pub const Scanner = struct {
     frames: std.ArrayList(Frame) = .empty,
     next_report_ns: i96 = 0,
     files_seen: u64 = 0,
+    /// An empty dir block, for subfolders a progress report hasn't reached.
+    empty_dir: ?Cid = null,
     /// Files read and hashed (not reused), since init.
     files_hashed: u64 = 0,
 
@@ -86,6 +88,10 @@ pub const Scanner = struct {
         name: []const u8,
         entries: *std.ArrayList(codec.DirEntry),
         total: *const u64,
+        /// The folder's subfolders, in scan order; those from `next_dir`
+        /// on aren't reached yet (the one before it is being scanned).
+        dirs: []const []const u8,
+        next_dir: *const usize,
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, store: *StorageEngine) Scanner {
@@ -180,6 +186,18 @@ pub const Scanner = struct {
         c.compact(&live) catch |err| std.debug.print("share: compacting the scan cache failed: {any}\n", .{err});
     }
 
+    /// The CID of an empty dir block (stored once).
+    fn emptyDir(self: *Scanner) !*const Cid {
+        if (self.empty_dir == null) {
+            const bytes = try codec.encodeDir(self.allocator, &.{});
+            defer self.allocator.free(bytes);
+            const block = Block.new(bytes);
+            try self.store.put(block);
+            self.empty_dir = block.cid;
+        }
+        return &self.empty_dir.?;
+    }
+
     const LiveEntries = struct {
         it: std.StringHashMapUnmanaged(Remembered).Iterator,
         pub fn next(self: *LiveEntries) ?struct { path: []const u8, entry: @import("scan_cache.zig").Entry } {
@@ -189,7 +207,9 @@ pub const Scanner = struct {
     };
 
     /// Reports progress when it's due: a root built from the directories
-    /// still being scanned, each holding what it has so far.
+    /// still being scanned, each holding what it has so far. Subfolders not
+    /// reached yet are listed empty, with mtime 0, so the folders show up
+    /// at once (the app reads mtime 0 and no size as "indexing").
     fn checkpoint(self: *Scanner) !void {
         const p = self.progress orelse return;
         const t = now(self.io);
@@ -204,6 +224,9 @@ pub const Scanner = struct {
             var entries: std.ArrayList(codec.DirEntry) = .empty;
             defer entries.deinit(self.allocator);
             try entries.appendSlice(self.allocator, frame.entries.items);
+            for (frame.dirs[frame.next_dir.*..]) |pending| {
+                try entries.append(self.allocator, .{ .name = pending, .cid = try self.emptyDir(), .size = 0, .kind = .dir, .mtime = 0 });
+            }
             var size = frame.total.*;
             if (child) |c| {
                 try entries.append(self.allocator, c);
@@ -229,64 +252,81 @@ pub const Scanner = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        var entries: std.ArrayList(codec.DirEntry) = .empty;
-        var total: u64 = 0;
-        try self.frames.append(self.allocator, .{ .name = name, .entries = &entries, .total = &total });
-        defer _ = self.frames.pop();
-
+        // The whole listing first: the files go before the subfolders (a
+        // folder's own files show up before a deep subtree is done), and a
+        // progress report can list the subfolders not reached yet.
+        var file_names: std.ArrayList([]const u8) = .empty;
+        var dir_names: std.ArrayList([]const u8) = .empty;
         var it = dir.iterate();
         while (try it.next(self.io)) |entry| {
             if (!codec.isValidName(entry.name)) continue;
-            const child_path = try std.fs.path.join(arena, &.{ path, entry.name });
             switch (entry.kind) {
-                .file => {
-                    const built = self.scanFile(dir, entry.name, child_path) catch |err| {
-                        std.debug.print("share: skipping {s}: {any}\n", .{ child_path, err });
-                        continue;
-                    };
-                    try entries.append(arena, .{
-                        .name = try arena.dupe(u8, entry.name),
-                        .cid = try arena.dupe(u8, &built.cid),
-                        .size = built.size,
-                        .kind = .file,
-                        .mtime = built.mtime,
-                    });
-                    total += built.size;
-                    files.* += 1;
-                    self.files_seen += 1;
-                    // A failed report is retried at the next one; only a
-                    // cancelled scan stops.
-                    self.checkpoint() catch |err| {
-                        if (err == error.ScanCancelled) return err;
-                        std.debug.print("share: progress report failed: {any}\n", .{err});
-                    };
-                },
-                .directory => {
-                    if (depth + 1 >= max_depth) continue;
-                    var sub = dir.openDir(self.io, entry.name, .{ .iterate = true, .follow_symlinks = false }) catch |err| {
-                        std.debug.print("share: skipping {s}: {any}\n", .{ child_path, err });
-                        continue;
-                    };
-                    defer sub.close(self.io);
-                    const mtime = mtimeSeconds((sub.stat(self.io) catch null));
-                    const child = self.scanDir(sub, entry.name, child_path, depth + 1, files) catch |err| switch (err) {
-                        error.ScanCancelled => return err,
-                        else => {
-                            std.debug.print("share: skipping {s}: {any}\n", .{ child_path, err });
-                            continue;
-                        },
-                    };
-                    try entries.append(arena, .{
-                        .name = try arena.dupe(u8, entry.name),
-                        .cid = try arena.dupe(u8, &child.cid),
-                        .size = child.size,
-                        .kind = .dir,
-                        .mtime = mtime,
-                    });
-                    total += child.size;
-                },
+                .file => try file_names.append(arena, try arena.dupe(u8, entry.name)),
+                .directory => if (depth + 1 < max_depth) try dir_names.append(arena, try arena.dupe(u8, entry.name)),
                 else => {},
             }
+        }
+
+        var entries: std.ArrayList(codec.DirEntry) = .empty;
+        var total: u64 = 0;
+        var next_dir: usize = 0;
+        try self.frames.append(self.allocator, .{
+            .name = name,
+            .entries = &entries,
+            .total = &total,
+            .dirs = dir_names.items,
+            .next_dir = &next_dir,
+        });
+        defer _ = self.frames.pop();
+
+        for (file_names.items) |file_name| {
+            const child_path = try std.fs.path.join(arena, &.{ path, file_name });
+            const built = self.scanFile(dir, file_name, child_path) catch |err| {
+                std.debug.print("share: skipping {s}: {any}\n", .{ child_path, err });
+                continue;
+            };
+            try entries.append(arena, .{
+                .name = file_name,
+                .cid = try arena.dupe(u8, &built.cid),
+                .size = built.size,
+                .kind = .file,
+                .mtime = built.mtime,
+            });
+            total += built.size;
+            files.* += 1;
+            self.files_seen += 1;
+            // A failed report is retried at the next one; only a
+            // cancelled scan stops.
+            self.checkpoint() catch |err| {
+                if (err == error.ScanCancelled) return err;
+                std.debug.print("share: progress report failed: {any}\n", .{err});
+            };
+        }
+
+        for (dir_names.items, 0..) |dir_name, i| {
+            next_dir = i + 1;
+            const child_path = try std.fs.path.join(arena, &.{ path, dir_name });
+            var sub = dir.openDir(self.io, dir_name, .{ .iterate = true, .follow_symlinks = false }) catch |err| {
+                std.debug.print("share: skipping {s}: {any}\n", .{ child_path, err });
+                continue;
+            };
+            defer sub.close(self.io);
+            const mtime = mtimeSeconds((sub.stat(self.io) catch null));
+            const child = self.scanDir(sub, dir_name, child_path, depth + 1, files) catch |err| switch (err) {
+                error.ScanCancelled => return err,
+                else => {
+                    std.debug.print("share: skipping {s}: {any}\n", .{ child_path, err });
+                    continue;
+                },
+            };
+            try entries.append(arena, .{
+                .name = dir_name,
+                .cid = try arena.dupe(u8, &child.cid),
+                .size = child.size,
+                .kind = .dir,
+                .mtime = mtime,
+            });
+            total += child.size;
         }
 
         sortEntries(entries.items);
@@ -453,3 +493,63 @@ const FileReader = struct {
         return n;
     }
 };
+
+test "scan: progress lists folders not reached yet, and the files done" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = testing.io;
+    const tree = @import("tree.zig");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "share/a");
+    try tmp.dir.createDirPath(io, "share/b/deep");
+    try tmp.dir.createDirPath(io, "blocks");
+    try tmp.dir.writeFile(io, .{ .sub_path = "share/top.txt", .data = "top" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "share/a/one.txt", .data = "one" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "share/b/deep/two.txt", .data = "two" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const blocks = try std.fs.path.join(allocator, &.{ base, "blocks" });
+    defer allocator.free(blocks);
+    const share = try std.fs.path.join(allocator, &.{ base, "share" });
+    defer allocator.free(share);
+
+    var store = try StorageEngine.init(allocator, blocks);
+    defer store.deinit();
+    var scanner = Scanner.init(allocator, io, &store);
+    defer scanner.deinit();
+
+    // The first report: after the share's own file, before any subfolder.
+    const First = struct {
+        root: ?Cid = null,
+        fn report(ctx: *anyopaque, partial: Result) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.root == null) self.root = partial.root;
+        }
+    };
+    var first: First = .{};
+    scanner.progress = .{ .ctx = &first, .reportFn = First.report, .first_ns = 0, .interval_ns = 0 };
+    const done = try scanner.scan(share);
+
+    const loader = tree.Loader.local(&store);
+    const partial = try tree.listDir(allocator, loader, &first.root.?);
+    defer partial.deinit();
+    try testing.expectEqual(@as(usize, 3), partial.entries.len);
+    const top = partial.find("top.txt").?;
+    try testing.expectEqual(@as(u64, 3), top.size);
+    for ([_][]const u8{ "a", "b" }) |pending| {
+        const e = partial.find(pending).?;
+        try testing.expectEqual(tree.EntryKind.dir, e.kind);
+        try testing.expectEqual(@as(u64, 0), e.size);
+        try testing.expectEqual(@as(u64, 0), e.mtime);
+    }
+
+    // The finished tree has everything, with real folder dates.
+    const full = try tree.listDir(allocator, loader, &done.root);
+    defer full.deinit();
+    try testing.expectEqual(@as(u64, 3), done.files);
+    try testing.expect(full.find("b").?.mtime > 0);
+    try testing.expectEqual(@as(u64, 3), full.find("b").?.size);
+}

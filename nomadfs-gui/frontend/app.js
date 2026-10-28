@@ -475,7 +475,9 @@ function renderBrowse() {
   list.replaceChildren();
   if (!shown.length) {
     setEmpty(query ? `Nothing here matches "${$("browse-search").value.trim()}".`
-      : shares ? "This device shares nothing yet." : "Empty folder.");
+      : shares ? "This device shares nothing yet."
+      : path.at(-1)?.pending ? "Not indexed yet: the device is still scanning this share. Check back soon."
+      : "Empty folder.");
     return;
   }
   setEmpty("");
@@ -483,13 +485,16 @@ function renderBrowse() {
   const files = shown.filter((x) => !x.dir);
   for (const e of shown) {
     if (e.dir) {
+      // A share's first scan lists folders it hasn't reached yet: empty,
+      // without a date.
+      const pending = !e.mtime && !e.size;
       list.appendChild(row({
         icon: "folder",
         iconClass: "folder",
         headline: e.name,
-        meta: shares ? `${formatSize(e.size)} · updated ${formatDate(e.mtime)}` : formatSize(e.size),
-        cols: { size: formatSize(e.size), date: formatDate(e.mtime) },
-        onClick: () => { path.push({ name: e.name, cid: e.cid }); showLocation(); },
+        meta: pending ? "Indexing…" : shares ? `${formatSize(e.size)} · updated ${formatDate(e.mtime)}` : formatSize(e.size),
+        cols: { size: pending ? "Indexing…" : formatSize(e.size), date: pending ? "" : formatDate(e.mtime) },
+        onClick: () => { path.push({ name: e.name, cid: e.cid, pending }); showLocation(); },
       }));
     } else {
       const fetchIt = (btn) => downloadFile(device, e, btn);
@@ -889,7 +894,33 @@ $("mount-open").addEventListener("click", async () => {
   try { await invoke("open_path", { path: mountPath }); } catch (err) { snack(`Couldn't open the folder: ${err}`); }
 });
 
-$("remote-refresh").addEventListener("click", () => (path.length ? showLocation() : showDevices()));
+$("remote-refresh").addEventListener("click", () => (path.length ? refreshLocation() : showDevices()));
+
+/** Reloads the open folder as it is now: a share's root changes with every
+ *  edit (and while a first scan fills it in), so the path is walked again
+ *  by name from the device's current share list. */
+async function refreshLocation() {
+  const peer = path[0].device.peer;
+  busy(true);
+  try {
+    const fresh = (await invoke("remote_devices", null)).find((d) => d.peer === peer);
+    if (!fresh) throw new Error("the device isn't reachable");
+    const walked = [{ ...path[0], device: fresh }];
+    let entries = fresh.shares.map((sh) => ({ ...sh, dir: true }));
+    for (const step of path.slice(1)) {
+      const e = entries.find((x) => x.dir && x.name === step.name);
+      if (!e) break; // gone: stop at the deepest folder still there
+      walked.push({ name: e.name, cid: e.cid, pending: !e.mtime && !e.size });
+      if (walked.length < path.length) entries = await invoke("browse", { peer, cid: e.cid });
+    }
+    path = walked;
+  } catch (err) {
+    snack(`Couldn't refresh: ${err.message || err}`);
+  } finally {
+    busy(false);
+  }
+  showLocation();
+}
 
 // ---- Swarm folder: one folder all devices read and write ----
 
