@@ -26,8 +26,9 @@ pub const Share = struct {
 - A background thread (`start`/`stop`) calls `rescanAll` every `rescan_interval_ns` = **30 s**.
 - `listing()` encodes the current shares as a **dir block** (tag `0x02`, see
   [DAGs](../storage/dag.md)): one entry per scanned share, `kind = .dir`, `cid` = the share's
-  root, `size` = total bytes, `mtime` = `scanned_at`. A share is listed as soon as its first scan
-  has something to show (below).
+  root, `size` = total bytes, `mtime` = `scanned_at`. Shares are scanned one at a time; one whose
+  first scan hasn't started is listed as an empty dir with `mtime` 0 (as "Indexing…" in the app),
+  and from its first progress report on with what it has (below).
 
 ### The first scan lists as it goes
 

@@ -224,6 +224,15 @@ pub const ShareIndex = struct {
         share.scanned_at = nowSeconds(self.io);
     }
 
+    /// The CID of an empty dir block (put is a no-op once it is stored).
+    fn emptyDir(self: *ShareIndex) !codec.Cid {
+        const bytes = try codec.encodeDir(self.allocator, &.{});
+        defer self.allocator.free(bytes);
+        const block = storage.block.Block.new(bytes);
+        try self.store.put(block);
+        return block.cid;
+    }
+
     fn newTable(allocator: std.mem.Allocator) !*filestore.Table {
         const table = try allocator.create(filestore.Table);
         table.* = filestore.Table.init(allocator);
@@ -288,14 +297,21 @@ pub const ShareIndex = struct {
         allocator.free(shares);
     }
 
-    /// The GET_SHARES reply: a dir block of the scanned shares.
+    /// The GET_SHARES reply: a dir block of the shares. One whose first
+    /// scan hasn't started (shares are scanned one at a time) is listed
+    /// empty with mtime 0, like the folders a scan hasn't reached
+    /// (scan.zig): every share shows up at once, as "Indexing…".
     pub fn listing(self: *ShareIndex, allocator: std.mem.Allocator) ![]u8 {
+        const empty = try self.emptyDir();
         self.mutex.lock();
         defer self.mutex.unlock();
         var entries: std.ArrayList(codec.DirEntry) = .empty;
         defer entries.deinit(allocator);
         for (self.shares.items) |*s| {
-            const root = &(s.root orelse continue);
+            const root = &(s.root orelse {
+                try entries.append(allocator, .{ .name = s.name, .cid = &empty, .size = 0, .kind = .dir, .mtime = 0 });
+                continue;
+            });
             try entries.append(allocator, .{
                 .name = s.name,
                 .cid = root,
@@ -519,4 +535,48 @@ test "shares: a restart reuses the scan cache instead of re-reading files" {
     const small = try tree.resolve(allocator, loader, snap[0].root.?, "small.txt");
     var buf: [8]u8 = undefined;
     try testing.expectEqualStrings("tiny", buf[0..try tree.readAt(allocator, loader, small.cid, 0, &buf)]);
+}
+
+test "shares: a share not scanned yet is listed empty, as indexing" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = testing.io;
+    const tree = @import("tree.zig");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "movies");
+    try tmp.dir.createDirPath(io, "blocks");
+    try tmp.dir.writeFile(io, .{ .sub_path = "movies/a.mkv", .data = "film" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const blocks = try std.fs.path.join(allocator, &.{ base, "blocks" });
+    defer allocator.free(blocks);
+    const movies = try std.fs.path.join(allocator, &.{ base, "movies" });
+    defer allocator.free(movies);
+
+    var store = try storage.engine.StorageEngine.init(allocator, blocks);
+    defer store.deinit();
+    const index = try ShareIndex.create(allocator, io, &store);
+    defer index.destroy();
+    try index.register("Movies", movies);
+
+    const before = try index.listing(allocator);
+    defer allocator.free(before);
+    const pending = try tree.decodeListing(allocator, before);
+    defer pending.deinit();
+    const e = pending.find("Movies").?;
+    try testing.expectEqual(@as(u64, 0), e.mtime);
+    try testing.expectEqual(@as(u64, 0), e.size);
+    const inside = try tree.listDir(allocator, tree.Loader.local(&store), &e.cid);
+    defer inside.deinit();
+    try testing.expectEqual(@as(usize, 0), inside.entries.len);
+
+    index.rescanAll();
+    const after = try index.listing(allocator);
+    defer allocator.free(after);
+    const scanned = try tree.decodeListing(allocator, after);
+    defer scanned.deinit();
+    try testing.expect(scanned.find("Movies").?.mtime > 0);
+    try testing.expectEqual(@as(u64, 4), scanned.find("Movies").?.size);
 }
