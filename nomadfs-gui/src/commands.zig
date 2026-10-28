@@ -193,9 +193,11 @@ pub fn ensureConfig(gpa: std.mem.Allocator) !ConfigResult {
         defer gpa.free(storage_path_abs);
         _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
             var swarm: [64]u8 = undefined;
-            var prng = std.Random.DefaultPrng.init(nomadfs.nowSeconds() * 7919);
+            // The swarm key admits devices to the swarm: from the OS's
+            // secure random source, never a seeded PRNG.
             var rnd: [32]u8 = undefined;
-            prng.random().bytes(&rnd);
+            try io.randomSecure(&rnd);
+            defer std.crypto.secureZero(u8, &rnd);
             const swarm_key = std.fmt.bufPrint(&swarm, "{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch unreachable;
             try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path) orelse "/");
             const keys_dir = try std.fs.path.join(gpa, &.{ dir, "keys" });
