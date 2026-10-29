@@ -499,6 +499,9 @@ main { padding-bottom: calc(104px + env(safe-area-inset-bottom)); }
   }
   .nav-spacer { flex: 1; }
   .nav-info { margin: 8px 16px 0; font-size: 11px; color: var(--md-on-surface-variant); }
+  /* Devices stack like the drawer's own items, so their hover and active
+     backgrounds take the full width too. */
+  #nav-devices { display: flex; flex-direction: column; gap: 2px; }
   #nav-devices:empty::after {
     content: "No devices reachable";
     display: block;
