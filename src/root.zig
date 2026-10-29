@@ -759,6 +759,7 @@ pub const InfoProvider = struct {
     started_at: u64,
 
     pub fn info(self: *InfoProvider, allocator: std.mem.Allocator) !node_info.Info {
+        const traffic = self.manager.trafficTotals();
         var out: node_info.Info = .{
             .version = .init(version),
             .platform = .init(node_info.platform()),
@@ -766,6 +767,8 @@ pub const InfoProvider = struct {
             .connections = std.math.lossyCast(u32, self.manager.getConnectionsCount()),
             .trusted = std.math.lossyCast(u32, self.trust.count()),
             .unmetered = net.local_addrs.onUnmeteredNetwork(),
+            .bytes_sent = traffic.sent,
+            .bytes_received = traffic.received,
         };
         if (fs.remote.knownPeers(self.block_manager, allocator)) |peers| {
             out.peers = std.math.lossyCast(u32, peers.len);

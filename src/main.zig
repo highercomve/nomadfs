@@ -12,7 +12,7 @@ const DevicePaths = device.paths.Paths;
 /// rotates, and an old QR code should not grant access forever.
 const ticket_lifetime_seconds = 24 * 60 * 60;
 
-const Command = enum { run, pair, trust, devices, revoke, mount, invite, cache, clear_cache };
+const Command = enum { run, pair, trust, devices, revoke, mount, invite, cache, clear_cache, bench_read, bench_idle };
 
 const Options = struct {
     command: Command = .run,
@@ -27,6 +27,10 @@ const Options = struct {
     /// --swarm-replicas <N>: push new/updated swarm folder files to N peers.
     swarm_replicas: ?u8 = null,
     swarm_backup: bool = false,
+    bench_read_path: ?[]const u8 = null,
+    bench_wait_seconds: u32 = 30,
+    bench_cold: bool = false,
+    bench_idle_seconds: u32 = 0,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -64,6 +68,8 @@ pub fn main(init: std.process.Init) !void {
         .invite => try inviteCommand(allocator, config, options.address),
         .cache => try cacheCommand(allocator, config, false),
         .clear_cache => try cacheCommand(allocator, config, true),
+        .bench_read => try benchReadCommand(allocator, config, options.bench_read_path.?, options.bench_wait_seconds, options.bench_cold),
+        .bench_idle => try benchIdleCommand(allocator, config, options.bench_idle_seconds),
     }
 }
 
@@ -93,6 +99,24 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Optio
             try selectCommand(options, .cache);
         } else if (std.mem.eql(u8, arg, "--clear-cache")) {
             try selectCommand(options, .clear_cache);
+        } else if (std.mem.eql(u8, arg, "--bench-read")) {
+            try selectCommand(options, .bench_read);
+            options.bench_read_path = try nextValue(args, &i, "--bench-read");
+        } else if (std.mem.eql(u8, arg, "--bench-wait")) {
+            const val_str = try nextValue(args, &i, "--bench-wait");
+            options.bench_wait_seconds = std.fmt.parseInt(u32, val_str, 10) catch {
+                std.debug.print("Error: --bench-wait expects an integer number of seconds\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--bench-cold")) {
+            options.bench_cold = true;
+        } else if (std.mem.eql(u8, arg, "--bench-idle")) {
+            try selectCommand(options, .bench_idle);
+            const val_str = try nextValue(args, &i, "--bench-idle");
+            options.bench_idle_seconds = std.fmt.parseInt(u32, val_str, 10) catch {
+                std.debug.print("Error: --bench-idle expects an integer number of seconds\n", .{});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, arg, "--mount")) {
             try selectCommand(options, .mount);
             options.mountpoint = try nextValue(args, &i, "--mount");
@@ -142,7 +166,7 @@ fn nextValue(args: []const []const u8, index: *usize, flag: []const u8) ![]const
 
 fn selectCommand(options: *Options, command: Command) !void {
     if (options.command != .run) {
-        std.debug.print("Error: only one of --pair, --trust, --devices, --revoke, --mount, --invite, --cache or --clear-cache may be used\n", .{});
+        std.debug.print("Error: only one of --pair, --trust, --devices, --revoke, --mount, --invite, --cache, --clear-cache, --bench-read or --bench-idle may be used\n", .{});
         std.process.exit(1);
     }
     options.command = command;
@@ -161,6 +185,8 @@ fn printHelp() void {
         \\  nomadfs --mount <dir> [config_path]
         \\  nomadfs --invite [--address ip] [config_path]
         \\  nomadfs --cache | --clear-cache [config_path]
+        \\  nomadfs --bench-read <swarm path> [--bench-wait SECONDS] [--bench-cold] [config_path]
+        \\  nomadfs --bench-idle SECONDS [config_path]
         \\
         \\Options:
         \\  --config <path>    Path to the configuration file
@@ -190,6 +216,10 @@ fn printHelp() void {
         \\                     `cache_mb` under [storage] (default 2048, 0 = no limit)
         \\  --clear-cache      Empty the read cache; what this device keeps (its
         \\                     writes, backups) is not touched
+        \\  --bench-read <path> Read a swarm folder file in 1 MiB chunks and print benchmark stats
+        \\  --bench-wait <sec>  Seconds to wait for swarm peer sync before bench read (default 30)
+        \\  --bench-cold        Clear the read cache before benchmarking a read
+        \\  --bench-idle <sec>  Run the node for SECONDS and print wire chatter totals
         \\  --help, -h         Show this help message
         \\
     , .{});
@@ -538,4 +568,164 @@ fn nowSeconds() u64 {
 fn writeStdout(bytes: []const u8) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     try std.Io.File.stdout().writeStreamingAll(io, bytes);
+}
+
+fn benchReadCommand(allocator: std.mem.Allocator, config: config_mod.Config, raw_path: []const u8, wait_seconds: u32, cold: bool) !void {
+    var node = try nomadfs.Node.init(allocator, config);
+    defer node.deinit();
+
+    var running = std.atomic.Value(bool).init(true);
+    node.bootstrap(config.network.bootstrap_peers, config.node.swarm_key) catch |err| {
+        std.debug.print("Bootstrap error: {any}\n", .{err});
+    };
+    try node.listen(&running, config);
+    defer node.stopListener();
+
+    const swarm = node.swarm orelse {
+        std.debug.print("Error: swarm folder not available (storage disabled?)\n", .{});
+        std.process.exit(1);
+    };
+
+    const deadline = nomadfs.sync.monotonicMillis() + @as(i64, wait_seconds) * std.time.ms_per_s;
+    while (nomadfs.sync.monotonicMillis() < deadline) {
+        if (swarm.status().peers_synced > 0) break;
+        nomadfs.sync.sleep(50 * std.time.ns_per_ms);
+        if (node.connection_manager.getConnectionsCount() > 0) {
+            _ = swarm.syncNow() catch {};
+        }
+    }
+
+    var path = raw_path;
+    while (path.len > 0 and path[0] == '/') path = path[1..];
+    swarm.mutex.lock();
+    const entry_opt = if (swarm.manifest.get(path)) |e| if (!e.deleted and e.kind == .file) e else null else null;
+    swarm.mutex.unlock();
+    const entry = entry_opt orelse {
+        std.debug.print("Error: swarm entry '{s}' not found\n", .{raw_path});
+        std.process.exit(1);
+    };
+
+    if (cold) {
+        if (node.store) |s| {
+            _ = s.clearCache() catch {};
+        }
+    }
+
+    const fetcher = if (node.block_manager.fetcher) |*f| f else {
+        std.debug.print("Error: fetcher not available\n", .{});
+        std.process.exit(1);
+    };
+
+    var before_peer_buf: [64]nomadfs.cluster.Fetcher.PeerState = undefined;
+    const before_snap = fetcher.snapshot(&before_peer_buf);
+    const before_totals = fetcher.totals();
+    const before_traffic = node.connection_manager.trafficTotals();
+
+    const chunk_size: usize = 1024 * 1024;
+    const buf = try allocator.alloc(u8, chunk_size);
+    defer allocator.free(buf);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const t0 = std.Io.Clock.awake.now(io).nanoseconds;
+    var offset: u64 = 0;
+    while (offset < entry.size) {
+        const to_read = @min(@as(u64, chunk_size), entry.size - offset);
+        const n = try swarm.readAt(allocator, entry.cid, entry.version.device, offset, buf[0..@intCast(to_read)]);
+        if (n == 0) break;
+        offset += n;
+    }
+    const t1 = std.Io.Clock.awake.now(io).nanoseconds;
+    const elapsed_ns = @max(t1 - t0, 0);
+
+    const after_traffic = node.connection_manager.trafficTotals();
+    const after_totals = fetcher.totals();
+    var after_peer_buf: [64]nomadfs.cluster.Fetcher.PeerState = undefined;
+    const after_snap = fetcher.snapshot(&after_peer_buf);
+
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    const mib_per_s = if (seconds > 0) (@as(f64, @floatFromInt(offset)) / (1024.0 * 1024.0)) / seconds else 0.0;
+    const wire_sent = after_traffic.sent -| before_traffic.sent;
+    const wire_received = after_traffic.received -| before_traffic.received;
+    const fetched_blocks = after_totals.fetched -| before_totals.fetched;
+    const fetched_bytes = after_totals.fetched_bytes -| before_totals.fetched_bytes;
+    const local_blocks = after_totals.local -| before_totals.local;
+    const not_found = after_totals.not_found -| before_totals.not_found;
+    const failed = after_totals.failed -| before_totals.failed;
+
+    const main_lines = try std.fmt.allocPrint(allocator,
+        \\bytes={d}
+        \\seconds={d:.3}
+        \\mib_per_s={d:.2}
+        \\wire_sent={d}
+        \\wire_received={d}
+        \\fetched_blocks={d}
+        \\fetched_bytes={d}
+        \\local_blocks={d}
+        \\not_found={d}
+        \\failed={d}
+        \\
+    , .{
+        offset,
+        seconds,
+        mib_per_s,
+        wire_sent,
+        wire_received,
+        fetched_blocks,
+        fetched_bytes,
+        local_blocks,
+        not_found,
+        failed,
+    });
+    defer allocator.free(main_lines);
+    try writeStdout(main_lines);
+
+    for (after_snap) |ap| {
+        var prev_blocks: u64 = 0;
+        var prev_bytes: u64 = 0;
+        for (before_snap) |bp| {
+            if (bp.id.eql(ap.id)) {
+                prev_blocks = bp.blocks;
+                prev_bytes = bp.bytes;
+                break;
+            }
+        }
+        const delta_blocks = ap.blocks -| prev_blocks;
+        const delta_bytes = ap.bytes -| prev_bytes;
+        const hex_id = std.fmt.bytesToHex(ap.id.bytes[0..4].*, .lower);
+        const peer_line = try std.fmt.allocPrint(allocator, "peer={s} blocks={d} bytes={d} rate_kib_s={d}\n", .{
+            hex_id,
+            delta_blocks,
+            delta_bytes,
+            ap.rate,
+        });
+        defer allocator.free(peer_line);
+        try writeStdout(peer_line);
+    }
+}
+
+fn benchIdleCommand(allocator: std.mem.Allocator, config: config_mod.Config, seconds: u32) !void {
+    var node = try nomadfs.Node.init(allocator, config);
+    defer node.deinit();
+
+    var running = std.atomic.Value(bool).init(true);
+    node.bootstrap(config.network.bootstrap_peers, config.node.swarm_key) catch |err| {
+        std.debug.print("Bootstrap error: {any}\n", .{err});
+    };
+    try node.listen(&running, config);
+    defer node.stopListener();
+
+    const before = node.connection_manager.trafficTotals();
+    nomadfs.sync.sleep(@as(u64, seconds) * std.time.ns_per_s);
+    const after = node.connection_manager.trafficTotals();
+
+    const wire_sent = after.sent -| before.sent;
+    const wire_received = after.received -| before.received;
+
+    const out = try std.fmt.allocPrint(allocator,
+        \\wire_sent={d}
+        \\wire_received={d}
+        \\
+    , .{ wire_sent, wire_received });
+    defer allocator.free(out);
+    try writeStdout(out);
 }

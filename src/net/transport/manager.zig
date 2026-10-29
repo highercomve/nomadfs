@@ -10,6 +10,11 @@ const sync = @import("../../sync.zig");
 const env_mod = @import("../../env.zig");
 const device_auth = @import("../../device/auth.zig");
 
+pub const TrafficCounters = struct {
+    sent: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    received: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
 pub const ConnectionManager = struct {
     const ManagedConnection = struct {
         conn: network.Connection,
@@ -50,6 +55,7 @@ pub const ConnectionManager = struct {
     /// Reaches a device through another one when none of its addresses
     /// answers (discovery/node.zig sets it; transport/relay.zig).
     relay_dialer: ?RelayDialer = null,
+    traffic: TrafficCounters = .{},
 
     pub const RelayDialer = struct {
         ctx: *anyopaque,
@@ -330,6 +336,13 @@ pub const ConnectionManager = struct {
     }
 
     /// Drops pooled sessions authenticated as this device or transport node.
+    pub fn trafficTotals(self: *const ConnectionManager) struct { sent: u64, received: u64 } {
+        return .{
+            .sent = self.traffic.sent.load(.monotonic),
+            .received = self.traffic.received.load(.monotonic),
+        };
+    }
+
     pub fn closePeer(self: *ConnectionManager, peer: id.NodeID) usize {
         var removed: [max_connections]ManagedConnection = undefined;
         var count: usize = 0;
@@ -637,7 +650,7 @@ pub const ConnectionManager = struct {
 
         switch (self.transport_type) {
             .tcp => {
-                const conn = try tcp.connectTracked(self.allocator, address, swarm_key, self.identity_key, self.handshake_timeout_ms, self.deviceAuthPtr(), &self.handshakes);
+                const conn = try tcp.connectTracked(self.allocator, address, swarm_key, self.identity_key, self.handshake_timeout_ms, self.deviceAuthPtr(), &self.handshakes, &self.traffic);
                 errdefer conn.deinit();
 
                 // The Noise handshake authenticated the remote key; make sure
