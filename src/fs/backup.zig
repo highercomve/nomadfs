@@ -436,9 +436,10 @@ pub const FolderBackup = struct {
     }
 
     fn copyShare(self: *FolderBackup, peer: @import("../net/id.zig").NodeID, owner: [32]u8, label: []const u8, share: []const u8, root: Cid) !void {
-        const conn = try self.block_manager.connectTo(peer);
-        defer conn.deinit();
-        const fetched = try cluster.repair.RepairManager.syncWhile(self.allocator, self.block_manager.dht_node, self.store, conn, &root, &self.running);
+        // The blocks come through the cluster layer, from the owner (and
+        // anyone else holding them); this side only merges the tree.
+        const fetcher = &(self.block_manager.fetcher orelse return error.StorageDisabled);
+        const fetched = (try cluster.keeper.copy(self.allocator, fetcher, self.store, root, &.{peer}, &self.running)).blocks;
         const previous = self.findHeld(owner, share);
         const merged = try merge(self.allocator, self.store, if (previous) |p| p.root else null, root, std.math.cast(u64, sync.timestamp()) orelse 0);
         var name_buf: [codec.max_name_len + 64]u8 = undefined;

@@ -2050,10 +2050,15 @@ for (const el of document.querySelectorAll(".about-link")) {
 // ---- Swarm backup (desktop) ----
 
 function renderBackup(st) {
-  $("backup-section").hidden = !st.supported;
+  // The copies settings are for every device; backing up all of it, for desktops.
+  $("swarm-backup-row").hidden = !st.supported;
+  $("swarm-replicas").value = String(Math.min(Math.max(st.replicas ?? 1, 1), 4));
+  $("accept-copies").checked = !!st.accept_copies;
+  $("copies-state").textContent = st.accept_copies
+    ? (st.kept_copies ? `Keeps ${st.kept_copies} file${st.kept_copies === 1 ? "" : "s"} for other devices.` : "")
+    : "This device keeps only its own files (and backups, if on).";
   if (!st.supported) return;
   $("swarm-backup").checked = st.enabled;
-  if ($("swarm-replicas")) $("swarm-replicas").value = String(st.replicas ?? 0);
   let text = "";
   if (st.enabled && !st.running) text = "Starts with the node.";
   else if (st.enabled && st.last_round === 0) text = "Starting the first backup…";
@@ -2083,9 +2088,21 @@ $("swarm-replicas").addEventListener("change", async (e) => {
   const replicas = Number(e.target.value);
   try {
     renderBackup(await invoke("swarm_replicas_set", { config_path: await ensureConfig(), replicas }));
-    snack(`Swarm replication set to ${replicas} peer(s)`);
+    snack(replicas === 1 ? "Each swarm file stays where it was added (and on backup devices)" : `Each swarm file is kept on ${replicas} devices`);
   } catch (err) {
-    snack(`Couldn't set replication: ${err}`);
+    snack(`Couldn't change it: ${err}`);
+    loadBackup();
+  }
+});
+
+$("accept-copies").addEventListener("change", async (e) => {
+  const on = e.target.checked;
+  try {
+    renderBackup(await invoke("accept_copies_set", { config_path: await ensureConfig(), on }));
+    snack(on ? "This device keeps copies of other devices' files" : "This device no longer takes copies of other devices' files");
+  } catch (err) {
+    e.target.checked = !on;
+    snack(`Couldn't change it: ${err}`);
   }
 });
 

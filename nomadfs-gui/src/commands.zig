@@ -250,7 +250,9 @@ fn createConfig(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, path: []con
     try text.writer.print("\n[node]\nnickname = \"{s}\"\nswarm_key = \"{s}\"\nkey_path = \"{s}\"\n" ++
         "\n[storage]\nenabled = true\nstorage_path = \"{s}\"\n" ++
         "\n[network]\nport = 14700\ntransport = \"tcp\"\nupnp_enabled = false\n" ++
-        "enable_mdns = false\nwrite_quorum = 0\nreplicas = 1\n", .{ defaultNickname(&nick_buf), swarm_key, keys_path, storage_path_abs });
+        "enable_mdns = false\nwrite_quorum = 0\nreplicas = 1\n" ++
+        // Phones keep only their own files unless the user says otherwise.
+        (if (builtin.abi.isAndroid()) "accept_copies = false\n" else ""), .{ defaultNickname(&nick_buf), swarm_key, keys_path, storage_path_abs });
     try writeConfigAtomic(gpa, io, path, text.written());
 }
 
@@ -1114,25 +1116,37 @@ pub const BackupInfo = struct {
     bytes: u64 = 0,
     unreachable_files: usize = 0,
     last_round: u64 = 0,
-    replicas: u8 = 0,
+    /// The swarm's copies setting (device/policy.zig).
+    replicas: u8 = 1,
+    /// This device keeps copies of other devices' files.
+    accept_copies: bool = true,
+    /// Files it keeps for others (backup or placement).
+    kept_copies: usize = 0,
 };
 
 pub const SwarmReplicasArgs = struct { config_path: []const u8, replicas: u8 };
+pub const AcceptCopiesArgs = struct { config_path: []const u8, on: bool };
 
 const backup_supported = !builtin.abi.isAndroid();
 
 /// `swarm_backup_status { config_path }`: whether this device keeps a copy
-/// of the whole swarm folder, and how far it got.
+/// of the whole swarm folder, and how far it got; the swarm's copies
+/// setting and whether this device accepts copies.
 pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
-    if (!backup_supported) return .{ .supported = false, .enabled = false, .running = false };
     {
         g_mutex.lock();
         defer g_mutex.unlock();
         if (swarmFolder()) |folder| {
             const st = folder.backupStatus();
-            const reps = folder.swarm_replicas.load(.acquire);
+            const handle = g_node.?;
+            const policy = handle.node.policy;
+            const reps = policy.copies();
+            const accept = policy.acceptsCopies(handle.node.device_identity.deviceId());
+            if (!backup_supported) return .{ .supported = false, .enabled = false, .running = true, .replicas = reps, .accept_copies = accept, .kept_copies = st.backed_up };
             return .{
                 .supported = true,
+                .accept_copies = accept,
+                .kept_copies = st.backed_up,
                 .enabled = st.enabled,
                 .running = true,
                 .files = st.files,
@@ -1146,7 +1160,7 @@ pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
     }
     var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
     defer config.deinit(gpa);
-    return .{ .supported = true, .enabled = config.storage.swarm_backup, .running = false, .replicas = config.storage.swarm_replicas };
+    return .{ .supported = backup_supported, .enabled = config.storage.swarm_backup, .running = false, .accept_copies = config.storage.accept_copies };
 }
 
 /// `swarm_backup_set { config_path, on }`: saved in the config
@@ -1165,22 +1179,37 @@ pub fn swarmBackupSet(gpa: std.mem.Allocator, args: BackupArgs) !BackupInfo {
     return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
 }
 
-/// `swarm_replicas_set { config_path, replicas }`: saved in the config
-/// (`swarm_replicas`), and applied to the running swarm folder at once.
+/// `swarm_replicas_set { config_path, replicas }`: the swarm's `copies`,
+/// signed by this device and spread to the others (device/policy.zig).
 pub fn swarmReplicasSet(gpa: std.mem.Allocator, args: SwarmReplicasArgs) !BackupInfo {
-    if (args.replicas > config_mod.max_replicas) return error.ReplicasOutOfRange;
-    var buf: [32]u8 = undefined;
-    const line = try std.fmt.bufPrint(&buf, "swarm_replicas = {d}", .{args.replicas});
+    {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        const handle = g_node orelse return error.NotRunning;
+        const node = &handle.node;
+        _ = try node.policy.setCopies(node.device_identity, node.trust_store, args.replicas, nomadfs.nowSeconds());
+        if (node.keeper) |k| k.wake();
+    }
+    return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
+}
+
+/// `accept_copies_set { config_path, on }`: whether this device keeps
+/// copies of other devices' swarm files. Saved in the config
+/// (`accept_copies`) and signed into the swarm's policy at once.
+pub fn acceptCopiesSet(gpa: std.mem.Allocator, args: AcceptCopiesArgs) !BackupInfo {
     try editConfig(gpa, args.config_path, .{
-        .drop_keys = &.{"swarm_replicas"},
-        .append = &.{line},
+        .drop_keys = &.{"accept_copies"},
+        .append = &.{if (args.on) "accept_copies = true" else "accept_copies = false"},
     });
     {
         g_mutex.lock();
         defer g_mutex.unlock();
-        if (swarmFolder()) |folder| {
-            folder.swarm_replicas.store(args.replicas, .release);
-        } else |_| {}
+        if (g_node) |handle| {
+            const node = &handle.node;
+            const now = nomadfs.nowSeconds();
+            const r = try nomadfs.device.policy.sign(node.device_identity, .accepts, node.device_identity.deviceId(), @intFromBool(args.on), now);
+            if (try node.policy.apply(r, node.trust_store, node.device_identity.deviceId(), now) == .applied) try node.policy.save();
+        }
     }
     return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
 }

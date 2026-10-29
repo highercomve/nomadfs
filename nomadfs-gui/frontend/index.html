@@ -89,21 +89,28 @@
             <p class="supporting">Keep a copy of every file in the swarm folder, and of the folders your devices mark for backup (a phone's camera), on this device. Photos stay here even after they're deleted on the phone, and your devices read from here when the one that has a file is offline. Turn it on for a computer that stays on.</p>
           </div>
         </div>
-        <label class="toggle-row">
-          <span>Back up the swarm here</span>
-          <input type="checkbox" id="swarm-backup" role="switch">
-        </label>
-        <p id="backup-state" class="supporting small"></p>
+        <div id="swarm-backup-row">
+          <label class="toggle-row">
+            <span>Back up the swarm here</span>
+            <input type="checkbox" id="swarm-backup" role="switch">
+          </label>
+          <p id="backup-state" class="supporting small"></p>
+        </div>
         <div class="toggle-row" style="margin-top: 12px;">
-          <span>Replicate new files to peers</span>
-          <select id="swarm-replicas" aria-label="Swarm folder replication count">
-            <option value="0">Local only (0 peers)</option>
-            <option value="1">1 peer</option>
-            <option value="2">2 peers</option>
-            <option value="3">3 peers</option>
+          <span>Keep each swarm file on</span>
+          <select id="swarm-replicas" aria-label="Devices that keep each swarm file">
+            <option value="1">1 device</option>
+            <option value="2">2 devices</option>
+            <option value="3">3 devices</option>
+            <option value="4">4 devices</option>
           </select>
         </div>
-        <p class="supporting small">Number of online swarm devices new or edited swarm folder files are pushed to immediately.</p>
+        <p class="supporting small">For the whole swarm: the device that added a file, plus devices chosen for each file among those that accept copies. Backup devices keep everything either way.</p>
+        <label class="toggle-row" style="margin-top: 12px;">
+          <span>Accept copies of other devices' files</span>
+          <input type="checkbox" id="accept-copies" role="switch">
+        </label>
+        <p id="copies-state" class="supporting small"></p>
       </section>
 
       <!-- Android: keep running in the background -->

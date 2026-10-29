@@ -25,7 +25,7 @@ const Options = struct {
     shares: std.ArrayList([]const u8) = .empty,
     /// --swarm-backup: keep a copy of the whole swarm folder.
     /// --swarm-replicas <N>: push new/updated swarm folder files to N peers.
-    swarm_replicas: ?u8 = null,
+    copies: ?u8 = null,
     swarm_backup: bool = false,
 };
 
@@ -52,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
         try config.addShare(allocator, share.name, share.path);
     }
     if (options.swarm_backup) config.storage.swarm_backup = true;
-    if (options.swarm_replicas) |r| config.storage.swarm_replicas = r;
+    if (options.copies) |n| config.storage.set_copies = n;
 
     switch (options.command) {
         .pair => try pairCommand(allocator, config, options.address),
@@ -100,16 +100,14 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Optio
             try options.shares.append(arena, try nextValue(args, &i, "--share"));
         } else if (std.mem.eql(u8, arg, "--swarm-backup")) {
             options.swarm_backup = true;
-        } else if (std.mem.eql(u8, arg, "--swarm-replicas")) {
-            const val_str = try nextValue(args, &i, "--swarm-replicas");
-            options.swarm_replicas = std.fmt.parseInt(u8, val_str, 10) catch {
-                std.debug.print("Error: --swarm-replicas expects an integer (0-{d})\n", .{config_mod.max_replicas});
-                std.process.exit(1);
-            };
-            if (options.swarm_replicas.? > config_mod.max_replicas) {
-                std.debug.print("Error: --swarm-replicas exceeds maximum ({d})\n", .{config_mod.max_replicas});
+        } else if (std.mem.eql(u8, arg, "--copies")) {
+            const val_str = try nextValue(args, &i, "--copies");
+            const n = std.fmt.parseInt(u8, val_str, 10) catch 0;
+            if (n < 1 or n > nomadfs.device.policy.max_copies) {
+                std.debug.print("Error: --copies expects 1-{d}\n", .{nomadfs.device.policy.max_copies});
                 std.process.exit(1);
             }
+            options.copies = n;
         } else if (std.mem.eql(u8, arg, "--address")) {
             options.address = try nextValue(args, &i, "--address");
         } else if (std.mem.startsWith(u8, arg, "-")) {
@@ -177,8 +175,11 @@ fn printHelp() void {
         \\                     so the folder stays readable while the device that
         \\                     added a file is offline (also `swarm_backup = true`
         \\                     under [storage])
-        \\  --swarm-replicas <N> Push new or updated swarm folder files to N peer
-        \\                     devices (also `swarm_replicas = N` under [storage])
+        \\  --copies <N>       Keep each swarm folder file on N devices (1-8): the
+        \\                     author and N-1 devices chosen for each file among
+        \\                     those that accept copies (`accept_copies = false`
+        \\                     under [storage] to refuse). A swarm-wide setting,
+        \\                     signed by this device and sent to the others
         \\  --invite           Print a one-time invite code (10 min, one use) that
         \\                     lets another device join this swarm; the swarm key
         \\                     travels encrypted and is never shown

@@ -48,6 +48,10 @@ pub const Node = struct {
     shares: ?*fs.ShareIndex,
     /// Keeps members' folders marked for backup on a swarm backup device.
     folder_backup: ?*fs.FolderBackup = null,
+    /// The swarm-wide settings every device agrees on (copies, who accepts).
+    policy: *device.policy.Policy,
+    /// Copies what this device keeps (cluster/keeper.zig); null without a store.
+    keeper: ?*cluster.keeper.Keeper = null,
     /// The swarm-wide folder every device reads and writes; null without
     /// block storage.
     swarm: ?*fs.SwarmFolder,
@@ -154,7 +158,6 @@ pub const Node = struct {
             const folder = try fs.SwarmFolder.create(allocator, std.Io.Threaded.global_single_threaded.io(), s, connection_manager.node_id, cfg.node.nickname, manifest_path);
             // Set before start(): the sync thread reads it.
             folder.read_ahead = read_ahead;
-            folder.swarm_replicas.store(cfg.storage.swarm_replicas, .release);
             discovery_node.swarm_source = folder.source();
             folder.start(block_manager) catch |err| std.debug.print("swarm: sync thread not started: {any}\n", .{err});
             if (cfg.storage.swarm_backup) folder.setBackup(true) catch |err| std.debug.print("swarm backup: not started: {any}\n", .{err});
@@ -202,6 +205,38 @@ pub const Node = struct {
         };
         errdefer if (folder_backup) |b| b.destroy();
         discovery_node.device_identity = device_identity;
+
+        const policy_path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(device_paths.trust) orelse ".", "swarm.policy" });
+        defer allocator.free(policy_path);
+        const policy = try device.policy.Policy.load(allocator, policy_path);
+        errdefer policy.destroy();
+
+        // The keeper copies what the swarm folder says this device keeps;
+        // its thread starts with the listener.
+        var keeper: ?*cluster.keeper.Keeper = null;
+        if (store) |s| if (block_manager.fetcher != null) {
+            const k = try allocator.create(cluster.keeper.Keeper);
+            k.* = cluster.keeper.Keeper.init(allocator, &block_manager.fetcher.?, s);
+            keeper = k;
+            if (swarm) |folder| {
+                folder.placement = .{ .trust = trust_store, .policy = policy, .self_device = device_identity.deviceId() };
+                folder.keeper = k;
+                try k.register(folder.keeperProvider());
+            }
+        };
+        errdefer if (keeper) |k| allocator.destroy(k);
+
+        // This device's say in the swarm's policy: whether it accepts copies
+        // (signed again only when it changed), and --copies.
+        const now = nowSeconds();
+        if (policy.acceptsCopies(device_identity.deviceId()) != cfg.storage.accept_copies or !policy.hasAccepts(device_identity.deviceId())) {
+            const r = try device.policy.sign(device_identity, .accepts, device_identity.deviceId(), @intFromBool(cfg.storage.accept_copies), now);
+            if (try policy.apply(r, trust_store, device_identity.deviceId(), now) == .applied) policy.save() catch |err| std.debug.print("policy: not saved: {any}\n", .{err});
+        }
+        if (cfg.storage.set_copies) |n| {
+            const r = try device.policy.sign(device_identity, .copies, .{ .bytes = [_]u8{0} ** 32 }, n, now);
+            if (try policy.apply(r, trust_store, device_identity.deviceId(), now) == .applied) policy.save() catch |err| std.debug.print("policy: not saved: {any}\n", .{err});
+        }
 
         const info_provider = try allocator.create(InfoProvider);
         errdefer allocator.destroy(info_provider);
@@ -254,6 +289,8 @@ pub const Node = struct {
             .swarm = swarm,
             .read_ahead = read_ahead,
             .folder_backup = folder_backup,
+            .policy = policy,
+            .keeper = keeper,
             .bootstrap_running = bootstrap_running,
             .bootstrap_thread = null,
         };
@@ -273,6 +310,10 @@ pub const Node = struct {
         self.connection_manager.stop();
         self.discovery_node.drainHandlers();
         self.connection_manager.relay_dialer = null;
+        if (self.keeper) |k| {
+            k.stop();
+            self.allocator.destroy(k);
+        }
         if (self.folder_backup) |b| b.destroy();
         if (self.shares) |index| index.destroy();
         if (self.swarm) |folder| folder.destroy();
@@ -281,6 +322,7 @@ pub const Node = struct {
         self.known_peers.deinit();
         self.allocator.destroy(self.known_peers);
         self.redial.deinit(self.allocator);
+        self.policy.destroy();
         self.trust_store.deinit();
         self.allocator.free(self.info_provider.storage_path);
         self.allocator.destroy(self.info_provider);
@@ -376,6 +418,7 @@ pub const Node = struct {
         try self.connection_manager.start();
         try self.connection_manager.listen(cfg, running);
         if (self.folder_backup) |b| b.start() catch |err| std.debug.print("backup: thread not started: {any}\n", .{err});
+        if (self.keeper) |k| k.start() catch |err| std.debug.print("keeper: thread not started: {any}\n", .{err});
         if (self.store != null and self.cache_thread == null) {
             self.cache_running.store(true, .release);
             self.cache_thread = std.Thread.spawn(.{}, runCacheSort, .{self}) catch null;
@@ -444,6 +487,10 @@ pub const Node = struct {
             const snap = try shares.snapshot(self.allocator);
             defer fs.ShareIndex.freeSnapshot(self.allocator, snap);
             for (snap) |sh| if (sh.root) |r| try storage.dag.walk.addStoredReachable(self.allocator, store, &r, &keep);
+            // Folder backups kept for other devices.
+            const held = try shares.heldSnapshot(self.allocator);
+            defer fs.ShareIndex.freeHeldSnapshot(self.allocator, held);
+            for (held) |h| try storage.dag.walk.addStoredReachable(self.allocator, store, &h.root, &keep);
         }
         if (self.swarm) |swarm| {
             const roots = try swarm.keptRoots(self.allocator);
@@ -460,6 +507,7 @@ pub const Node = struct {
     /// ManagerStopping until the connection manager can restart.
     pub fn stopListener(self: *Node) void {
         self.stopCacheThread();
+        if (self.keeper) |k| k.stop();
         if (self.folder_backup) |b| b.stop();
         self.bootstrap_running.store(false, .release);
         self.connection_manager.stop();

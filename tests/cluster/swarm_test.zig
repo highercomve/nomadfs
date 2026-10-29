@@ -111,7 +111,7 @@ test "swarm folder: two devices add, read, rename and delete in one folder" {
     try std.testing.expectEqual(@as(usize, 1), again.len);
 }
 
-test "swarm replication: swarm_replicas pushes files to peer on add" {
+test "swarm copies: placement gives a file to another device, whose keeper pulls it" {
     std.debug.print("\n=== Running Test: swarm replication ===\n", .{});
     const allocator = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -168,13 +168,39 @@ test "swarm replication: swarm_replicas pushes files to peer on add" {
     swarm_a.block_manager = bm_a;
     swarm_b.block_manager = bm_b;
 
-    // Set swarm_replicas = 1 on A
-    swarm_a.swarm_replicas.store(1, .release);
+    // B's view of the swarm: no members besides itself, so with copies = 2
+    // placement gives every file from another device to B.
+    const trust_path = "test_rep_b/trust.store";
+    var trust_b = try nomadfs.device.trust.Store.load(allocator, trust_path, null);
+    defer trust_b.deinit();
+    const id_b = try nomadfs.device.identity.Identity.fromSeed([_]u8{0x77} ** nomadfs.device.identity.seed_len);
+    const policy_b = try nomadfs.device.policy.Policy.load(allocator, "test_rep_b/swarm.policy");
+    defer policy_b.destroy();
+    swarm_b.placement = .{ .trust = &trust_b, .policy = policy_b, .self_device = id_b.deviceId() };
 
-    // A adds file -> pushes to B immediately
     try swarm_a.addFile("", "doc.txt", "test_rep_src/doc.txt");
-
     const info = swarm_a.fileInfo("doc.txt") orelse return error.FileNotFound;
-    // B should already have the block stored without B having initiated a read or backup round
+    _ = try swarm_b.syncNow();
+
+    // copies = 1 (the default): nothing is pulled.
+    try swarm_b.backupRound();
+    try std.testing.expect(!store_b.has(&info.cid));
+
+    // copies = 2: B keeps it, nothing pushed by A.
+    const now = nomadfs.nowSeconds();
+    _ = try policy_b.setCopies(id_b, &trust_b, 2, now);
+    try swarm_b.backupRound();
     try std.testing.expect(store_b.has(&info.cid));
+    try std.testing.expectEqual(StorageEngine.Where.kept, store_b.locate(&info.cid));
+    try std.testing.expectEqual(@as(usize, 1), swarm_b.backupStatus().backed_up);
+
+    // A device that refuses copies keeps nothing new.
+    const r = try nomadfs.device.policy.sign(id_b, .accepts, id_b.deviceId(), 0, now + 1);
+    _ = try policy_b.apply(r, &trust_b, id_b.deviceId(), now + 1);
+    try cwd.writeFile(io, .{ .sub_path = "test_rep_src/two.txt", .data = "a second file, not wanted on B" });
+    try swarm_a.addFile("", "two.txt", "test_rep_src/two.txt");
+    const two = swarm_a.fileInfo("two.txt") orelse return error.FileNotFound;
+    _ = try swarm_b.syncNow();
+    try swarm_b.backupRound();
+    try std.testing.expect(!store_b.has(&two.cid));
 }

@@ -161,6 +161,22 @@ pub const Policy = struct {
         return r.value != 0;
     }
 
+    pub fn hasAccepts(self: *Policy, device: NodeID) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.accepts.contains(device);
+    }
+
+    /// Signs `copies = n` as this device and applies it; the caller saves
+    /// and spreads it.
+    pub fn setCopies(self: *Policy, identity: identity_mod.Identity, trust: *trust_mod.Store, n: u8, now: u64) !Outcome {
+        if (n < 1 or n > max_copies) return error.InvalidCopies;
+        const r = try sign(identity, .copies, .{ .bytes = [_]u8{0} ** 32 }, n, now);
+        const outcome = try self.apply(r, trust, identity.deviceId(), now);
+        if (outcome == .applied) try self.save();
+        return outcome;
+    }
+
     /// Verifies and applies `r` (from a peer or this device). `trust` says
     /// who may sign; `self_device` is this device, always allowed.
     pub fn apply(self: *Policy, r: Record, trust: *trust_mod.Store, self_device: NodeID, now: u64) !Outcome {

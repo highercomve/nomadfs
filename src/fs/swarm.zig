@@ -9,6 +9,7 @@
 const std = @import("std");
 const sync = @import("../sync.zig");
 const cluster = @import("../cluster/mod.zig");
+const device = @import("../device/mod.zig");
 const storage = @import("../storage/mod.zig");
 const NodeID = @import("../net/id.zig").NodeID;
 const ShareSource = @import("../net/discovery/node.zig").Node.ShareSource;
@@ -47,9 +48,13 @@ pub const SwarmFolder = struct {
 
     /// Backup: a copy of every live file in this device's block store.
     backup_enabled: std.atomic.Value(bool) = .init(false),
-    backup_thread: ?std.Thread = null,
     /// Serialises setBackup (the app's switch, shutdown).
     backup_ctl: sync.Mutex = .{},
+    /// Copies this device keeps are made by the keeper (cluster/keeper.zig),
+    /// which asks `wants` what to hold; null: nobody keeps copies here.
+    keeper: ?*cluster.keeper.Keeper = null,
+    /// Who keeps which file besides backup devices (cluster/placement.zig).
+    placement: ?Placement = null,
     /// Guards `backed_up` and the backup counters.
     backup_mutex: sync.Mutex = .{},
     /// Root CIDs of files copied here in full, kept in `<manifest>.backup`
@@ -59,10 +64,10 @@ pub const SwarmFolder = struct {
     /// Files no reachable device could serve in the last round.
     backup_unreachable: usize = 0,
     backup_last_round: u64 = 0,
-    /// Number of peer devices to replicate newly added/updated files to.
-    /// When > 0, addFile pushes the file DAG to up to this many peers.
-    /// Atomic: the app changes it while edits run.
-    swarm_replicas: std.atomic.Value(u8) = .init(0),
+    /// Failures in the round under way, and copies since the list was saved.
+    round_failed: usize = 0,
+    unsaved: usize = 0,
+    saved_at: i64 = 0,
 
     pub fn create(allocator: std.mem.Allocator, io: std.Io, store: *storage.engine.StorageEngine, self_id: NodeID, self_name: []const u8, file_path: []const u8) !*SwarmFolder {
         const self = try allocator.create(SwarmFolder);
@@ -87,7 +92,7 @@ pub const SwarmFolder = struct {
 
     pub fn destroy(self: *SwarmFolder) void {
         self.stop();
-        self.setBackup(false) catch {};
+        self.backup_enabled.store(false, .release);
         self.backed_up.deinit(self.allocator);
         self.manifest.deinit();
         self.allocator.free(self.self_name);
@@ -166,23 +171,12 @@ pub const SwarmFolder = struct {
         const root = try builder.build(&reader);
         defer self.allocator.free(root);
 
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            _ = try self.manifest.edit(path, .{ .cid = root[0..32].*, .size = reader.offset, .mtime = self.now() }, self.self_id.bytes, self.self_name);
-            try self.saveLocked();
-        }
-
-        // Outside the lock: pushing a large file takes a while, and sync,
-        // peers' manifest requests and the app must not wait for it.
-        const replicas = self.swarm_replicas.load(.acquire);
-        if (replicas > 0) {
-            if (self.block_manager) |bm| {
-                _ = bm.replicate(root, replicas) catch |err| {
-                    std.debug.print("swarm: replicate failed: {any}\n", .{err});
-                };
-            }
-        }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = try self.manifest.edit(path, .{ .cid = root[0..32].*, .size = reader.offset, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+        try self.saveLocked();
+        // The devices that keep copies pull it (their keepers), once their
+        // manifest has it: nothing is pushed from here.
     }
 
     /// Root CIDs of the files this device must keep: the ones it wrote or
@@ -436,7 +430,11 @@ pub const SwarmFolder = struct {
         defer self.mutex.unlock();
         self.peers_synced = reached;
         self.last_sync = self.now();
-        if (changed > 0) self.saveLocked() catch |err| std.debug.print("swarm: saving the manifest failed: {any}\n", .{err});
+        if (changed > 0) {
+            self.saveLocked() catch |err| std.debug.print("swarm: saving the manifest failed: {any}\n", .{err});
+            // New files may be ones this device keeps.
+            if (self.keeper) |k| k.wake();
+        }
         return changed;
     }
 
@@ -482,31 +480,125 @@ pub const SwarmFolder = struct {
         last_round: u64,
     };
 
-    const BackupWant = struct { cid: [32]u8, author: NodeID };
+    /// What placement reads: membership, the swarm's policy, this device.
+    pub const Placement = struct {
+        trust: *device.trust.Store,
+        policy: *device.policy.Policy,
+        self_device: NodeID,
+    };
 
-    /// Turns the backup on or off. On: every live file is copied into this
-    /// device's block store, checked every sync interval for new ones. Other
-    /// devices read from here when the one that added a file is offline (they
-    /// try every known peer). Deleted files' blocks stay (no collection yet).
+    /// Turns the backup on or off. On: every live file is kept on this
+    /// device (the keeper copies it). Other devices read from here when the
+    /// one that added a file is offline. Off: copies made stay; files
+    /// placement gives this device are still kept.
     pub fn setBackup(self: *SwarmFolder, on: bool) !void {
         self.backup_ctl.lock();
         defer self.backup_ctl.unlock();
-        if (on == self.backup_enabled.load(.acquire)) return;
-        if (!on) {
-            self.backup_enabled.store(false, .release);
-            if (self.backup_thread) |t| t.join();
-            self.backup_thread = null;
+        self.ensureBackedUpLoaded();
+        self.backup_enabled.store(on, .release);
+        if (on) if (self.keeper) |k| k.wake();
+    }
+
+    fn ensureBackedUpLoaded(self: *SwarmFolder) void {
+        if (self.backed_up_loaded) return;
+        self.loadBackedUp() catch |err| std.debug.print("swarm backup: starting over ({any})\n", .{err});
+        self.backed_up_loaded = true;
+    }
+
+    /// The keeper's view of this folder (cluster/keeper.zig).
+    pub fn keeperProvider(self: *SwarmFolder) cluster.keeper.Provider {
+        return .{ .ctx = self, .wantsFn = wantsErased, .doneFn = doneErased };
+    }
+
+    fn wantsErased(ctx: *anyopaque, allocator: std.mem.Allocator, out: *std.ArrayList(cluster.keeper.Want), max: usize) anyerror!void {
+        const self: *SwarmFolder = @ptrCast(@alignCast(ctx));
+        return self.wants(allocator, out, max);
+    }
+
+    fn doneErased(ctx: *anyopaque, root: cluster.keeper.Cid, ok: bool) void {
+        const self: *SwarmFolder = @ptrCast(@alignCast(ctx));
+        self.kept(root, ok);
+    }
+
+    /// The live files this device should keep and doesn't yet: all of them
+    /// on a backup device; else the ones placement gives it (the swarm's
+    /// `copies` above 1). Hints: the author, then the other holders.
+    fn wants(self: *SwarmFolder, allocator: std.mem.Allocator, out: *std.ArrayList(cluster.keeper.Want), max: usize) !void {
+        {
+            self.backup_ctl.lock();
+            defer self.backup_ctl.unlock();
+            self.ensureBackedUpLoaded();
+        }
+        {
+            // A round starts: the last one's failures are its result.
+            self.backup_mutex.lock();
+            defer self.backup_mutex.unlock();
+            self.backup_unreachable = self.round_failed;
+            self.round_failed = 0;
+            self.backup_last_round = self.now();
+        }
+        const backup = self.backup_enabled.load(.acquire);
+        const copies: u8 = if (self.placement) |p| p.policy.copies() else 1;
+        if (!backup and copies <= 1) return;
+        const bm = self.block_manager orelse return;
+
+        const members: []NodeID = if (self.placement) |p| (if (copies > 1) try cluster.placement.candidates(allocator, p.trust, p.policy, self.self_id, p.self_device) else &.{}) else &.{};
+        defer allocator.free(members);
+        const known = try remote_mod.knownPeers(bm, allocator);
+        defer allocator.free(known);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.backup_mutex.lock();
+        defer self.backup_mutex.unlock();
+        for (self.manifest.entries.values()) |e| {
+            if (out.items.len >= max) break;
+            if (e.deleted or e.kind != .file or self.backed_up.contains(e.cid)) continue;
+            const author: NodeID = .{ .bytes = e.version.device };
+            if (author.eql(self.self_id)) continue; // its own: kept already
+            var placed: [policy_max]NodeID = undefined;
+            const holders = cluster.placement.replicaHolders(&e.cid, author, copies, members, &placed);
+            if (!backup and !contains(holders, self.self_id)) continue;
+            var hints: [cluster.fetcher.max_holders]NodeID = undefined;
+            var n: usize = 0;
+            hints[0] = author;
+            n = 1;
+            for (holders) |h| addHint(&hints, &n, h, self.self_id);
+            for (known) |h| addHint(&hints, &n, h, self.self_id);
+            try out.append(allocator, cluster.keeper.Want.init(e.cid, hints[0..n]));
+        }
+    }
+
+    const policy_max = device.policy.max_copies;
+
+    fn contains(ids: []const NodeID, id: NodeID) bool {
+        for (ids) |x| if (x.eql(id)) return true;
+        return false;
+    }
+
+    fn addHint(hints: *[cluster.fetcher.max_holders]NodeID, n: *usize, id: NodeID, self_id: NodeID) void {
+        if (n.* >= hints.len or id.eql(self_id) or contains(hints[0..n.*], id)) return;
+        hints[n.*] = id;
+        n.* += 1;
+    }
+
+    /// A copy finished (or failed); the list is saved now and then, so a
+    /// long first backup survives a restart.
+    fn kept(self: *SwarmFolder, root: [32]u8, ok: bool) void {
+        self.backup_mutex.lock();
+        defer self.backup_mutex.unlock();
+        if (!ok) {
+            self.round_failed += 1;
             return;
         }
-        if (!self.backed_up_loaded) {
-            self.loadBackedUp() catch |err| std.debug.print("swarm backup: starting over ({any})\n", .{err});
-            self.backed_up_loaded = true;
+        self.backed_up.put(self.allocator, root, {}) catch return;
+        self.unsaved += 1;
+        const at = sync.monotonicMillis();
+        if (self.unsaved >= 32 or at - self.saved_at > 10 * std.time.ms_per_s) {
+            self.saveBackedUpLocked() catch |err| std.debug.print("swarm backup: saving progress failed: {any}\n", .{err});
+            self.unsaved = 0;
+            self.saved_at = at;
         }
-        self.backup_enabled.store(true, .release);
-        self.backup_thread = std.Thread.spawn(.{}, backupLoop, .{self}) catch |err| {
-            self.backup_enabled.store(false, .release);
-            return err;
-        };
     }
 
     pub fn backupStatus(self: *SwarmFolder) BackupStatus {
@@ -536,90 +628,24 @@ pub const SwarmFolder = struct {
         return out;
     }
 
-    fn backupLoop(self: *SwarmFolder) void {
-        const step = 200 * std.time.ns_per_ms;
-        var waited: u64 = self.sync_interval_ns - 3 * std.time.ns_per_s; // first round soon
-        while (self.backup_enabled.load(.acquire)) {
-            sync.sleep(step);
-            waited += step;
-            if (waited < self.sync_interval_ns) continue;
-            waited = 0;
-            self.backupRound() catch |err| std.debug.print("swarm backup: round failed: {any}\n", .{err});
-        }
-    }
-
-    /// Copies every live file not copied yet. Stops early when turned off.
+    /// One keeping round without the keeper's thread (tests, the app's
+    /// "sync now"): copies every wanted file through the keeper's copy.
     pub fn backupRound(self: *SwarmFolder) !void {
         const bm = self.block_manager orelse return;
-        var want: std.ArrayList(BackupWant) = .empty;
-        defer want.deinit(self.allocator);
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            self.backup_mutex.lock();
-            defer self.backup_mutex.unlock();
-            for (self.manifest.entries.values()) |e| {
-                if (e.deleted or e.kind != .file or self.backed_up.contains(e.cid)) continue;
-                try want.append(self.allocator, .{ .cid = e.cid, .author = .{ .bytes = e.version.device } });
-            }
+        const fetcher = &(bm.fetcher orelse return error.StorageDisabled);
+        var todo: std.ArrayList(cluster.keeper.Want) = .empty;
+        defer todo.deinit(self.allocator);
+        try self.wants(self.allocator, &todo, std.math.maxInt(usize));
+        var go: std.atomic.Value(bool) = .init(true);
+        for (todo.items) |*w| {
+            const ok = if (cluster.keeper.copy(self.allocator, fetcher, self.store, w.root, w.holders(), &go)) |_| true else |_| false;
+            self.kept(w.root, ok);
         }
-
-        var missing: usize = 0;
-        var added: usize = 0;
-        if (want.items.len > 0) {
-            const peers = try remote_mod.knownPeers(bm, self.allocator);
-            defer self.allocator.free(peers);
-            for (want.items) |w| {
-                if (!self.backup_enabled.load(.acquire)) break;
-                if (!self.copyFile(bm, w, peers)) {
-                    missing += 1;
-                    continue;
-                }
-                self.backup_mutex.lock();
-                defer self.backup_mutex.unlock();
-                try self.backed_up.put(self.allocator, w.cid, {});
-                added += 1;
-                // Now and then, so a long first backup survives a restart.
-                if (added % 32 == 0) self.saveBackedUpLocked() catch {};
-            }
-        }
-
         self.backup_mutex.lock();
         defer self.backup_mutex.unlock();
-        self.backup_unreachable = missing;
-        self.backup_last_round = self.now();
-        if (added > 0) {
-            self.saveBackedUpLocked() catch |err| std.debug.print("swarm backup: saving progress failed: {any}\n", .{err});
-            std.debug.print("swarm backup: copied {d} file(s), {d} not reachable\n", .{ added, missing });
-        }
-    }
-
-    /// Whether the whole file is here afterwards: already (added here, or read
-    /// before), else from the device that added it, else from any other peer
-    /// (another backup).
-    fn copyFile(self: *SwarmFolder, bm: *cluster.BlockManager, w: BackupWant, peers: []const NodeID) bool {
-        if (storage.dag.walk.collectReachable(self.allocator, self.store, &w.cid)) |set| {
-            var cids = set;
-            defer cids.deinit(self.allocator);
-            // Held already, perhaps only because it was read: a backup keeps it.
-            var it = cids.keyIterator();
-            while (it.next()) |cid| self.store.pin(cid) catch return false;
-            return true;
-        } else |_| {}
-        if (self.copyFrom(bm, w.author, w.cid)) return true;
-        for (peers) |p| {
-            if (p.eql(w.author) or p.eql(self.self_id)) continue;
-            if (self.copyFrom(bm, p, w.cid)) return true;
-        }
-        return false;
-    }
-
-    fn copyFrom(self: *SwarmFolder, bm: *cluster.BlockManager, peer: NodeID, cid: [32]u8) bool {
-        if (peer.eql(self.self_id)) return false;
-        const conn = bm.connectTo(peer) catch return false;
-        defer conn.deinit();
-        _ = cluster.repair.RepairManager.syncWhile(self.allocator, bm.dht_node, self.store, conn, &cid, &self.backup_enabled) catch return false;
-        return true;
+        self.backup_unreachable = self.round_failed;
+        self.saveBackedUpLocked() catch {};
+        self.unsaved = 0;
     }
 
     fn backupPath(self: *SwarmFolder) ![]u8 {
