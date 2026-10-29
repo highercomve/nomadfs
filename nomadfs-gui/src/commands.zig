@@ -1391,6 +1391,8 @@ pub const DeviceInfo = struct {
     swarm_unreachable: u32,
     held_backups: u32,
     unmetered: bool,
+    bytes_sent: u64,
+    bytes_received: u64,
 };
 
 /// `invoke("device_info", { peer? })`: what a device reports about itself

@@ -2634,6 +2634,8 @@ async function openDeviceInfo(title, peer) {
   netStat(i.swarm_backup ? "On" : "Off", "swarm backup");
   if (i.held_backups) netStat(String(i.held_backups), "folder backups kept for others");
   netStat(i.unmetered ? "Yes" : "No", "on Wi-Fi or wired");
+  netStat(formatSize(i.bytes_sent), "sent");
+  netStat(formatSize(i.bytes_received), "received");
   section("Swarm and network", net);
 
   const again = el("button", "btn outlined", "Ask again");

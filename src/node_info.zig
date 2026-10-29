@@ -50,6 +50,8 @@ pub const Info = struct {
     held_backups: u32 = 0,
     /// On Wi-Fi or wired (phones); always true elsewhere.
     unmetered: bool = true,
+    bytes_sent: u64 = 0,
+    bytes_received: u64 = 0,
 
     pub const Text = struct {
         buf: [max_text]u8 = undefined,
@@ -167,7 +169,7 @@ pub fn nowSeconds() u64 {
 
 test "node info: round trip, and an older device's shorter info" {
     const a = std.testing.allocator;
-    var info: Info = .{ .uptime_s = 42, .disk_total = 1 << 40, .disk_free = 1 << 30, .peers = 3, .swarm_backup = true, .held_backups = 2, .unmetered = false };
+    var info: Info = .{ .uptime_s = 42, .disk_total = 1 << 40, .disk_free = 1 << 30, .peers = 3, .swarm_backup = true, .held_backups = 2, .unmetered = false, .bytes_sent = 123456, .bytes_received = 654321 };
     info.version = Info.Text.init("0.2.5");
     info.platform = Info.Text.init(platform());
     const bytes = try encode(a, info);
@@ -177,6 +179,15 @@ test "node info: round trip, and an older device's shorter info" {
     try std.testing.expectEqual(info.disk_free, got.disk_free);
     try std.testing.expect(got.swarm_backup and !got.unmetered);
     try std.testing.expectEqual(@as(u32, 2), got.held_backups);
+    try std.testing.expectEqual(@as(u64, 123456), got.bytes_sent);
+    try std.testing.expectEqual(@as(u64, 654321), got.bytes_received);
+
+    // Cut before the new traffic fields: an older device keeps defaults.
+    const older_len = bytes.len - 16;
+    const older = try decode(bytes[0..older_len]);
+    try std.testing.expectEqual(info.disk_free, older.disk_free);
+    try std.testing.expectEqual(@as(u64, 0), older.bytes_sent);
+    try std.testing.expectEqual(@as(u64, 0), older.bytes_received);
 
     // Cut after uptime: the rest keeps its defaults.
     const short = try decode(bytes[0 .. 1 + 1 + 5 + 1 + got.platform.len + 8]);

@@ -181,6 +181,7 @@ pub const TcpStream = struct {
     handshakes: ?*Handshakes = null,
     handshake_slot: usize = 0,
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    traffic: ?*network.manager.TrafficCounters = null,
 
     pub fn stream(self: *TcpStream) network.Stream {
         return network.Stream.init(self, &tcp_stream_vtable);
@@ -189,13 +190,17 @@ pub const TcpStream = struct {
     fn read(ptr: *anyopaque, buffer: []u8) anyerror!usize {
         const self: *TcpStream = @ptrCast(@alignCast(ptr));
         try self.boundOperation();
-        return self.net_stream.read(buffer);
+        const n = try self.net_stream.read(buffer);
+        if (self.traffic) |t| _ = t.received.fetchAdd(n, .monotonic);
+        return n;
     }
 
     fn write(ptr: *anyopaque, buffer: []const u8) anyerror!usize {
         const self: *TcpStream = @ptrCast(@alignCast(ptr));
         try self.boundOperation();
-        return self.net_stream.write(buffer);
+        const n = try self.net_stream.write(buffer);
+        if (self.traffic) |t| _ = t.sent.fetchAdd(n, .monotonic);
+        return n;
     }
 
     fn boundOperation(self: *TcpStream) !void {
@@ -326,7 +331,8 @@ fn handleIncomingConnection(
         }
     }
 
-    const connection = establish(allocator, conn.stream, conn.address, swarm_key, static_key, false, handshake_timeout_ms, device_auth_opt, handshakes, slot) catch {
+    const traffic = if (manager) |m| &m.traffic else null;
+    const connection = establish(allocator, conn.stream, conn.address, swarm_key, static_key, false, handshake_timeout_ms, device_auth_opt, handshakes, slot, traffic) catch {
         return;
     };
 
@@ -352,7 +358,7 @@ pub fn connect(
     handshake_timeout_ms: u32,
     device_auth_opt: ?*const device_auth.Authenticator,
 ) !network.Connection {
-    return connectTracked(allocator, address, swarm_key, static_key, handshake_timeout_ms, device_auth_opt, null);
+    return connectTracked(allocator, address, swarm_key, static_key, handshake_timeout_ms, device_auth_opt, null, null);
 }
 
 pub fn connectTracked(
@@ -363,6 +369,7 @@ pub fn connectTracked(
     handshake_timeout_ms: u32,
     device_auth_opt: ?*const device_auth.Authenticator,
     handshakes: ?*Handshakes,
+    traffic: ?*network.manager.TrafficCounters,
 ) !network.Connection {
     // A device has several addresses (LAN, Tailscale, ...) and the caller
     // tries them in turn: away from home the LAN one can hang until the
@@ -373,7 +380,7 @@ pub fn connectTracked(
         return error.TooManyHandshakes;
     } else 0;
     defer if (handshakes) |h| h.wg.finish();
-    return establish(allocator, stream, address, swarm_key, static_key, true, handshake_timeout_ms, device_auth_opt, handshakes, slot);
+    return establish(allocator, stream, address, swarm_key, static_key, true, handshake_timeout_ms, device_auth_opt, handshakes, slot, traffic);
 }
 
 /// Runs the Noise handshake and starts Yamux over `net_stream`, returning a
@@ -390,6 +397,7 @@ fn establish(
     device_auth_opt: ?*const device_auth.Authenticator,
     handshakes: ?*Handshakes,
     slot: usize,
+    traffic: ?*network.manager.TrafficCounters,
 ) !network.Connection {
     std.debug.assert(handshake_timeout_ms > 0);
     net_stream.setNoDelay();
@@ -406,6 +414,7 @@ fn establish(
             .deadline_ms = sync.monotonicMillis() + handshake_timeout_ms,
             .handshakes = handshakes,
             .handshake_slot = slot,
+            .traffic = traffic,
         },
         .noise_stream = undefined,
         .yamux = undefined,
