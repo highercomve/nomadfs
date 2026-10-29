@@ -367,6 +367,31 @@ function setEmpty(text) {
   el.textContent = text || "";
 }
 
+/** A list that is loading something new: the old rows go at once, and
+ *  placeholder rows stand in until the new ones arrive. */
+function listLoading(list, rows = 4) {
+  list.replaceChildren();
+  for (let i = 0; i < rows; i++) {
+    const li = document.createElement("li");
+    li.className = "skeleton";
+    li.setAttribute("aria-hidden", "true");
+    li.innerHTML = '<span class="row-icon"></span><span class="row-text"><span class="sk-bar"></span><span class="sk-bar short"></span></span>';
+    list.appendChild(li);
+  }
+  list.setAttribute("aria-busy", "true");
+}
+
+function listLoaded(list) {
+  list.removeAttribute("aria-busy");
+}
+
+// Each navigation in Browse gets a number; a response for an older one
+// (the user moved on while it loaded) is dropped instead of drawn.
+let browseNav = 0;
+// What Browse shows now ("devices", or the path), to tell a new place from
+// a refresh of the same one (which keeps its rows while it reloads).
+let browseShowing = "";
+
 function busy(on) {
   $("remote-refresh").classList.toggle("spin", on);
 }
@@ -379,20 +404,31 @@ let deviceRetries = 0;
 async function showDevices() {
   path = [];
   renderCrumbs();
+  const nav = ++browseNav;
   const list = $("remote-list");
   if (!running) {
     list.replaceChildren();
     setEmpty("Start the node, then add your other devices under Connect devices.");
+    browseShowing = "";
     return;
   }
-  busy(true);
-  try {
-    devices = await invoke("remote_devices", null);
-  } catch (err) {
-    devices = [];
-    snack(`Devices failed: ${err}`);
+  if (browseShowing !== "devices") {
+    setEmpty("");
+    listLoading(list);
   }
+  busy(true);
+  let found;
+  try {
+    found = await invoke("remote_devices", null);
+  } catch (err) {
+    found = [];
+    if (nav === browseNav) snack(`Devices failed: ${err}`);
+  }
+  if (nav !== browseNav) return;
+  devices = found;
+  browseShowing = "devices";
   busy(false);
+  listLoaded(list);
   renderNavDevices();
   list.replaceChildren();
   if (!devices.length) {
@@ -628,26 +664,42 @@ function browseRow(e, files) {
 async function showLocation() {
   if (path.length === 0) return showDevices();
   renderCrumbs();
+  const nav = ++browseNav;
   const device = path[0].device;
+  const where = [device.peer, ...path.slice(1).map((p) => p.name)].join("/");
 
   if (path.length === 1) {
+    busy(false);
     browse = { device, shares: true };
+    browseShowing = where;
+    listLoaded($("remote-list"));
     browseTable.show(device.shares.map((sh) => ({ ...sh, dir: true })));
     return;
   }
 
   const here = path[path.length - 1];
+  if (browseShowing !== where) {
+    setEmpty("");
+    listLoading($("remote-list"));
+  }
   busy(true);
   let entries;
   try {
     entries = await invoke("browse", { peer: device.peer, cid: here.cid });
   } catch (err) {
+    if (nav !== browseNav) return;
     busy(false);
-    snack(`Could not open ${here.name}: ${err}`);
+    listLoaded($("remote-list"));
+    $("remote-list").replaceChildren();
+    setEmpty(`Couldn't open ${here.name}: ${err}`);
+    browseShowing = "";
     return;
   }
+  if (nav !== browseNav) return;
   busy(false);
+  listLoaded($("remote-list"));
   browse = { device, shares: false };
+  browseShowing = where;
   browseTable.show(entries);
 }
 
@@ -1054,23 +1106,36 @@ function swarmStatusText(st) {
   return `${st.entries} item${st.entries === 1 ? "" : "s"} · synced with ${devices} · ${when}`;
 }
 
+let swarmNav = 0;
+
 async function loadSwarm() {
   swarmCrumbs();
+  const nav = ++swarmNav;
   const list = $("swarm-list");
   if (!running) {
     list.replaceChildren();
     $("swarm-empty").hidden = false;
     $("swarm-empty").textContent = "Start the node to see the swarm folder.";
     $("swarm-status").textContent = "Node stopped";
+    swarmTable.dir = null;
     return;
+  }
+  // Another folder: its rows aren't these. A refresh keeps them meanwhile.
+  if (swarmTable.dir !== swarmDir) {
+    $("swarm-empty").hidden = true;
+    listLoading(list);
   }
   let res;
   try {
     res = await invoke("swarm_list", { dir: swarmDir });
   } catch (err) {
+    if (nav !== swarmNav) return;
+    listLoaded(list);
     snack(`Swarm folder: ${err}`);
     return;
   }
+  if (nav !== swarmNav) return;
+  listLoaded(list);
   $("swarm-status").textContent = swarmStatusText(res);
   if (!res.items.length && swarmDir) { // folder vanished (deleted elsewhere): go up
     swarmDir = swarmDir.split("/").slice(0, -1).join("/");
@@ -1261,17 +1326,29 @@ setInterval(async () => {
 
 // ---- Shared folders ----
 
+let sharesNav = 0;
+
 async function loadShares() {
+  const nav = ++sharesNav;
   const list = $("shares-list");
-  list.replaceChildren();
-  if (!running) return;
+  if (!running) {
+    list.replaceChildren();
+    return;
+  }
+  if (!list.children.length) listLoading(list, 2);
   let shares = [];
   try {
     shares = await invoke("shares_local", null);
   } catch (err) {
+    if (nav !== sharesNav) return;
+    listLoaded(list);
+    list.replaceChildren();
     snack(`Shares failed: ${err}`);
     return;
   }
+  if (nav !== sharesNav) return;
+  listLoaded(list);
+  list.replaceChildren();
   for (const s of shares) {
     const li = row({
       icon: "folder",
@@ -2181,6 +2258,7 @@ async function revokeTrusted(d) {
 
 $("devices-refresh").addEventListener("click", async () => {
   const list = $("devices-list");
+  if (!list.children.length) listLoading(list, 3);
   try {
     const trusted = await invoke("devices_list", { config_path: await ensureConfig() });
     // Reachable now: the same swarm key, online. Not the same as trusted.
@@ -2219,8 +2297,10 @@ $("devices-refresh").addEventListener("click", async () => {
       list.appendChild(row({ icon: "device", headline: "No devices yet", meta: "Connect one under Connect devices" }));
     }
   } catch (err) {
+    list.replaceChildren();
     snack(`Devices failed: ${err}`);
   }
+  listLoaded(list);
 });
 
 // ---- Swarm key rotation ----

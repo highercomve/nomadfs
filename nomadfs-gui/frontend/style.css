@@ -1482,3 +1482,22 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 .dh-fill { background: var(--md-on-surface-variant); opacity: .45; }
 .dh-mine { background: var(--md-primary); }
 #device-about[hidden] { display: none; }
+
+/* Loading: placeholder rows while a list fetches (listLoading in app.js). */
+.list.rows li.skeleton { pointer-events: none; }
+.list.rows li.skeleton .row-icon { background: var(--md-surface-container-high); }
+.list.rows li.skeleton .row-text { display: flex; flex-direction: column; gap: 8px; flex: 1; }
+.sk-bar {
+  display: block;
+  height: 11px;
+  width: 55%;
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--md-surface-container-high) 0%, var(--md-surface-container) 50%, var(--md-surface-container-high) 100%);
+  background-size: 200% 100%;
+  animation: sk-shimmer 1.2s linear infinite;
+}
+.sk-bar.short { width: 30%; height: 9px; }
+.list.rows li.skeleton:nth-child(2) .sk-bar:not(.short) { width: 42%; }
+.list.rows li.skeleton:nth-child(3) .sk-bar:not(.short) { width: 63%; }
+@keyframes sk-shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+@media (prefers-reduced-motion: reduce) { .sk-bar { animation: none; } }
