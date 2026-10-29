@@ -11,8 +11,8 @@
 #
 # For each host: copy the binary next to the installed one, check it runs
 # there (`--help`; a binary built for the wrong CPU dies with SIGILL),
-# keep the old one as nomadfs.prev, swap, restart, and watch the service
-# for a few seconds. If it doesn't stay up, the old binary goes back.
+# keep the old one as nomadfs.prev, swap, restart, and check the same
+# process is still running 10 s later. If not, the old binary goes back.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -66,15 +66,18 @@ if ! "$path.new" --help >/dev/null 2>&1; then
   rm -f "$path.new"
   exit 1
 fi
+# Renames, never writes over a running binary ("Text file busy").
 cp "$path" "$path.prev"
 mv "$path.new" "$path"
-before=\$($ctl show nomadfs -p NRestarts --value 2>/dev/null || echo 0)
 $ctl restart nomadfs
+sleep 2
+pid=\$($ctl show nomadfs -p MainPID --value)
 sleep 8
-after=\$($ctl show nomadfs -p NRestarts --value 2>/dev/null || echo 0)
-if [ "\$($ctl is-active nomadfs)" != active ] || [ "\$after" != "\$before" ]; then
+# Up, and the same process: a crash loop would have a new one.
+if [ "\$($ctl is-active nomadfs)" != active ] || [ "\$($ctl show nomadfs -p MainPID --value)" != "\$pid" ] || [ "\$pid" = 0 ]; then
   echo "  the service didn't stay up; putting the previous binary back"
-  cp "$path.prev" "$path"
+  cp "$path.prev" "$path.rollback"
+  mv "$path.rollback" "$path"
   $ctl restart nomadfs
   exit 1
 fi
