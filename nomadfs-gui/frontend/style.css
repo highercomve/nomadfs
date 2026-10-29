@@ -1318,7 +1318,7 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
   font-size: 14px;
 }
 .search-field input::placeholder { color: var(--sand); opacity: .45; }
-#browse-sort {
+#browse-sort, #cache-limit {
   flex: none;
   height: 38px;
   padding: 0 10px;
@@ -1418,6 +1418,10 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 .update-box .progress { margin-top: 10px; }
 .update-box .progress.determinate::after { animation: none; width: var(--p, 0%); transition: width .2s; }
 .update-buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+/* The read cache: the size on its own line, what it is below; on a phone
+   the controls wrap under the text instead of squeezing it. */
+#cache-box .grow { flex: 1 1 260px; }
+.cache-hint { margin: 4px 0 0; color: var(--sand-dim); font-size: 13px; }
 /* A dot on About (drawer, bar's More) when an update is out. */
 .nav-item[data-view="about"].has-update::after {
   content: "";

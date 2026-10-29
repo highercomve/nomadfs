@@ -1769,7 +1769,7 @@ async function loadCache() {
     return;
   }
   const limit = c.limit_mb ? formatSize(c.limit_mb * 1024 * 1024) : "no limit";
-  $("cache-status").textContent = `${formatSize(c.bytes)} of ${limit} · ${c.blocks} blocks. Files you open from other devices are kept here; the least recently read go first when it is full.`;
+  $("cache-status").textContent = `${formatSize(c.bytes)} of ${limit} · ${c.blocks} blocks`;
   const sel = $("cache-limit");
   const want = String(c.limit_mb);
   if (![...sel.options].some((o) => o.value === want)) {

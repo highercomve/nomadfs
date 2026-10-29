@@ -3,6 +3,13 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.2.2 - 2026-10-29
+
+### Fixed
+
+- **About → Read cache** on a phone: the size has a line of its own and the controls sit below
+  the text instead of squeezing it into a narrow column; the limit menu matches the app.
+
 ## 0.2.1 - 2026-10-28
 
 ### Fixed
