@@ -305,6 +305,30 @@ that tombstone, it preserves the original timestamp `at` and signs a fresh `REVO
 with its *own* identity, so the revocation spreads hop by hop through devices
 that trust each other.
 
+### Swarm Membership
+
+Pairing with one member makes a device a member of the whole swarm. Members vouch for each other
+with signed **`ADMIT`** records (`src/device/trust.zig` `applyAdmission`, RPC type 24):
+
+```
+"nomadfs-admit-v1" ‖ public_key ‖ transport_key ‖ label_len ‖ label (64 B) ‖ at (u64 BE) ‖ signer_id
+```
+
+- **Who vouches:** every node, for every entry of its trust store, signed with its own identity
+  and the entry's `added_at` as `at`. Sent after each verified PONG (`pushAdmissions`, skipped
+  while the peer already took the same list) and to a sample of known peers every minute
+  (`sweepAdmissions`).
+- **Who accepts:** a node adds the device when it trusts the signer and doesn't know the device.
+  The new entry keeps the vouch's `at` as its `added_at`, so it vouches onward with the original
+  time and trust spreads hop by hop: pairing with one member reaches every member.
+- **Known devices are never changed from the network:** a vouch for a device already in the
+  store is a duplicate, so a stale vouch can't roll back a newer pinned transport key. A device
+  that rotates `node.key` is still re-paired.
+- **Revocation and membership are ordered by time:** a tombstone at or after a vouch's `at`
+  wins, and a vouch newer than a tombstone re-admits the device, like a re-pairing.
+- **Trust level:** any member can admit a device, as any member can revoke one. A compromised
+  member is removed everywhere by revoking it; threshold admission is future work.
+
 ## 8. Threat Notes & Next Steps
 
 | Threat | Current mitigation | Gap |

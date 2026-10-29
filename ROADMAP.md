@@ -126,6 +126,22 @@ NomadFS implements **Targeted Sync Policies** instead of indiscriminate global m
 4. **Local Space Reclamation ("Free Up Space"):**
    - Once the phone verifies that photos are cryptographically stored on the Server node (via Merkle CID receipt), the user can tap "Free Up Space" to safely purge local phone copies while leaving virtual thumbnails.
 
+### Plan: folder backup to the swarm (in progress)
+
+Built on two pieces, in this order:
+
+1. **Swarm-wide membership (done).** Pairing with one member makes a device a member everywhere:
+   members vouch for each other with signed `ADMIT` records that spread like revocations
+   ([pairing.md](learning/security/pairing.md#swarm-membership)). Backups only serve members.
+2. **Folder backup v1.** On a phone (or any device), mark shared folders for backup: presets for
+   Camera (on by default), Screenshots and WhatsApp, plus any other folder. Wi-Fi only by default.
+   Every **swarm backup** device (`swarm_backup = true`) pulls the marked folders of members when
+   they are reachable, keeps the original folder structure, and keeps files deleted at the source.
+   It publishes its copy as a browsable share (`<device> · <folder> (backup)`), so photos can be
+   opened and restored while the phone is off. The phone shows where each folder is backed up.
+3. **v2.** Per-file "backed up" marks and **Free up space** on the phone; charging-only option.
+4. **Later.** Backup away from home through a public relay; encryption at rest.
+
 ---
 
 ## 🧩 The Modular Capability Mesh Architecture

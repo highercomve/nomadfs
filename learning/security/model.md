@@ -56,6 +56,7 @@ tombstone in the local trust store is rejected with `UntrustedDevice`.
 | Leaked swarm key | Live rotation to paired devices (`ROTATE_KEY`, [7.3](./invites.md#2-swarm-key-rotation)) | Implemented (GUI-triggered) |
 | Lost or compromised device | Signed revocation, pushed on dial and swept every 60 s ([7.3](./invites.md#3-revocation)) | Implemented |
 | Port published to the Internet by the router | UPnP is off by default; when on: 1-hour renewed lease, responder must be on-link, deleted on stop | Implemented (opt-in) |
+| Admitting a device through any member | Signed `ADMIT` vouches accepted only from trusted members; tombstones newer than a vouch win; known entries are never changed from the network | Implemented; any single member can admit (as any member can revoke) |
 | Spoofed device nickname (an unpaired device claims a paired device's name) | Names of paired devices come from the local trust store; unpaired devices always carry a device-ID suffix and a "Not paired" badge (`src/fs/device_names.zig`) | Implemented |
 | Data read from a stolen disk | None | Not protected |
 | Sybil / DHT flooding by a key holder | None: any key holder can join the routing table | Risk |

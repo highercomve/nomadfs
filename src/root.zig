@@ -484,6 +484,9 @@ pub const Node = struct {
             _ = discovery_node.sweepRevocations(4) catch |err| {
                 std.debug.print("Revocation sweep error: {any}\n", .{err});
             };
+            _ = discovery_node.sweepAdmissions(4) catch |err| {
+                std.debug.print("Membership sweep error: {any}\n", .{err});
+            };
         }
     }
 

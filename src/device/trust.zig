@@ -145,6 +145,86 @@ pub fn applyRevocation(
     return .applied;
 }
 
+/// Signed swarm membership is bound to this domain: a member vouching that
+/// another device belongs to the swarm (applyAdmission).
+pub const admission_domain = "nomadfs-admit-v1";
+
+const admission_msg_len = admission_domain.len + 32 + 32 + 1 + max_label_len + 8 + NodeID.len;
+
+/// Bytes covered by a membership signature: the domain, the member's
+/// identity and transport keys, its label (length-prefixed, zero-padded),
+/// when it was admitted and who vouches for it.
+pub fn admissionMessage(public_key: [32]u8, transport_key: [32]u8, label: []const u8, at: u64, signer_id: NodeID) [admission_msg_len]u8 {
+    var message = [_]u8{0} ** admission_msg_len;
+    var offset: usize = 0;
+    @memcpy(message[0..admission_domain.len], admission_domain);
+    offset += admission_domain.len;
+    @memcpy(message[offset..][0..32], &public_key);
+    offset += 32;
+    @memcpy(message[offset..][0..32], &transport_key);
+    offset += 32;
+    const n = @min(label.len, max_label_len);
+    message[offset] = @intCast(n);
+    offset += 1;
+    @memcpy(message[offset..][0..n], label[0..n]);
+    offset += max_label_len;
+    std.mem.writeInt(u64, message[offset..][0..8], at, .big);
+    offset += 8;
+    @memcpy(message[offset..][0..NodeID.len], &signer_id.bytes);
+    return message;
+}
+
+/// Verifies a member's vouch that `public_key` belongs to the swarm, made at
+/// `at`, and records the device when this store trusts the signer: pairing
+/// with one member makes a device a member everywhere. Only devices not
+/// known here are added; a known entry is never changed from the network,
+/// so a stale vouch can't roll back a newer pinned transport key. A
+/// tombstone made at or after `at` wins; a vouch newer than a tombstone
+/// re-admits the device, as a re-pairing does.
+pub fn applyAdmission(
+    store: *Store,
+    public_key: [32]u8,
+    transport_key: [32]u8,
+    label: []const u8,
+    at: u64,
+    signer_key: [32]u8,
+    signature: [64]u8,
+    self_id: NodeID,
+    now: u64,
+) !RevocationOutcome {
+    const signer_id = NodeID.fromPublicKey(signer_key);
+    try identity_mod.Identity.verify(signer_key, &admissionMessage(public_key, transport_key, label, at, signer_id), signature);
+    const device_id = NodeID.fromPublicKey(public_key);
+    if (device_id.eql(self_id)) return .duplicate;
+    if (device_id.eql(signer_id)) return .rejected;
+    if (at > now +| max_revocation_skew) return .rejected;
+    if (label.len == 0 or label.len > max_label_len) return .rejected;
+    validateLabel(label) catch return .rejected;
+    if (std.mem.eql(u8, &transport_key, &no_transport_key)) return .rejected;
+
+    store.mutex.lock();
+    defer store.mutex.unlock();
+    if (!store.isTrustedLocked(signer_id)) return .rejected;
+    if (store.findLocked(device_id) != null) return .duplicate;
+    if (store.revocationLocked(device_id)) |r| {
+        if (r.at >= at) return .rejected;
+    }
+    if (store.entries.items.len >= max_entries) return Error.TrustStoreFull;
+    try store.entries.ensureUnusedCapacity(store.allocator, 1);
+    store.clearRevocationLocked(device_id);
+    var entry: Entry = .{
+        .device_id = device_id,
+        .public_key = public_key,
+        .transport_key = transport_key,
+        .label = [_]u8{0} ** max_label_len,
+        .label_len = @intCast(label.len),
+        .added_at = at,
+    };
+    @memcpy(entry.label[0..label.len], label);
+    store.entries.appendAssumeCapacity(entry);
+    return .applied;
+}
+
 /// Format marker of the trailing integrity line.
 const signature_marker = "\nSIG ";
 const signature_len = 64;
@@ -1347,4 +1427,42 @@ test "trust: re-pairing with a newer ticket clears a revocation tombstone" {
     _ = try store.trustTicket(newer, 30);
     try testing.expect(!store.isRevoked(identity.deviceId()));
     try testing.expectEqual(@as(u64, 2000), store.lookup(identity.deviceId()).?.ticket_expiry);
+}
+
+test "trust: admissions add unknown members, respect tombstones and need a trusted signer" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "test_trust_admission.store";
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var store = try Store.load(testing.allocator, path, null);
+    defer store.deinit();
+
+    const me = try identity_mod.Identity.fromSeed([_]u8{0x31} ** identity_mod.seed_len);
+    const admin = try identity_mod.Identity.fromSeed([_]u8{0x32} ** identity_mod.seed_len);
+    const phone = try identity_mod.Identity.fromSeed([_]u8{0x33} ** identity_mod.seed_len);
+    _ = try store.upsert(admin.publicKey(), [_]u8{0x41} ** 32, "Admin", 1);
+
+    const tk = [_]u8{0x42} ** 32;
+    const sign = struct {
+        fn by(signer: identity_mod.Identity, device: identity_mod.Identity, transport: [32]u8, at: u64) ![64]u8 {
+            return signer.sign(&admissionMessage(device.publicKey(), transport, "Phone", at, signer.deviceId()));
+        }
+    }.by;
+
+    // A forged signature is an error; a device can't vouch for itself.
+    try testing.expectError(error.SignatureVerificationFailed, applyAdmission(&store, phone.publicKey(), tk, "Phone", 50, admin.publicKey(), [_]u8{0} ** 64, me.deviceId(), 1000));
+    try testing.expectEqual(RevocationOutcome.rejected, try applyAdmission(&store, phone.publicKey(), tk, "Phone", 50, phone.publicKey(), try sign(phone, phone, tk, 50), me.deviceId(), 1000));
+
+    // A tombstone made after the admission wins; a later admission re-admits.
+    _ = try store.revokeDevice(phone.deviceId(), admin.deviceId(), 60);
+    try testing.expectEqual(RevocationOutcome.rejected, try applyAdmission(&store, phone.publicKey(), tk, "Phone", 50, admin.publicKey(), try sign(admin, phone, tk, 50), me.deviceId(), 1000));
+    try testing.expectEqual(RevocationOutcome.applied, try applyAdmission(&store, phone.publicKey(), tk, "Phone", 70, admin.publicKey(), try sign(admin, phone, tk, 70), me.deviceId(), 1000));
+    try testing.expect(store.isTrusted(phone.deviceId()));
+    try testing.expect(!store.isRevoked(phone.deviceId()));
+    try testing.expectEqual(@as(u64, 70), store.lookup(phone.deviceId()).?.added_at);
+
+    // Known now: a vouch with another transport key changes nothing.
+    const other = [_]u8{0x43} ** 32;
+    try testing.expectEqual(RevocationOutcome.duplicate, try applyAdmission(&store, phone.publicKey(), other, "Phone", 90, admin.publicKey(), try sign(admin, phone, other, 90), me.deviceId(), 1000));
+    try testing.expectEqual(tk, store.lookup(phone.deviceId()).?.transport_key);
 }

@@ -72,6 +72,9 @@ pub const Node = struct {
     /// Devices no relay reached lately -> when to try again (ms). Guarded
     /// by `mutex`.
     relay_misses: std.AutoHashMapUnmanaged(id.NodeID, i64) = .empty,
+    /// Per peer device: a digest of the member list it last took in full,
+    /// so pings don't re-send an unchanged list. Guarded by `mutex`.
+    admit_sent: std.AutoHashMapUnmanaged(id.NodeID, u64) = .empty,
 
     discovery_dials: std.AutoHashMapUnmanaged(id.NodeID, i64) = .empty,
 
@@ -199,6 +202,7 @@ pub const Node = struct {
         self.storage.deinit(self.allocator);
         self.providers.deinit(self.allocator);
         self.relay_misses.deinit(self.allocator);
+        self.admit_sent.deinit(self.allocator);
         self.discovery_dials.deinit(self.allocator);
     }
 
@@ -258,6 +262,9 @@ pub const Node = struct {
             if (trust.revocationCount() > 0) {
                 _ = self.pushRevocations(conn) catch {};
             }
+            // And which devices belong to the swarm: pairing with one member
+            // makes a device a member everywhere.
+            if (trust.count() > 0) _ = self.pushAdmissions(conn) catch {};
         }
     }
 
@@ -731,6 +738,104 @@ pub const Node = struct {
         return honored;
     }
 
+    /// Signs and sends this node's vouch for `entry` (ADMIT): `entry` is a
+    /// member here, admitted at `entry.added_at`.
+    fn sendAdmit(self: *Node, conn: network.Connection, entry: device_trust.Entry) !bool {
+        const identity = self.device_identity orelse return error.NoDeviceIdentity;
+        const label = entry.labelSlice();
+        const signed = device_trust.admissionMessage(entry.public_key, entry.transport_key, label, entry.added_at, identity.deviceId());
+        var admit: rpc.Admit = .{
+            .public_key = entry.public_key,
+            .transport_key = entry.transport_key,
+            .at = entry.added_at,
+            .signer_key = identity.publicKey(),
+            .signature = try identity.sign(&signed),
+        };
+        @memcpy(admit.label[0..label.len], label);
+        admit.label_len = @intCast(label.len);
+
+        const stream = try conn.openStream();
+        defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
+        const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .ADMIT = admit } };
+        try msg.send(self.allocator, stream);
+        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
+        defer response.deinit(self.allocator);
+        switch (response.payload) {
+            .STORE_ACK => |ack| return ack.stored,
+            else => return error.InvalidResponse,
+        }
+    }
+
+    /// Vouches for every member this node trusts to `conn`'s peer. A peer
+    /// that trusts this node adds the ones it doesn't know. Returns how many
+    /// it took. Entries without a pinned transport key are not sent.
+    pub fn pushAdmissions(self: *Node, conn: network.Connection) !usize {
+        const trust = self.trust_store orelse return 0;
+        if (self.device_identity == null) return 0;
+        const entries = try trust.copyEntries(self.allocator);
+        defer self.allocator.free(entries);
+        const peer = conn.getRemoteDeviceID();
+        var hasher = std.hash.Wyhash.init(0);
+        for (entries) |e| {
+            hasher.update(&e.device_id.bytes);
+            hasher.update(std.mem.asBytes(&e.added_at));
+        }
+        const digest = hasher.final();
+        if (peer) |p| {
+            self.mutex.lock();
+            const same = if (self.admit_sent.get(p)) |d| d == digest else false;
+            self.mutex.unlock();
+            if (same) return 0;
+        }
+
+        var taken: usize = 0;
+        var sent: usize = 0;
+        for (entries) |e| {
+            if (std.mem.eql(u8, &e.transport_key, &device_trust.no_transport_key)) continue;
+            // The peer itself needs no vouch for itself.
+            if (peer) |p| if (p.eql(e.device_id)) continue;
+            sent += 1;
+            const ok = self.sendAdmit(conn, e) catch |err| {
+                std.debug.print("Failed to vouch for {x}: {any}\n", .{ e.device_id.bytes[0..4], err });
+                continue;
+            };
+            if (ok) taken += 1;
+        }
+        // Remembered only when the peer took every vouch: one that doesn't
+        // trust this node yet hears the list again on the next round.
+        if (peer) |p| if (taken == sent) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.admit_sent.count() >= 256) self.admit_sent.clearRetainingCapacity();
+            self.admit_sent.put(self.allocator, p, digest) catch {};
+        };
+        return taken;
+    }
+
+    /// Anti-entropy for membership: vouches for every member to a sample of
+    /// known peers, so a device that joined through another member learns
+    /// the rest of the swarm even when nobody dials it.
+    pub fn sweepAdmissions(self: *Node, sample: usize) !usize {
+        const trust = self.trust_store orelse return 0;
+        if (trust.count() == 0 or self.device_identity == null) return 0;
+        self.mutex.lock();
+        const maybe_peers = self.routing_table.getClosestPeers(self.manager.node_id, sample) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
+        const peers = maybe_peers;
+        defer self.allocator.free(peers);
+        var reached: usize = 0;
+        for (peers) |peer| {
+            const conn = self.manager.connectToPeerMulti(peer.addresses[0..peer.addrs_count], self.swarm_key, peer.id) catch continue;
+            defer conn.deinit();
+            if ((self.pushAdmissions(conn) catch 0) > 0) reached += 1;
+        }
+        return reached;
+    }
+
     /// Anti-entropy for revocations: connects to a sample of known peers
     /// and replays every tombstone we hold, so peers that never dialed us
     /// still learn which devices were removed. Returns how many peers
@@ -1025,6 +1130,7 @@ pub const Node = struct {
             .ROTATE_KEY => |p| try self.handleRotateKey(stream, conn, p.epoch, p.new_key, p.signer_key, p.signature),
             .PUT_BLOCK => |p| try self.handlePutBlock(stream, conn, p.cid, p.data),
             .REVOKE => |p| try self.handleRevoke(stream, p.device_id, p.signer_key, p.at, p.signature),
+            .ADMIT => |p| try self.handleAdmit(stream, p),
             .ADD_PROVIDER => |p| try self.handleAddProvider(stream, conn, p.key),
             .GET_PROVIDERS => |p| try self.handleGetProviders(stream, p.key),
             .DIAL_BACK => |p| try self.handleDialBack(conn, p.port),
@@ -1450,6 +1556,23 @@ pub const Node = struct {
             .sender_id = self.manager.node_id,
             .payload = .{ .STORE_ACK = .{ .stored = honored } },
         };
+        try response.send(self.allocator, stream);
+    }
+
+    /// ADMIT: a member vouches for a device. Added when this node trusts
+    /// the signer and doesn't know the device (device_trust.applyAdmission).
+    fn handleAdmit(self: *Node, stream: network.Stream, admit: rpc.Admit) !void {
+        var taken = false;
+        if (self.trust_store) |trust| {
+            const self_id = if (self.device_identity) |identity| identity.deviceId() else id.NodeID{ .bytes = [_]u8{0} ** 32 };
+            const now = std.math.cast(u64, sync.timestamp()) orelse return error.InvalidTimestamp;
+            const outcome = device_trust.applyAdmission(trust, admit.public_key, admit.transport_key, admit.labelSlice(), admit.at, admit.signer_key, admit.signature, self_id, now) catch .rejected;
+            taken = outcome != .rejected;
+            if (outcome == .applied) trust.save() catch |err| {
+                std.debug.print("Failed to persist a new swarm member: {any}\n", .{err});
+            };
+        }
+        const response = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .STORE_ACK = .{ .stored = taken } } };
         try response.send(self.allocator, stream);
     }
 

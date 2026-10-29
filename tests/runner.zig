@@ -19,6 +19,7 @@ test {
     _ = @import("dht/relay_test.zig");
     _ = @import("cluster/transfer_test.zig");
     _ = @import("cluster/revocation_test.zig");
+    _ = @import("cluster/membership_test.zig");
     _ = @import("cluster/share_test.zig");
     _ = @import("cluster/swarm_test.zig");
     _ = @import("cluster/rotation_test.zig");

@@ -69,6 +69,10 @@ pub const MessageType = enum(u8) {
     /// with RELAY_ACK; then the stream carries that connection.
     RELAY_INCOMING = 22,
     RELAY_ACK = 23,
+    /// A member vouches that a device belongs to the swarm, signed by the
+    /// member's Ed25519 identity (device/trust.zig applyAdmission). Answered
+    /// with STORE_ACK.
+    ADMIT = 24,
 };
 
 pub const FindValueResult = union(enum) {
@@ -130,7 +134,28 @@ pub const MessagePayload = union(MessageType) {
     RELAY_CONNECT: struct { target: id.NodeID },
     RELAY_INCOMING: struct { from: id.NodeID },
     RELAY_ACK: struct { ok: bool },
+    ADMIT: Admit,
 };
+
+/// A member's signed vouch for another device (ADMIT). The label is a fixed
+/// buffer, so the message needs no allocation.
+pub const Admit = struct {
+    public_key: [32]u8,
+    transport_key: [32]u8,
+    label: [max_admit_label]u8 = [_]u8{0} ** max_admit_label,
+    label_len: u8 = 0,
+    /// When the device was admitted (signed).
+    at: u64,
+    signer_key: [32]u8,
+    signature: [64]u8,
+
+    pub fn labelSlice(self: *const Admit) []const u8 {
+        return self.label[0..self.label_len];
+    }
+};
+
+/// Longest device label an ADMIT carries: the pairing nickname limit.
+pub const max_admit_label = pairing.max_nickname_len;
 
 pub const Message = struct {
     sender_id: id.NodeID,
@@ -194,6 +219,16 @@ pub const Message = struct {
             .RELAY_CONNECT => |p| try writer.writeAll(&p.target.bytes),
             .RELAY_INCOMING => |p| try writer.writeAll(&p.from.bytes),
             .RELAY_ACK => |p| try writer.writeByte(@intFromBool(p.ok)),
+            .ADMIT => |p| {
+                try writer.writeAll(&p.public_key);
+                try writer.writeAll(&p.transport_key);
+                if (p.label_len > max_admit_label) return error.InvalidNickname;
+                try writer.writeByte(p.label_len);
+                try writer.writeAll(p.label[0..p.label_len]);
+                try writer.writeInt(u64, p.at, .big);
+                try writer.writeAll(&p.signer_key);
+                try writer.writeAll(&p.signature);
+            },
             .GET_BLOCK => |p| try writer.writeAll(&p.cid),
             .ADD_PROVIDER => |p| try writer.writeAll(&p.key.bytes),
             .GET_PROVIDERS => |p| try writer.writeAll(&p.key.bytes),
@@ -356,6 +391,18 @@ pub const Message = struct {
                 break :blk MessagePayload{ .RELAY_INCOMING = .{ .from = from } };
             },
             .RELAY_ACK => MessagePayload{ .RELAY_ACK = .{ .ok = try readBool(reader) } },
+            .ADMIT => blk: {
+                var a: Admit = .{ .public_key = undefined, .transport_key = undefined, .at = 0, .signer_key = undefined, .signature = undefined };
+                try reader.readNoEof(&a.public_key);
+                try reader.readNoEof(&a.transport_key);
+                a.label_len = try reader.readByte();
+                if (a.label_len > max_admit_label) return error.InvalidNickname;
+                try reader.readNoEof(a.label[0..a.label_len]);
+                a.at = try reader.readInt(u64, .big);
+                try reader.readNoEof(&a.signer_key);
+                try reader.readNoEof(&a.signature);
+                break :blk MessagePayload{ .ADMIT = a };
+            },
         };
 
         return Message{
@@ -763,4 +810,21 @@ test "rpc bounded random inputs do not panic" {
         const msg = Message.deserialize(allocator, buf.reader()) catch continue;
         msg.deinit(allocator);
     }
+}
+
+test "rpc: ADMIT round trip keeps every field" {
+    const allocator = std.testing.allocator;
+    var buf = TestBuffer{ .allocator = allocator };
+    defer buf.list.deinit(allocator);
+    var admit: Admit = .{ .public_key = [_]u8{1} ** 32, .transport_key = [_]u8{2} ** 32, .at = 77, .signer_key = [_]u8{3} ** 32, .signature = [_]u8{4} ** 64 };
+    @memcpy(admit.label[0..5], "Phone");
+    admit.label_len = 5;
+    const msg = Message{ .sender_id = id.NodeID{ .bytes = [_]u8{5} ** 32 }, .payload = .{ .ADMIT = admit } };
+    try msg.serialize(buf.writer());
+    const got = try Message.deserialize(allocator, buf.reader());
+    defer got.deinit(allocator);
+    try std.testing.expectEqualStrings("Phone", got.payload.ADMIT.labelSlice());
+    try std.testing.expectEqual(@as(u64, 77), got.payload.ADMIT.at);
+    try std.testing.expectEqual(admit.transport_key, got.payload.ADMIT.transport_key);
+    try std.testing.expectEqual(admit.signature, got.payload.ADMIT.signature);
 }
