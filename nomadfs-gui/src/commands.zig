@@ -564,7 +564,16 @@ pub fn revokeDevice(gpa: std.mem.Allocator, args: RevokeDeviceArgs) !void {
     const id = try target.resolve(args.query) orelse return error.DeviceNotFound;
     _ = try target.revokeDevice(id, identity.deviceId(), @intCast(nomadfs.nowSeconds()));
     try target.save();
-    if (g_node) |handle| _ = handle.node.connection_manager.closePeer(id);
+    if (g_node) |handle| {
+        _ = handle.node.connection_manager.closePeer(id);
+        // It stops being a holder too: its copies and its folders leave
+        // the registry (the running node's trust store maps the device ID
+        // to its transport ID).
+        if (target.lookup(id)) |entry| {
+            handle.node.block_manager.forgetPeer(.{ .bytes = entry.transport_key });
+        }
+        handle.node.block_manager.forgetPeer(id);
+    }
 }
 
 // ---- Shared folders ----
@@ -961,9 +970,8 @@ pub fn download(gpa: std.mem.Allocator, args: DownloadArgs) !DownloadResult {
     if (!nomadfs.storage.dag.codec.isValidName(args.name)) return error.InvalidName;
     g_mutex.lock();
     defer g_mutex.unlock();
-    var remote = try remoteFor(args.peer);
+    const remote = try remoteFor(args.peer);
     const cid = try parseHex32(args.cid);
-    const loader = remote.loader();
 
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try downloadsDir(gpa);
@@ -980,7 +988,9 @@ pub fn download(gpa: std.mem.Allocator, args: DownloadArgs) !DownloadResult {
     defer gpa.free(chunk);
     var offset: u64 = 0;
     while (true) {
-        const n = try fs.tree.readAt(gpa, loader, cid, offset, chunk);
+        // Likely holders, per chunk with the registry as current as shares
+        // heard since the download started.
+        const n = try nomadfs.fs.remote.readShareAt(gpa, remote.block_manager, remote.store, g_node.?.node.read_ahead, remote.peer, cid, offset, chunk);
         if (n == 0) break;
         try file.writePositionalAll(io, chunk[0..n], offset);
         offset += n;
@@ -1046,14 +1056,20 @@ pub fn readRange(gpa: std.mem.Allocator, args: ReadRangeArgs) ![]const u8 {
     if (args.len == 0 or args.len > max_range_len) return error.InvalidArgument;
     g_mutex.lock();
     defer g_mutex.unlock();
-    var remote = try remoteFor(args.peer);
+    const remote = try remoteFor(args.peer);
     const cid = try parseHex32(args.cid);
     const buf = try gpa.alloc(u8, args.len);
     defer gpa.free(buf);
-    const n = if (g_node.?.node.read_ahead) |ra|
-        try ra.readAt(gpa, &.{remote.peer}, cid, args.offset, buf)
-    else
-        try fs.tree.readAt(gpa, remote.loader(), cid, args.offset, buf);
+    const n = try nomadfs.fs.remote.readShareAt(
+        gpa,
+        remote.block_manager,
+        remote.store,
+        g_node.?.node.read_ahead,
+        remote.peer,
+        cid,
+        args.offset,
+        buf,
+    );
     const encoder = std.base64.standard.Encoder;
     const out = try gpa.alloc(u8, encoder.calcSize(n));
     return encoder.encode(out, buf[0..n]);
@@ -1175,6 +1191,8 @@ pub fn swarmBackupSet(gpa: std.mem.Allocator, args: BackupArgs) !BackupInfo {
         g_mutex.lock();
         defer g_mutex.unlock();
         if (swarmFolder()) |folder| try folder.setBackup(args.on) else |_| {}
+        // Peers learn the switch through PING and PONG roles.
+        if (g_node) |handle| handle.node.discovery_node.setRole(nomadfs.net.discovery.rpc.Roles.swarm_backup, args.on);
     }
     return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
 }
@@ -1209,6 +1227,7 @@ pub fn acceptCopiesSet(gpa: std.mem.Allocator, args: AcceptCopiesArgs) !BackupIn
             const now = nomadfs.nowSeconds();
             const r = try nomadfs.device.policy.sign(node.device_identity, .accepts, node.device_identity.deviceId(), @intFromBool(args.on), now);
             if (try node.policy.apply(r, node.trust_store, node.device_identity.deviceId(), now) == .applied) try node.policy.save();
+            node.discovery_node.setRole(nomadfs.net.discovery.rpc.Roles.accepts_copies, args.on);
         }
     }
     return swarmBackupStatus(gpa, .{ .config_path = args.config_path });

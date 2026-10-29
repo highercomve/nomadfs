@@ -906,10 +906,7 @@ pub const Mount = struct {
             break :blk self.devices.items[node.device].remote;
         };
         if (self.hooks.before_network) |hook| hook(self.hooks.ctx);
-        if (self.read_ahead) |ra| {
-            return ra.readAt(self.allocator, &.{remote.peer}, node.cid, offset, dest);
-        }
-        return tree.readAt(self.allocator, remote.loader(), node.cid, offset, dest);
+        return remote_mod.readShareAt(self.allocator, remote.block_manager, remote.store, self.read_ahead, remote.peer, node.cid, offset, dest);
     }
 
     fn opReaddir(self: *Mount, header: *const InHeader, body: []const u8) !void {

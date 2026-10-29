@@ -109,6 +109,10 @@ pub const Node = struct {
         discovery_node.block_store = store;
         discovery_node.nickname = cfg.node.nickname;
         discovery_node.swarm_epoch = cfg.node.swarm_epoch;
+        // What every PING and PONG says about this device (rpc.Roles).
+        discovery_node.setRole(net.discovery.rpc.Roles.swarm_backup, cfg.storage.swarm_backup);
+        discovery_node.setRole(net.discovery.rpc.Roles.metered, !net.local_addrs.onUnmeteredNetwork());
+        discovery_node.setRole(net.discovery.rpc.Roles.accepts_copies, cfg.storage.accept_copies);
 
         var shares: ?*fs.ShareIndex = null;
         if (store) |s| {
@@ -194,6 +198,8 @@ pub const Node = struct {
         // Revocations are signed with the device identity and recorded in
         // the same trust store the handshake policy reads.
         discovery_node.trust_store = trust_store;
+        // A revoked device stops being a holder too (cluster/holders.zig).
+        discovery_node.revocation_sink = .{ .ctx = block_manager, .revokedFn = cluster.BlockManager.revokedErased };
 
         // A swarm backup device keeps the members' folders marked for
         // backup too (fs/backup.zig); the thread starts with the listener.
@@ -562,6 +568,9 @@ pub const Node = struct {
         // Then the standard refresh of buckets nobody touched for an hour.
         var round: u32 = 0;
         while (self.sleepWhileBootstrapping(30 * std.time.ns_per_s)) : (round +%= 1) {
+            // What PINGs say about this device: the network may have
+            // changed under us (Wi-Fi to mobile data and back).
+            discovery_node.setRole(net.discovery.rpc.Roles.metered, !net.local_addrs.onUnmeteredNetwork());
             // Back in touch with devices we lost (we changed networks, they
             // woke up), then ask around for new ones, then remember them all.
             self.dialKnownPeers(swarm_key);
@@ -746,6 +755,7 @@ test {
         @import("cluster/placement.zig"),
         @import("cluster/keeper.zig"),
         @import("device/policy.zig"),
+        @import("cluster/holders.zig"),
         @import("mobile/api.zig"),
         @import("cluster/quorum.zig"),
         @import("cluster/repair.zig"),

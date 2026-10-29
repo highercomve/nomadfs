@@ -364,19 +364,40 @@ pub const SwarmFolder = struct {
         return out;
     }
 
-    /// Reads a file's bytes: from the local store, else the device that
-    /// added it, else any other known peer.
+    /// Reads a file's bytes: from the local store, else likely holders
+    /// (cluster/holders.zig): the device that added it, devices that keep
+    /// swarm backups, then any other known peer.
     pub fn readAt(self: *SwarmFolder, allocator: std.mem.Allocator, cid: [32]u8, author: [32]u8, offset: u64, dest: []u8) !usize {
         const bm = self.block_manager orelse return error.NotRunning;
-        const known = try remote_mod.knownPeers(bm, allocator);
-        defer allocator.free(known);
-        var peers: std.ArrayList(NodeID) = .empty;
-        defer peers.deinit(allocator);
-        try peers.append(allocator, .{ .bytes = author });
-        for (known) |p| if (!std.mem.eql(u8, &p.bytes, &author)) try peers.append(allocator, p);
-        if (self.read_ahead) |ra| return ra.readAt(allocator, peers.items, cid, offset, dest);
-        var multi = remote_mod.MultiRemote{ .block_manager = bm, .store = self.store, .peers = peers.items, .root = cid };
+        var buffer = remote_mod.holdersBuffer();
+        const peers = self.holdersOf(allocator, &cid, .{ .bytes = author }, &buffer);
+        if (self.read_ahead) |ra| return ra.readAt(allocator, peers, cid, offset, dest);
+        var multi = remote_mod.MultiRemote{ .block_manager = bm, .store = self.store, .peers = peers, .root = cid };
         return tree.readAt(allocator, multi.loader(), cid, offset, dest);
+    }
+
+    /// The devices likely to hold a swarm file, best first: its author, the
+    /// devices placement gives it (the swarm's `copies`), then the cluster's
+    /// list (swarm backup devices, everyone else).
+    fn holdersOf(self: *SwarmFolder, allocator: std.mem.Allocator, cid: *const [32]u8, author: NodeID, out: *[cluster.fetcher.max_holders]NodeID) []NodeID {
+        var n: usize = 0;
+        addHint(out, &n, author, self.self_id);
+        if (self.placement) |p| {
+            const copies = p.policy.copies();
+            if (copies > 1) {
+                if (cluster.placement.candidates(allocator, p.trust, p.policy, self.self_id, p.self_device)) |members| {
+                    defer allocator.free(members);
+                    var placed: [policy_max]NodeID = undefined;
+                    for (cluster.placement.replicaHolders(cid, author, copies, members, &placed)) |h| addHint(out, &n, h, self.self_id);
+                } else |_| {}
+            }
+        }
+        const bm = self.block_manager orelse return out[0..n];
+        if (bm.holders) |*holds| {
+            var more = remote_mod.holdersBuffer();
+            for (holds.forSwarm(author, &more)) |h| addHint(out, &n, h, self.self_id);
+        }
+        return out[0..n];
     }
 
     // ---- Sync ----
@@ -579,7 +600,10 @@ pub const SwarmFolder = struct {
             hints[0] = author;
             n = 1;
             for (holders) |h| addHint(&hints, &n, h, self.self_id);
-            for (known) |h| addHint(&hints, &n, h, self.self_id);
+            if (bm.holders) |*holds| {
+                var more = remote_mod.holdersBuffer();
+                for (holds.forSwarm(author, &more)) |h| addHint(&hints, &n, h, self.self_id);
+            } else for (known) |h| addHint(&hints, &n, h, self.self_id);
             try out.append(allocator, cluster.keeper.Want.init(e.cid, hints[0..n]));
         }
     }

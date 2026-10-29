@@ -7,3 +7,5 @@ pub const fetcher = @import("fetcher.zig");
 pub const Fetcher = fetcher.Fetcher;
 pub const placement = @import("placement.zig");
 pub const keeper = @import("keeper.zig");
+pub const holders = @import("holders.zig");
+pub const Holders = holders.Holders;
