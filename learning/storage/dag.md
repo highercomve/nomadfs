@@ -113,10 +113,10 @@ Folders are **dir blocks**, not parents. `src/fs/scan.zig` turns a local folder 
 
 ## 7. `DiffService` (not used by the node)
 
-`src/storage/dag/diff.zig` has `DiffService.calculateDiff(old_root, new_root)`: the CIDs reachable from the new root but not the old one, skipping shared subtrees without reading them. It is compiled and tested, but nothing in the node calls it. Fetching a new version is done by the DAG walk in [Chapter 4.1: Repair](../cluster/repair.md), which skips blocks already held and so gets the same effect.
+`src/storage/dag/diff.zig` has `DiffService.calculateDiff(old_root, new_root)`: the CIDs reachable from the new root but not the old one, skipping shared subtrees without reading them. It is compiled and tested, but nothing in the node calls it. Copying a new version is done by the keeper ([Chapter 4.4](../cluster/keeper.md)), which skips blocks already held and so gets the same effect.
 
 ---
 
 **Next Chapters:**
 *   [Chapter 3.3: The Disk Engine](./engine.md)
-*   [Chapter 4: Block Exchange & Replication](../cluster/overview.md)
+*   [Chapter 4: The Distribution Layer](../cluster/overview.md)

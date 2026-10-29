@@ -20,9 +20,11 @@ code-level companion: files, types and functions.
 | `scan_cache.zig` | `ScanCache`: what the scanner learned about each file, kept on disk across restarts. |
 | `filestore.zig` | `Filestore`: serves shared files' leaf blocks from the files themselves. |
 | `tree.zig` | `Loader`, `listDir`, `resolve`, `readAt`: reads a tree one block at a time. |
-| `remote.zig` | `Remote`, `MultiRemote`: Loaders that fetch missing blocks from peers and cache them. |
+| `remote.zig` | `readShareAt`, `Remote`, `MultiRemote`: name a file's likely holders and hand each block to the cluster layer's fetcher; `Remote.shares` (`GET_SHARES`). |
 | `manifest.zig` | `Manifest`: the swarm folder's listing, a state-based CRDT. |
-| `swarm.zig` | `SwarmFolder`: edits, the 10 s sync loop, reads, and the backup role. |
+| `swarm.zig` | `SwarmFolder`: edits, the 10 s sync loop, reads, and what this device keeps (a keeper provider). |
+| `backup.zig` | Folder backup: which members' marked folders to keep, and the merge that keeps what the source deleted. |
+| `readahead.zig` | `ReadAhead`: which blocks a reader needs next; its workers fetch them through the fetcher. |
 | `fuse.zig` | `Mount`: the Linux FUSE driver, speaking the kernel protocol on `/dev/fuse`. |
 
 ## 2. Where it sits
@@ -32,15 +34,24 @@ graph TD
     FUSE["fuse.zig (Mount)"] --> Tree["tree.zig (readAt, listDir)"]
     FUSE --> Swarm["swarm.zig (SwarmFolder)"]
     Swarm --> Manifest["manifest.zig (CRDT)"]
-    Swarm --> Remote["remote.zig (Remote / MultiRemote)"]
+    Swarm --> Remote["remote.zig (holders of a file)"]
     Tree --> Remote
+    Remote --> RA["readahead.zig (which blocks next)"]
     Shares["shares.zig (ShareIndex)"] --> Scan["scan.zig (Scanner)"]
     Scan --> Builder["storage/dag/builder.zig"]
     Shares --> Filestore["filestore.zig"]
     Filestore -. "StorageEngine.external" .-> Engine["storage/engine.zig"]
-    Remote --> Engine
-    Remote --> BM["cluster/block_manager.zig (connectTo)"]
-    BM --> DHT["net/discovery/node.zig (GET_BLOCK, GET_SHARES, GET_SWARM)"]
+    subgraph cluster["cluster/ — distribution (Chapter 4)"]
+        F["fetcher.zig"]
+        K["keeper.zig"]
+        H["holders.zig"]
+    end
+    RA --> F
+    Remote --> H
+    Swarm -- "what to keep" --> K
+    K --> F
+    F --> Engine
+    F --> DHT["net/discovery/node.zig (GET_BLOCK, GET_SHARES, GET_SWARM)"]
 ```
 
 - Everything below `fs/` is content-addressed: a share or a swarm file is named by a root CID

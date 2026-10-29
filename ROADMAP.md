@@ -9,6 +9,20 @@ NomadFS is pivoting from an academic, fully-distributed peer-to-peer storage clu
 - **Distributing Everything is the Wrong Default:** Users do not want or need their entire phone storage or desktop drive replicated everywhere. Phone storage is constrained, battery is finite, and transferring gigabytes over cellular is unacceptable.
 - **Monolithic Thinking:** A roaming device mesh isn't just about disk blocks; it is the ultimate substrate to share files, synchronize clipboards, stream phone cameras to desktops as virtual webcams, and mirror notifications.
 
+### What the pivot dropped, and what it must keep (October 2026)
+The pivot dropped **global, hash-based placement**: a ring that puts data where a hash says, on a
+phone as on a server. It did **not** drop the distribution layer itself, though for a while features
+behaved as if it had: shares, the swarm folder, read-ahead and three backup paths each chose their
+sources and made their copies inside `src/fs/`. That is fixed, and it is a rule from now on:
+
+- `src/fs/` says **what** (files, folders, what this device keeps); `src/cluster/` says **where
+  from and who keeps it** (the fetcher, holders, placement by role and signed policy, the keeper);
+  `src/net/` says **how**. A feature never works around a lower layer; when it needs more, the layer
+  grows. See [learning/cluster/overview.md](learning/cluster/overview.md) and
+  [history.md](learning/cluster/history.md).
+- **Lean**: learn from messages already exchanged, send only on change. A quiet swarm sends tens of
+  kilobytes a minute per device; a read moves about 1 % more than the file.
+
 ### The New Architecture: Personal Device Mesh & Capability Platform
 1. **Base Kernel (Zig 0.16):** Lightweight, robust content-addressed engine, authenticated Noise transport, and Yamux stream multiplexer.
 2. **Native Persistent Transport (No WebSockets Needed):** All nodes (desktop, mobile via Oriel, and headless servers) are native Zig binaries with full OS socket access. We use **native persistent TCP + Noise + Yamux** directly, eliminating HTTP/WebSocket framing overhead, masking, and extra dependencies.
@@ -126,7 +140,7 @@ NomadFS implements **Targeted Sync Policies** instead of indiscriminate global m
 4. **Local Space Reclamation ("Free Up Space"):**
    - Once the phone verifies that photos are cryptographically stored on the Server node (via Merkle CID receipt), the user can tap "Free Up Space" to safely purge local phone copies while leaving virtual thumbnails.
 
-### Plan: folder backup to the swarm (in progress)
+### Plan: folder backup to the swarm (v1 done)
 
 Built on two pieces, in this order:
 
@@ -139,8 +153,14 @@ Built on two pieces, in this order:
    they are reachable, keeps the original folder structure, and keeps files deleted at the source.
    It publishes its copy as a browsable share (`<device> · <folder> (backup)`), so photos can be
    opened and restored while the phone is off. The phone shows where each folder is backed up.
-3. **v2.** Per-file "backed up" marks and **Free up space** on the phone; charging-only option.
-4. **Later.** Backup away from home through a public relay; encryption at rest.
+   Since the distribution layer was restored, the copying is the keeper's and reads use every
+   holder: a backed-up folder opens from the backup device while the phone is off.
+3. **Swarm copies (done).** One signed swarm-wide setting keeps each swarm folder file on N devices,
+   chosen per file by rendezvous hashing among the devices that accept copies (phones opt out by
+   default); the devices that keep a file pull it.
+4. **v2.** Per-file "backed up" marks and **Free up space** on the phone; charging-only option.
+   Garbage collection of blocks no longer kept; replacing a holder that stays offline for long.
+5. **Later.** Backup away from home through a public relay; encryption at rest.
 
 ---
 

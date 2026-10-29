@@ -1,4 +1,4 @@
-# Chapter 4.3: The Hash Ring (Present, Unused)
+# Chapter 4.7: The Hash Ring (Present, Unused)
 
 `src/cluster/ring.zig` contains a consistent-hash ring. It is compiled, and the node creates one, but **nothing uses it to place or find data**. This chapter documents what the file does so readers of the code aren't misled, and why the project went another way.
 
@@ -30,9 +30,9 @@ When `BlockManager` replicates a new file (`replicas > 0`) or looks for copies o
 
 ## 4. Not Implemented Yet
 
-A ring-based design (N clockwise successors as replicas, virtual nodes per device, data hand-over when devices join or leave) is **not planned** any more. [ROADMAP.md](../../ROADMAP.md) moves away from a global hash ring toward a personal device mesh with **directed sync and backup policies** (choose which device keeps what), which are planned but not implemented. `ring.zig` is a leftover of the earlier design.
+A ring-based design (N clockwise successors as replicas, virtual nodes per device, data hand-over when devices join or leave) is **not planned** any more. Placement by role and policy replaced it: swarm backup devices keep everything, and the swarm's signed `copies` puts each file on devices chosen by rendezvous hashing among those that accept copies ([4.3](./placement.md)). Like the ring, rendezvous hashing moves only a newcomer's share of files; unlike it, a phone that refuses copies is never chosen. `ring.zig` is a leftover of the earlier design.
 
 ---
 
 **Next Chapters:**
-*   [Chapter 4.4: Vector Clocks (unused)](./vectors.md)
+*   [Chapter 4.8: Vector Clocks (unused)](./vectors.md)

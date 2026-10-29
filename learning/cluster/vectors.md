@@ -1,4 +1,4 @@
-# Chapter 4.5: Vector Clocks (and Why NomadFS Doesn't Use Them)
+# Chapter 4.8: Vector Clocks (and Why NomadFS Doesn't Use Them)
 
 `src/cluster/vectors.zig` implements vector clocks, but they are **used only by that file's tests**. No file, manifest entry or message carries one. The one piece of NomadFS that does need to order concurrent edits, the swarm folder, uses Lamport versions with a short history instead. This chapter covers both.
 
@@ -47,4 +47,5 @@ Per-file vector clocks, a "notify the user of a conflict" step and merged clocks
 ---
 
 **Next Chapters:**
+*   [Chapter 4.9: History](./history.md)
 *   [The Swarm Folder](../fs/swarm.md)

@@ -45,7 +45,24 @@ commands (`nomadfs-gui/src/commands.zig`), for example:
 
 See [Chapter 7: The App](../app/gui.md).
 
-## 3. `src/metrics.zig` (not wired in)
+## 3. Measuring traffic and speed
+
+- **Wire counters.** `ConnectionManager.trafficTotals()` counts every byte read from and written to
+  device sockets (Noise and Yamux framing included), as atomics in `src/net/transport/`. A device's
+  About in the app shows them as *sent* and *received* (`NODE_INFO`).
+- **`nomadfs --bench-read <swarm path> [--bench-cold] [--bench-wait S]`** runs a node with the
+  normal config, waits for a swarm sync and a connection to the file's author, optionally empties the
+  read cache, reads the file in 1 MiB reads through the normal path (read-ahead, fetcher), and prints
+  `key=value` lines: bytes, seconds, MiB/s, wire bytes, the fetcher's counters, and per device the
+  blocks and bytes it served and its measured rate.
+- **`nomadfs --bench-idle S`** runs a node for S seconds and prints the wire bytes: what a device
+  costs the network at rest.
+- **`scripts/bench-devices.sh <path> [reader…]`** stops each reader's node (a systemd service over
+  SSH, the desktop app, the phone app over adb), runs the benchmark with the same identity, starts
+  the node again, and prints a table; `WARM=<device>` reads the file there first, so it becomes a
+  second holder; `IDLE=60` measures idle traffic instead. Results are kept under `.agents/bench/`.
+
+## 4. `src/metrics.zig` (not wired in)
 
 `src/metrics.zig` defines a `MetricsCollector` (a fixed ring of 10,000
 samples: `incrementCounter`, `recordGauge`, `recordHistogram`, `snapshot`)

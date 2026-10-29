@@ -1,0 +1,83 @@
+---
+.title = "How it works",
+.description = "Three layers, each with one job: what your folders mean, where each piece of a file comes from and who keeps copies, and how the bytes travel.",
+.date = .date("2026-10-29T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "docs.shtml",
+.custom = { "label": "05 · how it works" },
+---
+
+NomadFS splits a file into pieces of about 256 KB, names each piece by its
+SHA-256 hash, and keeps a small index of the pieces. Every piece that arrives
+from another device is checked against its name, so it doesn't matter which
+device sent it: any copy will do.
+
+That one fact is what the rest builds on. It lets NomadFS keep three questions
+apart, each answered by its own layer.
+
+# [Three layers]($heading.id('layers'))
+
+| Layer | Answers | For example |
+| :--- | :--- | :--- |
+| **Folders** | *What* you need | "the next 8 MB of this video", "this photo must be kept on this device", "this file was added by the phone" |
+| **Distribution** | *Where from*, and *who keeps copies* | "the home server is fastest right now", "this file lives on the phone and the server" |
+| **Transport** | *How* the bytes travel | encrypted connections between your devices, finding each other, relaying when a device is behind a router |
+
+Shared folders, the swarm folder, backups, the Linux mount and the app all sit on
+the top layer, and they all go through the same distribution layer. None of them
+fetches pieces or makes copies on its own. So an improvement there, such as
+reading from several devices at once, reaches every feature together.
+
+# [Opening a file]($heading.id('reading'))
+
+When you play a video from the swarm folder:
+
+1. **Folders** knows the file and who added it, and works out which pieces cover
+   what the player asks for next. While you watch, it asks for the next few
+   seconds ahead of time.
+2. **Distribution** picks, for each piece, the device expected to answer first:
+   the one that has been fastest and is least busy. With several devices holding
+   the file, the pieces come from all of them at once, most from the fastest. A
+   device that turns out not to have the file is remembered, so it isn't asked
+   again for every piece.
+3. **Transport** carries each request over an encrypted connection and checks the
+   piece's hash before it's kept.
+
+A [shared folder]($link.page('docs/shared-folders')) works the same way: its
+pieces come from the device sharing it, or from a backup device that keeps a copy
+when that device is off.
+
+# [Keeping copies]($heading.id('copies'))
+
+Some devices keep copies of files that aren't theirs:
+
+- **Backup devices** keep every file of the swarm folder, and the shared folders
+  members marked for backup (a phone's camera).
+- **"Keep each swarm file on N devices"** (**Node & trust → Keep each swarm file on**, or
+  `--copies N`) is one setting for the whole swarm. Each file lives on the device
+  that added it plus N−1 others, chosen per file among the devices that accept
+  copies. Phones don't accept them unless you turn it on (**Accept copies of
+  other devices' files**).
+
+Every device works out on its own which devices keep each file, and they all
+get the same answer, so no device has to coordinate the others. When a device
+leaves the swarm, its files move to the next ones in line.
+
+Nothing is pushed when you save a file. The devices that should keep it notice
+it in the folder's listing and fetch it, a few pieces at a time from whoever has
+them.
+
+# [What it costs your network]($heading.id('traffic'))
+
+NomadFS tries not to talk when it has nothing to say:
+
+- Devices compare a short fingerprint of the swarm folder's listing every 10
+  seconds, and send the listing only when it differs. A quiet swarm costs a few
+  tens of kilobytes a minute per device.
+- A setting such as the number of copies goes to each device once per change.
+- Pieces travel only when a file is opened or must be kept. Reading a file moves
+  about 1 % more than the file itself.
+
+The [learning book](https://github.com/highercomve/nomadfs/tree/main/learning)
+explains each layer in detail, with the code: start with
+[the distribution layer](https://github.com/highercomve/nomadfs/blob/main/learning/cluster/overview.md).

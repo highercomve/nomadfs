@@ -91,7 +91,7 @@ refused).
 | `makeDir(dir, name)` | A `.dir` entry. Folders are also implied by deeper paths (`Manifest.list`). |
 | `remove(path)` | Tombstones the path and every live entry under it. |
 | `rename(path, new_name)` / `move(path, new_path, .{ .replace })` | For each live entry under `path`: a new entry at the destination with the same CID, then a tombstone at the old path. With `replace`, whatever was at the target is tombstoned first (POSIX rename). A folder can't move inside itself. |
-| `readAt(cid, author, offset, dest)` | `tree.readAt` over a `MultiRemote` whose peer list is the author first, then every other known peer. Any copy of a block will do, since every block is verified. |
+| `readAt(cid, author, offset, dest)` | Names the file's likely holders (the author, the devices placement gives it, then the cluster's list: swarm backup devices, everyone else) and reads through the read-ahead; the fetcher picks a holder per block ([Chapter 4.1](../cluster/fetcher.md)). Any copy of a block will do, since every block is verified. |
 | `fileInfo`, `isEmptyDir`, `stagingDir` | Helpers for the FUSE driver ([Chapter 5.3](./fuse.md)). |
 
 ## 3. Sync: pull every 10 seconds
@@ -104,39 +104,53 @@ sequenceDiagram
     participant A as This device
     participant P as Each known peer
     loop every 10 s, for every peer in knownPeers()
-        A->>P: GET_SWARM
-        P-->>A: SWARM { manifest JSON }
-        A->>A: mergeEncoded(bytes)
+        A->>P: GET_SWARM { have: digest of my manifest }
+        alt same content
+            P-->>A: SWARM { } (nothing)
+        else different
+            P-->>A: SWARM { manifest JSON }
+            A->>A: mergeEncoded(bytes)
+        end
     end
-    A->>A: saveLocked() if anything changed
+    A->>A: saveLocked() and wake the keeper if anything changed
 ```
 
 Sync only pulls; each device fetches what it lacks. Because the merge is order-independent, changes
 spread through any chain of devices that meet. `status()` reports the entry count, how many peers
 answered in the last round, and when it ran.
 
-## 4. Backup devices
+**Only when it differs.** `Manifest.digest()` is the XOR of a BLAKE2s hash per entry (path, kind,
+CID, size, mtime, version and history, deleted, author), so it doesn't depend on the order entries
+were learned in: two devices that converged have the same digest, and a peer with the same content
+answers with nothing. Before this, every device pulled the whole manifest (850 KB of JSON for 3,369
+files) from every peer every 10 s: 7 to 17 MB a minute on an idle swarm. Now a quiet swarm costs a
+32-byte digest per peer per round.
 
-If only the author has a file's blocks, the file can't be read while the author is offline. A
-**backup device** copies every live file in full:
+## 4. Who keeps copies: backup devices and `copies`
 
-- **Config:** `swarm_backup = true` in `nomadfs.conf` (default `false`), or the app's
-  "Back up the swarm folder here" switch, which calls `setBackup(on)`.
-- **`backupLoop`**: every 10 s (the first round about 3 s after it starts) runs `backupRound`, which
-  collects live file entries whose root isn't in `backed_up` yet.
-- **`copyFile`**: if `walk.collectReachable` finds the whole DAG locally, the file is already
-  complete. Otherwise `copyFrom` the author, then every other known peer.
-  `copyFrom` uses `cluster.repair.RepairManager.syncWhile`, which walks the DAG and fetches missing
-  blocks with `GET_BLOCK` (each verified) and stops early if backup is switched off.
-- **Progress** is kept in `<storage_path>.swarm.json.backup` (root CIDs copied in full), saved now and
-  then during a long first backup, so a restart doesn't check everything again.
-- **`backupStatus()`**: files, files backed up, bytes, files no reachable device could serve, and
-  the time of the last round.
+If only the author has a file's blocks, the file can't be read while the author is offline. Two
+settings put copies elsewhere; the swarm folder decides *which files* this device keeps, and the
+cluster layer's keeper does the copying ([Chapter 4.4](../cluster/keeper.md)):
 
-Other devices need no setting: when the author is offline, `readAt` tries every known peer and the
-backup answers.
+- **A swarm backup device** keeps every live file: `swarm_backup = true` under `[storage]`, or the
+  app's "Back up the swarm here" switch (`setBackup(on)`, which wakes the keeper).
+- **The swarm's `copies`** (1 to 8, signed and shared by every device, `--copies N` or the app's
+  "Keep each swarm file on") keeps each file on `copies − 1` more devices, chosen per file by
+  placement among those that accept copies ([Chapter 4.3](../cluster/placement.md)). A phone
+  refuses by default (`accept_copies = false`).
+
+The swarm folder is a keeper **provider** (`keeperProvider`): its `wants` lists the live files this
+device should keep and doesn't yet, with the author and the other holders as hints; its `kept`
+records each copied root in `<storage_path>.swarm.json.backup`, saved every 32 files or 10 s, so a
+restart doesn't check everything again. `backupRound()` runs the same logic once without the
+keeper's thread (tests, "sync now"). `backupStatus()` reports files, files kept, bytes, files no
+reachable device could serve, and the time of the last round.
+
+Nothing is pushed when a file is added: the devices that keep it pull it once the manifest sync tells
+them about it (a sync with changes wakes their keeper). Readers need no setting: the holders list
+already includes the backup devices and the placed holders.
 
 > **Not implemented yet:** blocks of deleted or replaced files are never reclaimed, on the author or
-> on a backup (no garbage collection), and tombstones are kept forever. There are no directed backup
-> policies (for example "only this folder, only to the home server"); those are planned in
-> [ROADMAP.md](../../ROADMAP.md) (Phase 4).
+> on a copy holder (no garbage collection), and copies made before `copies` was lowered stay. A
+> holder that is only offline is not replaced; placement moves files only when membership or
+> `copies` changes.

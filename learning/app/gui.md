@@ -83,8 +83,11 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
   CID returned by `nomadfs_put_file`).
 - **Node & trust**: node state and device ID, nickname, trusted devices and revocation
   ([Device identity & pairing](../security/pairing.md)), swarm key rotation (cross-referencing online
-  devices by authenticated fingerprint rather than claimed nickname), and the "Back up the swarm folder
-  here" switch.
+  devices by authenticated fingerprint rather than claimed nickname), the "Back up the swarm here"
+  switch (desktops), "Keep each swarm file on" (the swarm's signed `copies`, `swarm_replicas_set`)
+  and "Accept copies of other devices' files" (`accept_copies_set`, off on phones by default). The
+  last two are policy, not distribution: the app signs a setting; the cluster layer decides what
+  that means ([Chapter 4.3](../cluster/placement.md)).
 - **About** (also the "built with" line at the bottom of the drawer): the NomadFS, Oriel and Zig
   versions and the commit the app was built from, the platform and app size, this device's name,
   fingerprint, node ID, port and addresses, devices connected and trusted, and the configuration
@@ -92,6 +95,12 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
   `build.zig` passes the versions in an `about` options module: NomadFS's from its own
   `version`, Oriel's read from the Oriel package's `build.zig.zon`, the commit from `git` (with
   a `+` when the checkout has local changes).
+
+**Loading.** A list that loads something new (Browse's devices and folders, the swarm folder,
+shared folders, trusted devices) clears its old rows at once and shows placeholder rows
+(`listLoading`) until the answer arrives; refreshing the same place keeps its rows and only spins
+the button. Each navigation is numbered (`browseNav`, `swarmNav`, `sharesNav`), so an answer for a
+place the user already left is dropped instead of drawn over the current one.
 
 **Back** (Android's back button and gesture, a mouse's back button) goes up one level: it closes
 the open file or the More sheet, then goes to the parent folder, then back to Browse; at the top

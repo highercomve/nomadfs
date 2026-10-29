@@ -136,16 +136,23 @@ A `Loader` returns verified bytes for a CID. `Loader.local(store)` reads the loc
   from the root, skipping parent links by their subtree `size` until the link that contains the
   offset (`readLeafAt`, at most 64 levels). Only the blocks covering the range are loaded.
 
-## 5. Remote loaders (`src/fs/remote.zig`)
+## 5. Reading another device's files (`src/fs/remote.zig`)
 
-- **`Remote { block_manager, store, peer }`**: `load` returns the block from the local store if
-  present; otherwise it connects to `peer` (`BlockManager.connectTo`), calls `dht_node.fetchBlock`,
-  and `store.putCached`s the result, which rejects bytes that don't hash to the CID. The read cache
-  keeps what was read, so a file read once reads offline afterwards, until the least recently read
-  blocks are evicted past `cache_mb` ([the read cache](../storage/engine.md#the-read-cache)).
-- **`Remote.shares()`**: sends `GET_SHARES`, returns the nickname, the listing and the peer's authenticated device ID.
-- **`MultiRemote { peers }`**: tries the local store, then each peer in order until one serves the
-  block. The swarm folder uses it ([Chapter 5.2](./swarm.md)).
+This module decides *what* to read and from *whom it may come*; the cluster layer decides *where
+each block comes from* ([Chapter 4](../cluster/overview.md)).
+
+- **`readShareAt(peer, root, offset, dest)`**, used by the mount, the app's viewer, downloads and
+  file details: lists the share's likely holders (`holders.forOrigin`: the sharing device, then
+  devices known to keep backups of its folders) and reads through the read-ahead, whose workers
+  ask the fetcher per block. A phone's backed-up photos open from the backup device while the phone
+  is off.
+- **`Remote { block_manager, store, peer, root }`** and **`MultiRemote { peers, root }`**: tree
+  loaders that hand each block to `Fetcher.fetch` with one or several holders. Fetched blocks are
+  verified and kept in the read cache, so a file read once reads offline afterwards, until the least
+  recently read blocks are evicted past `cache_mb` ([the read cache](../storage/engine.md#the-read-cache)).
+- **`Remote.shares()`**: sends `GET_SHARES` (meaning, so it stays here), returns the nickname, the
+  listing and the peer's authenticated device ID, and notes for the cluster layer which devices keep
+  copies of whose folders (from the reply's `backup` field).
 - **`knownPeers(block_manager, allocator)`**: every node ID in the routing table. This is the
   "devices I know" list used by the mount, the swarm sync and the backup.
 - **Per-peer health gate (`HealthGate`)**: tracks unreachable or failing peers with exponential
@@ -156,21 +163,21 @@ A `Loader` returns verified bytes for a CID. `Loader.local(store)` reads the loc
 
 ```mermaid
 sequenceDiagram
-    participant R as Reader (app / mount)
-    participant L as Remote loader
+    participant R as Reader (app / mount, fs/)
+    participant L as Fetcher (cluster/)
     participant S as Local store
-    participant P as Peer (share owner)
-    R->>L: readAt(root, offset)
+    participant P as Best holder (owner or backup)
+    R->>L: block cid of file root, holders
     L->>S: get(cid)
-    alt cached
+    alt held
         S-->>L: bytes (verified)
     else missing
         L->>P: GET_BLOCK cid
         P-->>L: bytes (from its filestore or store)
-        L->>S: put(cid, bytes), SHA-256 checked
+        L->>S: putCached(cid, bytes), SHA-256 checked
     end
-    L-->>R: bytes for the range
+    L-->>R: bytes
 ```
 
-> **Not implemented yet:** there are no directed sync or backup policies for shares (for example "back up phone photos only to the home
-> server"). Both are planned in [ROADMAP.md](../../ROADMAP.md) (Phase 4).
+> Marked shares are kept by every swarm backup device ([Chapter 5.3](./backup.md)); there is no
+> per-share choice of *which* backup device yet.

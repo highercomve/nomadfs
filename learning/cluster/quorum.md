@@ -1,4 +1,4 @@
-# Chapter 4.2: The Write Quorum
+# Chapter 4.6: The Write Quorum
 
 `src/cluster/quorum.zig` defines the classic `N`, `W`, `R` triple, but the node uses only one of the three numbers, and that one means something narrower than in Dynamo-style systems.
 
@@ -47,9 +47,9 @@ There is no read quorum. `BlockManager.get` reads locally when the DAG is comple
 ## 6. Not Implemented Yet
 
 *   **Read quorums (`R`)** and **replication factor `N`** as in Dynamo.
-*   **Background re-replication** when a replica disappears, and periodic re-announcement of provider records (they expire after 24 h).
+*   Periodic re-announcement of provider records (they expire after 24 h). Re-replication when a holder goes away is placement's job now ([4.3](./placement.md), [4.4](./keeper.md)).
 
 ---
 
 **Next Chapters:**
-*   [Chapter 4.3: The Hash Ring (unused)](./ring.md)
+*   [Chapter 4.7: The Hash Ring (unused)](./ring.md)

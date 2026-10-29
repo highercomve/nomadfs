@@ -14,6 +14,8 @@
 				<a href="$site.page('docs/shared-folders').link()">Shared folders &amp; mount</a>
 				<a href="$site.page('docs/swarm-folder').link()">Swarm folder</a>
 				<a href="$site.page('docs/connecting-devices').link()">Connecting devices</a>
+				<h4>Under the hood</h4>
+				<a href="$site.page('docs/how-it-works').link()">How it works</a>
 			</nav>
 		</aside>
 		<main class="doc">

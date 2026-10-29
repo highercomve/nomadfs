@@ -48,7 +48,7 @@ no TLS or crypto libraries. The app adds Oriel.
 | **Transport** | `src/net/transport/` | TCP, the Noise `XXpsk3` handshake, Yamux streams, LAN announcements, UPnP. |
 | **Discovery** | `src/net/discovery/` | The Kademlia DHT and every RPC (`GET_BLOCK`, `GET_SHARES`, `GET_SWARM`, …). |
 | **Storage** | `src/storage/` | FastCDC chunking, SHA-256 content addressing, Merkle DAG blocks, the block store. |
-| **Cluster** | `src/cluster/` | Moving whole DAGs between devices: provider records, replication, fetch. |
+| **Cluster** | `src/cluster/` | Distribution: where each block comes from (the fetcher), who holds what, who keeps each swarm file (placement), copying (the keeper). |
 | **Folders** | `src/fs/` | Shared folders and the filestore, the swarm folder CRDT, the FUSE mount. |
 | **Devices** | `src/device/` | Ed25519 identity, the trust store, pairing tickets, invites, key rotation. |
 | **Node** | `src/root.zig`, `src/main.zig` | Wires everything together; the command line. |
@@ -93,12 +93,17 @@ no TLS or crypto libraries. The app adds Oriel.
     *   [3.2: Building the Merkle DAG](./storage/dag.md)
     *   [3.3: The Disk Engine](./storage/engine.md)
 
-### Part IV: Block Exchange (`src/cluster/`)
-7.  **[Chapter 4: Block Exchange & Replication](./cluster/overview.md)**
-    *   [4.1: Fetching DAGs (Repair)](./cluster/repair.md)
-    *   [4.2: The Write Quorum](./cluster/quorum.md)
-    *   [4.3: The Hash Ring (present, unused)](./cluster/ring.md)
-    *   [4.4: Vector Clocks (present, unused) and what the swarm folder uses](./cluster/vectors.md)
+### Part IV: The Distribution Layer (`src/cluster/`)
+7.  **[Chapter 4: The Distribution Layer](./cluster/overview.md)**: what each layer owns, a read and a copy from top to bottom
+    *   [4.1: The Fetcher](./cluster/fetcher.md)
+    *   [4.2: Holders](./cluster/holders.md)
+    *   [4.3: Placement and the Swarm Policy](./cluster/placement.md)
+    *   [4.4: The Keeper](./cluster/keeper.md)
+    *   [4.5: Fetching Whole DAGs (`RepairManager`)](./cluster/repair.md)
+    *   [4.6: The Write Quorum](./cluster/quorum.md)
+    *   [4.7: The Hash Ring (present, unused)](./cluster/ring.md)
+    *   [4.8: Vector Clocks (present, unused) and what the swarm folder uses](./cluster/vectors.md)
+    *   [4.9: History: how the layer was lost and restored](./cluster/history.md)
 
 ### Part V: Folders (`src/fs/`)
 8.  **[Chapter 5: Folders](./fs/overview.md)**

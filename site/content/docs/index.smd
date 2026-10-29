@@ -30,6 +30,9 @@ configuration, shares a folder and brings a second device into the swarm.
   device reads and writes, how edits merge and what happens on a conflict.
 - [Connecting devices]($link.page('docs/connecting-devices')): swarms, one-time
   invites and QR codes, trusted devices and revocation.
+- [How it works]($link.page('docs/how-it-works')): the three layers, how a file
+  is read from several devices at once, who keeps copies, and what it costs your
+  network.
 
 # [Words used here]($heading.id('words'))
 

@@ -32,16 +32,18 @@ where any program can write to it (see [below]($link.ref('from-the-mount'))).
 
 The swarm folder's listing is a manifest: every path with its kind, content
 hash, size, modification time and author. Each device keeps the whole manifest
-on disk, next to its block store, and merges it with every reachable device
-every 10 seconds.
+on disk, next to its block store, and checks it against every reachable device
+every 10 seconds. Only a short fingerprint is exchanged when nothing changed;
+the manifest itself travels only when the two differ.
 
 The manifest is a state-based CRDT: two devices that have seen the same edits
 hold the same manifest, whatever order the edits arrived in. No device is in
 charge and none has to be online for the others to keep working.
 
 File contents are not in the manifest. A file's bytes stay on the device that
-added it and travel when someone opens it: from the local cache first, then
-from the device that added it, then from any device that has it cached.
+added it (and the devices that keep copies, below) and travel when someone opens
+it: from the local cache first, then from the devices that hold it, several at
+once, most from the fastest ([how it works]($link.page('docs/how-it-works').ref('reading'))).
 
 # [Backup devices]($heading.id('backup'))
 
@@ -50,8 +52,8 @@ unless another device has a copy. A **backup device** keeps a copy of every
 file in the swarm folder: give the job to a computer that stays on, such as a
 desktop or a home server, and the folder stays readable when the phone is off.
 
-- In the app (Linux desktop): **Settings → Swarm backup → Back up the swarm
-  folder here**. The card shows how many files are backed up.
+- In the app (Linux desktop): **Node & trust → Back up the swarm
+  here**. The card shows how many files are backed up.
 - On the command line: `--swarm-backup`, or in the configuration:
 
 ```ini
@@ -59,13 +61,31 @@ desktop or a home server, and the folder stays readable when the phone is off.
 swarm_backup = true
 ```
 
-Every 10 seconds the backup device copies each new file, block by block,
-verifying every block against its hash. It asks the device that added the file
-first, then any other device that has a copy, so two backup devices also back
-each other up. It remembers what it copied (`<storage_path>.swarm.json.backup`),
-so a restart doesn't check everything again. Other devices need no setting:
-when the author is offline they try every known device, and the backup
-answers.
+When the listing shows a new file, the backup device copies it, a few pieces at
+a time from whichever devices have it, verifying every piece against its hash;
+two backup devices so also back each other up. It remembers what it copied
+(`<storage_path>.swarm.json.backup`), so a restart doesn't check everything
+again. Other devices need no setting: when the author is offline they read from
+the backup devices.
+
+# [Copies on more devices]($heading.id('copies'))
+
+A backup device keeps everything. To keep each file on a few devices instead,
+set how many devices keep each file, once, for the whole swarm:
+
+- In the app: **Node & trust → Keep each swarm file on**: 1 (only where it was
+  added) to 4 devices.
+- On the command line: `nomadfs --copies 2`.
+
+Each file then lives on the device that added it plus N−1 others, chosen per
+file among the devices that accept copies, so the files spread over the devices
+instead of all landing on one. Every device works out the same choice on its
+own. Phones don't accept copies unless you turn on **Accept copies of other
+devices' files** (`accept_copies = true` under `[storage]`); a computer accepts
+them unless you turn it off. Backup devices keep everything either way.
+
+The setting is signed by the device that sets it and reaches the others the next
+time they meet; the newest one wins.
 
 The copies stay when a file is deleted or replaced: the space they use isn't
 reclaimed yet. A file that no reachable device has, because its author has

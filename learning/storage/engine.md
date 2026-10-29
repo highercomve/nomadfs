@@ -92,7 +92,7 @@ Shared folders are not copied into the store. The share scanner records where ea
 ---
 
 **Next Chapters:**
-*   [Chapter 4: Block Exchange & Replication](../cluster/overview.md)
+*   [Chapter 4: The Distribution Layer](../cluster/overview.md)
 
 ## The read cache
 

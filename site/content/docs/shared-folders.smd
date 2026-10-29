@@ -61,6 +61,10 @@ folder's last sync, backups). A device answers only devices it is paired with.
 
 # [Opening and downloading files]($heading.id('opening'))
 
+A file's pieces come from the device sharing it, or from a backup device that
+keeps a copy of that folder: a phone's backed-up photos open from the home
+server while the phone is off ([how it works]($link.page('docs/how-it-works').ref('reading'))).
+
 Reading a file asks only for the blocks that cover the bytes being read. Every
 block that arrives is checked against its hash before it is kept, and kept
 blocks are kept in a read cache, so a file opened once opens again without the

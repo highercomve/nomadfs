@@ -35,10 +35,12 @@ A thread started with the listener runs a round a minute while swarm backup is o
 
 1. For every known device, `GET_SHARES`. Only swarm members (devices in the trust store) are
    backed up.
-2. For each wanted share whose root differs from the last copied one, copy every block with
-   `RepairManager.syncWhile`, which stores them in the kept area (never evicted, see
-   [the read cache](../storage/engine.md#the-read-cache)). An interrupted copy resumes: blocks
-   already held aren't fetched again.
+2. For each wanted share whose root differs from the last copied one, copy it with the cluster
+   layer's `keeper.copy` ([Chapter 4.4](../cluster/keeper.md)): every block through the fetcher,
+   kept in the kept area (never evicted, see [the read cache](../storage/engine.md#the-read-cache))
+   against the quota. File data already held is skipped without being read, so copying a large
+   camera folder again reads only its index; an interrupted copy resumes. Deciding *what* to keep
+   and the merge below are this module's; *how* blocks arrive is the cluster layer's.
 3. **Merge** the new version into this device's own tree of the share (`backup.merge`): every
    entry of the new version, plus every entry of the previous tree the new version no longer
    has; folders of the same name merge recursively, otherwise the new entry wins. Files deleted
@@ -53,6 +55,10 @@ A thread started with the listener runs a round a minute while swarm backup is o
 The app's **Shared folders** page shows, under each marked folder, which backup devices hold a
 copy and whether it is current (`backup_status`): *Backed up on Plex · Ridge*, *new files being
 copied*, or *waiting for Wi-Fi*.
+
+Reading those SHARES replies also tells the cluster layer who keeps whose folders
+(`holders.noteKeeps`, [Chapter 4.2](../cluster/holders.md)): when the phone is off, opening its
+photos from another device reads them from the backup device.
 
 > **Not implemented yet:** per-photo "backed up" marks and **Free up space**, a charging-only
 > option, backup away from home without Tailscale (needs a public relay), and encryption at rest.

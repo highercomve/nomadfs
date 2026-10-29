@@ -1,7 +1,8 @@
-# Chapter 4.5: The Distribution Layer, Restored (design)
+# Chapter 4.9: History: How the Distribution Layer Was Lost and Restored
 
-> Status: **design**, being built on the `cluster-layer` branch. Chapters 4 to 4.4 describe
-> the code as it is; this one describes where it is going and why.
+> This was the design written before the work (October 2026); it is built now. Chapters 4 to 4.4
+> describe the code. Kept here because *why* the layers are drawn where they are is the part that
+> is easy to lose again.
 
 ## 1. What went wrong
 
@@ -18,7 +19,7 @@ home server"), not everything everywhere.
 What it should have kept is the distribution layer itself. Instead, features were built
 top down, and each one chose its sources and made its copies inside `src/fs/`:
 
-| Feature | Where it reads from (today) | How it copies (today) |
+| Feature | Where it read from (before) | How it copied (before) |
 | :--- | :--- | :--- |
 | Browse, mount, app viewer | the sharing device only (`fs.Remote`) | n/a |
 | Swarm folder reads | the author, then every known device in turn (`MultiRemote`, `ReadAhead`) | n/a |
@@ -109,24 +110,26 @@ One loop in `cluster/` replaces the swarm backup round, `FolderBackup`'s copying
 The folder-backup merge (`fs/backup.zig`) stays in `fs/`: the keeper copies a share's
 blocks, then `fs/` merges the new tree into the kept one.
 
-## 7. Stages
+## 7. How it was built
 
-1. **Fetcher with hints.** `cluster.Fetcher`; every read path in `fs/`, the mount and the
-   app goes through it, with holders from hints and roles (no protocol change). Streams
-   use every known holder at once.
-2. **Holder registry.** Root announcements and re-announcing, "do you have this root?",
-   remembered misses.
-3. **Placement and keeper.** The swarm-wide N with opt-out; swarm backup, folder backup
-   and `swarm_replicas` folded into the keeper; repair when holders disappear.
-4. **Clean-up.** Remove `fs.Remote`'s fetching, `MultiRemote`, the old copy loops and
-   `BlockManager.get`'s own source loop; this chapter becomes the description of the code.
+1. **The fetcher** ([4.1](./fetcher.md)): every read path went through it; streams use every
+   known holder at once.
+2. **Holders** ([4.2](./holders.md)): roles in PING/PONG, backup holders noted from shares
+   replies; no announcements.
+3. **Placement, the policy and the keeper** ([4.3](./placement.md), [4.4](./keeper.md)): the
+   swarm-wide `copies` with opt-out; swarm backup, folder backup's copying and push-at-save
+   replicas became one keeper.
+4. **Measuring it**: wire byte counters and `nomadfs --bench-read` / `--bench-idle` showed the
+   reads spread as intended, and found the largest waste: every device pulled the whole swarm
+   manifest from every peer every 10 s. The manifest digest fixed that ([5.2](../fs/swarm.md)).
 
-Each stage brings cluster tests; the first: a stream from three holders at different
-speeds, one of which disappears mid-stream.
+Two reviews of the plan (Gemini, GLM) changed it before any code: placement must not depend on
+anything learned at run time (role bits from pings), the policy needs real acknowledgements, a
+revoked device must leave placement at once, and the read path must not wait on DHT lookups.
 
 ---
 
 **Next Chapters:**
-*   [Chapter 4: Block Exchange & Replication](./overview.md)
+*   [Chapter 4: The Distribution Layer](./overview.md)
 *   [Chapter 5.1: Shared Folders](../fs/shares.md)
 *   [Chapter 5.2: The Swarm Folder](../fs/swarm.md)

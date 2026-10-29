@@ -1,4 +1,4 @@
-# Chapter 4.1: Fetching DAGs (Repair)
+# Chapter 4.5: Fetching Whole DAGs (`RepairManager`)
 
 `src/cluster/repair.zig` holds `RepairManager`, which copies a whole Merkle DAG between two devices over one connection. Despite the name it is not a background anti-entropy process: it runs only when something asks for a specific root CID.
 
@@ -42,15 +42,16 @@ Pushed replicas do not require the receiving device to have a trusted-device pai
 | :--- | :--- | :--- |
 | `BlockManager.fetch` | `sync` | `get` of a DAG that isn't complete locally ([Chapter 4](./overview.md)) |
 | `BlockManager.replicate` | `push` | `put` with `replicas > 0` |
-| `SwarmFolder.copyFrom` (`src/fs/swarm.zig`) | `syncWhile` | a swarm **backup device** copying a file; stops when backup is switched off |
 
-Browsing shares and reading swarm files don't use `RepairManager`: they fetch only the blocks a read needs, through `tree.readAt` and `src/fs/remote.zig` ([Shared Folders](../fs/shares.md)).
+Only the mobile C API's `put`/`get` use it now. Every other read and copy goes through the fetcher
+and the keeper ([4.1](./fetcher.md), [4.4](./keeper.md)), which pick a holder per block instead of
+pulling a whole DAG over one connection, and skip held file data without reading it.
 
 ## 4. Not Implemented Yet
 
-The earlier design described here, a Merkle tree over each node's set of stored CIDs, root-hash comparison with neighbours, `WANT` lists, an hourly random-neighbour comparison and reactive repair with hash-ring neighbours, does **not** exist. Nothing compares the contents of two block stores. `DiffService` (`src/storage/dag/diff.zig`) computes the blocks one version of a file adds over another, but only its tests call it ([Chapter 3.2](../storage/dag.md)).
+The earlier design described here, a Merkle tree over each node's set of stored CIDs, root-hash comparison with neighbours, `WANT` lists, an hourly random-neighbour comparison and reactive repair with hash-ring neighbours, does **not** exist. Repair today is placement-driven: when membership or `copies` changes, the devices that now win a file copy it ([4.4](./keeper.md)). Nothing compares the contents of two block stores. `DiffService` (`src/storage/dag/diff.zig`) computes the blocks one version of a file adds over another, but only its tests call it ([Chapter 3.2](../storage/dag.md)).
 
 ---
 
 **Next Chapters:**
-*   [Chapter 4.2: The Write Quorum](./quorum.md)
+*   [Chapter 4.6: The Write Quorum](./quorum.md)

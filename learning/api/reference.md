@@ -99,12 +99,42 @@ Details: [The Disk Engine](../storage/engine.md).
 - `codec.decode(bytes) !View` validates and decodes a leaf, parent or dir
   block; `codec.encodeDir` builds a dir block.
 
-## 3. `cluster.BlockManager` (`src/cluster/block_manager.zig`)
+## 3. The distribution layer (`src/cluster/`)
 
-File-level put/get on top of the store and the DHT. Shares and the swarm
-folder don't use `put`; `put` and `get` are what the C ABI's
-`nomadfs_put_file`/`nomadfs_get_file` call (the app uses them for its text
-notes).
+Every read and copy of another device's blocks goes through here
+([Chapter 4](../cluster/overview.md)).
+
+```zig
+// cluster.Fetcher (fetcher.zig), BlockManager.fetcher
+pub fn fetch(self, root: *const Cid, cid: *const Cid, holders: []const NodeID, allocator) ![]u8;
+pub fn snapshot(self, out: []PeerState) []PeerState;  // per device: rate, in flight, blocks, bytes
+pub fn totals(self) Stats;                             // local, fetched, not_found, failed
+
+// cluster.Holders (holders.zig), BlockManager.holders
+pub fn noteKeeps(self, holder: NodeID, origin: NodeID) void;
+pub fn forOrigin(self, origin: NodeID, out: *[8]NodeID) []NodeID;  // a share's files
+pub fn forSwarm(self, author: NodeID, out: *[8]NodeID) []NodeID;   // a swarm file
+
+// cluster.placement (placement.zig)
+pub fn replicaHolders(root: *const Cid, author: NodeID, copies: u8, members: []const NodeID, out: []NodeID) []NodeID;
+pub fn candidates(allocator, trust, policy, self_node: NodeID, self_device: NodeID) ![]NodeID;
+
+// cluster.keeper (keeper.zig)
+pub fn copy(allocator, fetcher, store, root: Cid, hints: []const NodeID, keep_going: *const std.atomic.Value(bool)) !Copied;
+Keeper.register(provider: Provider) !void;  // fs says what to keep: wantsFn, doneFn
+Keeper.wake(self) void;
+
+// device.policy (src/device/policy.zig), Node.policy
+pub fn copies(self) u8;
+pub fn acceptsCopies(self, device: NodeID) bool;
+pub fn setCopies(self, identity, trust, n: u8, now: u64) !Outcome;  // signs, applies, saves
+pub fn apply(self, r: Record, trust, self_device: NodeID, now: u64) !Outcome;
+```
+
+### `cluster.BlockManager` (`src/cluster/block_manager.zig`)
+
+Owns the fetcher and the holders, and keeps a file-level put/get on top of the
+store and the DHT for the C ABI's `nomadfs_put_file`/`nomadfs_get_file`.
 
 ```zig
 pub fn put(self, reader: anytype) ![]const u8;                 // root CID, caller-owned
@@ -142,10 +172,11 @@ pub fn listDir(allocator, loader: Loader, cid: *const Cid) !Listing;
 pub fn resolve(allocator, loader: Loader, root: Cid, path: []const u8) !Entry;
 pub fn readAt(allocator, loader: Loader, root: Cid, offset: u64, dest: []u8) !usize;
 
-// fs.remote (src/fs/remote.zig)
-Remote{ .block_manager, .store, .peer }.loader()   // local store, else GET_BLOCK from `peer`, verified + cached
-Remote.shares(allocator) !Shares                   // GET_SHARES: nickname + listing
-MultiRemote{ .block_manager, .store, .peers }.loader()
+// fs.remote (src/fs/remote.zig): name the holders, the fetcher picks per block
+pub fn readShareAt(allocator, block_manager, store, read_ahead, peer: NodeID, root: Cid, offset: u64, dest: []u8) !usize;
+Remote{ .block_manager, .store, .peer, .root }.loader()   // one holder
+MultiRemote{ .block_manager, .store, .peers, .root }.loader()
+Remote.shares(allocator) !Shares                   // GET_SHARES: nickname + listing; notes who keeps whose folders
 
 // fs.SwarmFolder (src/fs/swarm.zig)
 pub fn addFile(self, dir: []const u8, name: []const u8, local_path: []const u8) !void;

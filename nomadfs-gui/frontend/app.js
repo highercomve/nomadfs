@@ -2128,6 +2128,7 @@ for (const el of document.querySelectorAll(".about-link")) {
 
 function renderBackup(st) {
   // The copies settings are for every device; backing up all of it, for desktops.
+  $("backup-section").hidden = false;
   $("swarm-backup-row").hidden = !st.supported;
   $("swarm-replicas").value = String(Math.min(Math.max(st.replicas ?? 1, 1), 4));
   $("accept-copies").checked = !!st.accept_copies;

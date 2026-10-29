@@ -22,17 +22,23 @@ and who drives it.
     starts the rescan thread (only with storage).
 5.  **Handlers**: the manager hands every new connection to the DHT serve
     loop, and every LAN-announced peer to `onDiscovery`.
-6.  **Block exchange**: `cluster.BlockManager` with `replicas` and
-    `write_quorum`.
+6.  **Distribution**: `cluster.BlockManager`, which owns the fetcher and the
+    holder registry ([Chapter 4](../cluster/overview.md)), and the mobile API's
+    `replicas` and `write_quorum`.
 7.  **Swarm folder**: `fs.SwarmFolder` with its manifest at
-    `<storage_path>.swarm.json`. It starts the 10-second sync thread, and
-    the backup thread if `swarm_backup = true` (only with storage).
+    `<storage_path>.swarm.json`. It starts the 10-second sync thread
+    (only with storage).
 8.  **Hash ring**: `cluster.ring` gets the local node with 10 tokens. Nothing
-    reads it ([Chapter 4.3](../cluster/ring.md)).
+    reads it ([Chapter 4.7](../cluster/ring.md)).
 9.  **Devices**: the Ed25519 identity (`device.key`) and the signed trust
     store (`trust.store`) are loaded. The manager gets a device
     `Authenticator` so every handshake verifies the peer's identity, and
     refuses unknown devices if `require_trusted_devices = true`.
+10. **Policy and keeper**: the swarm's signed settings (`swarm.policy` next
+    to the trust store; this device's `accept_copies` and `--copies` are
+    signed into it) and the keeper, with the swarm folder registered as a
+    provider of what to keep ([Chapter 4.4](../cluster/keeper.md)). The
+    keeper's thread starts with the listener.
 
 ### Lifecycle
 
@@ -52,8 +58,9 @@ and who drives it.
 A running node uses threads, not an event loop: the TCP accept loop, one
 handshake thread per incoming connection, one Yamux reader per connection,
 one handler thread per incoming stream, plus the reaper, the LAN announcer,
-the UPnP worker, the share rescanner, the swarm sync loop, the backup loop
-and the bootstrap/maintenance loop.
+the UPnP worker, the share rescanner, the swarm sync loop, the keeper, the
+folder backup round, the read-ahead's six workers, and the
+bootstrap/maintenance loop.
 
 ## 2. Nodes With and Without Storage
 
