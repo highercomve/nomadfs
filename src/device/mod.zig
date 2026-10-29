@@ -5,6 +5,7 @@ pub const trust = @import("trust.zig");
 pub const invite = @import("invite.zig");
 pub const rotation = @import("rotation.zig");
 pub const paths = @import("paths.zig");
+pub const policy = @import("policy.zig");
 pub const auth = @import("auth.zig");
 
 test {
@@ -15,5 +16,6 @@ test {
     _ = invite;
     _ = rotation;
     _ = paths;
+    _ = policy;
     _ = auth;
 }

@@ -693,6 +693,8 @@ test {
     inline for (.{
         @import("cluster/block_manager.zig"),
         @import("cluster/fetcher.zig"),
+        @import("cluster/placement.zig"),
+        @import("device/policy.zig"),
         @import("mobile/api.zig"),
         @import("cluster/quorum.zig"),
         @import("cluster/repair.zig"),
