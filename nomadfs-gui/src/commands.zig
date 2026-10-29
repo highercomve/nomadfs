@@ -1335,6 +1335,64 @@ pub fn fileDetails(gpa: std.mem.Allocator, args: FileDetailsArgs) !FileDetails {
     return d;
 }
 
+pub const DeviceInfoArgs = struct { peer: ?[]const u8 = null };
+
+/// node_info.Info with its texts as strings, for JSON.
+pub const DeviceInfo = struct {
+    version: []const u8,
+    platform: []const u8,
+    uptime_s: u64,
+    disk_total: u64,
+    disk_free: u64,
+    kept_bytes: u64,
+    kept_blocks: u64,
+    cache_bytes: u64,
+    cache_limit: u64,
+    quota: u64,
+    peers: u32,
+    connections: u32,
+    trusted: u32,
+    shares: u32,
+    shares_failing: u32,
+    shares_indexing: u32,
+    swarm_files: u32,
+    swarm_last_sync: u64,
+    swarm_backup: bool,
+    swarm_backed_up: u32,
+    swarm_unreachable: u32,
+    held_backups: u32,
+    unmetered: bool,
+};
+
+/// `invoke("device_info", { peer? })`: what a device reports about itself
+/// (GET_NODE_INFO), asked now; this device's own without `peer`. Fails with
+/// NotTrusted when the device doesn't trust this one, and with
+/// NeedsUpdate when it is too old to answer.
+pub fn deviceInfo(gpa: std.mem.Allocator, args: DeviceInfoArgs) !DeviceInfo {
+    // Asking takes a round trip: hold the node, not g_mutex.
+    const handle = mediaAcquire() orelse return error.NotRunning;
+    defer mediaRelease();
+    const info: nomadfs.node_info.Info = if (args.peer) |p| blk: {
+        const peer: NodeID = .{ .bytes = try parseHex32(p) };
+        const bm = handle.node.block_manager;
+        const conn = try bm.connectTo(peer);
+        defer conn.deinit();
+        const bytes = bm.dht_node.fetchNodeInfo(conn, gpa) catch |err| switch (err) {
+            error.NotTrusted => return err,
+            // An older device drops the request it can't read.
+            error.EndOfStream, error.InvalidResponse, error.ConnectionResetByPeer => return error.NeedsUpdate,
+            else => return err,
+        };
+        break :blk nomadfs.node_info.decode(bytes) catch return error.NeedsUpdate;
+    } else try handle.node.info_provider.info(gpa);
+    var out: DeviceInfo = undefined;
+    inline for (std.meta.fields(DeviceInfo)) |f| {
+        const v = @field(info, f.name);
+        @field(out, f.name) = if (@TypeOf(v) == nomadfs.node_info.Info.Text) try gpa.dupe(u8, v.slice()) else v;
+    }
+    return out;
+}
+
 pub const SwarmRangeArgs = struct { cid: []const u8, author_id: []const u8, offset: u64, len: u32 };
 
 /// `swarm_read_range`: base64 bytes of a swarm file, for previews.

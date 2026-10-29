@@ -333,6 +333,7 @@ let path = [];
 
 function renderCrumbs() {
   $("remote-head").hidden = path.length === 0;
+  $("device-about").hidden = path.length === 0;
   $("browse-tools").hidden = path.length === 0;
   renderNavDevices();
   const nav = $("crumbs");
@@ -413,6 +414,7 @@ async function showDevices() {
       headline: title,
       meta: `${badge} · ${fpShort}${qualifier} · ${sharesText}`,
       onClick: () => { path = [{ name: title, device: d }]; showLocation(); },
+      actions: [{ icon: "info", label: `About ${title}`, run: () => openDeviceInfo(title, d.peer) }],
     }));
   }
 }
@@ -914,6 +916,7 @@ $("mount-open").addEventListener("click", async () => {
   try { await invoke("open_path", { path: mountPath }); } catch (err) { snack(`Couldn't open the folder: ${err}`); }
 });
 
+$("device-about").addEventListener("click", () => { if (path.length) openDeviceInfo(path[0].name, path[0].device.peer); });
 $("remote-refresh").addEventListener("click", () => (path.length ? refreshLocation() : showDevices()));
 
 /** Reloads the open folder as it is now: a share's root changes with every
@@ -2296,6 +2299,148 @@ function drawChunkMap(canvas, d) {
     }
     x += width;
   }
+}
+
+// ---- A device's About and health (device_info, asked on demand) ----
+
+let deviceInfoToken = 0;
+
+function formatUptime(s) {
+  if (s < 60) return `${s} s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h} h ${m % 60} min`;
+  return `${Math.floor(h / 24)} days ${h % 24} h`;
+}
+
+/** [status, text] checks from what the device reported: ok, warn or bad. */
+function deviceHealth(i) {
+  const checks = [];
+  if (i.disk_total > 0) {
+    const free = i.disk_free / i.disk_total;
+    const text = `${formatSize(i.disk_free)} free of ${formatSize(i.disk_total)} (${Math.round(free * 100)}%)`;
+    checks.push([free < 0.05 || i.disk_free < 1e9 ? "bad" : free < 0.1 ? "warn" : "ok", `Disk: ${text}`]);
+  } else {
+    checks.push(["warn", "Disk: free space not known on this platform"]);
+  }
+  if (i.quota > 0) {
+    const used = i.kept_bytes / i.quota;
+    checks.push([used >= 1 ? "bad" : used >= 0.9 ? "warn" : "ok", `Quota: ${formatSize(i.kept_bytes)} of ${formatSize(i.quota)} kept`]);
+  }
+  if (i.shares_failing > 0) {
+    checks.push(["bad", `${i.shares_failing} shared folder${i.shares_failing === 1 ? "" : "s"} can't be read`]);
+  } else if (i.shares_indexing > 0) {
+    checks.push(["warn", `${i.shares_indexing} shared folder${i.shares_indexing === 1 ? " is" : "s are"} still being scanned`]);
+  } else if (i.shares > 0) {
+    checks.push(["ok", `${i.shares} shared folder${i.shares === 1 ? "" : "s"}, all readable`]);
+  }
+  checks.push(i.connections > 0
+    ? ["ok", `Connected to ${i.connections} device${i.connections === 1 ? "" : "s"}`]
+    : ["warn", "Not connected to any device"]);
+  if (!i.swarm_last_sync) {
+    checks.push(["warn", "Swarm folder: never synced"]);
+  } else {
+    const age = Date.now() / 1000 - i.swarm_last_sync;
+    checks.push([age > 600 ? "warn" : "ok", `Swarm folder synced ${timeAgo(i.swarm_last_sync * 1000)}`]);
+  }
+  if (i.swarm_backup) {
+    checks.push(i.swarm_unreachable > 0
+      ? ["warn", `Swarm backup: ${i.swarm_unreachable} file${i.swarm_unreachable === 1 ? "" : "s"} no device could serve`]
+      : ["ok", `Swarm backup: ${i.swarm_backed_up} of ${i.swarm_files} files kept here`]);
+  }
+  if (!i.unmetered) checks.push(["warn", "On mobile data: backups wait for Wi-Fi"]);
+  return checks;
+}
+
+async function openDeviceInfo(title, peer) {
+  const token = ++deviceInfoToken;
+  $("dt-name").textContent = title;
+  $("dt-meta").textContent = "Asking the device…";
+  const body = $("dt-body");
+  body.replaceChildren();
+  $("details").hidden = false;
+  let i;
+  try {
+    i = await invoke("device_info", peer ? { peer } : {});
+  } catch (err) {
+    if (token !== deviceInfoToken) return;
+    const why = String(err);
+    $("dt-meta").textContent = why.includes("NeedsUpdate")
+      ? "This device runs an older NomadFS that can't answer: update it."
+      : why.includes("NotTrusted")
+        ? "This device doesn't trust this one yet: pair them."
+        : `Couldn't ask the device: ${err}`;
+    return;
+  }
+  if (token !== deviceInfoToken) return;
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  };
+  const section = (title, ...nodes) => body.append(el("h3", "", title), ...nodes);
+  const checks = deviceHealth(i);
+  const worst = checks.some(([st]) => st === "bad") ? "bad" : checks.some(([st]) => st === "warn") ? "warn" : "ok";
+  $("dt-meta").textContent = `NomadFS ${i.version} · ${i.platform} · up ${formatUptime(i.uptime_s)}`;
+
+  // Health
+  const summary = el("div", `dh-summary ${worst}`, worst === "ok" ? "Healthy" : worst === "warn" ? "Needs a look" : "Needs attention");
+  const list = el("ul", "dh-checks");
+  for (const [st, text] of checks) {
+    const li = el("li", st);
+    li.append(el("i"), el("span", "", text));
+    list.append(li);
+  }
+  section("Health", summary, list);
+
+  // Storage
+  const stats = el("div", "dt-stats");
+  const stat = (value, label) => {
+    const s = el("div", "dt-stat");
+    s.append(el("b", "", value), el("span", "", label));
+    stats.append(s);
+  };
+  const storageNodes = [];
+  if (i.disk_total > 0) {
+    const used = i.disk_total - i.disk_free;
+    const bar = el("div", "dh-bar");
+    const fill = el("div", "dh-fill");
+    fill.style.width = `${Math.min(100, (used / i.disk_total) * 100)}%`;
+    const mine = el("div", "dh-mine");
+    mine.style.width = `${Math.min(100, ((i.kept_bytes + i.cache_bytes) / i.disk_total) * 100)}%`;
+    bar.append(fill, mine);
+    storageNodes.push(bar, el("p", "", `${formatSize(used)} used of ${formatSize(i.disk_total)}, ${formatSize(i.disk_free)} free; the highlighted part is NomadFS's.`));
+    stat(formatSize(i.disk_free), "free on the disk");
+  }
+  stat(formatSize(i.kept_bytes), `kept (${i.kept_blocks} blocks)`);
+  stat(i.cache_limit ? `${formatSize(i.cache_bytes)} / ${formatSize(i.cache_limit)}` : formatSize(i.cache_bytes), "read cache");
+  if (i.quota) stat(formatSize(i.quota), "quota for others' blocks");
+  section("Storage", ...storageNodes, stats,
+    el("p", "", "Kept blocks are what the device wrote, backs up or holds as replicas; the read cache holds what it opened from others and makes room by itself."));
+
+  // Swarm and network
+  const net = el("div", "dt-stats");
+  const netStat = (value, label) => {
+    const s = el("div", "dt-stat");
+    s.append(el("b", "", value), el("span", "", label));
+    net.append(s);
+  };
+  netStat(String(i.connections), "open connections");
+  netStat(String(i.peers), "devices known");
+  netStat(String(i.trusted), "devices trusted");
+  netStat(String(i.shares), "shared folders");
+  netStat(String(i.swarm_files), "swarm folder files");
+  netStat(i.swarm_backup ? "On" : "Off", "swarm backup");
+  if (i.held_backups) netStat(String(i.held_backups), "folder backups kept for others");
+  netStat(i.unmetered ? "Yes" : "No", "on Wi-Fi or wired");
+  section("Swarm and network", net);
+
+  const again = el("button", "btn outlined", "Ask again");
+  again.type = "button";
+  again.addEventListener("click", () => openDeviceInfo(title, peer));
+  body.append(again);
 }
 
 $("dt-close").addEventListener("click", () => { $("details").hidden = true; });

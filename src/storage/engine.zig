@@ -140,6 +140,14 @@ pub const StorageEngine = struct {
         return .missing;
     }
 
+    /// Bytes and blocks this store keeps (not the read cache). Counted from
+    /// the directory without the lock: a block written meanwhile may or may
+    /// not count.
+    pub fn keptUsage(self: *StorageEngine) !struct { bytes: u64, blocks: u64 } {
+        const t = try sumDir(self.root_dir);
+        return .{ .bytes = t.bytes, .blocks = t.blocks };
+    }
+
     /// Whether `cid` is held here as a leaf (file data). Reads one byte, so a
     /// walk can skip the chunks it already has without reading them; they
     /// were verified when stored. Leaves of shared files count too.

@@ -61,7 +61,13 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
   their links, and `StorageEngine.locate` says where each leaf is here (kept, read cache, a shared
   file through the filestore, or missing). The dialog shows the CID, depth and chunk sizes against
   the FastCDC bounds, a chunk map drawn to scale, and the first eight chunks
-  ([DAG](../storage/dag.md), [Disk engine](../storage/engine.md)).
+  ([DAG](../storage/dag.md), [Disk engine](../storage/engine.md)). A device's **ⓘ** (in the device
+  list, and in the header while browsing it) asks it about itself on demand (`device_info`, the
+  `GET_NODE_INFO` message, `src/node_info.zig`): version, platform, uptime, the free space of the
+  disk its store is on, kept blocks, read cache, quota, connections, shares, swarm folder and
+  backups. A device answers only devices it trusts. The app turns the numbers into health checks
+  (disk under 10% or 5% free, quota, unreadable shares, no connections, swarm folder not synced for
+  10 minutes, swarm backup files nobody could serve, mobile data).
 - **Swarm folder**: the shared folder every device writes ([Chapter 5.2](../fs/swarm.md)), with
   add, new folder, rename, delete, the author of each file, and the last sync.
 - **Shared folders**: pick a folder with the system picker (GTK on Linux, the Storage Access

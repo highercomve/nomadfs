@@ -1467,3 +1467,20 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 .dt-table th { text-align: left; font-weight: 500; color: var(--md-on-surface-variant); padding: 4px 8px 4px 0; border-bottom: 1px solid var(--md-outline-variant); }
 .dt-table td { padding: 5px 8px 5px 0; color: var(--md-on-surface); border-bottom: 1px solid var(--md-outline-variant); white-space: nowrap; }
 .dt-links { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* Device About: health */
+.dh-summary { font-family: var(--mono); font-size: 13px; letter-spacing: 1px; text-transform: uppercase; padding: 6px 10px; border-radius: 8px; align-self: flex-start; border: 1px solid currentColor; }
+.dh-summary.ok { color: var(--md-tertiary); }
+.dh-summary.warn { color: var(--md-primary); }
+.dh-summary.bad { color: var(--md-error); }
+.dh-checks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 13.5px; color: var(--md-on-surface); }
+.dh-checks li { display: flex; align-items: center; gap: 10px; }
+.dh-checks i { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.dh-checks li.ok i { background: var(--md-tertiary); }
+.dh-checks li.warn i { background: var(--md-primary); }
+.dh-checks li.bad i { background: var(--md-error); }
+.dh-bar { position: relative; height: 14px; border-radius: 7px; overflow: hidden; background: var(--md-surface-container); border: 1px solid var(--md-outline-variant); }
+.dh-fill, .dh-mine { position: absolute; inset: 0 auto 0 0; }
+.dh-fill { background: var(--md-on-surface-variant); opacity: .45; }
+.dh-mine { background: var(--md-primary); }
+#device-about[hidden] { display: none; }

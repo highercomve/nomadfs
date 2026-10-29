@@ -48,6 +48,8 @@ pub const Node = struct {
     /// Answers GET_SHARES. Null on nodes that share nothing: they reply
     /// with an empty listing.
     share_source: ?ShareSource = null,
+    /// Answers GET_NODE_INFO; set by the node (root.zig).
+    info_source: ?InfoSource = null,
     /// Answers GET_SWARM with the swarm folder's manifest. Null: an empty
     /// manifest.
     swarm_source: ?ShareSource = null,
@@ -90,6 +92,13 @@ pub const Node = struct {
         /// The SHARES `backup` field (fs/backup.zig), caller-owned; null
         /// when the source has none.
         backupFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 = null,
+    };
+
+    /// Answers GET_NODE_INFO (node_info.zig): the encoded info,
+    /// caller-owned.
+    pub const InfoSource = struct {
+        ctx: *anyopaque,
+        infoFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
     };
 
     pub const RotationSink = struct {
@@ -1147,6 +1156,7 @@ pub const Node = struct {
             .GET_BLOCK => |p| try self.handleGetBlock(stream, p.cid),
             .GET_SHARES => try self.handleGetShares(stream),
             .GET_SWARM => try self.handleGetSwarm(stream),
+            .GET_NODE_INFO => try self.handleGetNodeInfo(stream, conn),
             .ROTATE_KEY => |p| try self.handleRotateKey(stream, conn, p.epoch, p.new_key, p.signer_key, p.signature),
             .PUT_BLOCK => |p| try self.handlePutBlock(stream, conn, p.cid, p.data),
             .REVOKE => |p| try self.handleRevoke(stream, p.device_id, p.signer_key, p.at, p.signature),
@@ -1463,6 +1473,42 @@ pub const Node = struct {
             .payload = .{ .BLOCK = .{ .data = data } },
         };
         try response.send(self.allocator, stream);
+    }
+
+    /// GET_NODE_INFO: only devices this one trusts learn about it; others
+    /// get an empty reply.
+    fn handleGetNodeInfo(self: *Node, stream: network.Stream, conn: network.Connection) !void {
+        const trusted = blk: {
+            const trust = self.trust_store orelse break :blk false;
+            const device = conn.getRemoteDeviceID() orelse break :blk false;
+            break :blk trust.isTrusted(device);
+        };
+        const info: []u8 = if (trusted) (if (self.info_source) |source| source.infoFn(source.ctx, self.allocator) catch |err| blk: {
+            std.debug.print("NODE_INFO: unavailable: {any}\n", .{err});
+            break :blk &.{};
+        } else &.{}) else &.{};
+        defer self.allocator.free(info);
+        const response = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .NODE_INFO = .{ .info = info } } };
+        try response.send(self.allocator, stream);
+    }
+
+    /// Asks `conn`'s device about itself; caller-owned encoded info
+    /// (node_info.decode). error.NotTrusted when it doesn't trust this one.
+    pub fn fetchNodeInfo(self: *Node, conn: network.Connection, allocator: std.mem.Allocator) ![]u8 {
+        const stream = try conn.openStream();
+        defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
+        const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .GET_NODE_INFO = {} } };
+        try msg.send(self.allocator, stream);
+        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
+        defer response.deinit(self.allocator);
+        switch (response.payload) {
+            .NODE_INFO => |p| {
+                if (p.info.len == 0) return error.NotTrusted;
+                return allocator.dupe(u8, p.info);
+            },
+            else => return error.InvalidResponse,
+        }
     }
 
     fn handleGetShares(self: *Node, stream: network.Stream) !void {

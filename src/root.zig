@@ -7,6 +7,11 @@ pub const storage = @import("storage/mod.zig");
 pub const device = @import("device/mod.zig");
 pub const fs = @import("fs/mod.zig");
 
+pub const node_info = @import("node_info.zig");
+
+/// This release; scripts/release.sh checks it matches build.zig.zon.
+pub const version = "0.2.4";
+
 /// C ABI bindings for mobile hosts; the shared library target points here.
 pub const mobile_api = @import("mobile/api.zig");
 
@@ -58,6 +63,8 @@ pub const Node = struct {
     /// the swarm from any network (Tailscale away from home). Used only by
     /// the bootstrap thread.
     known_peers: *net.discovery.known_peers.KnownPeers,
+    /// Answers GET_NODE_INFO.
+    info_provider: *InfoProvider,
     /// When to try an unreachable known device again (ms), and how many
     /// tries failed in a row. Bootstrap thread only.
     redial: std.AutoHashMapUnmanaged(net.id.NodeID, Redial) = .empty,
@@ -196,6 +203,22 @@ pub const Node = struct {
         errdefer if (folder_backup) |b| b.destroy();
         discovery_node.device_identity = device_identity;
 
+        const info_provider = try allocator.create(InfoProvider);
+        errdefer allocator.destroy(info_provider);
+        info_provider.* = .{
+            .store = store,
+            .storage_path = cfg.storage.storage_path,
+            .shares = shares,
+            .swarm = swarm,
+            .trust = trust_store,
+            .manager = connection_manager,
+            .block_manager = block_manager,
+            .started_at = node_info.nowSeconds(),
+        };
+        info_provider.storage_path = try allocator.dupe(u8, cfg.storage.storage_path);
+        errdefer allocator.free(info_provider.storage_path);
+        discovery_node.info_source = .{ .ctx = info_provider, .infoFn = InfoProvider.infoErased };
+
         connection_manager.setDeviceAuthenticator(.{
             .identity = device_identity,
             .trust = trust_store,
@@ -226,6 +249,7 @@ pub const Node = struct {
             .device_identity = device_identity,
             .trust_store = trust_store,
             .known_peers = known_peers,
+            .info_provider = info_provider,
             .shares = shares,
             .swarm = swarm,
             .read_ahead = read_ahead,
@@ -258,6 +282,8 @@ pub const Node = struct {
         self.allocator.destroy(self.known_peers);
         self.redial.deinit(self.allocator);
         self.trust_store.deinit();
+        self.allocator.free(self.info_provider.storage_path);
+        self.allocator.destroy(self.info_provider);
         self.allocator.destroy(self.trust_store);
         self.device_paths.deinit(self.allocator);
 
@@ -672,6 +698,7 @@ test {
         @import("cluster/ring.zig"),
         @import("cluster/vectors.zig"),
         @import("config.zig"),
+        @import("node_info.zig"),
         @import("device/auth.zig"),
         @import("device/identity.zig"),
         @import("device/invite.zig"),
@@ -718,3 +745,71 @@ test {
         std.testing.refAllDecls(module);
     }
 }
+
+/// What GET_NODE_INFO reports (node_info.zig), gathered on request.
+pub const InfoProvider = struct {
+    store: ?*storage.engine.StorageEngine,
+    storage_path: []const u8,
+    shares: ?*fs.ShareIndex,
+    swarm: ?*fs.SwarmFolder,
+    trust: *device.trust.Store,
+    manager: *ConnectionManager,
+    block_manager: *cluster.BlockManager,
+    started_at: u64,
+
+    pub fn info(self: *InfoProvider, allocator: std.mem.Allocator) !node_info.Info {
+        var out: node_info.Info = .{
+            .version = .init(version),
+            .platform = .init(node_info.platform()),
+            .uptime_s = node_info.nowSeconds() -| self.started_at,
+            .connections = std.math.lossyCast(u32, self.manager.getConnectionsCount()),
+            .trusted = std.math.lossyCast(u32, self.trust.count()),
+            .unmetered = net.local_addrs.onUnmeteredNetwork(),
+        };
+        if (fs.remote.knownPeers(self.block_manager, allocator)) |peers| {
+            out.peers = std.math.lossyCast(u32, peers.len);
+            allocator.free(peers);
+        } else |_| {}
+        if (node_info.disk(self.storage_path)) |d| {
+            out.disk_total = d.total;
+            out.disk_free = d.free;
+        }
+        if (self.store) |s| {
+            if (s.keptUsage()) |k| {
+                out.kept_bytes = k.bytes;
+                out.kept_blocks = k.blocks;
+            } else |_| {}
+            const c = s.cacheStats();
+            out.cache_bytes = c.bytes;
+            out.cache_limit = c.limit orelse 0;
+            out.quota = s.quota orelse 0;
+        }
+        if (self.shares) |index| {
+            const snap = try index.snapshot(allocator);
+            defer fs.ShareIndex.freeSnapshot(allocator, snap);
+            out.shares = std.math.lossyCast(u32, snap.len);
+            for (snap) |sh| {
+                if (sh.scan_error != null) out.shares_failing += 1;
+                if (sh.root == null or sh.indexing) out.shares_indexing += 1;
+            }
+            const held = try index.heldSnapshot(allocator);
+            defer fs.ShareIndex.freeHeldSnapshot(allocator, held);
+            out.held_backups = std.math.lossyCast(u32, held.len);
+        }
+        if (self.swarm) |folder| {
+            const st = folder.status();
+            out.swarm_files = std.math.lossyCast(u32, st.entries);
+            out.swarm_last_sync = st.last_sync;
+            const b = folder.backupStatus();
+            out.swarm_backup = b.enabled;
+            out.swarm_backed_up = std.math.lossyCast(u32, b.backed_up);
+            out.swarm_unreachable = std.math.lossyCast(u32, b.unreachable_files);
+        }
+        return out;
+    }
+
+    fn infoErased(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+        const self: *InfoProvider = @ptrCast(@alignCast(ctx));
+        return node_info.encode(allocator, try self.info(allocator));
+    }
+};

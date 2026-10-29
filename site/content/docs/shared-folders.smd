@@ -54,6 +54,11 @@ In the app, **Browse** lists every reachable device; pick one to walk its
 shares with breadcrumbs. On wide windows the reachable devices are also listed
 in the drawer.
 
+The **ⓘ** next to a device asks it about itself: its NomadFS version, how long
+it has run, the free space on its disk and what NomadFS uses there, and a
+health check (disk space, folders it can't read, connections, the swarm
+folder's last sync, backups). A device answers only devices it is paired with.
+
 # [Opening and downloading files]($heading.id('opening'))
 
 Reading a file asks only for the blocks that cover the bytes being read. Every

@@ -6,6 +6,7 @@ const id = @import("../id.zig");
 const kbucket = @import("kbucket.zig");
 const providers_mod = @import("providers.zig");
 const pairing = @import("../../device/pairing.zig");
+const node_info = @import("../../node_info.zig");
 
 /// In-memory target for Message.serialize (Message.send).
 const MessageBuffer = struct {
@@ -73,6 +74,10 @@ pub const MessageType = enum(u8) {
     /// member's Ed25519 identity (device/trust.zig applyAdmission). Answered
     /// with STORE_ACK.
     ADMIT = 24,
+    /// Ask a trusted device about itself (node_info.zig). Answered with
+    /// NODE_INFO; empty when the asker isn't trusted.
+    GET_NODE_INFO = 25,
+    NODE_INFO = 26,
 };
 
 pub const FindValueResult = union(enum) {
@@ -138,6 +143,8 @@ pub const MessagePayload = union(MessageType) {
     RELAY_INCOMING: struct { from: id.NodeID },
     RELAY_ACK: struct { ok: bool },
     ADMIT: Admit,
+    GET_NODE_INFO: void,
+    NODE_INFO: struct { info: []const u8 },
 };
 
 /// A member's signed vouch for another device (ADMIT). The label is a fixed
@@ -280,6 +287,11 @@ pub const Message = struct {
                 try writer.writeInt(u32, try valueLen(p.manifest.len), .big);
                 try writer.writeAll(p.manifest);
             },
+            .GET_NODE_INFO => {},
+            .NODE_INFO => |p| {
+                try writer.writeInt(u32, try valueLen(p.info.len), .big);
+                try writer.writeAll(p.info);
+            },
         }
     }
 
@@ -380,6 +392,8 @@ pub const Message = struct {
                 break :blk MessagePayload{ .SHARES = .{ .nickname = nickname, .listing = listing, .backup = try readValueMax(allocator, reader, max_backup_info_len) } };
             },
             .GET_SWARM => MessagePayload{ .GET_SWARM = {} },
+            .GET_NODE_INFO => MessagePayload{ .GET_NODE_INFO = {} },
+            .NODE_INFO => MessagePayload{ .NODE_INFO = .{ .info = try readValueMax(allocator, reader, node_info.max_len) } },
             .ROTATE_KEY => blk: {
                 const epoch = try reader.readInt(u64, .big);
                 var new_key: [32]u8 = undefined;
@@ -525,6 +539,7 @@ pub const Message = struct {
                 allocator.free(p.backup);
             },
             .SWARM => |p| allocator.free(p.manifest),
+            .NODE_INFO => |p| allocator.free(p.info),
             else => {},
         }
     }
