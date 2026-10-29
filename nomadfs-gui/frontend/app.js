@@ -421,127 +421,212 @@ async function showDevices() {
 
 // ---- Browse: search and sort ----
 
-// What the open location lists: { device, entries, shares } (shares: a
-// device's top level, whose entries are its shared folders).
-let browse = null;
-// Sort order, remembered across locations and runs; the filter isn't.
-let browseSort = { key: "name", dir: 1 };
-try { Object.assign(browseSort, JSON.parse(localStorage.getItem("browseSort") || "{}")); } catch {}
+// ---- File tables: search, sort and sortable columns (Browse, Swarm folder) ----
 
-function setBrowseSort(key, dir) {
-  browseSort = { key, dir };
-  try { localStorage.setItem("browseSort", JSON.stringify(browseSort)); } catch {}
-  renderBrowse();
+const SEARCH_ICON = "M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z";
+const SORT_DIR_ICON = "M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z";
+
+/**
+ * A list of files and folders with a search field, a sort menu (phones) and
+ * sortable column headers (wide windows). The owner gives the entries
+ * ({ name, size, mtime, dir, ... }) and draws each row; the table filters,
+ * sorts (folders first) and remembers the order across runs.
+ *
+ *   columns: [{ key, label, cls }] after Name, e.g. size, mtime, author
+ *   renderRow(entry, files): an <li>; files = the shown files, in order
+ *   emptyText(query): what an empty list says
+ */
+class FileTable {
+  constructor({ view, tools, head, list, columns, storageKey, actions, placeholder = "Search this folder", renderRow, emptyText, setEmpty }) {
+    Object.assign(this, { view, tools, head, list, columns, storageKey, renderRow, emptyText, setEmpty });
+    this.entries = null;
+    this.sort = { key: "name", dir: 1 };
+    try { Object.assign(this.sort, JSON.parse(localStorage.getItem(storageKey) || "{}")); } catch {}
+    if (!this.allColumns().some((c) => c.key === this.sort.key)) this.sort = { key: "name", dir: 1 };
+    // Room for the row buttons, so the header lines up with the rows.
+    head.closest(".table-scroll").style.setProperty("--act-w", `${actions * 48}px`);
+    this.buildTools(placeholder);
+    this.buildHead();
+    FileTable.all.push(this);
+  }
+
+  allColumns() {
+    return [{ key: "name", label: "Name", cls: "th-name" }, ...this.columns];
+  }
+
+  buildTools(placeholder) {
+    const field = document.createElement("label");
+    field.className = "search-field";
+    field.append(svg(SEARCH_ICON));
+    const input = document.createElement("input");
+    Object.assign(input, { type: "search", placeholder, autocomplete: "off", spellcheck: false });
+    input.setAttribute("aria-label", placeholder);
+    input.addEventListener("input", () => this.render());
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && input.value) { input.value = ""; this.render(); e.stopPropagation(); }
+    });
+    field.append(input);
+    const select = document.createElement("select");
+    select.className = "sort-select";
+    select.setAttribute("aria-label", "Sort by");
+    for (const c of this.allColumns()) select.append(new Option(c.label, c.key));
+    select.addEventListener("change", () => this.setSort(select.value, this.sort.dir));
+    const dir = document.createElement("button");
+    dir.type = "button";
+    dir.className = "icon-btn sort-dir";
+    dir.setAttribute("aria-label", "Sort direction");
+    dir.append(svg(SORT_DIR_ICON));
+    dir.addEventListener("click", () => this.setSort(this.sort.key, -this.sort.dir));
+    this.tools.replaceChildren(field, select, dir);
+    Object.assign(this, { input, select, dirBtn: dir });
+  }
+
+  buildHead() {
+    this.head.replaceChildren();
+    for (const c of this.allColumns()) {
+      const th = document.createElement("button");
+      th.type = "button";
+      th.className = `${c.cls} th-sort`;
+      th.dataset.sort = c.key;
+      th.textContent = c.label;
+      th.addEventListener("click", () => {
+        // Sizes and dates read best biggest/newest first.
+        const first = c.key === "size" || c.key === "mtime" ? -1 : 1;
+        this.setSort(c.key, this.sort.key === c.key ? -this.sort.dir : first);
+      });
+      this.head.append(th);
+    }
+    const act = document.createElement("span");
+    act.className = "th-act";
+    this.head.append(act);
+  }
+
+  setSort(key, dir) {
+    this.sort = { key, dir };
+    try { localStorage.setItem(this.storageKey, JSON.stringify(this.sort)); } catch {}
+    this.render();
+  }
+
+  compare(a, b) {
+    // Folders stay above files whatever the order.
+    if (!!a.dir !== !!b.dir) return b.dir - a.dir;
+    const { key, dir } = this.sort;
+    let c = 0;
+    if (key !== "name") {
+      const x = a[key] ?? "";
+      const y = b[key] ?? "";
+      c = typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y), undefined, { sensitivity: "base" });
+    }
+    if (c === 0) c = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+    return c * dir;
+  }
+
+  /** A new place: new entries, search cleared. */
+  show(entries) {
+    this.entries = entries;
+    this.input.value = "";
+    this.render();
+  }
+
+  render() {
+    if (!this.entries) return;
+    this.select.value = this.sort.key;
+    this.dirBtn.title = this.sort.dir > 0 ? "Ascending" : "Descending";
+    this.dirBtn.classList.toggle("desc", this.sort.dir < 0);
+    for (const th of this.head.querySelectorAll(".th-sort")) {
+      th.classList.toggle("sorted", th.dataset.sort === this.sort.key);
+      th.classList.toggle("desc", this.sort.dir < 0);
+    }
+    const raw = this.input.value.trim();
+    const query = raw.toLocaleLowerCase();
+    const shown = this.entries
+      .filter((e) => !query || e.name.toLocaleLowerCase().includes(query))
+      .sort((a, b) => this.compare(a, b));
+    this.list.replaceChildren();
+    if (!shown.length) {
+      this.setEmpty(query ? `Nothing here matches "${raw}".` : this.emptyText());
+      return;
+    }
+    this.setEmpty("");
+    // Previews step through the files in the order shown.
+    const files = shown.filter((x) => !x.dir);
+    for (const e of shown) this.list.appendChild(this.renderRow(e, files));
+  }
+
+  focusSearch() {
+    this.input.focus();
+    this.input.select();
+  }
 }
+FileTable.all = [];
 
-$("browse-search").addEventListener("input", () => renderBrowse());
-$("browse-search").addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && e.target.value) { e.target.value = ""; renderBrowse(); e.stopPropagation(); }
-});
 // "/" or Ctrl+F searches the open folder (not while typing elsewhere).
 document.addEventListener("keydown", (e) => {
-  if (document.body.dataset.view !== "browse" || $("browse-tools").hidden) return;
+  const table = FileTable.all.find((t) => t.view === document.body.dataset.view && !t.tools.hidden);
+  if (!table) return;
   const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "");
   if ((e.key === "/" && !typing) || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f")) {
     e.preventDefault();
-    $("browse-search").focus();
-    $("browse-search").select();
+    table.focusSearch();
   }
 });
-$("browse-sort").addEventListener("change", (e) => setBrowseSort(e.target.value, browseSort.dir));
-$("browse-dir").addEventListener("click", () => setBrowseSort(browseSort.key, -browseSort.dir));
-// Wide windows: the column headers sort too; a second click reverses.
-for (const th of document.querySelectorAll("#remote-head .th-sort")) {
-  th.addEventListener("click", () => {
-    const key = th.dataset.sort;
-    // Sizes and dates read best biggest/newest first.
-    const first = key === "name" ? 1 : -1;
-    setBrowseSort(key, browseSort.key === key ? -browseSort.dir : first);
+
+// What the open location lists: { device, shares } (shares: a device's top
+// level, whose entries are its shared folders).
+let browse = null;
+
+const browseTable = new FileTable({
+  view: "browse",
+  tools: $("browse-tools"),
+  head: $("remote-head"),
+  list: $("remote-list"),
+  columns: [{ key: "size", label: "Size", cls: "th-size" }, { key: "mtime", label: "Modified", cls: "th-date" }],
+  storageKey: "browseSort",
+  actions: 2,
+  setEmpty: (text) => setEmpty(text),
+  emptyText: () => browse?.shares ? "This device shares nothing yet."
+    : path.at(-1)?.pending ? "Not indexed yet: the device is still scanning this share. Check back soon."
+    : "Empty folder.",
+  renderRow: (e, files) => browseRow(e, files),
+});
+
+function browseRow(e, files) {
+  const { device, shares } = browse;
+  if (e.dir) {
+    // A share's first scan lists folders it hasn't reached yet: empty,
+    // without a date.
+    const pending = !e.mtime && !e.size;
+    return row({
+      icon: "folder",
+      iconClass: "folder",
+      headline: e.name,
+      meta: pending ? "Indexing…" : shares ? `${formatSize(e.size)} · updated ${formatDate(e.mtime)}` : formatSize(e.size),
+      cols: { size: pending ? "Indexing…" : formatSize(e.size), date: pending ? "" : formatDate(e.mtime) },
+      onClick: () => { path.push({ name: e.name, cid: e.cid, pending }); showLocation(); },
+    });
+  }
+  const fetchIt = (btn) => downloadFile(device, e, btn);
+  return row({
+    icon: iconFor(e.name, false),
+    headline: e.name,
+    meta: `${formatSize(e.size)} · ${formatDate(e.mtime)}`,
+    cols: { size: formatSize(e.size), date: formatDate(e.mtime) },
+    onClick: () => openPreview(deviceSource(device), files, files.indexOf(e)),
+    actions: [
+      { icon: "info", label: `Details of ${e.name}`, run: () => openDetails(e.name, { cid: e.cid, peer: device.peer }) },
+      { icon: "download", label: "Download", run: fetchIt },
+    ],
   });
-}
-
-function compareEntries(a, b) {
-  // Folders stay above files whatever the order.
-  if (a.dir !== b.dir) return b.dir - a.dir;
-  const { key, dir } = browseSort;
-  let c = 0;
-  if (key === "size") c = a.size - b.size;
-  else if (key === "mtime") c = a.mtime - b.mtime;
-  if (c === 0) c = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
-  return c * dir;
-}
-
-function renderSortControls() {
-  $("browse-sort").value = browseSort.key;
-  const btn = $("browse-dir");
-  btn.title = browseSort.dir > 0 ? "Ascending" : "Descending";
-  btn.classList.toggle("desc", browseSort.dir < 0);
-  for (const th of document.querySelectorAll("#remote-head .th-sort")) {
-    th.classList.toggle("sorted", th.dataset.sort === browseSort.key);
-    th.classList.toggle("desc", browseSort.dir < 0);
-  }
-}
-
-function renderBrowse() {
-  if (!browse) return;
-  renderSortControls();
-  const { device, entries, shares } = browse;
-  const query = $("browse-search").value.trim().toLocaleLowerCase();
-  const shown = entries
-    .filter((e) => !query || e.name.toLocaleLowerCase().includes(query))
-    .sort(compareEntries);
-  const list = $("remote-list");
-  list.replaceChildren();
-  if (!shown.length) {
-    setEmpty(query ? `Nothing here matches "${$("browse-search").value.trim()}".`
-      : shares ? "This device shares nothing yet."
-      : path.at(-1)?.pending ? "Not indexed yet: the device is still scanning this share. Check back soon."
-      : "Empty folder.");
-    return;
-  }
-  setEmpty("");
-  // Previews step through the files in the order shown.
-  const files = shown.filter((x) => !x.dir);
-  for (const e of shown) {
-    if (e.dir) {
-      // A share's first scan lists folders it hasn't reached yet: empty,
-      // without a date.
-      const pending = !e.mtime && !e.size;
-      list.appendChild(row({
-        icon: "folder",
-        iconClass: "folder",
-        headline: e.name,
-        meta: pending ? "Indexing…" : shares ? `${formatSize(e.size)} · updated ${formatDate(e.mtime)}` : formatSize(e.size),
-        cols: { size: pending ? "Indexing…" : formatSize(e.size), date: pending ? "" : formatDate(e.mtime) },
-        onClick: () => { path.push({ name: e.name, cid: e.cid, pending }); showLocation(); },
-      }));
-    } else {
-      const fetchIt = (btn) => downloadFile(device, e, btn);
-      list.appendChild(row({
-        icon: iconFor(e.name, false),
-        headline: e.name,
-        meta: `${formatSize(e.size)} · ${formatDate(e.mtime)}`,
-        cols: { size: formatSize(e.size), date: formatDate(e.mtime) },
-        onClick: () => openPreview(deviceSource(device), files, files.indexOf(e)),
-        actions: [
-          { icon: "info", label: `Details of ${e.name}`, run: () => openDetails(e.name, { cid: e.cid, peer: device.peer }) },
-          { icon: "download", label: "Download", run: fetchIt },
-        ],
-      }));
-    }
-  }
 }
 
 async function showLocation() {
   if (path.length === 0) return showDevices();
   renderCrumbs();
-  // A new place starts unfiltered.
-  $("browse-search").value = "";
   const device = path[0].device;
 
   if (path.length === 1) {
-    browse = { device, shares: true, entries: device.shares.map((sh) => ({ ...sh, dir: true })) };
-    renderBrowse();
+    browse = { device, shares: true };
+    browseTable.show(device.shares.map((sh) => ({ ...sh, dir: true })));
     return;
   }
 
@@ -556,8 +641,8 @@ async function showLocation() {
     return;
   }
   busy(false);
-  browse = { device, shares: false, entries };
-  renderBrowse();
+  browse = { device, shares: false };
+  browseTable.show(entries);
 }
 
 const downloading = new Set();
@@ -994,35 +1079,59 @@ async function loadSwarm() {
     return;
   }
   $("swarm-status").textContent = swarmStatusText(res);
-  const items = res.items.sort((a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
-  if (!items.length && swarmDir) { // folder vanished (deleted elsewhere): go up
+  if (!res.items.length && swarmDir) { // folder vanished (deleted elsewhere): go up
     swarmDir = swarmDir.split("/").slice(0, -1).join("/");
     return loadSwarm();
   }
-  const files = items.filter((x) => !x.dir);
-  list.replaceChildren();
-  $("swarm-empty").hidden = items.length > 0;
-  $("swarm-empty").textContent = "Empty. Add a file, or create a folder; every device sees it.";
-  for (const it of items) {
-    const by = it.author || "";
-    const actions = [
-      { icon: "edit", label: `Rename ${it.name}`, run: () => swarmRenamePrompt(it) },
-      { icon: "trash", label: `Delete ${it.name}`, run: () => swarmDeleteConfirm(it) },
-    ];
-    if (!it.dir) actions.unshift({ icon: "download", label: "Download", run: (btn) => swarmDownload(it, btn) });
-    if (!it.dir && it.cid) actions.unshift({ icon: "info", label: `Details of ${it.name}`, run: () => openDetails(it.name, { cid: it.cid, author_id: it.author_id }) });
-    list.appendChild(row({
-      icon: it.dir ? "folder" : iconFor(it.name, false),
-      iconClass: it.dir ? "folder" : "",
-      headline: it.name,
-      meta: it.dir ? formatSize(it.size) : `${formatSize(it.size)} · ${formatDate(it.mtime)}${by ? ` · ${by}` : ""}`,
-      cols: { size: formatSize(it.size), date: formatDate(it.mtime), by },
-      onClick: it.dir
-        ? () => { swarmDir = it.path; loadSwarm(); }
-        : () => openPreview(swarmSource, files, files.indexOf(it)),
-      actions,
-    }));
+  // Same folder (a refresh): keep what is typed in the search.
+  if (swarmTable.dir === swarmDir) {
+    swarmTable.entries = res.items;
+    swarmTable.render();
+  } else {
+    swarmTable.dir = swarmDir;
+    swarmTable.show(res.items);
   }
+}
+
+const swarmTable = new FileTable({
+  view: "swarm",
+  tools: $("swarm-tools"),
+  head: $("swarm-head"),
+  list: $("swarm-list"),
+  columns: [
+    { key: "size", label: "Size", cls: "th-size" },
+    { key: "mtime", label: "Modified", cls: "th-date" },
+    { key: "author", label: "Added by", cls: "th-by" },
+  ],
+  storageKey: "swarmSort",
+  actions: 4,
+  setEmpty: (text) => {
+    $("swarm-empty").hidden = !text;
+    $("swarm-empty").textContent = text;
+  },
+  emptyText: () => "Empty. Add a file, or create a folder; every device sees it.",
+  renderRow: (it, files) => swarmRow(it, files),
+});
+
+function swarmRow(it, files) {
+  const by = it.author || "";
+  const actions = [
+    { icon: "edit", label: `Rename ${it.name}`, run: () => swarmRenamePrompt(it) },
+    { icon: "trash", label: `Delete ${it.name}`, run: () => swarmDeleteConfirm(it) },
+  ];
+  if (!it.dir) actions.unshift({ icon: "download", label: "Download", run: (btn) => swarmDownload(it, btn) });
+  if (!it.dir && it.cid) actions.unshift({ icon: "info", label: `Details of ${it.name}`, run: () => openDetails(it.name, { cid: it.cid, author_id: it.author_id }) });
+  return row({
+    icon: it.dir ? "folder" : iconFor(it.name, false),
+    iconClass: it.dir ? "folder" : "",
+    headline: it.name,
+    meta: it.dir ? formatSize(it.size) : `${formatSize(it.size)} · ${formatDate(it.mtime)}${by ? ` · ${by}` : ""}`,
+    cols: { size: formatSize(it.size), date: formatDate(it.mtime), by },
+    onClick: it.dir
+      ? () => { swarmDir = it.path; loadSwarm(); }
+      : () => openPreview(swarmSource, files, files.indexOf(it)),
+    actions,
+  });
 }
 
 async function swarmDownload(it, btn) {

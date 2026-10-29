@@ -141,25 +141,10 @@
           </button>
         </div>
         <nav id="crumbs" class="crumbs" hidden></nav>
-        <div id="browse-tools" class="browse-tools" hidden>
-          <label class="search-field">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
-            <input id="browse-search" type="search" placeholder="Search this folder" autocomplete="off" spellcheck="false" aria-label="Search this folder">
-          </label>
-          <select id="browse-sort" aria-label="Sort by">
-            <option value="name">Name</option>
-            <option value="size">Size</option>
-            <option value="mtime">Modified</option>
-          </select>
-          <button id="browse-dir" type="button" class="icon-btn" title="Ascending" aria-label="Sort direction">
-            <svg viewBox="0 0 24 24"><path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z"/></svg>
-          </button>
-        </div>
+        <div id="browse-tools" class="browse-tools" hidden></div>
         <p id="remote-empty" class="empty-state">Start the node, then add your other devices under Connect devices.</p>
         <div id="remote-scroll" class="table-scroll">
-          <div id="remote-head" class="table-head" hidden>
-            <button type="button" class="th-name th-sort" data-sort="name">Name</button><button type="button" class="th-size th-sort" data-sort="size">Size</button><button type="button" class="th-date th-sort" data-sort="mtime">Modified</button><span class="th-act"></span>
-          </div>
+          <div id="remote-head" class="table-head" hidden></div>
           <ul id="remote-list" class="list rows"></ul>
         </div>
       </section>
@@ -187,13 +172,12 @@
             </button>
           </div>
         </div>
+        <div id="swarm-tools" class="browse-tools"></div>
+        <p id="swarm-empty" class="empty-state" hidden></p>
         <div class="table-scroll" id="swarm-scroll">
-          <div class="table-head swarm-head">
-            <span class="th-name">Name</span><span class="th-size">Size</span><span class="th-date">Modified</span><span class="th-by">Added by</span><span class="th-act"></span>
-          </div>
+          <div id="swarm-head" class="table-head"></div>
           <ul id="swarm-list" class="list rows"></ul>
         </div>
-        <p id="swarm-empty" class="empty-state" hidden></p>
       </section>
 
       <!-- Shared folders -->
