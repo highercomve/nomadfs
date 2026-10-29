@@ -157,6 +157,10 @@ pub const Admit = struct {
     }
 };
 
+/// Longest SHARES `backup` field (fs/backup.zig encodeInfo): 255 wanted
+/// names and 255 held backups come to about 150 KiB.
+pub const max_backup_info_len = 256 * 1024;
+
 /// Longest device label an ADMIT carries: the pairing nickname limit.
 pub const max_admit_label = pairing.max_nickname_len;
 
@@ -373,7 +377,7 @@ pub const Message = struct {
                 if (!isValidNickname(nickname)) return error.InvalidNickname;
                 const listing = try readValue(allocator, reader);
                 errdefer allocator.free(listing);
-                break :blk MessagePayload{ .SHARES = .{ .nickname = nickname, .listing = listing, .backup = try readValue(allocator, reader) } };
+                break :blk MessagePayload{ .SHARES = .{ .nickname = nickname, .listing = listing, .backup = try readValueMax(allocator, reader, max_backup_info_len) } };
             },
             .GET_SWARM => MessagePayload{ .GET_SWARM = {} },
             .ROTATE_KEY => blk: {
@@ -482,8 +486,12 @@ pub const Message = struct {
     /// buffer grows as bytes arrive, so a peer that declares a large length and
     /// then stalls costs only the bytes it actually sent.
     fn readValue(allocator: std.mem.Allocator, reader: anytype) ![]u8 {
+        return readValueMax(allocator, reader, max_value_len);
+    }
+
+    fn readValueMax(allocator: std.mem.Allocator, reader: anytype, max: usize) ![]u8 {
         const len = try reader.readInt(u32, .big);
-        if (len > max_value_len) return error.ValueTooLarge;
+        if (len > max) return error.ValueTooLarge;
 
         var val: std.ArrayList(u8) = .empty;
         errdefer val.deinit(allocator);

@@ -169,7 +169,7 @@ test "swarm replication: swarm_replicas pushes files to peer on add" {
     swarm_b.block_manager = bm_b;
 
     // Set swarm_replicas = 1 on A
-    swarm_a.swarm_replicas = 1;
+    swarm_a.swarm_replicas.store(1, .release);
 
     // A adds file -> pushes to B immediately
     try swarm_a.addFile("", "doc.txt", "test_rep_src/doc.txt");

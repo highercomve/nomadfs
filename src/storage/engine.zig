@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Block = @import("block.zig").Block;
+const dag_codec = @import("dag/codec.zig");
 const sync = @import("../sync.zig");
 const env_mod = @import("../env.zig");
 
@@ -137,6 +138,29 @@ pub const StorageEngine = struct {
         }
         if (self.external) |ext| if (ext.hasFn(ext.ctx, cid)) return .external;
         return .missing;
+    }
+
+    /// Whether `cid` is held here as a leaf (file data). Reads one byte, so a
+    /// walk can skip the chunks it already has without reading them; they
+    /// were verified when stored. Leaves of shared files count too.
+    pub fn heldLeaf(self: *StorageEngine, cid: *const [32]u8) bool {
+        const hex_cid = std.fmt.bytesToHex(cid.*, .lower);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const io = std.Io.Threaded.global_single_threaded.io();
+            const file = self.root_dir.openFile(io, &hex_cid, .{}) catch
+                self.cache_dir.openFile(io, &hex_cid, .{}) catch null;
+            if (file) |f| {
+                defer f.close(io);
+                var tag: [1]u8 = undefined;
+                const n = f.readPositionalAll(io, &tag, 0) catch return false;
+                return n == 1 and tag[0] == @intFromEnum(dag_codec.Tag.leaf);
+            }
+        }
+        // The filestore serves only leaves.
+        if (self.external) |ext| return ext.hasFn(ext.ctx, cid);
+        return false;
     }
 
     /// Counted from the directory, so a cache cleared by another process

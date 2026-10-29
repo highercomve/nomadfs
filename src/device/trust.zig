@@ -28,6 +28,8 @@ pub const revocation_domain = "nomadfs-revoke-v2";
 /// A revocation dated further ahead than this is refused. Same units as `at`
 /// (seconds since the Unix epoch).
 pub const max_revocation_skew: u64 = 24 * 60 * 60;
+/// How far ahead of this device's clock a membership vouch may be dated.
+pub const max_admission_skew: u64 = 10 * 60;
 
 pub const Error = error{
     CorruptTrustStore,
@@ -197,7 +199,11 @@ pub fn applyAdmission(
     const device_id = NodeID.fromPublicKey(public_key);
     if (device_id.eql(self_id)) return .duplicate;
     if (device_id.eql(signer_id)) return .rejected;
-    if (at > now +| max_revocation_skew) return .rejected;
+    // A vouch dated ahead of this clock would outrank a later revocation
+    // (and refuse it), so only a little skew is allowed, and the time kept
+    // is never later than now.
+    if (at > now +| max_admission_skew) return .rejected;
+    const kept_at = @min(at, now);
     if (label.len == 0 or label.len > max_label_len) return .rejected;
     validateLabel(label) catch return .rejected;
     if (std.mem.eql(u8, &transport_key, &no_transport_key)) return .rejected;
@@ -207,7 +213,7 @@ pub fn applyAdmission(
     if (!store.isTrustedLocked(signer_id)) return .rejected;
     if (store.findLocked(device_id) != null) return .duplicate;
     if (store.revocationLocked(device_id)) |r| {
-        if (r.at >= at) return .rejected;
+        if (r.at >= kept_at) return .rejected;
     }
     if (store.entries.items.len >= max_entries) return Error.TrustStoreFull;
     try store.entries.ensureUnusedCapacity(store.allocator, 1);
@@ -218,7 +224,7 @@ pub fn applyAdmission(
         .transport_key = transport_key,
         .label = [_]u8{0} ** max_label_len,
         .label_len = @intCast(label.len),
-        .added_at = at,
+        .added_at = kept_at,
     };
     @memcpy(entry.label[0..label.len], label);
     store.entries.appendAssumeCapacity(entry);
@@ -1465,4 +1471,15 @@ test "trust: admissions add unknown members, respect tombstones and need a trust
     const other = [_]u8{0x43} ** 32;
     try testing.expectEqual(RevocationOutcome.duplicate, try applyAdmission(&store, phone.publicKey(), other, "Phone", 90, admin.publicKey(), try sign(admin, phone, other, 90), me.deviceId(), 1000));
     try testing.expectEqual(tk, store.lookup(phone.deviceId()).?.transport_key);
+
+    // A vouch dated far ahead is refused; a little ahead is kept as now, so
+    // a revocation made after now still wins over it.
+    const tablet = try identity_mod.Identity.fromSeed([_]u8{0x34} ** identity_mod.seed_len);
+    const tk2 = [_]u8{0x44} ** 32;
+    const ahead = 1000 + max_admission_skew + 1;
+    try testing.expectEqual(RevocationOutcome.rejected, try applyAdmission(&store, tablet.publicKey(), tk2, "Phone", ahead, admin.publicKey(), try sign(admin, tablet, tk2, ahead), me.deviceId(), 1000));
+    try testing.expectEqual(RevocationOutcome.applied, try applyAdmission(&store, tablet.publicKey(), tk2, "Phone", 1300, admin.publicKey(), try sign(admin, tablet, tk2, 1300), me.deviceId(), 1000));
+    try testing.expectEqual(@as(u64, 1000), store.lookup(tablet.deviceId()).?.added_at);
+    try testing.expectEqual(RevocationOutcome.applied, try applyRevocation(&store, tablet.deviceId(), admin.publicKey(), 1001, try admin.sign(&revocationMessage(tablet.deviceId(), admin.deviceId(), 1001)), 1001));
+    try testing.expect(!store.isTrusted(tablet.deviceId()));
 }

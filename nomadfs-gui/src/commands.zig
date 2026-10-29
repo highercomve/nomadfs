@@ -749,7 +749,11 @@ pub fn backupStatus(gpa: std.mem.Allocator) ![]BackupStatus {
         trust = handle.node.trust_store;
         snap = try index.snapshot(gpa);
         for (snap) |s| if (index.isBackup(s.name)) try marked.append(gpa, s.name);
+        // Asking every device takes a while: keep the node alive without
+        // holding g_mutex (nodeClose waits for media users).
+        _ = g_media_users.fetchAdd(1, .acq_rel);
     }
+    defer mediaRelease();
     const peers = fs.remote.knownPeers(bm, gpa) catch &.{};
     var copies = try gpa.alloc(std.ArrayList(BackupCopy), marked.items.len);
     for (copies) |*c| c.* = .empty;
@@ -1126,7 +1130,7 @@ pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
         defer g_mutex.unlock();
         if (swarmFolder()) |folder| {
             const st = folder.backupStatus();
-            const reps = folder.swarm_replicas;
+            const reps = folder.swarm_replicas.load(.acquire);
             return .{
                 .supported = true,
                 .enabled = st.enabled,
@@ -1175,7 +1179,7 @@ pub fn swarmReplicasSet(gpa: std.mem.Allocator, args: SwarmReplicasArgs) !Backup
         g_mutex.lock();
         defer g_mutex.unlock();
         if (swarmFolder()) |folder| {
-            folder.swarm_replicas = args.replicas;
+            folder.swarm_replicas.store(args.replicas, .release);
         } else |_| {}
     }
     return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
@@ -1271,9 +1275,9 @@ pub const FileDetails = struct {
 /// (and one chunk), never the whole file.
 pub fn fileDetails(gpa: std.mem.Allocator, args: FileDetailsArgs) !FileDetails {
     const root = try parseHex32(args.cid);
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    const handle = g_node orelse return error.NotRunning;
+    // The walk may fetch blocks from other devices: hold the node, not g_mutex.
+    const handle = mediaAcquire() orelse return error.NotRunning;
+    defer mediaRelease();
     const store = handle.node.store orelse return error.StorageDisabled;
     const bm = handle.node.block_manager;
 
@@ -1281,7 +1285,7 @@ pub fn fileDetails(gpa: std.mem.Allocator, args: FileDetailsArgs) !FileDetails {
     var multi: fs.remote.MultiRemote = undefined;
     var peers: std.ArrayList(nomadfs.net.id.NodeID) = .empty;
     const loader = if (args.peer) |p| blk: {
-        remote = try remoteFor(p);
+        remote = .{ .block_manager = bm, .store = store, .peer = .{ .bytes = try parseHex32(p) } };
         break :blk remote.loader();
     } else blk: {
         if (args.author_id) |a| if (a.len == 64) try peers.append(gpa, .{ .bytes = try parseHex32(a) });

@@ -47,6 +47,12 @@ pub const RepairManager = struct {
             if (keep_going) |k| if (!k.load(.acquire)) return error.Cancelled;
             if ((try visited.getOrPut(allocator, cid)).found_existing) continue;
             if (visited.count() > max_blocks) return error.DagTooLarge;
+            // A chunk already here needs no read: keep it and move on, so a
+            // share copied again reads only its index blocks.
+            if (store.heldLeaf(&cid)) {
+                try store.pin(&cid);
+                continue;
+            }
 
             const data = try loadOrFetch(allocator, node, store, peer, cid, &fetched);
             defer allocator.free(data);

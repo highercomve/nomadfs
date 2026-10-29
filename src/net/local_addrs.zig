@@ -104,7 +104,8 @@ pub fn haveCgnat() bool {
 
 /// Whether this device is on a network where large transfers are fine: on
 /// Android, an IPv4 address on a Wi-Fi (`wlan*`) or wired (`eth*`)
-/// interface, not only mobile data; elsewhere always. Backups use it to
+/// interface, not only mobile data or the phone's own hotspot; elsewhere
+/// always. Backups use it to
 /// wait for Wi-Fi.
 pub fn onUnmeteredNetwork() bool {
     if (builtin.os.tag != .linux or !builtin.abi.isAndroid()) return true;
@@ -126,6 +127,10 @@ pub fn onUnmeteredNetwork() bool {
     for (reqs[0..count]) |req| {
         if (req.addr.family != linux.AF.INET) continue;
         const name = std.mem.sliceTo(&req.name, 0);
+        // The phone's own hotspot (sharing mobile data) is a wlan too, and
+        // its address is the gateway's, x.x.x.1: a Wi-Fi client never is.
+        const octets: [4]u8 = @bitCast(req.addr.addr);
+        if (octets[3] == 1) continue;
         if (std.mem.startsWith(u8, name, "wlan") or std.mem.startsWith(u8, name, "eth")) return true;
     }
     return false;

@@ -7,12 +7,45 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.2.4 - 2026-10-29
+
+## Fixed
+
+- Closing the app while **Shared folders** checked where a folder is backed up could crash it.
+- Quitting, or stopping a backup device, no longer waits for a whole folder copy to finish.
+- Adding a file to the swarm folder with `swarm_replicas` set no longer freezes the folder,
+  syncing and the app while the file is pushed to other devices.
+- **File details** no longer blocks the app while it reads a file's structure from another device.
+- A device could stay in the swarm after being removed, when it was added from a device whose
+  clock ran ahead. Membership dated more than 10 minutes ahead is refused.
+- A backup device that can't read its list of backups moves it aside instead of overwriting it;
+  that list is the only record of the photos kept after the phone deleted them.
+- A backed-up folder that grows past what one folder can hold (65,535 entries) keeps working:
+  the files deleted on the phone move into a `Deleted before <date>` folder.
+- A folder copied again only reads its index from disk, not every photo: a new photo in a
+  large camera folder no longer re-reads the whole folder.
+- Very deeply nested folders can't crash a backup device.
+- Devices no longer resend the whole member list on every ping to a device that refused part of it.
+- A device whose backup information fails still lists its shared folders.
+- Two devices with the same name backing up a folder of the same name both show, told apart by
+  device ID; long backup names keep whole characters and the "(backup)" ending.
+- A phone sharing its mobile data as a hotspot no longer counts as being on Wi-Fi for backups.
+
 # 0.2.3 - 2026-10-29
 
 ## Added
 
 - **Swarm folder replication**: Configure `swarm_replicas = N` in `[storage]` or `--swarm-replicas N` to push new and edited files in the swarm folder to up to N online peers immediately upon save.
 - **Settings**: Added a replica count selector for the swarm folder in the desktop and mobile settings panel.
+- **Pairing with one device pairs the whole swarm.** Members vouch for each other, so a device
+  paired with one member is trusted by all of them.
+- **Folder backup**, like a phone's camera backup: mark a shared folder for backup (presets for
+  Camera, Screenshots and WhatsApp) and every swarm backup device keeps a copy, on Wi-Fi only.
+  Photos deleted on the phone stay in the backup, listed as `<device> · <folder> (backup)`.
+  **Shared folders** shows where each folder is backed up.
+- **File details:** the ⓘ next to a file shows its content ID, its chunks and the block tree above
+  them, and a map of where this device holds each chunk.
+- A shared folder that can't be read says why instead of "Scanning…" forever.
 
 # 0.2.2 - 2026-10-29
 

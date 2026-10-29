@@ -72,9 +72,9 @@ pub const Node = struct {
     /// Devices no relay reached lately -> when to try again (ms). Guarded
     /// by `mutex`.
     relay_misses: std.AutoHashMapUnmanaged(id.NodeID, i64) = .empty,
-    /// Per peer device: a digest of the member list it last took in full,
-    /// so pings don't re-send an unchanged list. Guarded by `mutex`.
-    admit_sent: std.AutoHashMapUnmanaged(id.NodeID, u64) = .empty,
+    /// Per peer device: the member list last sent to it, so pings don't
+    /// re-send an unchanged list. Guarded by `mutex`.
+    admit_sent: std.AutoHashMapUnmanaged(id.NodeID, AdmitSent) = .empty,
 
     discovery_dials: std.AutoHashMapUnmanaged(id.NodeID, i64) = .empty,
 
@@ -743,6 +743,19 @@ pub const Node = struct {
         return honored;
     }
 
+    pub const AdmitSent = struct {
+        digest: u64,
+        at: i64,
+        /// The peer took every vouch.
+        complete: bool,
+
+        /// Seconds before the same list is sent again: rarely once taken (a
+        /// peer may have lost its store), sooner when some were refused.
+        fn retryAfter(self: AdmitSent) i64 {
+            return if (self.complete) 6 * 60 * 60 else 10 * 60;
+        }
+    };
+
     /// Signs and sends this node's vouch for `entry` (ADMIT): `entry` is a
     /// member here, admitted at `entry.added_at`.
     fn sendAdmit(self: *Node, conn: network.Connection, entry: device_trust.Entry) !bool {
@@ -787,11 +800,12 @@ pub const Node = struct {
             hasher.update(std.mem.asBytes(&e.added_at));
         }
         const digest = hasher.final();
+        const now = sync.timestamp();
         if (peer) |p| {
             self.mutex.lock();
-            const same = if (self.admit_sent.get(p)) |d| d == digest else false;
+            const fresh = if (self.admit_sent.get(p)) |last| last.digest == digest and now -| last.at < last.retryAfter() else false;
             self.mutex.unlock();
-            if (same) return 0;
+            if (fresh) return 0;
         }
 
         var taken: usize = 0;
@@ -807,14 +821,15 @@ pub const Node = struct {
             };
             if (ok) taken += 1;
         }
-        // Remembered only when the peer took every vouch: one that doesn't
-        // trust this node yet hears the list again on the next round.
-        if (peer) |p| if (taken == sent) {
+        // Remembered either way: a peer that refused some vouches (it
+        // doesn't trust this node yet, or its store is full) hears the list
+        // again after a while, not on every ping.
+        if (peer) |p| {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.admit_sent.count() >= 256) self.admit_sent.clearRetainingCapacity();
-            self.admit_sent.put(self.allocator, p, digest) catch {};
-        };
+            self.admit_sent.put(self.allocator, p, .{ .digest = digest, .at = now, .complete = taken == sent }) catch {};
+        }
         return taken;
     }
 
@@ -1457,7 +1472,11 @@ pub const Node = struct {
         else
             try self.allocator.dupe(u8, &empty_listing);
         defer self.allocator.free(listing);
-        const backup: []u8 = if (self.share_source) |source| (if (source.backupFn) |f| try f(source.ctx, self.allocator) else &.{}) else &.{};
+        // The backup field is extra: failing to build it must not hide the shares.
+        const backup: []u8 = if (self.share_source) |source| (if (source.backupFn) |f| f(source.ctx, self.allocator) catch |err| blk: {
+            std.debug.print("SHARES: backup info unavailable: {any}\n", .{err});
+            break :blk &.{};
+        } else &.{}) else &.{};
         defer self.allocator.free(backup);
         const response = rpc.Message{
             .sender_id = self.manager.node_id,

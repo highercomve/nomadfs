@@ -61,7 +61,8 @@ pub const SwarmFolder = struct {
     backup_last_round: u64 = 0,
     /// Number of peer devices to replicate newly added/updated files to.
     /// When > 0, addFile pushes the file DAG to up to this many peers.
-    swarm_replicas: u8 = 0,
+    /// Atomic: the app changes it while edits run.
+    swarm_replicas: std.atomic.Value(u8) = .init(0),
 
     pub fn create(allocator: std.mem.Allocator, io: std.Io, store: *storage.engine.StorageEngine, self_id: NodeID, self_name: []const u8, file_path: []const u8) !*SwarmFolder {
         const self = try allocator.create(SwarmFolder);
@@ -165,14 +166,19 @@ pub const SwarmFolder = struct {
         const root = try builder.build(&reader);
         defer self.allocator.free(root);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        _ = try self.manifest.edit(path, .{ .cid = root[0..32].*, .size = reader.offset, .mtime = self.now() }, self.self_id.bytes, self.self_name);
-        try self.saveLocked();
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            _ = try self.manifest.edit(path, .{ .cid = root[0..32].*, .size = reader.offset, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+            try self.saveLocked();
+        }
 
-        if (self.swarm_replicas > 0) {
+        // Outside the lock: pushing a large file takes a while, and sync,
+        // peers' manifest requests and the app must not wait for it.
+        const replicas = self.swarm_replicas.load(.acquire);
+        if (replicas > 0) {
             if (self.block_manager) |bm| {
-                _ = bm.replicate(root, self.swarm_replicas) catch |err| {
+                _ = bm.replicate(root, replicas) catch |err| {
                     std.debug.print("swarm: replicate failed: {any}\n", .{err});
                 };
             }

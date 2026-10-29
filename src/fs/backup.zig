@@ -128,54 +128,111 @@ const Reader = struct {
 
 pub const Merged = struct { root: Cid, size: u64 };
 
+/// Below this many folder levels `new` wins without merging: a peer's deep
+/// tree can't exhaust the backup thread's stack.
+pub const max_merge_depth = 64;
+
 /// The union of the dir trees `old` and `new`, both held in `store`: every
 /// entry of `new`, plus every entry of `old` that `new` no longer has. Where
 /// both have a folder of the same name the folders are merged; otherwise
-/// `new` wins. Writes the merged dir blocks into the kept area.
-pub fn merge(allocator: std.mem.Allocator, store: *storage.engine.StorageEngine, old: ?Cid, new: Cid) !Merged {
+/// `new` wins. Writes the merged dir blocks into the kept area. When the
+/// union no longer fits one dir block, the entries deleted at the source
+/// move into a `Deleted before <date>` folder (`now`, Unix seconds).
+pub fn merge(allocator: std.mem.Allocator, store: *storage.engine.StorageEngine, old: ?Cid, new: Cid, now: u64) !Merged {
+    return mergeAt(allocator, store, old, new, now, 0);
+}
+
+fn mergeAt(allocator: std.mem.Allocator, store: *storage.engine.StorageEngine, old: ?Cid, new: Cid, now: u64, depth: usize) !Merged {
     const loader = tree.Loader.local(store);
     var new_list = try tree.listDir(allocator, loader, &new);
     defer new_list.deinit();
     const old_cid = old orelse return .{ .root = new, .size = sumSizes(new_list.entries) };
-    if (std.mem.eql(u8, &old_cid, &new)) return .{ .root = new, .size = sumSizes(new_list.entries) };
+    if (std.mem.eql(u8, &old_cid, &new) or depth >= max_merge_depth) return .{ .root = new, .size = sumSizes(new_list.entries) };
     var old_list = try tree.listDir(allocator, loader, &old_cid);
     defer old_list.deinit();
 
-    // Child merges produce new CIDs; keep them alive until the encode.
+    // Child merges produce new CIDs; keep them alive until the encode
+    // (one more for the folder of deleted entries).
     var cids: std.ArrayList(Cid) = .empty;
     defer cids.deinit(allocator);
-    try cids.ensureTotalCapacity(allocator, new_list.entries.len + old_list.entries.len);
-    var entries: std.ArrayList(codec.DirEntry) = .empty;
-    defer entries.deinit(allocator);
+    try cids.ensureTotalCapacity(allocator, new_list.entries.len + old_list.entries.len + 1);
+    var current: std.ArrayList(codec.DirEntry) = .empty;
+    defer current.deinit(allocator);
+    var deleted: std.ArrayList(codec.DirEntry) = .empty;
+    defer deleted.deinit(allocator);
 
     for (new_list.entries) |e| {
         var cid = e.cid;
         var size = e.size;
         if (e.kind == .dir) if (old_list.find(e.name)) |o| if (o.kind == .dir and !std.mem.eql(u8, &o.cid, &e.cid)) {
-            const m = try merge(allocator, store, o.cid, e.cid);
+            const m = try mergeAt(allocator, store, o.cid, e.cid, now, depth + 1);
             cid = m.root;
             size = m.size;
         };
         cids.appendAssumeCapacity(cid);
-        try entries.append(allocator, .{ .name = e.name, .cid = &cids.items[cids.items.len - 1], .size = size, .kind = e.kind, .mtime = e.mtime });
+        try current.append(allocator, .{ .name = e.name, .cid = &cids.items[cids.items.len - 1], .size = size, .kind = e.kind, .mtime = e.mtime });
     }
     for (old_list.entries) |o| {
         if (new_list.find(o.name) != null) continue;
         cids.appendAssumeCapacity(o.cid);
-        try entries.append(allocator, .{ .name = o.name, .cid = &cids.items[cids.items.len - 1], .size = o.size, .kind = o.kind, .mtime = o.mtime });
+        try deleted.append(allocator, .{ .name = o.name, .cid = &cids.items[cids.items.len - 1], .size = o.size, .kind = o.kind, .mtime = o.mtime });
     }
-    std.mem.sort(codec.DirEntry, entries.items, {}, struct {
+
+    var all: std.ArrayList(codec.DirEntry) = .empty;
+    defer all.deinit(allocator);
+    try all.appendSlice(allocator, current.items);
+    try all.appendSlice(allocator, deleted.items);
+    return putDir(allocator, store, all.items) catch |err| switch (err) {
+        error.TooManyEntries, error.DirectoryTooLarge => {
+            // Every deleted entry came from `old`, one dir block, so they
+            // fit one of their own.
+            const moved = try putDir(allocator, store, deleted.items);
+            var name_buf: [64]u8 = undefined;
+            const name = deletedFolderName(&name_buf, now, new_list);
+            cids.appendAssumeCapacity(moved.root);
+            try current.append(allocator, .{ .name = name, .cid = &cids.items[cids.items.len - 1], .size = moved.size, .kind = .dir, .mtime = now });
+            return putDir(allocator, store, current.items);
+        },
+        else => return err,
+    };
+}
+
+/// Sorts `entries` by name, stores them as a dir block in the kept area.
+fn putDir(allocator: std.mem.Allocator, store: *storage.engine.StorageEngine, entries: []codec.DirEntry) !Merged {
+    std.mem.sort(codec.DirEntry, entries, {}, struct {
         fn less(_: void, a: codec.DirEntry, b: codec.DirEntry) bool {
             return std.mem.order(u8, a.name, b.name) == .lt;
         }
     }.less);
-    const bytes = try codec.encodeDir(allocator, entries.items);
+    const bytes = try codec.encodeDir(allocator, entries);
     defer allocator.free(bytes);
     const block = storage.block.Block.new(bytes);
     try store.put(block);
     var size: u64 = 0;
-    for (entries.items) |e| size +|= e.size;
+    for (entries) |e| size +|= e.size;
     return .{ .root = block.cid, .size = size };
+}
+
+/// `Deleted before 2026-10-29`, with ` (2)`… if the source has that name.
+fn deletedFolderName(buf: *[64]u8, now: u64, taken: tree.Listing) []const u8 {
+    const day = (std.time.epoch.EpochSeconds{ .secs = now }).getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    var n: usize = 1;
+    while (true) : (n += 1) {
+        const name = (if (n == 1)
+            std.fmt.bufPrint(buf, "Deleted before {d}-{d:0>2}-{d:0>2}", .{ year_day.year, month_day.month.numeric(), month_day.day_index + 1 })
+        else
+            std.fmt.bufPrint(buf, "Deleted before {d}-{d:0>2}-{d:0>2} ({d})", .{ year_day.year, month_day.month.numeric(), month_day.day_index + 1, n })) catch unreachable;
+        if (taken.find(name) == null or n >= 1000) return name;
+    }
+}
+
+fn hex32(text: []const u8) ?[32]u8 {
+    if (text.len != 64) return null;
+    var out: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, text) catch return null;
+    return out;
 }
 
 fn sumSizes(entries: []const tree.Entry) u64 {
@@ -187,12 +244,38 @@ fn sumSizes(entries: []const tree.Entry) u64 {
 /// The name a backup is listed under: `<device> · <share> (backup)`, made
 /// a valid entry name.
 pub fn displayName(buf: []u8, device: []const u8, share: []const u8) []const u8 {
-    const raw = std.fmt.bufPrint(buf, "{s} · {s} (backup)", .{ device, share }) catch buf[0..@min(buf.len, codec.max_name_len)];
-    const out = buf[0..@min(raw.len, codec.max_name_len)];
+    return displayNameTagged(buf, device, share, null);
+}
+
+/// As displayName, with ` · <tag>` after the device when two backups would
+/// otherwise share a name. Long names are cut on a character boundary and
+/// keep the ` (backup)` ending.
+pub fn displayNameTagged(buf: []u8, device: []const u8, share: []const u8, tag: ?[]const u8) []const u8 {
+    const suffix = " (backup)";
+    const sep = " · ";
+    const limit = @min(buf.len, codec.max_name_len);
+    const tag_len = if (tag) |t| sep.len + t.len else 0;
+    const room = limit -| (sep.len + suffix.len + tag_len);
+    // Give the share at least half of the room, the device the rest.
+    const share_part = utf8Prefix(share, @max(room / 2, room -| device.len));
+    const device_part = utf8Prefix(device, room -| share_part.len);
+    const out = (if (tag) |t|
+        std.fmt.bufPrint(buf[0..limit], "{s}{s}{s}{s}{s}{s}", .{ device_part, sep, t, sep, share_part, suffix })
+    else
+        std.fmt.bufPrint(buf[0..limit], "{s}{s}{s}{s}", .{ device_part, sep, share_part, suffix })) catch buf[0..0];
     for (out) |*c| if (c.* == '/' or c.* == '\\' or c.* == 0) {
         c.* = '-';
     };
     return out;
+}
+
+/// The longest prefix of `s` no longer than `max` bytes that ends on a
+/// UTF-8 character boundary.
+fn utf8Prefix(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    var end = max;
+    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
+    return s[0..end];
 }
 
 // ---- The backup device ----
@@ -213,6 +296,9 @@ pub const FolderBackup = struct {
     thread: ?std.Thread = null,
     /// Serializes rounds and state saves.
     round_mutex: sync.Mutex = .{},
+    /// The state file couldn't be read nor moved aside: no rounds, so it is
+    /// never overwritten.
+    state_unreadable: bool = false,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -236,7 +322,19 @@ pub const FolderBackup = struct {
             .enabled = enabled,
             .state_path = try allocator.dupe(u8, state_path),
         };
-        self.load() catch |err| std.debug.print("backup: couldn't read {s}: {any}\n", .{ state_path, err });
+        self.load() catch |err| {
+            // The file is the only record of the trees that keep what the
+            // sources deleted: keep it for inspection, never overwrite it.
+            var aside_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const aside = std.fmt.bufPrint(&aside_buf, "{s}.unreadable-{d}", .{ state_path, std.math.cast(u64, sync.timestamp()) orelse 0 }) catch state_path;
+            const cwd = std.Io.Dir.cwd();
+            cwd.rename(state_path, cwd, aside, io) catch |rename_err| {
+                std.debug.print("backup: couldn't read {s} ({any}) or move it aside ({any}); backups are off\n", .{ state_path, err, rename_err });
+                self.state_unreadable = true;
+                return self;
+            };
+            std.debug.print("backup: couldn't read {s} ({any}); moved it to {s}\n", .{ state_path, err, aside });
+        };
         return self;
     }
 
@@ -270,7 +368,7 @@ pub const FolderBackup = struct {
                 sync.sleep(step);
             }
             wait = self.interval_ns;
-            if (!self.enabled.load(.acquire)) continue;
+            if (!self.enabled.load(.acquire) or self.state_unreadable) continue;
             _ = self.round() catch |err| std.debug.print("backup: round failed: {any}\n", .{err});
         }
     }
@@ -326,14 +424,31 @@ pub const FolderBackup = struct {
         return null;
     }
 
+    /// Whether another held backup already lists under `display`.
+    fn displayTaken(self: *FolderBackup, display: []const u8, owner: [32]u8, share: []const u8) bool {
+        const held = self.shares.heldSnapshot(self.allocator) catch return false;
+        defer shares_mod.ShareIndex.freeHeldSnapshot(self.allocator, held);
+        for (held) |h| {
+            if (std.mem.eql(u8, &h.owner, &owner) and std.mem.eql(u8, h.share, share)) continue;
+            if (std.mem.eql(u8, h.display, display)) return true;
+        }
+        return false;
+    }
+
     fn copyShare(self: *FolderBackup, peer: @import("../net/id.zig").NodeID, owner: [32]u8, label: []const u8, share: []const u8, root: Cid) !void {
         const conn = try self.block_manager.connectTo(peer);
         defer conn.deinit();
-        const fetched = try cluster.repair.RepairManager.syncWhile(self.allocator, self.block_manager.dht_node, self.store, conn, &root, self.enabled);
+        const fetched = try cluster.repair.RepairManager.syncWhile(self.allocator, self.block_manager.dht_node, self.store, conn, &root, &self.running);
         const previous = self.findHeld(owner, share);
-        const merged = try merge(self.allocator, self.store, if (previous) |p| p.root else null, root);
+        const merged = try merge(self.allocator, self.store, if (previous) |p| p.root else null, root, std.math.cast(u64, sync.timestamp()) orelse 0);
         var name_buf: [codec.max_name_len + 64]u8 = undefined;
-        const display = displayName(&name_buf, label, share);
+        var display = displayName(&name_buf, label, share);
+        // Two members with the same label and share name: tell them apart
+        // by the owner's ID, or the second would be hidden.
+        if (self.displayTaken(display, owner, share)) {
+            const hex = std.fmt.bytesToHex(owner[0..4].*, .lower);
+            display = displayNameTagged(&name_buf, label, share, &hex);
+        }
         try self.shares.setHeld(.{
             .owner = owner,
             .share = @constCast(share),
@@ -388,17 +503,17 @@ pub const FolderBackup = struct {
         };
         defer file.close(self.io);
         const size = (try file.stat(self.io)).size;
-        if (size > 4 * 1024 * 1024) return error.StateTooLarge;
+        if (size > 64 * 1024 * 1024) return error.StateTooLarge;
         const text = try self.allocator.alloc(u8, @intCast(size));
         defer self.allocator.free(text);
-        _ = try file.readPositionalAll(self.io, text, 0);
+        if (try file.readPositionalAll(self.io, text, 0) != text.len) return error.ShortRead;
         const b64 = std.base64.url_safe_no_pad.Decoder;
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
             var f = std.mem.splitScalar(u8, line, '\t');
             var h: shares_mod.ShareIndex.Held = undefined;
-            _ = std.fmt.hexToBytes(&h.owner, f.next() orelse continue) catch continue;
+            h.owner = hex32(f.next() orelse continue) orelse continue;
             var share_buf: [512]u8 = undefined;
             var display_buf: [512]u8 = undefined;
             const share_text = f.next() orelse continue;
@@ -408,8 +523,8 @@ pub const FolderBackup = struct {
             if (share_len > share_buf.len or display_len > display_buf.len) continue;
             b64.decode(share_buf[0..share_len], share_text) catch continue;
             b64.decode(display_buf[0..display_len], display_text) catch continue;
-            _ = std.fmt.hexToBytes(&h.root, f.next() orelse continue) catch continue;
-            _ = std.fmt.hexToBytes(&h.source_root, f.next() orelse continue) catch continue;
+            h.root = hex32(f.next() orelse continue) orelse continue;
+            h.source_root = hex32(f.next() orelse continue) orelse continue;
             h.size = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
             h.synced_at = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
             h.share = share_buf[0..share_len];
@@ -472,7 +587,7 @@ test "backup: merging keeps what the new version no longer has" {
         .{ .name = "sub", .cid = &sub_v2, .size = 7, .kind = .dir, .mtime = 2 },
     });
 
-    const m = try merge(a, &store, v1, v2);
+    const m = try merge(a, &store, v1, v2, 0);
     var top = try tree.listDir(a, tree.Loader.local(&store), &m.root);
     defer top.deinit();
     try std.testing.expectEqual(@as(usize, 4), top.entries.len);
@@ -483,4 +598,45 @@ test "backup: merging keeps what the new version no longer has" {
     defer sub.deinit();
     try std.testing.expectEqual(@as(usize, 2), sub.entries.len); // old.jpg kept, new.jpg added
     try std.testing.expectEqual(@as(u64, 10 + 20 + 30 + 12), m.size);
+}
+
+test "backup: a merge too large for one folder moves the deleted entries into a folder" {
+    const a = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "test_backup_merge_overflow";
+    std.Io.Dir.cwd().deleteTree(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, path) catch {};
+    var store = try storage.engine.StorageEngine.init(a, path);
+    defer store.deinit();
+
+    const f = [_]u8{7} ** 32;
+    const build = struct {
+        fn dir(s: *storage.engine.StorageEngine, al: std.mem.Allocator, prefix: []const u8, n: usize, cid: *const Cid) !Cid {
+            const names = try al.alloc([12]u8, n);
+            defer al.free(names);
+            const entries = try al.alloc(codec.DirEntry, n);
+            defer al.free(entries);
+            for (names, entries, 0..) |*buf, *e, i| {
+                const name = try std.fmt.bufPrint(buf, "{s}{d:0>8}", .{ prefix, i });
+                e.* = .{ .name = name, .cid = cid, .size = 1, .kind = .file, .mtime = 1 };
+            }
+            const bytes = try codec.encodeDir(al, entries);
+            defer al.free(bytes);
+            const b = storage.block.Block.new(bytes);
+            try s.put(b);
+            return b.cid;
+        }
+    }.dir;
+    // 40000 old photos deleted at the source, 30000 new: 70000 > max_links.
+    const v1 = try build(&store, a, "old", 40000, &f);
+    const v2 = try build(&store, a, "new", 30000, &f);
+    const m = try merge(a, &store, v1, v2, 1793232000); // 2026-10-29
+    var top = try tree.listDir(a, tree.Loader.local(&store), &m.root);
+    defer top.deinit();
+    try std.testing.expectEqual(@as(usize, 30001), top.entries.len);
+    const moved = top.find("Deleted before 2026-10-29").?;
+    var kept = try tree.listDir(a, tree.Loader.local(&store), &moved.cid);
+    defer kept.deinit();
+    try std.testing.expectEqual(@as(usize, 40000), kept.entries.len);
+    try std.testing.expectEqual(@as(u64, 70000), m.size);
 }
