@@ -370,18 +370,20 @@ pub const SwarmFolder = struct {
         return out;
     }
 
-    /// Reads a file's bytes: from the local store, else the device that
-    /// added it, else any other known peer.
+    /// Reads a file's bytes: from the local store, else likely holders
+    /// (cluster/holders.zig): the device that added it, devices that keep
+    /// swarm backups, then any other known peer.
     pub fn readAt(self: *SwarmFolder, allocator: std.mem.Allocator, cid: [32]u8, author: [32]u8, offset: u64, dest: []u8) !usize {
         const bm = self.block_manager orelse return error.NotRunning;
-        const known = try remote_mod.knownPeers(bm, allocator);
-        defer allocator.free(known);
-        var peers: std.ArrayList(NodeID) = .empty;
-        defer peers.deinit(allocator);
-        try peers.append(allocator, .{ .bytes = author });
-        for (known) |p| if (!std.mem.eql(u8, &p.bytes, &author)) try peers.append(allocator, p);
-        if (self.read_ahead) |ra| return ra.readAt(allocator, peers.items, cid, offset, dest);
-        var multi = remote_mod.MultiRemote{ .block_manager = bm, .store = self.store, .peers = peers.items, .root = cid };
+        var buffer = remote_mod.holdersBuffer();
+        const peers: []const NodeID = if (bm.holders) |*holds|
+            holds.forSwarm(.{ .bytes = author }, &buffer)
+        else blk: {
+            buffer[0] = .{ .bytes = author };
+            break :blk buffer[0..1];
+        };
+        if (self.read_ahead) |ra| return ra.readAt(allocator, peers, cid, offset, dest);
+        var multi = remote_mod.MultiRemote{ .block_manager = bm, .store = self.store, .peers = peers, .root = cid };
         return tree.readAt(allocator, multi.loader(), cid, offset, dest);
     }
 

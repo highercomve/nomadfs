@@ -6,6 +6,7 @@ const storage = @import("../storage/mod.zig");
 const quorum = @import("quorum.zig");
 const RepairManager = @import("repair.zig").RepairManager;
 const fetcher_mod = @import("fetcher.zig");
+const holders_mod = @import("holders.zig");
 const walk = storage.dag.walk;
 
 /// Stores files as Merkle DAGs and moves them between nodes.
@@ -30,6 +31,9 @@ pub const BlockManager = struct {
     /// Where each block of a read comes from (fetcher.zig); null without a
     /// store.
     fetcher: ?fetcher_mod.Fetcher = null,
+    /// Who probably holds what (holders.zig); null without a store, since
+    /// only reads need it.
+    holders: ?holders_mod.Holders = null,
 
     pub const Config = struct {
         network: *network.manager.ConnectionManager,
@@ -54,7 +58,13 @@ pub const BlockManager = struct {
             .quorum = config.quorum,
             .replication = config.replication,
         };
-        if (config.storage) |s| self.fetcher = fetcher_mod.Fetcher.init(s, .{ .ctx = self, .getFn = getBlockFrom });
+        if (config.storage) |s| {
+            self.fetcher = fetcher_mod.Fetcher.init(s, .{ .ctx = self, .getFn = getBlockFrom });
+            self.holders = .{
+                .self_id = config.dht.manager.node_id,
+                .peers = .{ .ctx = config.dht, .rolesFn = rolesOfPeered, .knownFn = knownIDsOf },
+            };
+        }
         return self;
     }
 
@@ -238,6 +248,38 @@ pub const BlockManager = struct {
         const data = (try self.dht_node.fetchBlock(conn, cid.*)) orelse return null;
         defer self.dht_node.allocator.free(data);
         return try allocator.dupe(u8, data);
+    }
+
+    // ---- The holder registry's view of discovery ----
+
+    /// A peer's announced roles (PING/PONG), or null when unknown.
+    fn rolesOfPeered(ctx: *anyopaque, peer: NodeID) ?u8 {
+        const node: *dht.Node = @ptrCast(@alignCast(ctx));
+        return node.peerRoles(peer);
+    }
+
+    /// Copies the routing table's peer IDs.
+    fn knownIDsOf(ctx: *anyopaque, out: []NodeID) usize {
+        const node: *dht.Node = @ptrCast(@alignCast(ctx));
+        return node.copyPeerIDs(out);
+    }
+
+    /// A device stops holding: drop its records, as holder or as origin.
+    /// `device_id` is a device's identity ID; the trust store (which knows
+    /// the device) maps it to its transport ID, the keys holders are
+    /// recorded under.
+    pub fn forgetPeer(self: *BlockManager, device_id: NodeID) void {
+        var stands = &(self.holders orelse return);
+        stands.forget(device_id);
+        const trust = self.dht_node.trust_store orelse return;
+        const entry = trust.lookup(device_id) orelse return;
+        stands.forget(NodeID.fromPublicKey(entry.transport_key));
+    }
+
+    /// The discovery node's revocation sink: type erased for it.
+    pub fn revokedErased(ctx: *anyopaque, device_id: NodeID) void {
+        const self: *BlockManager = @ptrCast(@alignCast(ctx));
+        self.forgetPeer(device_id);
     }
 
     fn findPeer(self: *BlockManager, peer_id: NodeID) !dht.kbucket.PeerInfo {

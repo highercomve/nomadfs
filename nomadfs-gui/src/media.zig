@@ -128,10 +128,8 @@ fn readAt(_: *anyopaque, path: []const u8, offset: u64, dest: []u8) anyerror!usi
         return folder.readAt(gpa, t.cid, t.id, offset, want);
     }
     const peer: nomadfs.net.id.NodeID = .{ .bytes = t.id };
-    if (node.read_ahead) |ra| return ra.readAt(gpa, &.{peer}, t.cid, offset, want);
     const store = node.store orelse return error.StorageDisabled;
-    var remote = nomadfs.fs.Remote{ .block_manager = node.block_manager, .store = store, .peer = peer };
-    return nomadfs.fs.tree.readAt(gpa, remote.loader(), t.cid, offset, want);
+    return nomadfs.fs.remote.readShareAt(gpa, node.block_manager, store, node.read_ahead, peer, t.cid, offset, want);
 }
 
 fn isHex64(s: []const u8) bool {

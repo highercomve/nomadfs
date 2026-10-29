@@ -99,13 +99,25 @@ pub const Announced = struct {
     }
 };
 
+/// What a device says about itself in every PING and PONG (one trailing
+/// byte both sides can read). Readers of the holder registry use bit 0
+/// (it keeps swarm backups) and bit 2 (its network is metered).
+pub const Roles = struct {
+    /// The device keeps the swarm folder's files as they appear.
+    pub const swarm_backup: u8 = 1 << 0;
+    /// The device accepts copies of files it did not touch (stage 3).
+    pub const accepts_copies: u8 = 1 << 1;
+    /// Transfers to it should wait or stay small (mobile data).
+    pub const metered: u8 = 1 << 2;
+};
+
 pub const MessagePayload = union(MessageType) {
-    PING: struct { port: u16, announced: Announced = .{} },
+    PING: struct { port: u16, announced: Announced = .{}, roles: u8 = 0 },
     /// `port`: where the responder listens. A PING can travel over a
     /// connection the responder opened, whose source port is not that.
     /// Sent last, so 0.3.2 and older read the rest and ignore it; null
     /// from them.
-    PONG: struct { announced: Announced = .{}, port: ?u16 = null },
+    PONG: struct { announced: Announced = .{}, port: ?u16 = null, roles: u8 = 0 },
     FIND_NODE: struct { target: id.NodeID },
     FIND_NODE_RESPONSE: struct { closer_peers: []kbucket.PeerInfo },
     FIND_VALUE: struct { key: id.NodeID },
@@ -196,10 +208,12 @@ pub const Message = struct {
             .PING => |p| {
                 try writer.writeInt(u16, p.port, .big);
                 try writeAnnounced(p.announced, writer);
+                try writer.writeByte(p.roles);
             },
             .PONG => |p| {
                 try writeAnnounced(p.announced, writer);
                 if (p.port) |port| try writer.writeInt(u16, port, .big);
+                try writer.writeByte(p.roles);
             },
             .FIND_NODE => |p| {
                 try writer.writeAll(&p.target.bytes);
@@ -305,13 +319,17 @@ pub const Message = struct {
         const payload = switch (msg_type) {
             .PING => blk: {
                 const port = try reader.readInt(u16, .big);
-                break :blk MessagePayload{ .PING = .{ .port = port, .announced = try readAnnounced(reader) } };
+                const announced = try readAnnounced(reader);
+                // Before 0.3.3 the message ends here; roles arrive last.
+                const roles: u8 = reader.readByte() catch 0;
+                break :blk MessagePayload{ .PING = .{ .port = port, .announced = announced, .roles = roles } };
             },
             .PONG => blk: {
                 const announced = try readAnnounced(reader);
                 // Older nodes end the reply here and close the stream.
                 const port: ?u16 = reader.readInt(u16, .big) catch null;
-                break :blk MessagePayload{ .PONG = .{ .announced = announced, .port = port } };
+                const roles: u8 = reader.readByte() catch 0;
+                break :blk MessagePayload{ .PONG = .{ .announced = announced, .port = port, .roles = roles } };
             },
             .FIND_NODE => blk: {
                 var target: id.NodeID = undefined;
@@ -731,20 +749,40 @@ test "rpc: PONG carries the listening port, and reads without it from older node
 
     var buf = TestBuffer{ .allocator = allocator };
     defer buf.list.deinit(allocator);
-    try (Message{ .sender_id = sender, .payload = .{ .PONG = .{ .announced = announced, .port = 7865 } } }).serialize(buf.writer());
+    try (Message{ .sender_id = sender, .payload = .{ .PONG = .{ .announced = announced, .port = 7865, .roles = Roles.swarm_backup | Roles.metered } } }).serialize(buf.writer());
     const pong = try Message.deserialize(allocator, buf.reader());
     defer pong.deinit(allocator);
     try std.testing.expectEqual(@as(?u16, 7865), pong.payload.PONG.port);
     try std.testing.expectEqual(@as(u8, 1), pong.payload.PONG.announced.count);
+    try std.testing.expectEqual(Roles.swarm_backup | Roles.metered, pong.payload.PONG.roles);
 
     // 0.3.2 and older: the addresses, then the stream ends.
     var old = TestBuffer{ .allocator = allocator };
     defer old.list.deinit(allocator);
     try (Message{ .sender_id = sender, .payload = .{ .PONG = .{ .announced = announced } } }).serialize(old.writer());
+    // The roles byte is trailing: an old peer's message ends before it.
+    old.list.items.len -= 1;
     const old_pong = try Message.deserialize(allocator, old.reader());
     defer old_pong.deinit(allocator);
     try std.testing.expectEqual(@as(?u16, null), old_pong.payload.PONG.port);
     try std.testing.expectEqual(@as(u8, 1), old_pong.payload.PONG.announced.count);
+    try std.testing.expectEqual(@as(u8, 0), old_pong.payload.PONG.roles);
+
+    // Same for PING: a full round trip, then the pre-roles short form.
+    var ping_buf = TestBuffer{ .allocator = allocator };
+    defer ping_buf.list.deinit(allocator);
+    try (Message{ .sender_id = sender, .payload = .{ .PING = .{ .port = 7865, .announced = announced, .roles = Roles.metered } } }).serialize(ping_buf.writer());
+    const ping = try Message.deserialize(allocator, ping_buf.reader());
+    defer ping.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 7865), ping.payload.PING.port);
+    try std.testing.expectEqual(Roles.metered, ping.payload.PING.roles);
+
+    try (Message{ .sender_id = sender, .payload = .{ .PING = .{ .port = 7865, .announced = announced } } }).serialize(old.writer());
+    old.list.items.len -= 1;
+    const old_ping = try Message.deserialize(allocator, old.reader());
+    defer old_ping.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 7865), old_ping.payload.PING.port);
+    try std.testing.expectEqual(@as(u8, 0), old_ping.payload.PING.roles);
 }
 
 test "rpc: readValue bounds allocation before payload arrival" {

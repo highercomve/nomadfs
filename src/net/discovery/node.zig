@@ -62,6 +62,16 @@ pub const Node = struct {
     rotation_mutex: sync.Mutex = .{},
     /// Human name sent with SHARES (config node.nickname).
     nickname: []const u8 = "",
+    /// The roles this node announces in every PING and PONG (rpc.Roles):
+    /// swarm backup, metered network. Root.zig keeps them current.
+    local_roles: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// Each peer's announced roles (the PING/PONG trailing byte), keyed by
+    /// node ID; the peer least recently heard makes room. Guarded by
+    /// `mutex`.
+    peer_roles: PeerRoles = .{},
+    /// Told about a revocation applied here (the revoked device's ID), so
+    /// it leaves every registry that lists it (e.g. cluster/holders.zig).
+    revocation_sink: ?RevocationSink = null,
     /// This node's Ed25519 identity, used to sign revocations it pushes.
     device_identity: ?identity_mod.Identity = null,
     store_limits: StoreLimits = .{},
@@ -107,6 +117,85 @@ pub const Node = struct {
         /// from a request thread after the rotation was verified.
         applyFn: *const fn (ctx: *anyopaque, new_key: [32]u8, epoch: u64) void,
     };
+
+    /// Told about an honored revocation (its device ID).
+    pub const RevocationSink = struct {
+        ctx: *anyopaque,
+        revokedFn: *const fn (ctx: *anyopaque, device_id: id.NodeID) void,
+    };
+
+    /// Peers' announced roles, bounded: at most max_peer_roles devices,
+    /// the least recently heard making room.
+    pub const PeerRoles = struct {
+        entries: [max_peer_roles]RoleEntry = undefined,
+        count: usize = 0,
+
+        pub const max_peer_roles = 256;
+        const RoleEntry = struct { id: id.NodeID, roles: u8, heard_ms: i64 };
+    };
+
+    /// Turns one announced role bit (rpc.Roles) on or off. The next PING
+    /// or PONG tells peers.
+    pub fn setRole(self: *Node, bit: u8, on: bool) void {
+        const old = self.local_roles.load(.acquire);
+        self.local_roles.store(if (on) old | bit else old & ~bit, .release);
+    }
+
+    fn announcedRoles(self: *Node) u8 {
+        return self.local_roles.load(.monotonic);
+    }
+
+    /// Records `roles` for an authenticated peer (PING or PONG heard).
+    fn recordPeerRoles(self: *Node, peer: id.NodeID, roles: u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.recordPeerRolesLocked(peer, roles, sync.monotonicMillis());
+    }
+
+    fn recordPeerRolesLocked(self: *Node, peer: id.NodeID, roles: u8, now: i64) void {
+        for (self.peer_roles.entries[0..self.peer_roles.count]) |*e| {
+            if (e.id.eql(peer)) {
+                e.roles = roles;
+                e.heard_ms = now;
+                return;
+            }
+        }
+        if (self.peer_roles.count < PeerRoles.max_peer_roles) {
+            self.peer_roles.entries[self.peer_roles.count] = .{ .id = peer, .roles = roles, .heard_ms = now };
+            self.peer_roles.count += 1;
+            return;
+        }
+        // Full: the peer least recently heard makes room.
+        var victim: usize = 0;
+        for (self.peer_roles.entries, 0..) |e, i| {
+            if (e.heard_ms < self.peer_roles.entries[victim].heard_ms) victim = i;
+        }
+        self.peer_roles.entries[victim] = .{ .id = peer, .roles = roles, .heard_ms = now };
+    }
+
+    /// A peer's announced roles, or null when it hasn't been heard since
+    /// this node started.
+    pub fn peerRoles(self: *Node, peer: id.NodeID) ?u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.peer_roles.entries[0..self.peer_roles.count]) |e| {
+            if (e.id.eql(peer)) return e.roles;
+        }
+        return null;
+    }
+
+    /// Copies up to `out.len` known peer IDs (the routing table).
+    pub fn copyPeerIDs(self: *Node, out: []id.NodeID) usize {
+        const peers = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :blk self.routing_table.getAllPeers() catch return 0;
+        };
+        defer self.routing_table.allocator.free(peers);
+        const n = @min(peers.len, out.len);
+        for (peers[0..n], out[0..n]) |p, *o| o.* = p.id;
+        return n;
+    }
 
     pub fn init(allocator: std.mem.Allocator, manager: *network.manager.ConnectionManager, swarm_key: []const u8) Node {
         return .{
@@ -233,7 +322,7 @@ pub const Node = struct {
 
         const msg = rpc.Message{
             .sender_id = self.manager.node_id,
-            .payload = .{ .PING = .{ .port = self.manager.bound_port, .announced = self.announced() } },
+            .payload = .{ .PING = .{ .port = self.manager.bound_port, .announced = self.announced(), .roles = self.announcedRoles() } },
         };
 
         try msg.send(self.allocator, stream);
@@ -246,6 +335,7 @@ pub const Node = struct {
         // Record the ID the handshake authenticated, not the claimed one.
         const peer_id = conn.getRemoteNodeID();
         if (!response.sender_id.eql(peer_id)) return error.PeerIdMismatch;
+        self.recordPeerRoles(peer_id, response.payload.PONG.roles);
 
         var info = kbucket.PeerInfo{
             .id = peer_id,
@@ -1149,7 +1239,7 @@ pub const Node = struct {
         // NOTE: We do NOT add the peer here anymore. We wait for PING to get the correct port.
 
         switch (msg.payload) {
-            .PING => |p| try self.handlePing(stream, conn, msg.sender_id, p.port, p.announced.slice()),
+            .PING => |p| try self.handlePing(stream, conn, msg.sender_id, p.port, p.roles, p.announced.slice()),
             .FIND_NODE => |p| try self.respondCloserPeers(stream, p.target, .find_node),
             .FIND_VALUE => |p| try self.handleFindValue(stream, p.key),
             .STORE => |p| try self.handleStore(stream, p.key, p.value),
@@ -1362,11 +1452,12 @@ pub const Node = struct {
         return true;
     }
 
-    fn handlePing(self: *Node, stream: network.Stream, conn: network.Connection, claimed_id: id.NodeID, port: u16, announced_addrs: []const network.Address) !void {
+    fn handlePing(self: *Node, stream: network.Stream, conn: network.Connection, claimed_id: id.NodeID, port: u16, roles: u8, announced_addrs: []const network.Address) !void {
         // The handshake authenticated the connection; a PING may not claim
         // another node's identity (or ours) to plant it in the routing table.
         const sender_id = conn.getRemoteNodeID();
         if (!claimed_id.eql(sender_id)) return error.PeerIdMismatch;
+        self.recordPeerRoles(sender_id, roles);
 
         // If we receive an INCOMING ping, it means we are reachable!
         self.is_public.store(true, .release);
@@ -1393,7 +1484,7 @@ pub const Node = struct {
 
         const response = rpc.Message{
             .sender_id = self.manager.node_id,
-            .payload = .{ .PONG = .{ .port = self.manager.bound_port, .announced = self.announced() } },
+            .payload = .{ .PONG = .{ .port = self.manager.bound_port, .announced = self.announced(), .roles = self.announcedRoles() } },
         };
         try response.send(self.allocator, stream);
     }
@@ -1617,7 +1708,11 @@ pub const Node = struct {
             const now = std.math.cast(u64, sync.timestamp()) orelse return error.InvalidTimestamp;
             const outcome = device_trust.applyRevocation(trust, device_id, signer_key, at, signature, now) catch .rejected;
             honored = outcome != .rejected;
-            if (outcome == .applied) _ = self.manager.closePeer(device_id);
+            if (outcome == .applied) {
+                _ = self.manager.closePeer(device_id);
+                // It stops being a holder too (cluster/holders.zig).
+                if (self.revocation_sink) |sink| sink.revokedFn(sink.ctx, device_id);
+            }
             // Accepted tombstones must survive a restart, or every re-dial
             // replays the whole revocation.
             if (outcome == .applied) trust.save() catch |err| {

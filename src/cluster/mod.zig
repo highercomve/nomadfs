@@ -5,3 +5,5 @@ pub const vectors = @import("vectors.zig");
 pub const repair = @import("repair.zig");
 pub const fetcher = @import("fetcher.zig");
 pub const Fetcher = fetcher.Fetcher;
+pub const holders = @import("holders.zig");
+pub const Holders = holders.Holders;
