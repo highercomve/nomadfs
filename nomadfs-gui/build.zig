@@ -74,7 +74,7 @@ pub fn build(b: *std.Build) void {
             .types_path = null,
         },
         .package = .{
-            .id = "net.nomadfs.app",
+            .id = "com.foreachdeveloper.nomadfs",
             .name = "NomadFS",
             // .publisher = "Your Name <you@example.com>", // default: from the app id
             .summary = "Share folders across your devices; files download on demand",
@@ -101,7 +101,7 @@ pub fn build(b: *std.Build) void {
         .extensions = &.{.{
             .name = "nomadfs.storage",
             .android = .{
-                .class = "net.nomadfs.app.StorageExtension",
+                .class = "com.foreachdeveloper.nomadfs.StorageExtension",
                 .sources = &.{b.path("android-src/StorageExtension.kt")},
             },
         }},

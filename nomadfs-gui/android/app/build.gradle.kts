@@ -7,11 +7,11 @@ plugins {
 }
 
 android {
-    namespace = "net.nomadfs.app"
+    namespace = "com.foreachdeveloper.nomadfs"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "net.nomadfs.app"
+        applicationId = "com.foreachdeveloper.nomadfs"
         minSdk = 29
         targetSdk = 36
         versionCode = 205

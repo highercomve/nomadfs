@@ -21,7 +21,7 @@ pub const std_options: std.Options = .{ .logFn = oriel.log.logFn };
 /// main runs; point the command layer at them.
 fn initDataDirs() void {
     if (builtin.abi.isAndroid()) {
-        const app_id = "net.nomadfs.app";
+        const app_id = "com.foreachdeveloper.nomadfs";
         if (oriel.paths.appData(std.heap.page_allocator, .{ .name = app_id })) |dir| {
             commands.initAndroidDataDir(dir);
         } else |_| {}

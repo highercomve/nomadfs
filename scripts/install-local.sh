@@ -3,8 +3,8 @@
 # node) and install it for this user, replacing the running copy:
 #   ~/.local/bin/nomadfs-gui                          the app (AppImage)
 #   ~/.local/bin/nomadfs                              the command line node
-#   ~/.local/share/applications/net.nomadfs.app.desktop
-#   ~/.local/share/icons/hicolor/*/apps/net.nomadfs.app.png
+#   ~/.local/share/applications/com.foreachdeveloper.nomadfs.desktop
+#   ~/.local/share/icons/hicolor/*/apps/com.foreachdeveloper.nomadfs.png
 #
 #   scripts/install-local.sh              build and install, restart the app
 #   NO_RESTART=1 scripts/install-local.sh leave the app stopped
@@ -57,11 +57,13 @@ if [ -z "${NO_DESKTOP:-}" ]; then
   share="$tmp/squashfs-root/usr/share"
   apps=~/.local/share/applications
   mkdir -p "$apps"
+  # Before 0.3.0 the app was net.nomadfs.app: drop its launcher entry and icons.
+  rm -f "$apps/net.nomadfs.app.desktop" ~/.local/share/icons/hicolor/*/apps/net.nomadfs.app.png
   # Exec the installed AppImage, wherever ~/.local/bin is on PATH or not.
-  sed "s|^Exec=.*|Exec=$HOME/.local/bin/nomadfs-gui|" "$share/applications/net.nomadfs.app.desktop" > "$apps/net.nomadfs.app.desktop"
-  for icon in "$share"/icons/hicolor/*/apps/net.nomadfs.app.png; do
+  sed "s|^Exec=.*|Exec=$HOME/.local/bin/nomadfs-gui|" "$share/applications/com.foreachdeveloper.nomadfs.desktop" > "$apps/com.foreachdeveloper.nomadfs.desktop"
+  for icon in "$share"/icons/hicolor/*/apps/com.foreachdeveloper.nomadfs.png; do
     size=$(basename "$(dirname "$(dirname "$icon")")")
-    install -Dm644 "$icon" ~/.local/share/icons/hicolor/"$size"/apps/net.nomadfs.app.png
+    install -Dm644 "$icon" ~/.local/share/icons/hicolor/"$size"/apps/com.foreachdeveloper.nomadfs.png
   done
   command -v update-desktop-database >/dev/null && update-desktop-database "$apps" 2>/dev/null || true
   command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q ~/.local/share/icons/hicolor 2>/dev/null || true

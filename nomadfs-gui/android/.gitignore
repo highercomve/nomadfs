@@ -7,6 +7,6 @@ local.properties
 # Oriel's Kotlin runtime: rewritten from the library on every build.
 /app/src/main/java/dev/oriel/*.kt
 # Copied from ../android-src on every build.
-/app/src/main/java/net/nomadfs/app/StorageExtension.kt
+/app/src/main/java/com/foreachdeveloper/nomadfs/StorageExtension.kt
 # The list of extension sources the build copied (regenerated).
 /app/.oriel-sources

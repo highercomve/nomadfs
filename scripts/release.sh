@@ -82,7 +82,7 @@ cp android/app/build/outputs/apk/debug/app-debug.apk "$assets/nomadfs-$version.a
 
 step "Update manifest (latest.json)"
 sign() { # <asset> <target> <format>
-  run "sign-$2" zig build sign-update -- "$assets/$1" --app-id net.nomadfs.app \
+  run "sign-$2" zig build sign-update -- "$assets/$1" --app-id com.foreachdeveloper.nomadfs \
     --version "$version" --target "$2" --format "$3" --url "$base/$1" \
     --key "$key" --out "$out/manifests/update-$2.json"
 }

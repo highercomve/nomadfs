@@ -25,7 +25,7 @@ const repo = "https://github.com/highercomve/nomadfs";
 
 /// `updater_check`, `updater_install`, `updater_restart`.
 pub const Updater = oriel.updater.Commands(.{
-    .app_id = "net.nomadfs.app",
+    .app_id = "com.foreachdeveloper.nomadfs",
     .manifest_url = repo ++ "/releases/latest/download/latest.json",
     .current_version = about.version,
     .public_key_b64 = app.update_public_key orelse @compileError("set update_public_key in build.zig"),

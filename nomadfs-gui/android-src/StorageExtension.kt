@@ -1,4 +1,4 @@
-package net.nomadfs.app
+package com.foreachdeveloper.nomadfs
 
 import android.content.Intent
 import android.net.Uri

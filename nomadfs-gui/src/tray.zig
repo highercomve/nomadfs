@@ -17,7 +17,7 @@ const gpa = std.heap.smp_allocator;
 pub fn setup() !void {
     if (!available) return;
     tray = try oriel.tray.Tray.create(gpa, .{
-        .id = "net.nomadfs.app",
+        .id = "com.foreachdeveloper.nomadfs",
         .title = "NomadFS",
         .tooltip = "NomadFS is running",
         .icon = .{ .png = @embedFile("tray.png") },

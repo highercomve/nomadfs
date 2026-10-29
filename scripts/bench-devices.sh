@@ -65,7 +65,7 @@ run_on() {
     poco)
       # The app's own identity and config, run as the app (run-as); the
       # static aarch64 build runs on Android.
-      local app=net.nomadfs.app
+      local app=com.foreachdeveloper.nomadfs
       adb push -q "$aarch64_bin" /data/local/tmp/nomadfs-bench >/dev/null
       adb shell am force-stop $app
       adb shell "run-as $app sh -c 'cp /data/local/tmp/nomadfs-bench files/nomadfs-bench && chmod 700 files/nomadfs-bench && cd files && ./nomadfs-bench $(quote "${bench_args[@]}") --config /data/user/0/$app/files/nomadfs.conf 2>/dev/null; rc=\$?; rm -f nomadfs-bench; exit \$rc'"
