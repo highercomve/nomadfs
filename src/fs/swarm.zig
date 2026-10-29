@@ -383,7 +383,14 @@ pub const SwarmFolder = struct {
 
     /// Adapter for discovery Node.swarm_source (GET_SWARM).
     pub fn source(self: *SwarmFolder) ShareSource {
-        return .{ .ctx = self, .listFn = encodeErased };
+        return .{ .ctx = self, .listFn = encodeErased, .digestFn = digestErased };
+    }
+
+    fn digestErased(ctx: *anyopaque) [32]u8 {
+        const self: *SwarmFolder = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.manifest.digest();
     }
 
     fn encodeErased(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -419,9 +426,17 @@ pub const SwarmFolder = struct {
         for (peers) |peer| {
             const conn = bm.connectTo(peer) catch continue;
             defer conn.deinit();
-            const bytes = bm.dht_node.fetchSwarm(conn) catch continue;
+            // A peer with the same content answers with nothing: a quiet
+            // swarm costs a digest per peer per round, not the manifest.
+            const have = blk: {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                break :blk self.manifest.digest();
+            };
+            const bytes = bm.dht_node.fetchSwarm(conn, have) catch continue;
             defer bm.dht_node.allocator.free(bytes);
             reached += 1;
+            if (bytes.len == 0) continue;
             self.mutex.lock();
             defer self.mutex.unlock();
             changed += self.manifest.mergeEncoded(bytes) catch continue;

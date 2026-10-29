@@ -309,6 +309,39 @@ pub const Manifest = struct {
         a: []const u8 = "",
     };
 
+    /// A digest of the content, the same whatever order the entries are in:
+    /// two devices that converged have the same one, so a sync can skip
+    /// sending a manifest that wouldn't change anything.
+    pub fn digest(self: *Manifest) [32]u8 {
+        var out = [_]u8{0} ** 32;
+        for (self.entries.values()) |e| {
+            var h = std.crypto.hash.blake2.Blake2s256.init(.{});
+            var num: [8]u8 = undefined;
+            h.update(e.path);
+            h.update(&.{ @intFromEnum(e.kind), @intFromBool(e.deleted) });
+            h.update(&e.cid);
+            std.mem.writeInt(u64, &num, e.size, .big);
+            h.update(&num);
+            std.mem.writeInt(u64, &num, e.mtime, .big);
+            h.update(&num);
+            for ([_]?Version{e.version} ++ e.history) |maybe| {
+                const v = maybe orelse {
+                    h.update(&.{0});
+                    continue;
+                };
+                std.mem.writeInt(u64, &num, v.clock, .big);
+                h.update(&.{1});
+                h.update(&num);
+                h.update(&v.device);
+            }
+            h.update(e.author);
+            var one: [32]u8 = undefined;
+            h.final(&one);
+            for (&out, one) |*o, b| o.* ^= b;
+        }
+        return out;
+    }
+
     pub fn encode(self: *Manifest, allocator: std.mem.Allocator) ![]u8 {
         if (self.entries.count() > max_entries) return error.ManifestTooLarge;
         var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -617,4 +650,24 @@ test "manifest: prune tombstones after 90 days" {
     try testing.expect(m.get("unknown_del.txt") != null); // mtime == 0 kept
     try testing.expect(m.get("old_del.txt") == null); // pruned!
     try testing.expectEqual(@as(usize, 3), m.entries.count());
+}
+
+test "manifest: the digest ignores order, changes on edits, and agrees once synced" {
+    var a = Manifest.init(testing.allocator);
+    defer a.deinit();
+    var b = Manifest.init(testing.allocator);
+    defer b.deinit();
+    const empty = a.digest();
+    _ = try a.edit("one.txt", .{ .cid = cid1, .size = 10 }, dev_a, "Desk");
+    _ = try a.edit("two.txt", .{ .cid = cid2, .size = 20 }, dev_a, "Desk");
+    try testing.expect(!std.mem.eql(u8, &empty, &a.digest()));
+    // B learns the entries in the other order: same content, same digest.
+    _ = try b.edit("two.txt", .{ .cid = cid2, .size = 20 }, dev_b, "Phone");
+    _ = try syncInto(&b, &a);
+    _ = try syncInto(&a, &b);
+    try testing.expectEqualSlices(u8, &a.digest(), &b.digest());
+    // Any edit changes it.
+    const before = a.digest();
+    _ = try a.edit("one.txt", .{ .cid = cid2, .size = 11 }, dev_a, "Desk");
+    try testing.expect(!std.mem.eql(u8, &before, &a.digest()));
 }

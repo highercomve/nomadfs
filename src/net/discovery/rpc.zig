@@ -58,7 +58,8 @@ pub const MessageType = enum(u8) {
     SHARES = 17,
     /// Ask a device for its swarm folder manifest. Answered with SWARM.
     GET_SWARM = 18,
-    /// Reply to GET_SWARM: the encoded manifest (fs/manifest.zig).
+    /// Reply to GET_SWARM: the encoded manifest (fs/manifest.zig), or nothing
+/// when the asker's digest (`have`) says it has the same content.
     SWARM = 19,
     /// A new swarm key from a trusted device (device/rotation.zig).
     /// Answered with STORE_ACK.
@@ -140,7 +141,8 @@ pub const MessagePayload = union(MessageType) {
     /// which backups it holds for others (fs/backup.zig encodes it; empty
     /// when there's nothing to say).
     SHARES: struct { nickname: []const u8, listing: []const u8, backup: []const u8 = &.{} },
-    GET_SWARM: void,
+    /// `have`: the digest of the asker's manifest (Manifest.digest).
+    GET_SWARM: struct { have: [32]u8 },
     SWARM: struct { manifest: []const u8 },
     ROTATE_KEY: struct { epoch: u64, new_key: [32]u8, signer_key: [32]u8, signature: [64]u8 },
     RELAY_CONNECT: struct { target: id.NodeID },
@@ -281,7 +283,7 @@ pub const Message = struct {
                 try writer.writeInt(u32, try valueLen(p.backup.len), .big);
                 try writer.writeAll(p.backup);
             },
-            .GET_SWARM => {},
+            .GET_SWARM => |p| try writer.writeAll(&p.have),
             .ROTATE_KEY => |p| {
                 try writer.writeInt(u64, p.epoch, .big);
                 try writer.writeAll(&p.new_key);
@@ -397,7 +399,11 @@ pub const Message = struct {
                 errdefer allocator.free(listing);
                 break :blk MessagePayload{ .SHARES = .{ .nickname = nickname, .listing = listing, .backup = try readValueMax(allocator, reader, max_backup_info_len) } };
             },
-            .GET_SWARM => MessagePayload{ .GET_SWARM = {} },
+            .GET_SWARM => blk: {
+                var have: [32]u8 = undefined;
+                try reader.readNoEof(&have);
+                break :blk MessagePayload{ .GET_SWARM = .{ .have = have } };
+            },
             .GET_NODE_INFO => MessagePayload{ .GET_NODE_INFO = {} },
             .POLICY => blk: {
                 var record: [policy_mod.Record.encoded_len]u8 = undefined;

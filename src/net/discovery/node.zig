@@ -101,6 +101,9 @@ pub const Node = struct {
         /// The SHARES `backup` field (fs/backup.zig), caller-owned; null
         /// when the source has none.
         backupFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 = null,
+        /// The swarm manifest's digest (GET_SWARM answers nothing when the
+        /// asker has the same).
+        digestFn: ?*const fn (ctx: *anyopaque) [32]u8 = null,
     };
 
     /// Answers GET_NODE_INFO (node_info.zig): the encoded info,
@@ -670,11 +673,13 @@ pub const Node = struct {
 
     /// Asks `conn`'s peer for its swarm folder manifest (caller-owned,
     /// allocated with the node's allocator; validate by merging it).
-    pub fn fetchSwarm(self: *Node, conn: network.Connection) ![]u8 {
+    /// The peer's swarm manifest, or empty when it is the same as `have`
+    /// (the digest of the asker's).
+    pub fn fetchSwarm(self: *Node, conn: network.Connection, have: [32]u8) ![]u8 {
         const stream = try conn.openStream();
         defer stream.close();
         stream.setTimeout(self.rpc_timeout_ms);
-        const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .GET_SWARM = {} } };
+        const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .GET_SWARM = .{ .have = have } } };
         try msg.send(self.allocator, stream);
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         switch (response.payload) {
@@ -1228,7 +1233,7 @@ pub const Node = struct {
             .STORE => |p| try self.handleStore(stream, p.key, p.value),
             .GET_BLOCK => |p| try self.handleGetBlock(stream, p.cid),
             .GET_SHARES => try self.handleGetShares(stream),
-            .GET_SWARM => try self.handleGetSwarm(stream),
+            .GET_SWARM => |p| try self.handleGetSwarm(stream, p.have),
             .GET_NODE_INFO => try self.handleGetNodeInfo(stream, conn),
             .ROTATE_KEY => |p| try self.handleRotateKey(stream, conn, p.epoch, p.new_key, p.signer_key, p.signature),
             .PUT_BLOCK => |p| try self.handlePutBlock(stream, conn, p.cid, p.data),
@@ -1632,8 +1637,11 @@ pub const Node = struct {
         return true;
     }
 
-    fn handleGetSwarm(self: *Node, stream: network.Stream) !void {
-        const manifest: []u8 = if (self.swarm_source) |source|
+    fn handleGetSwarm(self: *Node, stream: network.Stream, have: [32]u8) !void {
+        const same = if (self.swarm_source) |source| (if (source.digestFn) |f| std.mem.eql(u8, &f(source.ctx), &have) else false) else false;
+        const manifest: []u8 = if (same)
+            try self.allocator.alloc(u8, 0)
+        else if (self.swarm_source) |source|
             try source.listFn(source.ctx, self.allocator)
         else
             try self.allocator.dupe(u8, "[]");
