@@ -3,6 +3,16 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.1.1 - 2026-10-28
+
+### Fixed
+
+- **Android:** a fresh install couldn't start its node or join a swarm. The device identity
+  was saved in a way Android doesn't allow apps, and a failed network accept crashed the app.
+  The desktop app and the command line for ARM had the same accept bug.
+- Invite and pairing codes typed on a phone are accepted when the keyboard capitalizes the
+  first letter.
+
 ## 0.1.0 - 2026-10-28
 
 A fresh start. This release breaks compatibility with every earlier build,
