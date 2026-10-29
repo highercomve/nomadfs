@@ -6,3 +6,4 @@ pub const repair = @import("repair.zig");
 pub const fetcher = @import("fetcher.zig");
 pub const Fetcher = fetcher.Fetcher;
 pub const placement = @import("placement.zig");
+pub const keeper = @import("keeper.zig");

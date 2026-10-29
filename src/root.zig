@@ -694,6 +694,7 @@ test {
         @import("cluster/block_manager.zig"),
         @import("cluster/fetcher.zig"),
         @import("cluster/placement.zig"),
+        @import("cluster/keeper.zig"),
         @import("device/policy.zig"),
         @import("mobile/api.zig"),
         @import("cluster/quorum.zig"),

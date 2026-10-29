@@ -223,6 +223,8 @@ pub const StorageEngine = struct {
         const hex_cid = std.fmt.bytesToHex(cid.*, .lower);
         if (self.rootHasLocked(&hex_cid)) return;
         const stat = self.cache_dir.statFile(io, &hex_cid, .{}) catch return;
+        // Keeping it counts against the quota, like a put.
+        if (self.quota) |limit| if (self.used_bytes > limit or stat.size > limit - self.used_bytes) return error.StorageFull;
         try self.cache_dir.rename(&hex_cid, self.root_dir, &hex_cid, io);
         self.cache_bytes -|= stat.size;
         self.cache_blocks -|= 1;
