@@ -27,7 +27,7 @@ Section 6 tells how this was lost and won back ([4.9](./history.md) has the whol
 | `Holders` | `holders.zig` | Who probably holds what, learned from messages already exchanged. | [4.2](./holders.md) |
 | `placement` + `device.policy` | `placement.zig`, `../device/policy.zig` | Who *should* hold each swarm file: the swarm's signed `copies`, rendezvous hashing over members that accept copies. | [4.3](./placement.md) |
 | `Keeper` | `keeper.zig` | Makes this device hold what it should: copies whole files through the fetcher. | [4.4](./keeper.md) |
-| `BlockManager` | `block_manager.zig` | Owns the fetcher and the holders; dials holders; the mobile C API's `put`/`get`. | below |
+| `BlockManager` | `block_manager.zig` | Owns the fetcher and the holders; dials holders; the mobile C API's `put`/`get`. | below, [4.5](./repair.md) |
 
 ```mermaid
 flowchart TB
@@ -127,8 +127,10 @@ them: `connectKnown` uses a live connection or the routing table's addresses; a 
 yet is looked up through the DHT once, and the fetcher backs off if it can't be reached.
 
 It also keeps the mobile C API's own path (`nomadfs_put_file` / `nomadfs_get_file`): `put`
-stores a file and announces it as a DHT provider record; `get` fetches a whole DAG from the
-providers ([4.5](./repair.md)). The app's text drop no longer uses it: notes are swarm folder files.
+stores a file and announces it as a DHT provider record; `get` copies a whole DAG with the keeper's
+copy, the providers and closest peers as holders ([4.5](./repair.md)). Nothing is pushed: there is
+no message that writes to another device's store. The app's text drop no longer uses it: notes are
+swarm folder files.
 
 ---
 
@@ -137,7 +139,7 @@ providers ([4.5](./repair.md)). The app's text drop no longer uses it: notes are
 *   [4.2: Holders](./holders.md)
 *   [4.3: Placement and the Swarm Policy](./placement.md)
 *   [4.4: The Keeper](./keeper.md)
-*   [4.5: Fetching whole DAGs (`RepairManager`)](./repair.md)
+*   [4.5: The Mobile API's `put` and `get`](./repair.md)
 *   [4.6: The Write Quorum](./quorum.md)
 *   [4.7: The Hash Ring (present, unused)](./ring.md)
 *   [4.8: Vector Clocks (present, unused)](./vectors.md)

@@ -54,7 +54,7 @@ pub const Copied = struct { blocks: usize, bytes: u64 };
 
 /// Blocks fetched at once during one copy.
 pub const copy_workers = 4;
-/// Most blocks one DAG may have (as RepairManager).
+/// Most blocks one DAG may have: a valid DAG from a peer can still be enormous.
 pub const max_blocks = 1 << 20;
 const max_providers = 4;
 /// Most files copied per provider per round.

@@ -93,7 +93,7 @@ test "holders: C reads a shared file from B while A, the sharing device, is down
     // C browses A's share (listing and dir blocks only) and finds the file.
     const a_id = peer_a.manager.node_id;
     const b_id = peer_b.manager.node_id;
-    var remote_a = fs.Remote{ .block_manager = bm_c, .store = &store_c, .peer = a_id };
+    var remote_a = fs.Remote{ .block_manager = bm_c, .peer = a_id };
     const shares = try remote_a.shares(allocator);
     defer shares.deinit(allocator);
     const share = shares.listing.entries[0];
@@ -109,7 +109,7 @@ test "holders: C reads a shared file from B while A, the sharing device, is down
         try dht_b.ping(conn);
     }
     nomadfs.sync.sleep(200 * std.time.ns_per_ms);
-    var remote_b = fs.Remote{ .block_manager = bm_b, .store = &store_b, .peer = a_id };
+    var remote_b = fs.Remote{ .block_manager = bm_b, .peer = a_id };
     {
         const b_loader = remote_b.loader();
         const whole = try fs.tree.readAt(allocator, b_loader, img.cid, 0, content);
@@ -131,7 +131,7 @@ test "holders: C reads a shared file from B while A, the sharing device, is down
     const read: []u8 = try allocator.alloc(u8, content.len);
     defer allocator.free(read);
     try std.testing.expect(!try nomadfs.storage.dag.walk.isComplete(allocator, &store_c, &img.cid));
-    const n = try fs.remote.readShareAt(allocator, bm_c, &store_c, null, a_id, img.cid, 0, read);
+    const n = try fs.remote.readShareAt(allocator, bm_c, null, a_id, img.cid, 0, read);
     try std.testing.expectEqual(content.len, n);
     try std.testing.expectEqualSlices(u8, content, read);
     // B serves every block; C fetched the whole file through the registry.

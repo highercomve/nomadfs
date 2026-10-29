@@ -7,8 +7,6 @@ const network = @import("../transport/mod.zig");
 const relay = network.relay;
 const local_addrs = @import("../local_addrs.zig");
 const lookup_mod = @import("lookup.zig");
-const chunker = @import("../../storage/chunker.zig");
-const codec = @import("../../storage/dag/codec.zig");
 const StorageEngine = @import("../../storage/engine.zig").StorageEngine;
 const providers_mod = @import("providers.zig");
 const device_trust = @import("../../device/trust.zig");
@@ -781,27 +779,6 @@ pub const Node = struct {
         }
     }
 
-    /// Pushes a block to `conn`'s peer. The receiver verifies the bytes
-    /// against the CID before storing; returns whether it kept the block.
-    pub fn putBlock(self: *Node, conn: network.Connection, cid: [32]u8, data: []const u8) !bool {
-        const stream = try conn.openStream();
-        defer stream.close();
-        stream.setTimeout(self.rpc_timeout_ms);
-
-        const msg = rpc.Message{
-            .sender_id = self.manager.node_id,
-            .payload = .{ .PUT_BLOCK = .{ .cid = cid, .data = data } },
-        };
-        try msg.send(self.allocator, stream);
-
-        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
-        defer response.deinit(self.allocator);
-        switch (response.payload) {
-            .STORE_ACK => |ack| return ack.stored,
-            else => return error.InvalidResponse,
-        }
-    }
-
     /// Signs and pushes `device`'s revocation to `conn`'s peer. Fails when
     /// this node has no device identity to sign with.
     pub fn sendRevoke(self: *Node, conn: network.Connection, device_id: id.NodeID) !bool {
@@ -1326,7 +1303,6 @@ pub const Node = struct {
             .GET_SWARM => |p| try self.handleGetSwarm(stream, p.have),
             .GET_NODE_INFO => try self.handleGetNodeInfo(stream, conn),
             .ROTATE_KEY => |p| try self.handleRotateKey(stream, conn, p.epoch, p.new_key, p.signer_key, p.signature),
-            .PUT_BLOCK => |p| try self.handlePutBlock(stream, conn, p.cid, p.data),
             .REVOKE => |p| try self.handleRevoke(stream, p.device_id, p.signer_key, p.at, p.signature),
             .ADMIT => |p| try self.handleAdmit(stream, p),
             .POLICY => |p| try self.handlePolicy(stream, p.record),
@@ -1741,38 +1717,6 @@ pub const Node = struct {
         try response.send(self.allocator, stream);
     }
 
-    /// PUT_BLOCK: verify the bytes against their CID, then keep the block.
-    /// A node with no block storage acknowledges nothing, so the sender does
-    /// not count it as a replica.
-    fn handlePutBlock(self: *Node, stream: network.Stream, conn: network.Connection, cid: [32]u8, data: []const u8) !void {
-        var stored = false;
-        _ = conn;
-        if (canPutBlock(data.len)) if (self.block_store) |block_store| {
-            // put() rejects bytes that do not hash to `cid`.
-            if (block_store.put(.{ .cid = cid, .data = data })) {
-                stored = true;
-            } else |err| {
-                std.debug.print("PUT_BLOCK rejected: {any}\n", .{err});
-            }
-        };
-        const response = rpc.Message{
-            .sender_id = self.manager.node_id,
-            .payload = .{ .STORE_ACK = .{ .stored = stored } },
-        };
-        try response.send(self.allocator, stream);
-    }
-
-    /// Admission to the swarm is the write authorization: under the default
-    /// policy any swarm-key holder may push replicas (learning/security/model.md),
-    /// and under `require_trusted_devices` the handshake already refused untrusted
-    /// devices. What is bounded here is the size: no valid encoded block (a leaf
-    /// is a chunk plus its tag byte, a dir block is capped by the codec) is larger.
-    /// The CID check, the handler cap and the storage quota bound the rest.
-    fn canPutBlock(len: usize) bool {
-        return len <= max_put_block_len;
-    }
-
-    const max_put_block_len = @max((chunker.Params{}).max_size + 1, codec.max_dir_block_len);
 
     /// REVOKE: only honored when the signature verifies, the signer is not
     /// the revoked device, and the signer's Ed25519 identity is in this
@@ -1917,12 +1861,6 @@ test "handler admission is capped and drain permanently stops admission" {
     try std.testing.expect(!node.startHandler());
 }
 
-test "PUT_BLOCK accepts any valid encoded block size and nothing larger" {
-    try std.testing.expect(Node.canPutBlock(1));
-    try std.testing.expect(Node.canPutBlock((chunker.Params{}).max_size + 1));
-    try std.testing.expect(Node.canPutBlock(codec.max_dir_block_len));
-    try std.testing.expect(!Node.canPutBlock(Node.max_put_block_len + 1));
-}
 
 test "recent peer maps prune expired deadlines" {
     var map: std.AutoHashMapUnmanaged(id.NodeID, i64) = .empty;

@@ -4,7 +4,7 @@
 //!
 //! - It asks each member which shares it wants kept (the SHARES `backup`
 //!   field), copies every block of a share whose root changed, and keeps
-//!   them (`RepairManager.syncWhile` stores into the kept area).
+//!   them (the keeper, cluster/keeper.zig, stores into the kept area).
 //! - It merges each new version into its own tree of that share: files and
 //!   folders deleted at the source stay, so a phone can free space without
 //!   losing a photo. The newest version of a file wins.
@@ -392,7 +392,7 @@ pub const FolderBackup = struct {
     }
 
     fn backUpPeer(self: *FolderBackup, peer: @import("../net/id.zig").NodeID) !usize {
-        var remote = remote_mod.Remote{ .block_manager = self.block_manager, .store = self.store, .peer = peer };
+        var remote = remote_mod.Remote{ .block_manager = self.block_manager, .peer = peer };
         var listed = try remote.shares(self.allocator);
         defer listed.deinit(self.allocator);
         // Only the swarm's members are backed up.

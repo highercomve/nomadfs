@@ -250,7 +250,7 @@ fn createConfig(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, path: []con
     try text.writer.print("\n[node]\nnickname = \"{s}\"\nswarm_key = \"{s}\"\nkey_path = \"{s}\"\n" ++
         "\n[storage]\nenabled = true\nstorage_path = \"{s}\"\n" ++
         "\n[network]\nport = 14700\ntransport = \"tcp\"\nupnp_enabled = false\n" ++
-        "enable_mdns = false\nwrite_quorum = 0\nreplicas = 1\n" ++
+        "enable_mdns = false\nwrite_quorum = 0\n" ++
         // Phones keep only their own files unless the user says otherwise.
         (if (builtin.abi.isAndroid()) "accept_copies = false\n" else ""), .{ defaultNickname(&nick_buf), swarm_key, keys_path, storage_path_abs });
     try writeConfigAtomic(gpa, io, path, text.written());
@@ -769,7 +769,7 @@ pub fn backupStatus(gpa: std.mem.Allocator) ![]BackupStatus {
     var copies = try gpa.alloc(std.ArrayList(BackupCopy), marked.items.len);
     for (copies) |*c| c.* = .empty;
     for (peers) |peer| {
-        var remote = fs.Remote{ .block_manager = bm, .store = store, .peer = peer };
+        var remote = fs.Remote{ .block_manager = bm, .peer = peer };
         const listed = remote.shares(gpa) catch continue;
         var info = fs.backup.decodeInfo(gpa, listed.backup) catch continue;
         defer info.deinit();
@@ -824,7 +824,7 @@ pub fn remoteDevices(gpa: std.mem.Allocator) ![]RemoteDevice {
     g_mutex.lock();
     defer g_mutex.unlock();
     const handle = g_node orelse return error.NotRunning;
-    const store = handle.node.store orelse return error.StorageDisabled;
+    if (handle.node.store == null) return error.StorageDisabled;
     const bm = handle.node.block_manager;
 
     const peers = try fs.remote.knownPeers(bm, gpa);
@@ -857,7 +857,7 @@ pub fn remoteDevices(gpa: std.mem.Allocator) ![]RemoteDevice {
     const trust_store = handle.node.trust_store;
 
     for (peers) |peer| {
-        var remote = fs.Remote{ .block_manager = bm, .store = store, .peer = peer };
+        var remote = fs.Remote{ .block_manager = bm, .peer = peer };
         const shares = remote.shares(gpa) catch |err| {
             std.debug.print("remote_devices: {x} unavailable: {any}\n", .{ peer.bytes[0..4], err });
             continue;
@@ -990,7 +990,7 @@ pub fn download(gpa: std.mem.Allocator, args: DownloadArgs) !DownloadResult {
     while (true) {
         // Likely holders, per chunk with the registry as current as shares
         // heard since the download started.
-        const n = try nomadfs.fs.remote.readShareAt(gpa, remote.block_manager, remote.store, g_node.?.node.read_ahead, remote.peer, cid, offset, chunk);
+        const n = try nomadfs.fs.remote.readShareAt(gpa, remote.block_manager.?, g_node.?.node.read_ahead, remote.peer, cid, offset, chunk);
         if (n == 0) break;
         try file.writePositionalAll(io, chunk[0..n], offset);
         offset += n;
@@ -1001,8 +1001,8 @@ pub fn download(gpa: std.mem.Allocator, args: DownloadArgs) !DownloadResult {
 /// Caller holds g_mutex.
 fn remoteFor(peer_hex: []const u8) !fs.Remote {
     const handle = g_node orelse return error.NotRunning;
-    const store = handle.node.store orelse return error.StorageDisabled;
-    return .{ .block_manager = handle.node.block_manager, .store = store, .peer = .{ .bytes = try parseHex32(peer_hex) } };
+    if (handle.node.store == null) return error.StorageDisabled;
+    return .{ .block_manager = handle.node.block_manager, .peer = .{ .bytes = try parseHex32(peer_hex) } };
 }
 
 fn parseHex32(text: []const u8) ![32]u8 {
@@ -1062,8 +1062,7 @@ pub fn readRange(gpa: std.mem.Allocator, args: ReadRangeArgs) ![]const u8 {
     defer gpa.free(buf);
     const n = try nomadfs.fs.remote.readShareAt(
         gpa,
-        remote.block_manager,
-        remote.store,
+        remote.block_manager.?,
         g_node.?.node.read_ahead,
         remote.peer,
         cid,
@@ -1329,19 +1328,18 @@ pub fn fileDetails(gpa: std.mem.Allocator, args: FileDetailsArgs) !FileDetails {
     const store = handle.node.store orelse return error.StorageDisabled;
     const bm = handle.node.block_manager;
 
-    var remote: fs.Remote = undefined;
-    var multi: fs.remote.MultiRemote = undefined;
+    // Its likely holders: a share's device, or a swarm file's author and
+    // the rest; the fetcher picks per block.
     var peers: std.ArrayList(nomadfs.net.id.NodeID) = .empty;
-    const loader = if (args.peer) |p| blk: {
-        remote = .{ .block_manager = bm, .store = store, .peer = .{ .bytes = try parseHex32(p) }, .root = root };
-        break :blk remote.loader();
-    } else blk: {
+    if (args.peer) |p| {
+        try peers.append(gpa, .{ .bytes = try parseHex32(p) });
+    } else {
         if (args.author_id) |a| if (a.len == 64) try peers.append(gpa, .{ .bytes = try parseHex32(a) });
         const known = fs.remote.knownPeers(bm, gpa) catch &.{};
         for (known) |k| try peers.append(gpa, k);
-        multi = .{ .block_manager = bm, .store = store, .peers = peers.items, .root = root };
-        break :blk multi.loader();
-    };
+    }
+    var source = fs.remote.Source{ .block_manager = bm, .root = root, .holders = peers.items };
+    const loader = source.loader();
 
     const info = try fs.inspect.inspect(gpa, loader, root);
     var d: FileDetails = .{

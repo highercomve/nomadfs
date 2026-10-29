@@ -32,7 +32,7 @@ the clear. There is no client-side or end-to-end encryption of blocks.
 | :--- | :--- | :--- |
 | Network observer | See that two IPs talk TCP; see the LAN announcement (`NMFS{"id":…,"port":…}`, UDP 5354) | Read or alter session traffic |
 | Device without the swarm key | Complete message 1-2 of a handshake and learn the listener's static key and device hello | Finish the handshake; send any request |
-| Holder of the swarm key (default policy) | Connect, browse every share, read every block it asks for, read and write the swarm folder, join the DHT, push replicas up to `max_put_block_len` | Impersonate a *paired* device (its transport key is pinned; it can claim any nickname, so the app and the mount mark unpaired devices as such and never name them like a paired device), forge blocks (CIDs are checked) |
+| Holder of the swarm key (default policy) | Connect, browse every share, read every block it asks for, read and write the swarm folder, join the DHT (it can't write to another device's store: devices only keep blocks they asked for) | Impersonate a *paired* device (its transport key is pinned; it can claim any nickname, so the app and the mount mark unpaired devices as such and never name them like a paired device), forge blocks (CIDs are checked) |
 | Holder of the swarm key, `require_trusted_devices = true` on the peer | Nothing on that peer unless its device ID is in the peer's trust store | - |
 | Paired, trusted device | Everything above, plus have its `REVOKE` and `ROTATE_KEY` messages honoured | Revoke itself; replay an old rotation (epoch check) |
 
@@ -50,7 +50,7 @@ tombstone in the local trust store is rejected with `UntrustedDevice`.
 | :--- | :--- | :--- |
 | Eavesdropping | ChaCha20-Poly1305 on every Noise frame (`src/net/transport/noise.zig`) | Implemented |
 | Man-in-the-middle | `Noise_XXpsk3`: both static keys authenticated, swarm key mixed in | Implemented |
-| Tampered or forged blocks | SHA-256 CID checked on `put`, `get`, `PUT_BLOCK` and remote loads | Implemented |
+| Tampered or forged blocks | SHA-256 CID checked on `put`, `get` and every fetched block | Implemented |
 | Unknown device with the swarm key | Signed device hello; `require_trusted_devices` rejects unknown IDs | Implemented, strict policy opt-in |
 | Stolen `node.key` posing as a paired device | Trust store pins the X25519 key; `TransportKeyMismatch` | Implemented |
 | Leaked swarm key | Live rotation to paired devices (`ROTATE_KEY`, [7.3](./invites.md#2-swarm-key-rotation)) | Implemented (GUI-triggered) |

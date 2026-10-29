@@ -1,55 +1,49 @@
-# Chapter 4.5: Fetching Whole DAGs (`RepairManager`)
+# Chapter 4.5: The Mobile API's `put` and `get`
 
-`src/cluster/repair.zig` holds `RepairManager`, which copies a whole Merkle DAG between two devices over one connection. Despite the name it is not a background anti-entropy process: it runs only when something asks for a specific root CID.
+The C ABI (`nomadfs_put_file` / `nomadfs_get_file`, [Mobile API](../mobile/api.md)) works with whole
+files by root CID, outside any folder. It is the last user of DHT **provider records**; everything
+else finds holders through the holder registry and placement ([4.2](./holders.md), [4.3](./placement.md)).
 
-## 1. `sync`: Pull a DAG
-
-```zig
-pub fn sync(allocator, node: *dht.Node, store: *StorageEngine,
-            peer: network.Connection, root_cid: []const u8) !usize
-pub fn syncWhile(..., keep_going: ?*const std.atomic.Value(bool)) !usize
-```
-
-A depth-first walk from the root:
-
-1.  Pop a CID from the stack; skip it if already visited.
-2.  `loadOrFetch`: if the local store has the block, use it; otherwise send `GET_BLOCK` on the connection (`dht.Node.fetchBlock`) and store the reply with `StorageEngine.put`, which **rejects bytes that don't hash to the CID**.
-3.  Decode it (`codec.decode`). For a parent or dir block, push its children (`walk.pushChildren`); leaves end the branch.
-
-```text
-root ─ have it  → read locally, push children
-  ├─ child A ─ missing → GET_BLOCK, verify, store, push its children
-  └─ child B ─ have it → read locally, push children
-```
-
-Blocks already held are not fetched again, but their children are still checked, so a DAG that was only partly present gets completed. Returns how many blocks were fetched.
-
-Bounds: at most `max_blocks` = 2²⁰ distinct blocks per sync (and `blockBudget(max_bytes)` during file walks, returning `error.DagTooLarge`), because a valid DAG from a peer can still be enormous. `syncWhile` checks `keep_going` between blocks and returns `error.Cancelled` once it turns false.
-
-## 2. `push`: Send a DAG
+## 1. `put`: store and announce
 
 ```zig
-pub fn push(allocator, node, store, peer, root_cid) !usize
+pub fn put(self: *BlockManager, reader: anytype) ![]const u8 // root CID
 ```
 
-Collects every CID under the root (`walk.collectReachable`, which fails if the local DAG is incomplete, so partial content is never replicated) and sends each block with `PUT_BLOCK`.
+1. A `DagBuilder` (`.Balanced`) chunks the stream into the local store (kept).
+2. `announce(root)` sends `ADD_PROVIDER` to the K = 20 closest peers; with `write_quorum = W > 0`,
+   fewer than `W` acknowledgements return `error.QuorumNotReached` (the blocks stay; `put` again
+   retries) ([4.6](./quorum.md)). `W = 0` skips it.
 
-Pushed replicas do not require the receiving device to have a trusted-device pairing entry: admission to the swarm (the Noise handshake) is the write authorization. The receiver bounds each pushed block to `max_put_block_len` (`@max((chunker.Params{}).max_size + 1, codec.max_dir_block_len)`), checks the SHA-256 hash against the CID, and verifies that the block does not exceed `quota_mb` (`error.StorageFull`), answering with `STORE_ACK`. Used by `BlockManager.replicate`.
+Nothing is pushed. An earlier version pushed the whole DAG to the closest peers with `PUT_BLOCK`
+(`[storage] replicas`); it was removed with the message: a device stores only blocks it asked for,
+and the devices that keep files pull them (the keeper, [4.4](./keeper.md)).
 
-## 3. Who Calls It
+## 2. `get`: copy what's missing, then write
 
-| Caller | Function | When |
-| :--- | :--- | :--- |
-| `BlockManager.fetch` | `sync` | `get` of a DAG that isn't complete locally ([Chapter 4](./overview.md)) |
-| `BlockManager.replicate` | `push` | `put` with `replicas > 0` |
+```zig
+pub fn get(self: *BlockManager, root: []const u8, writer: anytype, options: walk.ReadOptions) !u64
+```
 
-Only the mobile C API's `put`/`get` use it now. Every other read and copy goes through the fetcher
-and the keeper ([4.1](./fetcher.md), [4.4](./keeper.md)), which pick a holder per block instead of
-pulling a whole DAG over one connection, and skip held file data without reading it.
+1. If the DAG isn't complete locally, `fetch(root)` names the holders: the nodes in provider records
+   (`findProviders`), then the peers the DHT holds closest to the CID, at most eight; with none,
+   `error.NoProvider`.
+2. It copies the DAG with the keeper's `copy` ([4.4](./keeper.md)): four blocks at a time, the
+   fetcher picking the best holder per block, each block verified and kept, held file data skipped.
+3. `walk.readFile` writes the file; `options.max_bytes` caps it (`error.FileTooLarge`), and a DAG
+   past 2²⁰ blocks is refused (`error.DagTooLarge`), since a small DAG from a peer can describe an
+   enormous file.
 
-## 4. Not Implemented Yet
+## 3. What was here before
 
-The earlier design described here, a Merkle tree over each node's set of stored CIDs, root-hash comparison with neighbours, `WANT` lists, an hourly random-neighbour comparison and reactive repair with hash-ring neighbours, does **not** exist. Repair today is placement-driven: when membership or `copies` changes, the devices that now win a file copy it ([4.4](./keeper.md)). Nothing compares the contents of two block stores. `DiffService` (`src/storage/dag/diff.zig`) computes the blocks one version of a file adds over another, but only its tests call it ([Chapter 3.2](../storage/dag.md)).
+This chapter used to describe `RepairManager` (`src/cluster/repair.zig`): a DAG copy from **one**
+device over one connection (`sync`), and a push of a whole DAG to one device (`push`). Swarm backup,
+folder backup and `get` used `sync`; put-time replication used `push`. The keeper replaced the first
+(every holder at once, held data not re-read) and the push went away, so the file was removed.
+
+The anti-entropy of the first design (Merkle trees of stored CIDs compared between neighbours) was
+never built. Repair today is placement-driven: when membership or `copies` changes, the devices
+that now win a file copy it ([4.4](./keeper.md)).
 
 ---
 

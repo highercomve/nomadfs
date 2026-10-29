@@ -15,7 +15,7 @@ pub fn isWriteSatisfied(config: QuorumConfig, successful_writes: u8) bool;
 pub fn isReadSatisfied(config: QuorumConfig, successful_reads: u8) bool; // never called
 ```
 
-`src/root.zig` builds the `BlockManager` with `.quorum = .{ .W = cfg.storage.write_quorum }` and `.replication = cfg.storage.replicas`. `N` and `R` keep their defaults and nothing reads them.
+`src/root.zig` builds the `BlockManager` with `.quorum = .{ .W = cfg.storage.write_quorum }`. `N` and `R` keep their defaults and nothing reads them.
 
 ## 2. What `W` Counts
 
@@ -32,11 +32,11 @@ The app writes `write_quorum = 0` into the configuration it generates (`nomadfs-
 
 ## 3. What Plays the Role of `N`
 
-The number of copies is `replicas` (`[storage] replicas`, default **0**, capped at `config.max_replicas` = 20), passed to `BlockManager` as `replication`. With `replicas > 0`, `put` pushes the DAG to that many of the Kademlia-closest peers to the root CID, synchronously, and only logs failures ([Chapter 4](./overview.md)). The app's generated configuration sets `replicas = 1`.
+The number of copies is the swarm's signed `copies` setting, applied to swarm folder files by placement and the keeper ([4.3](./placement.md), [4.4](./keeper.md)). Nothing is pushed at `put` any more: the devices that keep a file pull it. (An earlier `[storage] replicas` pushed each new DAG to the closest peers; it was removed with `PUT_BLOCK`.)
 
 ## 4. Reads
 
-There is no read quorum. `BlockManager.get` reads locally when the DAG is complete, otherwise copies it from the **first** source that can serve the whole DAG ([Chapter 4.1](./repair.md)). Every block is verified against its CID, so one source is enough: a wrong block can't pass as a right one.
+There is no read quorum. `BlockManager.get` reads locally when the DAG is complete, otherwise copies it with the keeper's copy from every holder it can name, the fetcher picking per block ([4.5](./repair.md)). Every block is verified against its CID, so one source is enough: a wrong block can't pass as a right one.
 
 ## 5. Availability during Partitions
 

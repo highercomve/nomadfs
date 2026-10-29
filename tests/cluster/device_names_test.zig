@@ -125,7 +125,7 @@ test "device names: loopback peer shares returns authenticated device_id and ass
     defer bm_b.deinit();
 
     // 9. Remote.shares returns authenticated device_id
-    var remote_a = fs.Remote{ .block_manager = bm_b, .store = &store_b, .peer = peer_a.manager.node_id };
+    var remote_a = fs.Remote{ .block_manager = bm_b, .peer = peer_a.manager.node_id };
     const shares_a = try remote_a.shares(allocator);
     defer shares_a.deinit(allocator);
 
@@ -133,7 +133,7 @@ test "device names: loopback peer shares returns authenticated device_id and ass
     try std.testing.expect(shares_a.device_id != null);
     try std.testing.expect(shares_a.device_id.?.eql(expected_a_did));
 
-    var remote_c = fs.Remote{ .block_manager = bm_b, .store = &store_b, .peer = peer_c.manager.node_id };
+    var remote_c = fs.Remote{ .block_manager = bm_b, .peer = peer_c.manager.node_id };
     const shares_c = try remote_c.shares(allocator);
     defer shares_c.deinit(allocator);
 
@@ -209,7 +209,7 @@ test "device names: mount readdir lists Swarm and avoids reserved name collision
 
     // Add three fake devices directly
     const dev_a = try allocator.create(fuse.Remote);
-    dev_a.* = .{ .block_manager = undefined, .store = &store, .peer = NodeID{ .bytes = [_]u8{0xaa} ** 32 } };
+    dev_a.* = .{ .block_manager = null, .peer = NodeID{ .bytes = [_]u8{0xaa} ** 32 } };
     try mount.devices.append(allocator, .{
         .name = try allocator.dupe(u8, "Alpha"),
         .remote = dev_a,
@@ -218,7 +218,7 @@ test "device names: mount readdir lists Swarm and avoids reserved name collision
     });
 
     const dev_c = try allocator.create(fuse.Remote);
-    dev_c.* = .{ .block_manager = undefined, .store = &store, .peer = NodeID{ .bytes = [_]u8{0xcc} ** 32 } };
+    dev_c.* = .{ .block_manager = null, .peer = NodeID{ .bytes = [_]u8{0xcc} ** 32 } };
     try mount.devices.append(allocator, .{
         .name = try allocator.dupe(u8, "Alpha-cccccccc"),
         .remote = dev_c,
@@ -228,7 +228,7 @@ test "device names: mount readdir lists Swarm and avoids reserved name collision
 
     // Device D claims "Swarm" but gets suffixed
     const dev_d = try allocator.create(fuse.Remote);
-    dev_d.* = .{ .block_manager = undefined, .store = &store, .peer = NodeID{ .bytes = [_]u8{0xdd} ** 32 } };
+    dev_d.* = .{ .block_manager = null, .peer = NodeID{ .bytes = [_]u8{0xdd} ** 32 } };
     try mount.devices.append(allocator, .{
         .name = try allocator.dupe(u8, "Swarm-dddddddd"),
         .remote = dev_d,

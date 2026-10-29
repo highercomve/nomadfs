@@ -70,12 +70,11 @@ test "fuse mt: stalled network op does not block other ops" {
 
     // Create a fake device with a remote file inode (mount.deinit owns remote_peer)
     const remote_peer = try allocator.create(fuse.Remote);
+    // No block manager: reads of this device fail at once (error.PeerDown).
     remote_peer.* = .{
-        .block_manager = undefined,
-        .store = &store,
+        .block_manager = null,
         .peer = NodeID{ .bytes = [_]u8{0x22} ** 32 },
     };
-    fs.remote.health.markDown(remote_peer.peer);
     try mount.devices.append(allocator, .{
         .name = try allocator.dupe(u8, "RemoteDev"),
         .remote = remote_peer,
@@ -216,11 +215,9 @@ test "fuse mt: out-of-order replies match by unique" {
 
     const remote_peer = try allocator.create(fuse.Remote);
     remote_peer.* = .{
-        .block_manager = undefined,
-        .store = &store,
+        .block_manager = null,
         .peer = NodeID{ .bytes = [_]u8{0x44} ** 32 },
     };
-    fs.remote.health.markDown(remote_peer.peer);
     try mount.devices.append(allocator, .{
         .name = try allocator.dupe(u8, "RemoteDev"),
         .remote = remote_peer,
@@ -342,11 +339,9 @@ test "fuse mt: pool growth up to worker_max" {
 
     const remote_peer = try allocator.create(fuse.Remote);
     remote_peer.* = .{
-        .block_manager = undefined,
-        .store = &store,
+        .block_manager = null,
         .peer = NodeID{ .bytes = [_]u8{0x66} ** 32 },
     };
-    fs.remote.health.markDown(remote_peer.peer);
     try mount.devices.append(allocator, .{
         .name = try allocator.dupe(u8, "RemoteDev"),
         .remote = remote_peer,
@@ -544,19 +539,4 @@ test "fuse mt: atomic writer check (16 concurrent writers)" {
 
     try std.testing.expectEqual(@as(u32, 1), opener.succeeded.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 15), opener.busy.load(.monotonic));
-}
-
-test "fuse mt: peer health gate immediate failure" {
-    fs.remote.health.reset();
-    const dead_peer = NodeID{ .bytes = [_]u8{0x88} ** 32 };
-    fs.remote.health.markDown(dead_peer);
-
-    try std.testing.expect(fs.remote.health.isDown(dead_peer));
-
-    const start = sync.monotonicMillis();
-    const is_down = fs.remote.health.isDown(dead_peer);
-    const elapsed = sync.monotonicMillis() - start;
-
-    try std.testing.expect(is_down);
-    try std.testing.expect(elapsed < 50); // fast rejection
 }

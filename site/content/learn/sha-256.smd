@@ -49,7 +49,7 @@ The name doubles as a checksum. When a device asks a peer for block `X`
 
 The same check runs at other points: a block read from the local store is
 re-hashed, so corruption on disk shows up as an error, not as wrong data.
-Blocks pushed by a peer (`PUT_BLOCK`) are checked before they are stored.
+Every block fetched from another device is checked before it is kept.
 Shared files are re-hashed as they are read from the original file (see the
 [filestore]($link.page('learn/merkle-dag').ref('filestore'))). A file that
 changed since its last scan reads as missing until the next scan.

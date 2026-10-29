@@ -45,9 +45,7 @@ pub const MessageType = enum(u8) {
     GET_PROVIDERS = 12,
     /// Reply to GET_PROVIDERS.
     PROVIDERS = 13,
-    /// Push a content-addressed block; the receiver verifies it against the
-    /// CID before storing. Answered with STORE_ACK.
-    PUT_BLOCK = 14,
+    // 14 was PUT_BLOCK (push replication, removed: holders pull).
     /// Tell a peer that a device was revoked, signed by the revoking
     /// device's Ed25519 identity. Answered with STORE_ACK.
     REVOKE = 15,
@@ -137,7 +135,6 @@ pub const MessagePayload = union(MessageType) {
     ADD_PROVIDER: struct { key: id.NodeID },
     GET_PROVIDERS: struct { key: id.NodeID },
     PROVIDERS: struct { providers: []const id.NodeID },
-    PUT_BLOCK: struct { cid: [32]u8, data: []const u8 },
     REVOKE: struct {
         /// The revoked device's NodeID (hash of its Ed25519 public key).
         device_id: id.NodeID,
@@ -278,11 +275,6 @@ pub const Message = struct {
                 try writer.writeInt(u32, try valueLen(data.len), .big);
                 try writer.writeAll(data);
             },
-            .PUT_BLOCK => |p| {
-                try writer.writeAll(&p.cid);
-                try writer.writeInt(u32, try valueLen(p.data.len), .big);
-                try writer.writeAll(p.data);
-            },
             .REVOKE => |p| {
                 try writer.writeAll(&p.device_id.bytes);
                 try writer.writeAll(&p.signer_key);
@@ -390,11 +382,6 @@ pub const Message = struct {
             .BLOCK => MessagePayload{ .BLOCK = .{
                 .data = if (try readBool(reader)) try readValue(allocator, reader) else null,
             } },
-            .PUT_BLOCK => blk: {
-                var cid: [32]u8 = undefined;
-                try reader.readNoEof(&cid);
-                break :blk MessagePayload{ .PUT_BLOCK = .{ .cid = cid, .data = try readValue(allocator, reader) } };
-            },
             .REVOKE => blk: {
                 var device: id.NodeID = undefined;
                 try reader.readNoEof(&device.bytes);
@@ -566,7 +553,6 @@ pub const Message = struct {
             },
             .STORE => |p| allocator.free(p.value),
             .BLOCK => |p| if (p.data) |d| allocator.free(d),
-            .PUT_BLOCK => |p| allocator.free(p.data),
             .PROVIDERS => |p| allocator.free(p.providers),
             .SHARES => |p| {
                 allocator.free(p.nickname);
@@ -709,7 +695,6 @@ test "rpc: block exchange and store ack round trip" {
         .{ .sender_id = sender, .payload = .{ .GET_BLOCK = .{ .cid = [_]u8{9} ** 32 } } },
         .{ .sender_id = sender, .payload = .{ .BLOCK = .{ .data = "block bytes" } } },
         .{ .sender_id = sender, .payload = .{ .BLOCK = .{ .data = null } } },
-        .{ .sender_id = sender, .payload = .{ .PUT_BLOCK = .{ .cid = [_]u8{7} ** 32, .data = "block bytes" } } },
         .{ .sender_id = sender, .payload = .{ .REVOKE = .{ .device_id = sender, .signer_key = [_]u8{8} ** 32, .signature = [_]u8{9} ** 64, .at = 42 } } },
         .{ .sender_id = sender, .payload = .{ .PROVIDERS = .{ .providers = &.{ sender, sender } } } },
     };
@@ -730,11 +715,6 @@ test "rpc: block exchange and store ack round trip" {
     const missing = try Message.deserialize(allocator, buf.reader());
     defer missing.deinit(allocator);
     try std.testing.expect(missing.payload.BLOCK.data == null);
-
-    const pushed = try Message.deserialize(allocator, buf.reader());
-    defer pushed.deinit(allocator);
-    try std.testing.expectEqual([_]u8{7} ** 32, pushed.payload.PUT_BLOCK.cid);
-    try std.testing.expectEqualStrings("block bytes", pushed.payload.PUT_BLOCK.data);
 
     const revoke = try Message.deserialize(allocator, buf.reader());
     defer revoke.deinit(allocator);

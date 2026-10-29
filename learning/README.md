@@ -99,7 +99,7 @@ no TLS or crypto libraries. The app adds Oriel.
     *   [4.2: Holders](./cluster/holders.md)
     *   [4.3: Placement and the Swarm Policy](./cluster/placement.md)
     *   [4.4: The Keeper](./cluster/keeper.md)
-    *   [4.5: Fetching Whole DAGs (`RepairManager`)](./cluster/repair.md)
+    *   [4.5: The Mobile API's `put` and `get`](./cluster/repair.md)
     *   [4.6: The Write Quorum](./cluster/quorum.md)
     *   [4.7: The Hash Ring (present, unused)](./cluster/ring.md)
     *   [4.8: Vector Clocks (present, unused) and what the swarm folder uses](./cluster/vectors.md)

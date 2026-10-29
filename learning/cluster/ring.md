@@ -26,7 +26,7 @@ There is no preference list, no removal of nodes and no hand-over on churn.
 
 ## 3. Where Placement Actually Happens
 
-When `BlockManager` replicates a new file (`replicas > 0`) or looks for copies of one, it uses the **Kademlia XOR distance** of the DHT: the K closest peers to the root CID (`dht.Node.closestFor`). See [Chapter 4](./overview.md) and [Kademlia lookups](../net/discovery/lookup.md). Shares and the swarm folder don't place data at all: a file's blocks stay on the device that owns or added it, plus whoever has read it and any swarm backup device.
+The mobile API's `BlockManager.get`, looking for copies of a file without provider records, asks the **Kademlia-closest** peers to its root CID (`dht.Node.closestFor`) as extra holders. Placement of swarm files is by role and policy ([4.3](./placement.md)); shares stay on their device, plus backup devices and whoever has read them.
 
 ## 4. Not Implemented Yet
 

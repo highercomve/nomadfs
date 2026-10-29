@@ -129,7 +129,7 @@ transport = "tcp"
 upnp_enabled = false
 enable_mdns = false
 write_quorum = 0
-replicas = 1
+accept_copies = false   # phones only
 ```
 
 `write_quorum = 0` keeps `nomadfs_put_file` (Text drop) from failing when no peer is there to

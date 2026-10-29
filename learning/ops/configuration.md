@@ -75,10 +75,10 @@ The format looks like TOML but the parser is much simpler:
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `storage_path` | path | **required** | Block store directory (one file per block). The swarm manifest is `<storage_path>.swarm.json`, the backup record `<storage_path>.swarm.json.backup`, the FUSE staging dir `<storage_path>.swarm.json.staging/`. |
-| `quota_mb` | u64 | `0` | Capacity limit, in MiB, for the blocks this device keeps (its own writes, backups, replicas). `0` = unlimited. When reached, `put` fails with `StorageFull`. |
+| `quota_mb` | u64 | `0` | Capacity limit, in MiB, for the blocks this device keeps (its own writes, backups, copies it keeps for others). `0` = unlimited. When reached, `put` and the keeper's pinning fail with `StorageFull`. |
 | `cache_mb` | u64 | `2048` | Limit, in MiB, of the read cache: blocks fetched from other devices only to be read. Past it the least recently read are deleted. `0` = no limit. See [the read cache](../storage/engine.md#the-read-cache). |
 | `enabled` | bool | `true` | Without storage there are no shares, no swarm folder, no mount (`--mount` refuses) and `BlockManager.put`/`get` fail with `StorageDisabled`. The node still joins the DHT and answers RPCs. |
-| `replicas` | u8, ≤ 20 | `0` | Peers closest to a new file's root CID that `BlockManager.put` pushes the whole DAG to (`PUT_BLOCK`). Above 20 is `ReplicasOutOfRange`. Shares and the swarm folder don't use `put`. |
+| `accept_copies` | bool | `true` | Keep copies of other devices' swarm folder files when placement gives this device some (the swarm's `copies`). The app writes `false` on phones. Signed into the swarm's policy at start ([4.3](../cluster/placement.md)). |
 | `write_quorum` | u8 | `1` | Provider-record acknowledgements (`ADD_PROVIDER`) `BlockManager.put` needs. `0` skips the announcement, so a device with no peers can store. With `1` and no peers, `put` returns `QuorumNotReached` (blocks stay local). |
 | `swarm_backup` | bool | `false` | Copy every swarm folder file into this device's store ([The Swarm Folder](../fs/swarm.md)). Same as `--swarm-backup`. |
 | `share` | `"Name:/path"` | none | A shared folder; repeatable. Split at the first `:`. Same as `--share`. |
@@ -106,7 +106,7 @@ Booleans are `true` only when the value is exactly `true`.
 The desktop and Android app create their own config on first start
 (`nomadfs-gui/src/commands.zig`) with a random swarm key, `key_path` inside
 the app's data directory, `port = 14700`, `upnp_enabled = false`,
-`enable_mdns = false`, `write_quorum = 0` and `replicas = 1`. It then edits
+`enable_mdns = false`, `write_quorum = 0`, and on phones `accept_copies = false`. It then edits
 that file line by line (nickname, shares, swarm key after a join or
 rotation, bootstrap peers), keeping comments and other settings.
 

@@ -59,4 +59,4 @@ copies them. A holder that is only offline is not replaced, to avoid churn when 
 
 ---
 
-**Next:** [Chapter 4.5: Fetching whole DAGs (`RepairManager`)](./repair.md)
+**Next:** [Chapter 4.5: The Mobile API's `put` and `get`](./repair.md)

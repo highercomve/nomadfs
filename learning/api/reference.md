@@ -141,15 +141,13 @@ pub fn put(self, reader: anytype) ![]const u8;                 // root CID, call
 pub fn get(self, root: []const u8, writer: anytype, options: walk.ReadOptions) !u64;
 pub fn fetch(self, root: []const u8) !void;                    // copy missing blocks only
 pub fn announce(self, root: []const u8) !void;                 // ADD_PROVIDER to closest peers
-pub fn replicate(self, root: []const u8, fanout: usize) !usize; // PUT_BLOCK the DAG
 pub fn connectTo(self, peer_id: NodeID) !network.Connection;   // routing table, else lookup
 ```
 
 - `put` builds the DAG into the local store, then `announce` (skipped when
   `write_quorum = 0`; with no acknowledgements it returns
-  `error.QuorumNotReached`, blocks stay local, calling `put` again retries),
-  then, if `replicas > 0`, `replicate` synchronously to the Kademlia-closest
-  peers of the root CID. Replication failures never fail a `put`.
+  `error.QuorumNotReached`, blocks stay local, calling `put` again retries).
+  Nothing is pushed: devices that keep files pull them (the keeper).
 - `get` returns `error.StorageDisabled` without a store; otherwise fetches
   missing blocks (`fetch`: provider records first, then the closest peers),
   then writes the file. Fetch errors include `NoProvider`, `BlockNotFound`,
@@ -216,7 +214,7 @@ See [Chapter 6](../security/model.md).
 
 | Error | From |
 | :--- | :--- |
-| `MissingRequiredField`, `InvalidSwarmKey`, `UnsupportedTransport`, `ReplicasOutOfRange` | `config` |
+| `MissingRequiredField`, `InvalidSwarmKey`, `UnsupportedTransport` | `config` |
 | `StorageDisabled`, `QuorumNotReached`, `NoProvider`, `ProviderUnreachable` | `BlockManager` |
 | `HashMismatch`, `CorruptBlock` | `StorageEngine` |
 | `BlockNotFound`, `IsDirectory`, `NotADirectory`, `DagTooDeep` | `fs.tree`, `fs.remote` |

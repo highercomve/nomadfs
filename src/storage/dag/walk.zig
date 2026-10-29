@@ -35,7 +35,7 @@ pub const ReadOptions = struct {
 
 /// Most blocks one read may visit, repeats included. Empty leaves add no
 /// bytes, so `max_bytes` alone cannot stop a DAG that references one subtree
-/// many times over. Matches RepairManager.max_blocks.
+/// many times over. Matches keeper.max_blocks.
 pub const default_max_blocks = 1 << 20;
 
 /// Fewest blocks any read may visit, so a small `max_bytes` still allows a

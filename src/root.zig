@@ -142,7 +142,6 @@ pub const Node = struct {
             .network = connection_manager,
             .dht = discovery_node,
             .storage = store,
-            .replication = cfg.storage.replicas,
             .quorum = .{ .W = cfg.storage.write_quorum },
         });
         errdefer block_manager.deinit();
@@ -758,7 +757,6 @@ test {
         @import("cluster/holders.zig"),
         @import("mobile/api.zig"),
         @import("cluster/quorum.zig"),
-        @import("cluster/repair.zig"),
         @import("cluster/ring.zig"),
         @import("cluster/vectors.zig"),
         @import("config.zig"),

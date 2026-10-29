@@ -49,12 +49,15 @@ as one diagram. This chapter maps each layer to its code.
     stored once, and a read loads only the blocks it needs. See
     [Chapter 3](../storage/overview.md).
 
-## Layer 4: Block exchange (the couriers)
-*   **Problem**: how do I copy a whole file's DAG from another device?
-*   **Solution**: `BlockManager` and `RepairManager` walk a DAG and fetch the
-    missing blocks (`GET_BLOCK`). Optionally they announce provider records
-    and push replicas to the closest peers.
-*   **Outcome**: swarm backup and the library's `put`/`get`. See
+## Layer 4: Distribution (the couriers)
+*   **Problem**: where does each block of a file come from, and which devices
+    keep copies?
+*   **Solution**: the fetcher picks the best holder per block, the holder
+    registry and placement say who has and who should keep a file, and the
+    keeper copies whole files (`GET_BLOCK` only: holders pull, nothing is
+    pushed).
+*   **Outcome**: every read and copy (shares, the swarm folder, backups, the
+    mount, the library's `put`/`get`) goes through one layer. See
     [Chapter 4](../cluster/overview.md).
 
 ## Layer 5: Folders (what you see)

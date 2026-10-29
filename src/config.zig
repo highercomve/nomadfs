@@ -76,9 +76,6 @@ pub const Config = struct {
     pub const StorageConfig = struct {
         enabled: bool,
         storage_path: []const u8,
-        /// Closest peers the DAG of every new file is pushed to. 0 keeps
-        /// puts local (provider records only).
-        replicas: u8 = 0,
         /// Provider-record acknowledgements a put requires. 0 lets a
         /// device with no peers adopt content offline.
         write_quorum: u8 = 1,
@@ -261,10 +258,6 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
 
 /// Replaces an owned string, freeing the previous value. A repeated key in
 /// the file therefore does not leak the earlier value.
-/// Upper bound on storage.replicas: mirrors the routing-table width
-/// (kbucket.K), which is the widest replica set the DHT can address.
-pub const max_replicas: u8 = 20;
-
 fn replaceString(allocator: std.mem.Allocator, field: *[]const u8, new_value: []const u8) void {
     if (field.len > 0) allocator.free(field.*);
     field.* = new_value;
@@ -295,12 +288,6 @@ fn applyConfigEntry(
         replaceString(allocator, &config.storage.storage_path, try allocator.dupe(u8, val));
     } else if (std.mem.eql(u8, key, "write_quorum")) {
         config.storage.write_quorum = try std.fmt.parseInt(u8, val, 10);
-    } else if (std.mem.eql(u8, key, "replicas")) {
-        // Bounded by the routing-table width (kbucket.K): replicating wider
-        // than the DHT can name targets is pointless.
-        const n = try std.fmt.parseInt(u8, val, 10);
-        if (n > max_replicas) return error.ReplicasOutOfRange;
-        config.storage.replicas = n;
     } else if (std.mem.eql(u8, key, "swarm_backup")) {
         config.storage.swarm_backup = std.mem.eql(u8, val, "true");
     } else if (std.mem.eql(u8, key, "accept_copies")) {
@@ -404,7 +391,6 @@ test "parseConfigText parses all fields" {
         \\swarm_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         \\[storage]
         \\storage_path = "/tmp/nomad"
-        \\replicas = 2
         \\quota_mb = 512
         \\[network]
         \\port = 9100
@@ -420,7 +406,6 @@ test "parseConfigText parses all fields" {
     try std.testing.expectEqual(Config.TransportType.tcp, cfg.network.transport);
     try std.testing.expectEqual(@as(usize, 2), cfg.network.bootstrap_peers.len);
     try std.testing.expect(cfg.security.require_trusted_devices);
-    try std.testing.expectEqual(@as(u8, 2), cfg.storage.replicas);
     try std.testing.expectEqual(@as(u64, 512), cfg.storage.quota_mb);
 }
 

@@ -70,7 +70,7 @@ test "shares: browse a peer's folder and read a file range on demand" {
     defer allocator.free(peers);
     try std.testing.expectEqual(@as(usize, 1), peers.len);
 
-    var remote = fs.Remote{ .block_manager = bm, .store = &reader_store, .peer = peers[0] };
+    var remote = fs.Remote{ .block_manager = bm, .peer = peers[0] };
     const shares = try remote.shares(allocator);
     defer shares.deinit(allocator);
     try std.testing.expectEqualStrings("Poco X3", shares.nickname);

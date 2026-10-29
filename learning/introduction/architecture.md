@@ -24,7 +24,7 @@ and who drives it.
     loop, and every LAN-announced peer to `onDiscovery`.
 6.  **Distribution**: `cluster.BlockManager`, which owns the fetcher and the
     holder registry ([Chapter 4](../cluster/overview.md)), and the mobile API's
-    `replicas` and `write_quorum`.
+    `write_quorum`.
 7.  **Swarm folder**: `fs.SwarmFolder` with its manifest at
     `<storage_path>.swarm.json`. It starts the 10-second sync thread
     (only with storage).

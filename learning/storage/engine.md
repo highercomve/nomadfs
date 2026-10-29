@@ -74,8 +74,8 @@ Shared folders are not copied into the store. The share scanner records where ea
 
 ## 4. Who Uses the Engine
 
-*   **`GET_BLOCK` / `PUT_BLOCK`** handlers in `src/net/discovery/node.zig` read from and write to the store. `PUT_BLOCK` accepts replicas from any authenticated swarm member (swarm admission is the write authorization; no trusted-device entry required) up to `max_put_block_len`. Pushed blocks are verified against their CID and quota before storage.
-*   **`BlockManager`** stores new files and fetched DAGs ([Chapter 4](../cluster/overview.md)). Subtree traversals and fetches enforce `blockBudget(max_bytes)`, returning `error.DagTooLarge` if the visit count exceeds budget.
+*   **`GET_BLOCK`** handler in `src/net/discovery/node.zig` reads from the store (and shared files through the filestore). Nothing writes to a device's store from outside: a device keeps only blocks it fetched itself.
+*   **The cluster layer** keeps what this device copies (the keeper pins it) and caches what it reads (the fetcher) ([Chapter 4](../cluster/overview.md)). Subtree traversals and fetches enforce `blockBudget(max_bytes)`, returning `error.DagTooLarge` if the visit count exceeds budget.
 *   **Remote browsing** (`src/fs/remote.zig`) caches every fetched block here, so a file read once reads offline afterwards.
 *   **The swarm folder** stores added files in full here.
 
@@ -128,6 +128,5 @@ long that takes (a share whose folder is gone and so never gets a root is given 
 it collects the blocks reachable from its shares' roots and from the swarm folder files it wrote or
 backed up (`walk.addStoredReachable`, which reads stored block files only, never a shared file), and
 moves every other kept block into `cache/` (`demoteExcept`). A `cache/.sorted-v1` marker keeps it from
-running again. Blocks received as replicas can't be told from read blocks afterwards and are moved
-too; the device that wrote them still keeps its own copy.
+running again.
 

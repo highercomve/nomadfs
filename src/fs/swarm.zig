@@ -372,8 +372,8 @@ pub const SwarmFolder = struct {
         var buffer = remote_mod.holdersBuffer();
         const peers = self.holdersOf(allocator, &cid, .{ .bytes = author }, &buffer);
         if (self.read_ahead) |ra| return ra.readAt(allocator, peers, cid, offset, dest);
-        var multi = remote_mod.MultiRemote{ .block_manager = bm, .store = self.store, .peers = peers, .root = cid };
-        return tree.readAt(allocator, multi.loader(), cid, offset, dest);
+        var from = remote_mod.Source{ .block_manager = bm, .root = cid, .holders = peers };
+        return tree.readAt(allocator, from.loader(), cid, offset, dest);
     }
 
     /// The devices likely to hold a swarm file, best first: its author, the

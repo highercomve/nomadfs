@@ -155,11 +155,9 @@ each block comes from* ([Chapter 4](../cluster/overview.md)).
   copies of whose folders (from the reply's `backup` field).
 - **`knownPeers(block_manager, allocator)`**: every node ID in the routing table. This is the
   "devices I know" list used by the mount, the swarm sync and the backup.
-- **Per-peer health gate (`HealthGate`)**: tracks unreachable or failing peers with exponential
-  backoff (5 s up to 60 s). When a dial or block fetch times out or fails with connection errors,
-  the peer is marked down. Subsequent `Remote.load` attempts fail fast with `error.PeerDown` without
-  waiting on network timeouts or stalling thread workers. A successful block fetch or `GET_SHARES`
-  response clears the backoff (`markUp`).
+- **Unreachable devices** back off in the fetcher, not here ([Chapter 4.1](../cluster/fetcher.md)):
+  5 s, doubling up to 60 s; a successful block or `GET_SHARES` reply clears it. (A global
+  `HealthGate` in this module did the same before the cluster layer was restored.)
 
 ```mermaid
 sequenceDiagram

@@ -25,7 +25,7 @@ Everything `nomadfs.h` declares (all are `export fn` in `api.zig`):
 | `nomadfs_node_run` | Binds listener synchronously before returning `NOMADFS_OK`. Idempotent no-op while running. Returns `NOMADFS_UNAVAILABLE` on bind failure or if called after stop |
 | `nomadfs_node_stop` | Stop listener and join threads. Cannot be re-run; allocate a new node to restart |
 | `nomadfs_node_bootstrap(node, urls_csv)` | `Node.bootstrap` with comma-separated `tcp://host:port` peers |
-| `nomadfs_put_file(node, in_path)` | `BlockManager.put`: chunk, store, announce (and replicate if `replicas > 0`); returns a 64-hex root CID |
+| `nomadfs_put_file(node, in_path)` | `BlockManager.put`: chunk, store, announce; returns a 64-hex root CID. Nothing is pushed: other devices fetch it when they read it |
 | `nomadfs_get_file(node, cid, out_path)` | `BlockManager.get`: strictly validates 64-hex CID before creating `out_path`, enforces 4 GiB download limit, fetches missing blocks |
 | `nomadfs_node_device_id(node, out, out_len)` | Device ID as 64 hex characters + NUL |
 | `nomadfs_free` | Release a CID string from `nomadfs_put_file` |

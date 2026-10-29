@@ -65,7 +65,7 @@ On the wire, all integers big-endian:
 | 11 | `ADD_PROVIDER` | `key: 32 B` (the provider is the authenticated sender) | `STORE_ACK` |
 | 12 | `GET_PROVIDERS` | `key: 32 B` | `PROVIDERS` |
 | 13 | `PROVIDERS` | `count: u8` (≤ 20), then `count` × 32-byte node IDs | |
-| 14 | `PUT_BLOCK` | `cid: 32 B`, data | `STORE_ACK` (stored only if size ≤ `max_put_block_len` and bytes hash to `cid`) |
+| 14 | *(retired)* | was `PUT_BLOCK`, push replication; devices that keep a file pull it now | |
 | 15 | `REVOKE` | `device_id: 32 B`, `signer_key: 32 B`, `at: u64`, `signature: 64 B` | `STORE_ACK` |
 | 16 | `GET_SHARES` | empty | `SHARES` |
 | 17 | `SHARES` | `nick_len: u8`, nickname (≤ 64 B), listing (a dir block) | (the nickname is not authenticated; the sender is the session's device ID, `Connection.getRemoteDeviceID`) |
@@ -86,11 +86,6 @@ What each handler does:
     files' chunks from the original files (see
     [Shared folders](../../fs/shares.md)). The caller verifies the bytes
     against the CID ([Blocks](../../storage/block.md)).
-*   **`PUT_BLOCK`** accepts pushed replicas from any authenticated swarm member
-    (swarm admission is the write authorization; a trusted-device entry is not
-    required). The payload is strictly capped at `max_put_block_len`
-    (`@max((chunker.Params{}).max_size + 1, codec.max_dir_block_len)`), and `put`
-    enforces CID verification and the storage quota (`quota_mb`).
 *   **`GET_SHARES`** returns the node's nickname and a dir block whose entries
     are its shares (an empty dir block, `{2, 0, 0}`, if it shares nothing).
     **`GET_SWARM`** returns the encoded manifest, or `[]`
@@ -179,8 +174,10 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Message {
 *   **Identity comes from the handshake**: a `PING` whose `sender_id` differs
     from the connection's node ID is refused (`error.PeerIdMismatch`), and the
     caller of `ping()` checks the `PONG` the same way.
-*   **Content is checked against its name**: `PUT_BLOCK` goes through
-    `StorageEngine.put`, which rejects bytes that don't hash to the CID.
+*   **Content is checked against its name**: every fetched block goes through
+    `StorageEngine.putCached` or `put`, which reject bytes that don't hash to the CID.
+*   **Nobody can write to another device's store**: there is no push message;
+    a device stores only blocks it asked for.
 *   **Addresses are filtered**: port 0, `0.0.0.0`/`::`, multicast, broadcast,
     reserved, link-local (`169.254/16`, `fe80::/10`) addresses are dropped when
     a peer list or an announcement is read. Loopback is kept only from a peer

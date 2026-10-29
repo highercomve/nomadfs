@@ -171,8 +171,9 @@ it over the original.
 - Concurrent requests: up to 16 worker threads concurrently serve requests from `/dev/fuse`.
 - Network resilience: slow network or remote hash verification on one file does not stall independent
   requests (such as `LOOKUP`, `GETATTR`, or `STATFS`).
-- Per-peer health gate: dead or unresponsive peers back off exponentially (5 s to 60 s), failing fast
-  with `EIO` (`error.PeerDown`) without stalling worker threads.
+- Dead or unresponsive devices back off in the fetcher (5 s up to 60 s, [Chapter 4.1](../cluster/fetcher.md));
+  a device that stops answering the mount's share probe is marked down there, so reads of its files
+  fail fast with `EIO` instead of stalling worker threads.
 - No extended attributes, symlinks or hard links. Mode and time changes (`chmod`, `touch`,
   `cp -p`) are accepted but not stored; the modes shown are fixed.
 - `d_ino` values in directory listings are not the inode numbers `stat` reports (like libfuse without `use_ino`).

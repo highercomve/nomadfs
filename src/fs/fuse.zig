@@ -616,7 +616,6 @@ pub const Mount = struct {
                 fn run(ctx: *@This()) void {
                     var probe = Remote{
                         .block_manager = ctx.mount.block_manager.?,
-                        .store = ctx.mount.store,
                         .peer = ctx.peer,
                     };
                     ctx.shares_res = probe.shares(ctx.mount.allocator) catch null;
@@ -647,7 +646,8 @@ pub const Mount = struct {
                         }
                     }
                     self.lock.unlock();
-                    remote_mod.health.markDown(peer);
+                    // Reads of its files fail fast until it answers again.
+                    if (bm.fetcher) |*f| f.markDown(peer);
                 }
             }
         }
@@ -671,7 +671,7 @@ pub const Mount = struct {
                 return;
             };
             errdefer self.allocator.destroy(remote);
-            remote.* = .{ .block_manager = bm, .store = self.store, .peer = peer };
+            remote.* = .{ .block_manager = bm, .peer = peer };
             const name = self.allocator.dupe(u8, "") catch {
                 self.allocator.destroy(remote);
                 shares.listing.deinit();
@@ -906,7 +906,8 @@ pub const Mount = struct {
             break :blk self.devices.items[node.device].remote;
         };
         if (self.hooks.before_network) |hook| hook(self.hooks.ctx);
-        return remote_mod.readShareAt(self.allocator, remote.block_manager, remote.store, self.read_ahead, remote.peer, node.cid, offset, dest);
+        const bm = remote.block_manager orelse return error.PeerDown;
+        return remote_mod.readShareAt(self.allocator, bm, self.read_ahead, remote.peer, node.cid, offset, dest);
     }
 
     fn opReaddir(self: *Mount, header: *const InHeader, body: []const u8) !void {

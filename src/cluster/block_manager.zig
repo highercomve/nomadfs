@@ -4,22 +4,18 @@ const dht = @import("../net/discovery/mod.zig");
 const NodeID = @import("../net/id.zig").NodeID;
 const storage = @import("../storage/mod.zig");
 const quorum = @import("quorum.zig");
-const RepairManager = @import("repair.zig").RepairManager;
+const keeper_mod = @import("keeper.zig");
 const fetcher_mod = @import("fetcher.zig");
 const holders_mod = @import("holders.zig");
 const walk = storage.dag.walk;
 
-/// Stores files as Merkle DAGs and moves them between nodes.
-///
-/// Writes: `put` stores the file locally, announces this node as provider of
-/// the root CID and, when `replication > 0`, pushes the whole DAG to that
-/// many peers closest to the CID (PUT_BLOCK, content-verified by the
-/// receiver). Reads: `get` collects holder records, finds their addresses
-/// through the DHT and copies the missing blocks from the first one that
-/// can serve them; when no record exists or every holder fails, it falls
-/// back to the peers closest to the CID, where PUT_BLOCK replicas live.
-/// Records expire after providers.default_ttl_s; call `announce`
-/// periodically to keep them.
+/// Owns the fetcher and the holder registry, and dials holders for them.
+/// Also the mobile C API's file-level path: `put` stores a file locally and
+/// announces this node as provider of its root CID; `get` copies the
+/// missing blocks with the keeper's copy (several blocks at once, from every
+/// holder) using the provider records and the peers closest to the CID as
+/// holders. Nothing is pushed at put: devices that keep files pull them
+/// (cluster/keeper.zig). Records expire after providers.default_ttl_s.
 pub const BlockManager = struct {
     allocator: std.mem.Allocator,
     net: *network.manager.ConnectionManager,
@@ -27,7 +23,6 @@ pub const BlockManager = struct {
     store: ?*storage.engine.StorageEngine, // Nullable for mobile
     quorum: quorum.QuorumConfig,
     layout: storage.dag.Layout = .Balanced,
-    replication: u8,
     /// Where each block of a read comes from (fetcher.zig); null without a
     /// store.
     fetcher: ?fetcher_mod.Fetcher = null,
@@ -42,10 +37,6 @@ pub const BlockManager = struct {
         /// W = number of peers that must acknowledge a provider record.
         /// W = 0 keeps `put` local-only.
         quorum: quorum.QuorumConfig = .{},
-        /// N = closest peers the DAG of a new file is pushed to. 0 keeps
-        /// puts local (provider records only) -- the default, so a single
-        /// node still stores without touching the network.
-        replication: u8 = 0,
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !*BlockManager {
@@ -56,7 +47,6 @@ pub const BlockManager = struct {
             .dht_node = config.dht,
             .store = config.storage,
             .quorum = config.quorum,
-            .replication = config.replication,
         };
         if (config.storage) |s| {
             self.fetcher = fetcher_mod.Fetcher.init(s, .{ .ctx = self, .getFn = getBlockFrom });
@@ -88,52 +78,7 @@ pub const BlockManager = struct {
         errdefer self.allocator.free(root);
 
         try self.announce(root);
-        if (self.replication > 0) {
-            const acked = self.replicate(root, self.replication) catch |err| blk: {
-                // Content is durable locally and announced; replication is
-                // best effort and never invalidates a put.
-                std.debug.print("BlockManager: replication incomplete: {any}\n", .{err});
-                break :blk @as(usize, 0);
-            };
-            if (acked == 0) {
-                std.debug.print("BlockManager: no replica acknowledged the DAG\n", .{});
-            }
-        }
         return root;
-    }
-
-    /// Pushes every block of the DAG rooted at `root` to up to `fanout` of
-    /// the peers closest to its CID, counting a peer as a replica once it has
-    /// acknowledged the whole DAG. Returns how many peers now hold it. Local
-    /// storage remains the source of truth: `put` never fails on replication
-    /// problems, it only copies availability.
-    pub fn replicate(self: *BlockManager, root: []const u8, fanout: usize) !usize {
-        if (self.store == null) return error.StorageDisabled;
-
-        const key = NodeID{ .bytes = try walk.cidFromSlice(root) };
-        const closest = try self.dht_node.closestFor(key);
-        defer self.allocator.free(closest);
-
-        var acked: usize = 0;
-        for (closest) |peer| {
-            if (acked >= fanout) break;
-            const conn = self.net.connectToPeerMulti(
-                peer.addresses[0..peer.addrs_count],
-                self.dht_node.swarm_key,
-                peer.id,
-            ) catch |err| {
-                std.debug.print("BlockManager: replica target {x} unreachable: {any}\n", .{ peer.id.bytes[0..4], err });
-                continue;
-            };
-            defer conn.deinit();
-
-            _ = RepairManager.push(self.allocator, self.dht_node, self.store.?, conn, root) catch |err| {
-                std.debug.print("BlockManager: replica {x} rejected the DAG: {any}\n", .{ peer.id.bytes[0..4], err });
-                continue;
-            };
-            acked += 1;
-        }
-        return acked;
     }
 
     /// Publishes this node as provider of `root` to the closest DHT peers.
@@ -164,56 +109,35 @@ pub const BlockManager = struct {
         return walk.readFile(self.allocator, store, root, writer, options);
     }
 
-    /// Copies every block of `root` that is missing locally, from the first
-    /// source able to serve them. Sources are tried in order: nodes named by
-    /// holder records, then the peers the DHT holds closest to the CID, whose
-    /// replicated copies survive records that expired or were never
-    /// published. Unreachable or incomplete sources are skipped; the last
-    /// failure is returned if none succeeds.
+    /// Copies every block of `root` that is missing locally, through the
+    /// keeper's copy: the holders are the nodes named by provider records,
+    /// then the peers the DHT holds closest to the CID; the fetcher picks
+    /// among them per block.
     pub fn fetch(self: *BlockManager, root: []const u8) !void {
-        const key = NodeID{ .bytes = try walk.cidFromSlice(root) };
+        const store = self.store orelse return error.StorageDisabled;
+        const fetcher = &(self.fetcher orelse return error.StorageDisabled);
+        const cid = try walk.cidFromSlice(root);
+        const key = NodeID{ .bytes = cid };
 
-        var tried: std.ArrayList(NodeID) = .empty;
-        defer tried.deinit(self.allocator);
-        var last_err: anyerror = error.NoProvider;
-
+        var holders: [fetcher_mod.max_holders]NodeID = undefined;
+        var n: usize = 0;
         const providers = try self.dht_node.findProviders(key);
         defer self.allocator.free(providers);
-        for (providers) |provider| {
-            try tried.append(self.allocator, provider);
-            if (self.syncFrom(provider, root, &last_err)) return;
-        }
-
-        // Holder records are only published by puts that write with W >= 1
-        // and expire with the record TTL. Replication also leaves plain DHT
-        // peers behind; either way the replica answers GET_BLOCK for its
-        // blocks without any record.
+        for (providers) |p| addHolder(&holders, &n, p);
         const closest = try self.dht_node.closestFor(key);
         defer self.allocator.free(closest);
-        for (closest) |peer| {
-            if (alreadyTried(&tried, peer.id)) continue;
-            try tried.append(self.allocator, peer.id);
-            if (self.syncFrom(peer.id, root, &last_err)) return;
-        }
-        return last_err;
+        for (closest) |peer| addHolder(&holders, &n, peer.id);
+        if (n == 0) return error.NoProvider;
+
+        var go: std.atomic.Value(bool) = .init(true);
+        _ = try keeper_mod.copy(self.allocator, fetcher, store, cid, holders[0..n], &go);
     }
 
-    /// One retrieval attempt. Returns true when the peer served the whole
-    /// DAG; otherwise records the failure for fetch().
-    fn syncFrom(self: *BlockManager, source: NodeID, root: []const u8, last_err: *anyerror) bool {
-        self.fetchFrom(source, root) catch |err| {
-            std.debug.print("BlockManager: source {x} failed: {any}\n", .{ source.bytes[0..4], err });
-            last_err.* = err;
-            return false;
-        };
-        return true;
-    }
-
-    fn alreadyTried(list: *const std.ArrayList(NodeID), id: NodeID) bool {
-        for (list.items) |candidate| {
-            if (candidate.eql(id)) return true;
-        }
-        return false;
+    fn addHolder(out: *[fetcher_mod.max_holders]NodeID, n: *usize, id: NodeID) void {
+        if (n.* >= out.len) return;
+        for (out[0..n.*]) |x| if (x.eql(id)) return;
+        out[n.*] = id;
+        n.* += 1;
     }
 
     /// A connection to `peer_id`, located through the routing table or a
@@ -221,15 +145,6 @@ pub const BlockManager = struct {
     pub fn connectTo(self: *BlockManager, peer_id: NodeID) !network.Connection {
         const peer = try self.findPeer(peer_id);
         return self.net.connectToPeerMulti(peer.addresses[0..peer.addrs_count], self.dht_node.swarm_key, peer_id);
-    }
-
-    fn fetchFrom(self: *BlockManager, provider: NodeID, root: []const u8) !void {
-        const store = self.store orelse return error.StorageDisabled;
-        const peer = try self.findPeer(provider);
-        const conn = try self.net.connectToPeerMulti(peer.addresses[0..peer.addrs_count], self.dht_node.swarm_key, provider);
-        defer conn.deinit();
-
-        _ = try RepairManager.sync(self.allocator, self.dht_node, store, conn, root);
     }
 
     /// A connection to a device already in the routing table, without a DHT
