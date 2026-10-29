@@ -53,6 +53,7 @@ const ICONS = {
   copy: "M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z",
   backup: "M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z",
   backup_off: "M19.35 10.04C18.67 6.59 15.64 4 12 4c-1.48 0-2.85.43-4.01 1.17l1.46 1.46C10.21 6.23 11.08 6 12 6c3.04 0 5.5 2.46 5.5 5.5v.5H19c1.66 0 3 1.34 3 3 0 1.13-.64 2.11-1.56 2.62l1.45 1.45C23.16 18.16 24 16.68 24 15c0-2.64-2.05-4.78-4.65-4.96zM3 5.27l2.75 2.74C2.56 8.15 0 10.77 0 14c0 3.31 2.69 6 6 6h11.73l2 2L21 20.73 4.27 4 3 5.27zM7.73 10l8 8H6c-2.21 0-4-1.79-4-4s1.79-4 4-4h1.73z",
+  info: "M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z",
   remove: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z",
 };
 
@@ -520,7 +521,10 @@ function renderBrowse() {
         meta: `${formatSize(e.size)} · ${formatDate(e.mtime)}`,
         cols: { size: formatSize(e.size), date: formatDate(e.mtime) },
         onClick: () => openPreview(deviceSource(device), files, files.indexOf(e)),
-        action: { icon: "download", label: "Download", run: fetchIt },
+        actions: [
+          { icon: "info", label: `Details of ${e.name}`, run: () => openDetails(e.name, { cid: e.cid, peer: device.peer }) },
+          { icon: "download", label: "Download", run: fetchIt },
+        ],
       }));
     }
   }
@@ -1003,6 +1007,7 @@ async function loadSwarm() {
       { icon: "trash", label: `Delete ${it.name}`, run: () => swarmDeleteConfirm(it) },
     ];
     if (!it.dir) actions.unshift({ icon: "download", label: "Download", run: (btn) => swarmDownload(it, btn) });
+    if (!it.dir && it.cid) actions.unshift({ icon: "info", label: `Details of ${it.name}`, run: () => openDetails(it.name, { cid: it.cid, author_id: it.author_id }) });
     list.appendChild(row({
       icon: it.dir ? "folder" : iconFor(it.name, false),
       iconClass: it.dir ? "folder" : "",
@@ -1168,7 +1173,8 @@ async function loadShares() {
       iconClass: "folder",
       headline: s.name,
       meta: [
-        !s.ready ? `Scanning… ${s.path}`
+        s.scan_error ? `Can't read the folder (${s.scan_error}) · ${s.path}`
+          : !s.ready ? `Scanning… ${s.path}`
           : s.indexing ? `Indexing… ${s.files} files so far · ${formatSize(s.size)} · ${s.path}`
           : `${s.files} files · ${formatSize(s.size)} · ${s.path}`,
         s.backup ? "Backup: checking…" : "",
@@ -2144,3 +2150,143 @@ async function boot() {
 }
 
 boot();
+
+// ---- File details: how NomadFS stores a file ----
+
+// Chunk map colours: the app's primary and tertiary, its muted text colour, and the
+// outline for chunks this device doesn't hold.
+const DT_STATES = [
+  ["kept", "Kept on this device", "--md-primary"],
+  ["cached", "In the read cache", "--md-tertiary"],
+  ["external", "Read from the shared file here", "--md-on-surface-variant"],
+  ["missing", "Not here: fetched when read", "--md-outline-variant"],
+];
+
+function cssVar(name) {
+  return getComputedStyle(document.body).getPropertyValue(name).trim() || "#888";
+}
+
+async function openDetails(name, src) {
+  $("dt-name").textContent = name;
+  $("dt-meta").textContent = "Reading the file's structure…";
+  const body = $("dt-body");
+  body.replaceChildren();
+  $("details").hidden = false;
+  let d;
+  try {
+    d = await invoke("file_details", src);
+  } catch (err) {
+    $("dt-meta").textContent = `Couldn't read the details: ${err}`;
+    return;
+  }
+  $("dt-meta").textContent = `${formatSize(d.size)} · ${d.chunks} chunk${d.chunks === 1 ? "" : "s"}`;
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  };
+  const section = (title, ...nodes) => {
+    body.append(el("h3", "", title), ...nodes);
+  };
+
+  // Identity
+  const cidRow = el("div", "dt-cid");
+  cidRow.append(el("code", "", d.cid));
+  const copy = el("button", "btn outlined", "Copy");
+  copy.type = "button";
+  copy.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(d.cid); snack("CID copied"); } catch { snack("Select the CID to copy it"); }
+  });
+  cidRow.append(copy);
+  section("Content ID (CID)", cidRow,
+    el("p", "", "The SHA-256 hash of the file's root block. Every device names this file by it; any change to the content gives a different CID, so a block can't be swapped without being noticed."));
+
+  // Structure
+  const stats = el("div", "dt-stats");
+  const stat = (value, label) => {
+    const s = el("div", "dt-stat");
+    s.append(el("b", "", value), el("span", "", label));
+    stats.append(s);
+  };
+  stat(String(d.chunks), "chunks (leaf blocks)");
+  stat(String(d.parents), d.parents === 1 ? "parent block" : "parent blocks");
+  stat(String(d.depth + 1), "levels in the tree");
+  stat(formatSize(d.chunk_avg), "average chunk");
+  stat(`${formatSize(d.chunk_min)} – ${formatSize(d.chunk_max)}`, "smallest – largest chunk");
+  section("How it's stored", stats,
+    el("p", "", d.depth === 0
+      ? "The file fits in one chunk, so its root block is the chunk itself."
+      : `The file is cut into chunks by FastCDC (content-defined chunking: ${formatSize(d.chunker_min)} to ${formatSize(d.chunker_max)}, ${formatSize(d.chunker_avg)} on average). Boundaries follow the content, so an edit in the middle only changes the chunks around it. Parent blocks list the chunks' CIDs and sizes, forming a Merkle tree whose root is the file's CID.`));
+
+  // Chunk map
+  const canvas = el("canvas", "dt-map");
+  const legend = el("div", "dt-legend");
+  const counts = [d.kept, d.cached, d.external, d.missing];
+  DT_STATES.forEach(([, label, color], i) => {
+    if (!counts[i]) return;
+    const item = el("span");
+    const sw = el("i");
+    sw.style.background = cssVar(color);
+    item.append(sw, `${label}: ${counts[i]} (${Math.round(100 * counts[i] / Math.max(1, d.chunks))}%)`);
+    legend.append(item);
+  });
+  section("Chunk map", canvas, legend,
+    el("p", "", "Each segment is one chunk, as wide as its share of the file. Reading a range fetches only the chunks it covers; fetched chunks go to the read cache."));
+  requestAnimationFrame(() => drawChunkMap(canvas, d));
+
+  // First chunks
+  if (d.first.length) {
+    const table = el("table", "dt-table");
+    const head = el("tr");
+    for (const h of ["Offset", "Size", "CID", "Where"]) head.append(el("th", "", h));
+    table.append(head);
+    for (const c of d.first) {
+      const tr = el("tr");
+      tr.append(el("td", "", formatSize(c.offset)), el("td", "", formatSize(c.size)), el("td", "", `${c.cid.slice(0, 12)}…`), el("td", "", c.where));
+      table.append(tr);
+    }
+    const wrap = el("div");
+    wrap.style.overflowX = "auto";
+    wrap.append(table);
+    section(d.chunks > d.first.length ? `First ${d.first.length} chunks` : "Chunks", wrap);
+  }
+
+  // Learn more
+  const links = el("div", "dt-links");
+  for (const [label, page] of [["FastCDC", "fastcdc"], ["Merkle DAG", "merkle-dag"], ["SHA-256", "sha-256"]]) {
+    const b = el("button", "btn text", label);
+    b.type = "button";
+    b.addEventListener("click", () => openLink(`https://nomadfs.foreachdeveloper.com/learn/${page}/`));
+    links.append(b);
+  }
+  section("Learn more", links);
+}
+
+function drawChunkMap(canvas, d) {
+  const ratio = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  canvas.width = Math.round(w * ratio);
+  canvas.height = Math.round(h * ratio);
+  const g = canvas.getContext("2d");
+  g.scale(ratio, ratio);
+  const colors = DT_STATES.map(([, , c]) => cssVar(c));
+  const total = d.size || 1;
+  let x = 0;
+  for (let i = 0; i < d.sizes.length; i++) {
+    const width = (d.sizes[i] / total) * w;
+    g.fillStyle = colors[d.states[i]] || colors[3];
+    g.fillRect(x, 0, Math.max(width, 0.6), h);
+    // A thin gap between chunks while they're wide enough to see.
+    if (width > 3) {
+      g.fillStyle = "rgb(0 0 0 / .35)";
+      g.fillRect(x + width - 1, 0, 1, h);
+    }
+    x += width;
+  }
+}
+
+$("dt-close").addEventListener("click", () => { $("details").hidden = true; });
+$("details").addEventListener("click", (e) => { if (e.target === $("details")) $("details").hidden = true; });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("details").hidden) $("details").hidden = true; });

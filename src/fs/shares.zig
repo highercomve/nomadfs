@@ -27,6 +27,8 @@ pub const Share = struct {
     files: u64 = 0,
     scanned_at: u64 = 0,
     generation: u64 = 0,
+    /// Why the last scan failed, until one succeeds.
+    scan_error: ?anyerror = null,
 };
 
 pub const ShareIndex = struct {
@@ -300,6 +302,10 @@ pub const ShareIndex = struct {
         const started = std.Io.Timestamp.now(self.io, .awake);
         const result = self.scanner.scan(snap.path) catch |err| {
             std.debug.print("share '{s}': scan of {s} failed: {any}\n", .{ name, snap.path, err });
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const at = self.indexOf(name);
+            if (at.found) self.shares.items[at.index].scan_error = err;
             return;
         };
 
@@ -320,6 +326,7 @@ pub const ShareIndex = struct {
         share.size = result.size;
         share.files = result.files;
         share.indexing = false;
+        share.scan_error = null;
         share.scanned_at = nowSeconds(self.io);
     }
 

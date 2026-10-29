@@ -41,12 +41,12 @@ class StorageExtension : OrielAppExtension {
                 out.put("model", "${Build.MANUFACTURER} ${Build.MODEL}".trim())
                 out.put("storage", root)
                 out.put("camera", "$root/${Environment.DIRECTORY_DCIM}/Camera")
-                // Screenshots: Pictures/Screenshots on most phones, DCIM/Screenshots on some.
+                // Screenshots: Pictures/Screenshots on most phones, DCIM/Screenshots on some (MIUI).
                 val shots = listOf("$root/${Environment.DIRECTORY_PICTURES}/Screenshots", "$root/${Environment.DIRECTORY_DCIM}/Screenshots")
-                out.put("screenshots", shots.firstOrNull { java.io.File(it).isDirectory } ?: shots[0])
+                out.put("screenshots", fullest(shots))
                 // WhatsApp's received photos: under Android/media since Android 11.
                 val wa = listOf("$root/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images", "$root/WhatsApp/Media/WhatsApp Images")
-                out.put("whatsapp", wa.firstOrNull { java.io.File(it).isDirectory } ?: wa[0])
+                out.put("whatsapp", fullest(wa))
                 out.put("pictures", "$root/${Environment.DIRECTORY_PICTURES}")
                 out.put("documents", "$root/${Environment.DIRECTORY_DOCUMENTS}")
                 out.put("downloads", "$root/${Environment.DIRECTORY_DOWNLOADS}")
@@ -55,6 +55,11 @@ class StorageExtension : OrielAppExtension {
         }
         return out.toString().toByteArray()
     }
+
+    // Of folders that may hold the same thing, the one with the most files
+    // (phones put screenshots in different places).
+    private fun fullest(paths: List<String>): String =
+        paths.maxByOrNull { java.io.File(it).list()?.size ?: -1 } ?: paths[0]
 
     private fun granted(): Boolean =
         if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager() else true

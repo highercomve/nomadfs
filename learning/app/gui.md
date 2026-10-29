@@ -56,7 +56,12 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
   in pieces with `readRange`; **Download** saves to `~/Downloads/NomadFS` (Android:
   `Download/NomadFS`). On touch screens a sideways swipe in the viewer opens the next or previous
   file. Refresh walks the open path again by name from the device's current share list, since a
-  share's root changes with every edit.
+  share's root changes with every edit. A file's **ⓘ** opens its details (`file_details`):
+  `fs.inspect.inspect` (`src/fs/inspect.zig`) loads the parent blocks only and lists the leaves from
+  their links, and `StorageEngine.locate` says where each leaf is here (kept, read cache, a shared
+  file through the filestore, or missing). The dialog shows the CID, depth and chunk sizes against
+  the FastCDC bounds, a chunk map drawn to scale, and the first eight chunks
+  ([DAG](../storage/dag.md), [Disk engine](../storage/engine.md)).
 - **Swarm folder**: the shared folder every device writes ([Chapter 5.2](../fs/swarm.md)), with
   add, new folder, rename, delete, the author of each file, and the last sync.
 - **Shared folders**: pick a folder with the system picker (GTK on Linux, the Storage Access

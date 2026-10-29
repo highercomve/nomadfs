@@ -582,6 +582,8 @@ pub const ShareInfo = struct {
     indexing: bool,
     /// Marked for backup: swarm backup devices keep a copy (fs/backup.zig).
     backup: bool = false,
+    /// Why the last scan failed (an error name), until one succeeds.
+    scan_error: ?[]const u8 = null,
 };
 
 fn shareIndex(handle: *mobile.NodeHandle) !*fs.ShareIndex {
@@ -598,7 +600,7 @@ pub fn sharesLocal(gpa: std.mem.Allocator) ![]ShareInfo {
     const out = try gpa.alloc(ShareInfo, snapshot.len);
     const index = try shareIndex(handle);
     for (snapshot, out) |s, *o| {
-        o.* = .{ .name = s.name, .path = s.path, .files = s.files, .size = s.size, .ready = s.root != null, .indexing = s.indexing, .backup = index.isBackup(s.name) };
+        o.* = .{ .name = s.name, .path = s.path, .files = s.files, .size = s.size, .ready = s.root != null, .indexing = s.indexing, .backup = index.isBackup(s.name), .scan_error = if (s.scan_error) |e| @errorName(e) else null };
     }
     return out;
 }
@@ -1197,6 +1199,111 @@ pub fn swarmRename(args: SwarmRenameArgs) !void {
     g_mutex.lock();
     defer g_mutex.unlock();
     try (try swarmFolder()).rename(args.path, std.mem.trim(u8, args.name, " \t"));
+}
+
+// ---- File details (how NomadFS stores a file) ----
+
+pub const FileDetailsArgs = struct {
+    cid: []const u8,
+    /// The device sharing the file (Browse), or
+    peer: ?[]const u8 = null,
+    /// the swarm folder file's author (Swarm folder).
+    author_id: ?[]const u8 = null,
+};
+
+pub const ChunkInfo = struct { offset: u64, size: u64, cid: []const u8, where: []const u8 };
+
+pub const FileDetails = struct {
+    cid: []const u8,
+    size: u64,
+    /// Levels of parent blocks above the chunks.
+    depth: u32,
+    parents: u32,
+    chunks: usize,
+    chunk_min: u64,
+    chunk_avg: u64,
+    chunk_max: u64,
+    /// Chunks by where this device holds them.
+    kept: usize,
+    cached: usize,
+    external: usize,
+    missing: usize,
+    /// Every chunk's size and where it is (0 kept, 1 read cache, 2 the
+    /// shared file itself, 3 not here), in file order, for the chunk map.
+    sizes: []u64,
+    /// Numbers, not `[]u8`: JSON writes a `[]u8` as a string.
+    states: []u32,
+    /// The first chunks, for a table.
+    first: []ChunkInfo,
+    /// The chunker's bounds (FastCDC).
+    chunker_min: u64,
+    chunker_avg: u64,
+    chunker_max: u64,
+};
+
+/// `invoke("file_details", { cid, peer | author_id })`: the file's DAG and
+/// chunks, and where this device holds each chunk. Loads only parent blocks
+/// (and one chunk), never the whole file.
+pub fn fileDetails(gpa: std.mem.Allocator, args: FileDetailsArgs) !FileDetails {
+    const root = try parseHex32(args.cid);
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const handle = g_node orelse return error.NotRunning;
+    const store = handle.node.store orelse return error.StorageDisabled;
+    const bm = handle.node.block_manager;
+
+    var remote: fs.Remote = undefined;
+    var multi: fs.remote.MultiRemote = undefined;
+    var peers: std.ArrayList(nomadfs.net.id.NodeID) = .empty;
+    const loader = if (args.peer) |p| blk: {
+        remote = try remoteFor(p);
+        break :blk remote.loader();
+    } else blk: {
+        if (args.author_id) |a| if (a.len == 64) try peers.append(gpa, .{ .bytes = try parseHex32(a) });
+        const known = fs.remote.knownPeers(bm, gpa) catch &.{};
+        for (known) |k| try peers.append(gpa, k);
+        multi = .{ .block_manager = bm, .store = store, .peers = peers.items };
+        break :blk multi.loader();
+    };
+
+    const info = try fs.inspect.inspect(gpa, loader, root);
+    var d: FileDetails = .{
+        .cid = try gpa.dupe(u8, args.cid),
+        .size = 0,
+        .depth = info.depth,
+        .parents = info.parents,
+        .chunks = info.chunks.len,
+        .chunk_min = std.math.maxInt(u64),
+        .chunk_avg = 0,
+        .chunk_max = 0,
+        .kept = 0,
+        .cached = 0,
+        .external = 0,
+        .missing = 0,
+        .sizes = try gpa.alloc(u64, info.chunks.len),
+        .states = try gpa.alloc(u32, info.chunks.len),
+        .first = try gpa.alloc(ChunkInfo, @min(info.chunks.len, 8)),
+        .chunker_min = (nomadfs.storage.chunker.Params{}).min_size,
+        .chunker_avg = (nomadfs.storage.chunker.Params{}).avg_size,
+        .chunker_max = (nomadfs.storage.chunker.Params{}).max_size,
+    };
+    for (info.chunks, 0..) |c, i| {
+        d.size +|= c.size;
+        d.chunk_min = @min(d.chunk_min, c.size);
+        d.chunk_max = @max(d.chunk_max, c.size);
+        d.sizes[i] = c.size;
+        const where = store.locate(&c.cid);
+        d.states[i] = @intFromEnum(where);
+        switch (where) {
+            .kept => d.kept += 1,
+            .cached => d.cached += 1,
+            .external => d.external += 1,
+            .missing => d.missing += 1,
+        }
+        if (i < d.first.len) d.first[i] = .{ .offset = c.offset, .size = c.size, .cid = try hexAlloc(gpa, &c.cid), .where = @tagName(where) };
+    }
+    if (info.chunks.len == 0) d.chunk_min = 0 else d.chunk_avg = d.size / info.chunks.len;
+    return d;
 }
 
 pub const SwarmRangeArgs = struct { cid: []const u8, author_id: []const u8, offset: u64, len: u32 };

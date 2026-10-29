@@ -70,6 +70,12 @@ next through the folder (arrow keys and Esc on the desktop). It reads the file
 in 4 MiB pieces, so it shows progress and works the same on Android.
 **Download** saves a copy in `~/Downloads/NomadFS` (the shared `Download/NomadFS` folder on Android); a name that exists already gets a number.
 
+The **ⓘ** button next to a file shows how NomadFS stores it: its content ID,
+how many chunks it was cut into and how big they are, the tree of blocks above
+them, and a map of the chunks colored by where this device has each one (kept,
+in the read cache, read from the shared file itself, or not here yet). It reads
+only the file's index blocks, never the file, so it is quick on a large file.
+
 # [Backing up your phone's photos]($heading.id('backup'))
 
 Any shared folder can be backed up by the swarm. On the phone, share the

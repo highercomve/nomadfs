@@ -114,6 +114,31 @@ pub const StorageEngine = struct {
 
     pub const CacheStats = struct { bytes: u64, blocks: u64, limit: ?u64 };
 
+    /// Where this store holds a block.
+    pub const Where = enum {
+        /// A block this device keeps (its own data, backups, replicas).
+        kept,
+        /// In the read cache: fetched to be read, evictable.
+        cached,
+        /// Read from a shared file on this device (the filestore).
+        external,
+        /// Not here: fetched from another device when read.
+        missing,
+    };
+
+    pub fn locate(self: *StorageEngine, cid: *const [32]u8) Where {
+        const hex_cid = std.fmt.bytesToHex(cid.*, .lower);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.rootHasLocked(&hex_cid)) return .kept;
+            const io = std.Io.Threaded.global_single_threaded.io();
+            if (self.cache_dir.statFile(io, &hex_cid, .{})) |_| return .cached else |_| {}
+        }
+        if (self.external) |ext| if (ext.hasFn(ext.ctx, cid)) return .external;
+        return .missing;
+    }
+
     /// Counted from the directory, so a cache cleared by another process
     /// (the command line while the app runs) reads right.
     pub fn cacheStats(self: *StorageEngine) CacheStats {
