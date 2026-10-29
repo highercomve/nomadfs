@@ -127,7 +127,10 @@ pub const MessagePayload = union(MessageType) {
         at: u64,
     },
     GET_SHARES: void,
-    SHARES: struct { nickname: []const u8, listing: []const u8 },
+    /// `backup`: which shares the device asks backup devices to keep, and
+    /// which backups it holds for others (fs/backup.zig encodes it; empty
+    /// when there's nothing to say).
+    SHARES: struct { nickname: []const u8, listing: []const u8, backup: []const u8 = &.{} },
     GET_SWARM: void,
     SWARM: struct { manifest: []const u8 },
     ROTATE_KEY: struct { epoch: u64, new_key: [32]u8, signer_key: [32]u8, signature: [64]u8 },
@@ -259,6 +262,8 @@ pub const Message = struct {
                 try writeNickname(p.nickname, writer);
                 try writer.writeInt(u32, try valueLen(p.listing.len), .big);
                 try writer.writeAll(p.listing);
+                try writer.writeInt(u32, try valueLen(p.backup.len), .big);
+                try writer.writeAll(p.backup);
             },
             .GET_SWARM => {},
             .ROTATE_KEY => |p| {
@@ -366,7 +371,9 @@ pub const Message = struct {
                 errdefer allocator.free(nickname);
                 try reader.readNoEof(nickname);
                 if (!isValidNickname(nickname)) return error.InvalidNickname;
-                break :blk MessagePayload{ .SHARES = .{ .nickname = nickname, .listing = try readValue(allocator, reader) } };
+                const listing = try readValue(allocator, reader);
+                errdefer allocator.free(listing);
+                break :blk MessagePayload{ .SHARES = .{ .nickname = nickname, .listing = listing, .backup = try readValue(allocator, reader) } };
             },
             .GET_SWARM => MessagePayload{ .GET_SWARM = {} },
             .ROTATE_KEY => blk: {
@@ -507,6 +514,7 @@ pub const Message = struct {
             .SHARES => |p| {
                 allocator.free(p.nickname);
                 allocator.free(p.listing);
+                allocator.free(p.backup);
             },
             .SWARM => |p| allocator.free(p.manifest),
             else => {},

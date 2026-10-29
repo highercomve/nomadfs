@@ -158,6 +158,8 @@ fn printHelp() void {
         \\  --revoke <id>      Remove a trusted device by ID or fingerprint
         \\  --share Name:/path Share a folder with the swarm (repeatable; also
         \\                     `share = "Name:/path"` in the config)
+        \\                     Mark a share for backup with `backup = "Name"`: every
+        \\                     swarm backup device keeps a copy of it
         \\  --swarm-backup     Keep a copy of every swarm folder file on this device,
         \\                     so the folder stays readable while the device that
         \\                     added a file is offline (also `swarm_backup = true`

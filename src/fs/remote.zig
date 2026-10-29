@@ -127,10 +127,13 @@ pub const Remote = struct {
         nickname: []u8,
         listing: tree.Listing,
         device_id: ?NodeID = null,
+        /// The SHARES `backup` field, undecoded (fs/backup.zig).
+        backup: []u8 = &.{},
 
         pub fn deinit(self: Shares, allocator: std.mem.Allocator) void {
             allocator.free(self.nickname);
             self.listing.deinit();
+            allocator.free(self.backup);
         }
     };
 
@@ -143,14 +146,18 @@ pub const Remote = struct {
         const reply = try dht_node.fetchShares(conn);
         defer dht_node.allocator.free(reply.listing);
         defer dht_node.allocator.free(reply.nickname);
+        defer dht_node.allocator.free(reply.backup);
 
         const nickname = try allocator.dupe(u8, reply.nickname);
         errdefer allocator.free(nickname);
         const device_id = conn.getRemoteDeviceID();
+        const backup = try allocator.dupe(u8, reply.backup);
+        errdefer allocator.free(backup);
         const res = Shares{
             .nickname = nickname,
             .listing = try tree.decodeListing(allocator, reply.listing),
             .device_id = device_id,
+            .backup = backup,
         };
         health.markUp(self.peer);
         return res;

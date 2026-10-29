@@ -87,6 +87,9 @@ pub const Node = struct {
     pub const ShareSource = struct {
         ctx: *anyopaque,
         listFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
+        /// The SHARES `backup` field (fs/backup.zig), caller-owned; null
+        /// when the source has none.
+        backupFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 = null,
     };
 
     pub const RotationSink = struct {
@@ -593,6 +596,8 @@ pub const Node = struct {
         nickname: []u8,
         /// Encoded dir block; validate with codec.decode.
         listing: []u8,
+        /// The `backup` field (fs/backup.zig decodes it); may be empty.
+        backup: []u8,
     };
 
     /// Asks `conn`'s peer which folders it shares. Both slices of the reply
@@ -610,7 +615,7 @@ pub const Node = struct {
 
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         switch (response.payload) {
-            .SHARES => |p| return .{ .nickname = @constCast(p.nickname), .listing = @constCast(p.listing) },
+            .SHARES => |p| return .{ .nickname = @constCast(p.nickname), .listing = @constCast(p.listing), .backup = @constCast(p.backup) },
             else => {
                 response.deinit(self.allocator);
                 return error.InvalidResponse;
@@ -1452,9 +1457,11 @@ pub const Node = struct {
         else
             try self.allocator.dupe(u8, &empty_listing);
         defer self.allocator.free(listing);
+        const backup: []u8 = if (self.share_source) |source| (if (source.backupFn) |f| try f(source.ctx, self.allocator) else &.{}) else &.{};
+        defer self.allocator.free(backup);
         const response = rpc.Message{
             .sender_id = self.manager.node_id,
-            .payload = .{ .SHARES = .{ .nickname = self.nickname, .listing = listing } },
+            .payload = .{ .SHARES = .{ .nickname = self.nickname, .listing = listing, .backup = backup } },
         };
         try response.send(self.allocator, stream);
     }

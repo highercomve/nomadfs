@@ -580,6 +580,8 @@ pub const ShareInfo = struct {
     /// The first scan is still running: other devices see what it has
     /// done so far.
     indexing: bool,
+    /// Marked for backup: swarm backup devices keep a copy (fs/backup.zig).
+    backup: bool = false,
 };
 
 fn shareIndex(handle: *mobile.NodeHandle) !*fs.ShareIndex {
@@ -594,8 +596,9 @@ pub fn sharesLocal(gpa: std.mem.Allocator) ![]ShareInfo {
     const snapshot = try (try shareIndex(handle)).snapshot(gpa);
     defer gpa.free(snapshot);
     const out = try gpa.alloc(ShareInfo, snapshot.len);
+    const index = try shareIndex(handle);
     for (snapshot, out) |s, *o| {
-        o.* = .{ .name = s.name, .path = s.path, .files = s.files, .size = s.size, .ready = s.root != null, .indexing = s.indexing };
+        o.* = .{ .name = s.name, .path = s.path, .files = s.files, .size = s.size, .ready = s.root != null, .indexing = s.indexing, .backup = index.isBackup(s.name) };
     }
     return out;
 }
@@ -665,7 +668,7 @@ test "commands: SAF tree URIs map onto shared storage paths" {
     try testing.expectError(error.UnsupportedFolder, treeUriToPath(gpa, "content://com.android.externalstorage.documents/tree/primary%3A..%2Fx"));
 }
 
-pub const ShareAddArgs = struct { config_path: []const u8, name: []const u8, path: []const u8 };
+pub const ShareAddArgs = struct { config_path: []const u8, name: []const u8, path: []const u8, backup: bool = false };
 
 /// `invoke("share_add", { config_path, name, path })`: scans the folder,
 /// starts sharing it and records it in the config so it survives restarts.
@@ -686,6 +689,93 @@ pub fn shareAdd(gpa: std.mem.Allocator, args: ShareAddArgs) !void {
     const line = try std.fmt.allocPrint(gpa, "share = \"{s}:{s}\"", .{ name, path });
     defer gpa.free(line);
     try editConfig(gpa, args.config_path, .{ .drop_share = name, .append = &.{line} });
+    if (args.backup) try setShareBackup(gpa, args.config_path, index, name, true);
+}
+
+/// Marks or unmarks a share for backup, live and in the config.
+fn setShareBackup(gpa: std.mem.Allocator, config_path: []const u8, index: *fs.ShareIndex, name: []const u8, on: bool) !void {
+    try index.setBackup(name, on);
+    const line = try std.fmt.allocPrint(gpa, "backup = \"{s}\"", .{name});
+    defer gpa.free(line);
+    try editConfig(gpa, config_path, .{ .drop_backup = name, .append = if (on) &.{line} else &.{} });
+}
+
+pub const ShareBackupArgs = struct { config_path: []const u8, name: []const u8, on: bool };
+
+/// `invoke("share_backup_set", { config_path, name, on })`: asks the swarm's
+/// backup devices to keep a copy of this share, or stops asking (copies
+/// already made stay on them).
+pub fn shareBackupSet(gpa: std.mem.Allocator, args: ShareBackupArgs) !void {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const handle = g_node orelse return error.NotRunning;
+    try setShareBackup(gpa, args.config_path, try shareIndex(handle), args.name, args.on);
+}
+
+pub const BackupCopy = struct {
+    /// The backup device, as this device names it.
+    device: []const u8,
+    /// Its copy matches this share as it is now.
+    current: bool,
+    synced_at: u64,
+};
+pub const BackupStatus = struct {
+    share: []const u8,
+    copies: []BackupCopy,
+    /// This device is on Wi-Fi (or not a phone): marked shares are offered.
+    unmetered: bool,
+};
+
+/// `invoke("backup_status")`: for each share marked for backup, which
+/// backup devices hold a copy and whether it's up to date. Asks every
+/// reachable device, so it takes a moment.
+pub fn backupStatus(gpa: std.mem.Allocator) ![]BackupStatus {
+    var my_id: [32]u8 = undefined;
+    var bm: *nomadfs.cluster.BlockManager = undefined;
+    var store: *nomadfs.storage.engine.StorageEngine = undefined;
+    var trust: *TrustStore = undefined;
+    var snap: []fs.shares.Share = &.{};
+    var marked: std.ArrayList([]const u8) = .empty;
+    {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        const handle = g_node orelse return error.NotRunning;
+        const index = try shareIndex(handle);
+        my_id = handle.node.device_identity.deviceId().bytes;
+        bm = handle.node.block_manager;
+        store = handle.node.store orelse return error.StorageDisabled;
+        trust = handle.node.trust_store;
+        snap = try index.snapshot(gpa);
+        for (snap) |s| if (index.isBackup(s.name)) try marked.append(gpa, s.name);
+    }
+    const peers = fs.remote.knownPeers(bm, gpa) catch &.{};
+    var copies = try gpa.alloc(std.ArrayList(BackupCopy), marked.items.len);
+    for (copies) |*c| c.* = .empty;
+    for (peers) |peer| {
+        var remote = fs.Remote{ .block_manager = bm, .store = store, .peer = peer };
+        const listed = remote.shares(gpa) catch continue;
+        var info = fs.backup.decodeInfo(gpa, listed.backup) catch continue;
+        defer info.deinit();
+        const device_name = blk: {
+            if (listed.device_id) |d| if (trust.lookup(d)) |e| break :blk try gpa.dupe(u8, e.labelSlice());
+            break :blk listed.nickname;
+        };
+        for (info.held) |h| {
+            if (!std.mem.eql(u8, &h.owner, &my_id)) continue;
+            for (marked.items, 0..) |name, i| {
+                if (!std.mem.eql(u8, name, h.share)) continue;
+                const root = for (snap) |s| {
+                    if (std.mem.eql(u8, s.name, name)) break s.root;
+                } else null;
+                const current = if (root) |r| std.mem.eql(u8, &r, &h.source_root) else false;
+                try copies[i].append(gpa, .{ .device = device_name, .current = current, .synced_at = h.synced_at });
+            }
+        }
+    }
+    const out = try gpa.alloc(BackupStatus, marked.items.len);
+    const unmetered = nomadfs.net.local_addrs.onUnmeteredNetwork();
+    for (marked.items, out, copies) |name, *o, *c| o.* = .{ .share = name, .copies = c.items, .unmetered = unmetered };
+    return out;
 }
 
 pub const ShareRemoveArgs = struct { config_path: []const u8, name: []const u8 };
@@ -1771,6 +1861,8 @@ const ConfigEdit = struct {
     drop_keys: []const []const u8 = &.{},
     /// Remove the `share = "<name>:..."` line for this share.
     drop_share: ?[]const u8 = null,
+    /// Remove the `backup = "<name>"` line for this share.
+    drop_backup: ?[]const u8 = null,
     append: []const []const u8 = &.{},
 };
 
@@ -1810,6 +1902,12 @@ fn editConfig(gpa: std.mem.Allocator, path: []const u8, edit: ConfigEdit) !void 
                 if (config_mod.Config.Share.parse(value)) |share| {
                     if (std.mem.eql(u8, share.name, name)) drop = true;
                 } else |_| {}
+            }
+        }
+        if (edit.drop_backup) |name| {
+            if (std.mem.eql(u8, key, "backup")) {
+                const value = std.mem.trim(u8, trimmed[std.mem.indexOfScalar(u8, trimmed, '=').? + 1 ..], " \t\"");
+                if (std.mem.eql(u8, value, name)) drop = true;
             }
         }
         if (drop) continue;

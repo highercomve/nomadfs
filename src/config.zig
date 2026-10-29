@@ -47,6 +47,9 @@ pub const Config = struct {
     security: SecurityConfig = .{},
     /// Folders shared with the swarm: `share = "Name:/path"`, repeatable.
     shares: []Share = &.{},
+    /// Shares marked for backup (`backup = "Camera"`, repeatable): swarm
+    /// backup devices keep a copy of them (fs/backup.zig).
+    backup_shares: [][]const u8 = &.{},
 
     pub const Share = struct {
         name: []const u8,
@@ -126,10 +129,26 @@ pub const Config = struct {
             allocator.free(share.name);
             allocator.free(share.path);
         }
+        for (self.backup_shares) |n| allocator.free(n);
+        if (self.backup_shares.len > 0) allocator.free(self.backup_shares);
         allocator.free(self.shares);
     }
 
     /// Adds a share (copies `name` and `path`), replacing one of that name.
+    /// Marks the share `name` for backup (once).
+    pub fn addBackupShare(self: *Config, allocator: std.mem.Allocator, name: []const u8) !void {
+        const trimmed = std.mem.trim(u8, name, " \t");
+        if (trimmed.len == 0) return error.InvalidShare;
+        for (self.backup_shares) |n| if (std.mem.eql(u8, n, trimmed)) return;
+        const owned = try allocator.dupe(u8, trimmed);
+        errdefer allocator.free(owned);
+        const grown = try allocator.alloc([]const u8, self.backup_shares.len + 1);
+        @memcpy(grown[0..self.backup_shares.len], self.backup_shares);
+        grown[self.backup_shares.len] = owned;
+        if (self.backup_shares.len > 0) allocator.free(self.backup_shares);
+        self.backup_shares = grown;
+    }
+
     pub fn addShare(self: *Config, allocator: std.mem.Allocator, name: []const u8, path: []const u8) !void {
         const owned_name = try allocator.dupe(u8, name);
         errdefer allocator.free(owned_name);
@@ -308,6 +327,8 @@ fn applyConfigEntry(
     } else if (std.mem.eql(u8, key, "share")) {
         const share = try Config.Share.parse(val);
         try config.addShare(allocator, share.name, share.path);
+    } else if (std.mem.eql(u8, key, "backup")) {
+        try config.addBackupShare(allocator, val);
     }
 }
 

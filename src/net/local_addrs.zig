@@ -102,6 +102,35 @@ pub fn haveCgnat() bool {
     return false;
 }
 
+/// Whether this device is on a network where large transfers are fine: on
+/// Android, an IPv4 address on a Wi-Fi (`wlan*`) or wired (`eth*`)
+/// interface, not only mobile data; elsewhere always. Backups use it to
+/// wait for Wi-Fi.
+pub fn onUnmeteredNetwork() bool {
+    if (builtin.os.tag != .linux or !builtin.abi.isAndroid()) return true;
+    const linux = std.os.linux;
+    const fd_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return false;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+    const Ifreq = extern struct {
+        name: [16]u8,
+        addr: linux.sockaddr.in,
+        pad: [if (@sizeOf(usize) == 8) 8 else 0]u8,
+    };
+    const Ifconf = extern struct { len: c_int, buf: [*]Ifreq };
+    var reqs: [32]Ifreq = undefined;
+    var conf = Ifconf{ .len = @sizeOf(@TypeOf(reqs)), .buf = &reqs };
+    if (linux.errno(linux.ioctl(fd, 0x8912, @intFromPtr(&conf))) != .SUCCESS) return false;
+    const count = @min(@as(usize, @intCast(@max(conf.len, 0))) / @sizeOf(Ifreq), reqs.len);
+    for (reqs[0..count]) |req| {
+        if (req.addr.family != linux.AF.INET) continue;
+        const name = std.mem.sliceTo(&req.name, 0);
+        if (std.mem.startsWith(u8, name, "wlan") or std.mem.startsWith(u8, name, "eth")) return true;
+    }
+    return false;
+}
+
 fn skipped(name: []const u8) bool {
     for (skipped_prefixes) |p| if (std.mem.startsWith(u8, name, p)) return true;
     return false;

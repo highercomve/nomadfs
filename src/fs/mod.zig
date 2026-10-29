@@ -15,6 +15,7 @@ pub const manifest = @import("manifest.zig");
 pub const swarm = @import("swarm.zig");
 pub const readahead = @import("readahead.zig");
 pub const device_names = @import("device_names.zig");
+pub const backup = @import("backup.zig");
 /// Read-only FUSE mount of every device's shares (desktop Linux only).
 pub const fuse = if (builtin.os.tag == .linux and !builtin.abi.isAndroid()) @import("fuse.zig") else struct {};
 
@@ -22,6 +23,7 @@ pub const ShareIndex = shares.ShareIndex;
 pub const Remote = remote.Remote;
 pub const SwarmFolder = swarm.SwarmFolder;
 pub const ReadAhead = readahead.ReadAhead;
+pub const FolderBackup = backup.FolderBackup;
 
 test {
     _ = scan;

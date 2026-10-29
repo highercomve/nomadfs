@@ -51,6 +51,8 @@ const ICONS = {
   trash: "M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z",
   swarm: "M12 2a3 3 0 0 0-1 5.83V10H7.83A3 3 0 1 0 6 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 0 0 9.83 12h4.34A3 3 0 0 0 16 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 1 0 16.17 10H13V7.83A3 3 0 0 0 12 2z",
   copy: "M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z",
+  backup: "M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z",
+  backup_off: "M19.35 10.04C18.67 6.59 15.64 4 12 4c-1.48 0-2.85.43-4.01 1.17l1.46 1.46C10.21 6.23 11.08 6 12 6c3.04 0 5.5 2.46 5.5 5.5v.5H19c1.66 0 3 1.34 3 3 0 1.13-.64 2.11-1.56 2.62l1.45 1.45C23.16 18.16 24 16.68 24 15c0-2.64-2.05-4.78-4.65-4.96zM3 5.27l2.75 2.74C2.56 8.15 0 10.77 0 14c0 3.31 2.69 6 6 6h11.73l2 2L21 20.73 4.27 4 3 5.27zM7.73 10l8 8H6c-2.21 0-4-1.79-4-4s1.79-4 4-4h1.73z",
   remove: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z",
 };
 
@@ -1161,16 +1163,59 @@ async function loadShares() {
     return;
   }
   for (const s of shares) {
-    list.appendChild(row({
+    const li = row({
       icon: "folder",
       iconClass: "folder",
       headline: s.name,
-      meta: !s.ready ? `Scanning… ${s.path}`
-        : s.indexing ? `Indexing… ${s.files} files so far · ${formatSize(s.size)} · ${s.path}`
-        : `${s.files} files · ${formatSize(s.size)} · ${s.path}`,
-      action: { icon: "remove", label: `Stop sharing ${s.name}`, run: () => removeShare(s.name) },
-    }));
+      meta: [
+        !s.ready ? `Scanning… ${s.path}`
+          : s.indexing ? `Indexing… ${s.files} files so far · ${formatSize(s.size)} · ${s.path}`
+          : `${s.files} files · ${formatSize(s.size)} · ${s.path}`,
+        s.backup ? "Backup: checking…" : "",
+      ],
+      actions: [
+        { icon: s.backup ? "backup" : "backup_off", label: s.backup ? `Stop backing up ${s.name}` : `Back up ${s.name}`, run: () => setShareBackup(s.name, !s.backup) },
+        { icon: "remove", label: `Stop sharing ${s.name}`, run: () => removeShare(s.name) },
+      ],
+    });
+    li.dataset.share = s.name;
+    list.appendChild(li);
   }
+  if (shares.some((s) => s.backup)) loadBackupStatus();
+}
+
+/** Where each folder marked for backup is kept, on its row. */
+async function loadBackupStatus() {
+  let status = [];
+  try {
+    status = await invoke("backup_status", null);
+  } catch {
+    return;
+  }
+  for (const s of status) {
+    const li = [...$("shares-list").children].find((el) => el.dataset.share === s.share);
+    const meta = li && li.querySelectorAll(".meta")[1];
+    if (!meta) continue;
+    if (s.copies.length === 0) {
+      meta.textContent = s.unmetered ? "Backup: no backup device has a copy yet" : "Backup: waiting for Wi-Fi";
+      continue;
+    }
+    const names = s.copies.map((c) => c.device).join(" · ");
+    const behind = s.copies.filter((c) => !c.current).length;
+    meta.textContent = behind === 0
+      ? `Backed up on ${names}`
+      : `Backed up on ${names} · ${s.unmetered ? "new files being copied" : "new files wait for Wi-Fi"}`;
+  }
+}
+
+async function setShareBackup(name, on) {
+  try {
+    await invoke("share_backup_set", { config_path: await ensureConfig(), name, on });
+    snack(on ? `${name} will be backed up by the swarm's backup devices` : `Stopped backing up ${name}; copies already made stay`);
+  } catch (err) {
+    snack(`Couldn't change the backup: ${err}`);
+  }
+  loadShares();
 }
 
 async function removeShare(name) {
@@ -1183,11 +1228,13 @@ async function removeShare(name) {
   loadShares();
 }
 
-/** Shows the share form for `path`, with the name pre-filled. */
-function stageShare(path, name) {
+/** Shows the share form for `path`, with the name pre-filled; `backup`
+ *  ticks "Back up" (the camera presets). */
+function stageShare(path, name, backup = false) {
   path = String(path || "");
   $("share-path").textContent = path;
   $("share-name").value = name || path.split("/").filter(Boolean).pop() || "";
+  $("share-backup").checked = backup;
   $("share-form").hidden = false;
 }
 
@@ -1228,7 +1275,7 @@ $("share-form").addEventListener("submit", async (e) => {
   if (btn) btn.disabled = true;
   snack(`Indexing ${sharePath}…`, 120000);
   try {
-    await invoke("share_add", { config_path: await ensureConfig(), name, path: sharePath });
+    await invoke("share_add", { config_path: await ensureConfig(), name, path: sharePath, backup: $("share-backup").checked });
     snack(`Sharing ${name}`);
     $("share-form").hidden = true;
   } catch (err) {
@@ -1251,11 +1298,21 @@ async function storageSetup() {
   $("storage-banner").hidden = info.granted;
   const presets = $("share-presets");
   presets.replaceChildren();
-  for (const [label, p] of [["Camera", info.camera], ["Pictures", info.pictures], ["Documents", info.documents], ["Download", info.downloads]]) {
+  // Camera, Screenshots and WhatsApp come with "Back up" ticked.
+  const items = [
+    ["Camera", info.camera, true],
+    ["Screenshots", info.screenshots, true],
+    ["WhatsApp", info.whatsapp, true],
+    ["Pictures", info.pictures, false],
+    ["Documents", info.documents, false],
+    ["Download", info.downloads, false],
+  ];
+  for (const [label, p, backup] of items) {
+    if (!p) continue;
     const b = document.createElement("button");
     b.type = "button";
     b.textContent = label;
-    b.addEventListener("click", () => stageShare(p, label));
+    b.addEventListener("click", () => stageShare(p, label, backup));
     presets.appendChild(b);
   }
   presets.hidden = false;

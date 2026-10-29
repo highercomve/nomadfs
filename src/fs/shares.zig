@@ -47,6 +47,28 @@ pub const ShareIndex = struct {
     progress_interval_ns: u64 = 10 * std.time.ns_per_s,
     running: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    /// Names of the shares this device asks backup devices to keep
+    /// (backup.zig), whether or not they are shared right now. Owned;
+    /// guarded by `mutex`.
+    backup_names: std.ArrayList([]u8) = .empty,
+    /// Copies of other devices' shares this device keeps as a backup
+    /// device, listed as shares of their own. Guarded by `mutex`.
+    held: std.ArrayList(Held) = .empty,
+
+    /// A backup this device holds (backup.zig), listed under `display`.
+    pub const Held = struct {
+        owner: [32]u8,
+        /// The owner's share name.
+        share: []u8,
+        /// The name it is listed under here.
+        display: []u8,
+        /// Root of the kept tree (files deleted at the source stay).
+        root: codec.Cid,
+        /// The owner's share root last copied.
+        source_root: codec.Cid,
+        size: u64,
+        synced_at: u64,
+    };
 
     pub fn create(allocator: std.mem.Allocator, io: std.Io, store: *storage.engine.StorageEngine) !*ShareIndex {
         const self = try allocator.create(ShareIndex);
@@ -68,6 +90,10 @@ pub const ShareIndex = struct {
         self.store.external = null;
         for (self.shares.items) |s| freeShare(self.allocator, s);
         self.shares.deinit(self.allocator);
+        for (self.backup_names.items) |n| self.allocator.free(n);
+        self.backup_names.deinit(self.allocator);
+        for (self.held.items) |h| freeHeld(self.allocator, h);
+        self.held.deinit(self.allocator);
         self.scanner.deinit();
         self.files.deinit();
         self.allocator.destroy(self);
@@ -76,6 +102,81 @@ pub const ShareIndex = struct {
     fn freeShare(allocator: std.mem.Allocator, s: Share) void {
         allocator.free(s.name);
         allocator.free(s.path);
+    }
+
+    fn freeHeld(allocator: std.mem.Allocator, h: Held) void {
+        allocator.free(h.share);
+        allocator.free(h.display);
+    }
+
+    /// Marks the share `name` for backup, or clears the mark.
+    pub fn setBackup(self: *ShareIndex, name: []const u8, on: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.backup_names.items, 0..) |n, i| if (std.mem.eql(u8, n, name)) {
+            if (!on) self.allocator.free(self.backup_names.orderedRemove(i));
+            return;
+        };
+        if (on) {
+            const owned = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(owned);
+            try self.backup_names.append(self.allocator, owned);
+        }
+    }
+
+    pub fn isBackup(self: *ShareIndex, name: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.backup_names.items) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
+    }
+
+    /// Records (or updates) a backup this device holds; it is listed as a
+    /// share named `held.display`. Takes copies of the strings.
+    pub fn setHeld(self: *ShareIndex, held: Held) !void {
+        const share = try self.allocator.dupe(u8, held.share);
+        errdefer self.allocator.free(share);
+        const display = try self.allocator.dupe(u8, held.display);
+        errdefer self.allocator.free(display);
+        var copy = held;
+        copy.share = share;
+        copy.display = display;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.held.items) |*h| if (std.mem.eql(u8, &h.owner, &held.owner) and std.mem.eql(u8, h.share, held.share)) {
+            freeHeld(self.allocator, h.*);
+            h.* = copy;
+            return;
+        };
+        try self.held.append(self.allocator, copy);
+    }
+
+    /// Copies of the held backups (strings owned by the caller's allocator).
+    pub fn heldSnapshot(self: *ShareIndex, allocator: std.mem.Allocator) ![]Held {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const out = try allocator.alloc(Held, self.held.items.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |h| freeHeld(allocator, h);
+            allocator.free(out);
+        }
+        for (self.held.items) |h| {
+            var copy = h;
+            copy.share = try allocator.dupe(u8, h.share);
+            copy.display = allocator.dupe(u8, h.display) catch |err| {
+                allocator.free(copy.share);
+                return err;
+            };
+            out[filled] = copy;
+            filled += 1;
+        }
+        return out;
+    }
+
+    pub fn freeHeldSnapshot(allocator: std.mem.Allocator, held: []Held) void {
+        for (held) |h| freeHeld(allocator, h);
+        allocator.free(held);
     }
 
     /// Shares `path` as `name`, replacing any share of that name. The
@@ -320,12 +421,52 @@ pub const ShareIndex = struct {
                 .mtime = s.scanned_at,
             });
         }
+        // Backups kept for other devices list like shares of this one.
+        for (self.held.items) |*h| {
+            const taken = for (entries.items) |e| {
+                if (std.mem.eql(u8, e.name, h.display)) break true;
+            } else false;
+            if (taken) continue;
+            try entries.append(allocator, .{ .name = h.display, .cid = &h.root, .size = h.size, .kind = .dir, .mtime = h.synced_at });
+        }
+        std.mem.sort(codec.DirEntry, entries.items, {}, struct {
+            fn less(_: void, a: codec.DirEntry, b: codec.DirEntry) bool {
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        }.less);
         return codec.encodeDir(allocator, entries.items);
     }
 
     /// Adapter for discovery Node.share_source.
     pub fn source(self: *ShareIndex) @import("../net/discovery/node.zig").Node.ShareSource {
-        return .{ .ctx = self, .listFn = listingErased };
+        return .{ .ctx = self, .listFn = listingErased, .backupFn = backupErased };
+    }
+
+    /// The SHARES `backup` field: the shares marked for backup that have a
+    /// root (only on an unmetered network, so a phone on mobile data is not
+    /// pulled from), and the backups held here.
+    pub fn backupInfo(self: *ShareIndex, allocator: std.mem.Allocator) ![]u8 {
+        const backup = @import("backup.zig");
+        const unmetered = @import("../net/local_addrs.zig").onUnmeteredNetwork();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var wanted: std.ArrayList([]const u8) = .empty;
+        defer wanted.deinit(allocator);
+        if (unmetered) for (self.backup_names.items) |n| {
+            for (self.shares.items) |s| if (std.mem.eql(u8, s.name, n) and s.root != null) {
+                try wanted.append(allocator, n);
+                break;
+            };
+        };
+        var held: std.ArrayList(backup.HeldInfo) = .empty;
+        defer held.deinit(allocator);
+        for (self.held.items) |h| try held.append(allocator, .{ .owner = h.owner, .share = h.share, .source_root = h.source_root, .synced_at = h.synced_at });
+        return backup.encodeInfo(allocator, wanted.items, held.items);
+    }
+
+    fn backupErased(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+        const self: *ShareIndex = @ptrCast(@alignCast(ctx));
+        return self.backupInfo(allocator);
     }
 
     fn listingErased(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {

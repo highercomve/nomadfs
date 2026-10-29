@@ -70,6 +70,27 @@ next through the folder (arrow keys and Esc on the desktop). It reads the file
 in 4 MiB pieces, so it shows progress and works the same on Android.
 **Download** saves a copy in `~/Downloads/NomadFS` (the shared `Download/NomadFS` folder on Android); a name that exists already gets a number.
 
+# [Backing up your phone's photos]($heading.id('backup'))
+
+Any shared folder can be backed up by the swarm. On the phone, share the
+camera folder with the **Camera** preset (Screenshots and WhatsApp have
+presets too), or turn on **Back up** on any shared folder. A computer that
+stays on, with **Swarm backup** on under Node & trust, then keeps a copy of
+it:
+
+- New photos are copied whenever the phone is on Wi-Fi and can reach it.
+- Photos deleted on the phone **stay in the backup**, so you can free space
+  on the phone without losing them.
+- The copy appears on every device as a folder of the backup computer,
+  named like *Pixel 8 · Camera (backup)*. Open or download photos from it
+  while the phone is off, or restore them to a new phone.
+- Under the folder on the phone, the app shows where it is backed up and
+  whether the copy is up to date.
+
+Only devices of your swarm are backed up. On the command line, mark a share
+with `backup = "Camera"` in `nomadfs.conf`, and turn backup on with
+`swarm_backup = true` or `--swarm-backup`.
+
 # [The Linux mount]($heading.id('mount'))
 
 On Linux everything can be mounted as an ordinary folder that any program can

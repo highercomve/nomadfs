@@ -41,6 +41,8 @@ pub const Node = struct {
     trust_store: *device.trust.Store,
     /// Folders this device shares; null without block storage.
     shares: ?*fs.ShareIndex,
+    /// Keeps members' folders marked for backup on a swarm backup device.
+    folder_backup: ?*fs.FolderBackup = null,
     /// The swarm-wide folder every device reads and writes; null without
     /// block storage.
     swarm: ?*fs.SwarmFolder,
@@ -114,6 +116,7 @@ pub const Node = struct {
                 };
             }
             if (cfg.shares.len > 0) try index.start();
+            for (cfg.backup_shares) |name| try index.setBackup(name, true);
         }
 
         // Register DHT serve loop for new connections
@@ -180,6 +183,16 @@ pub const Node = struct {
         // Revocations are signed with the device identity and recorded in
         // the same trust store the handshake policy reads.
         discovery_node.trust_store = trust_store;
+
+        // A swarm backup device keeps the members' folders marked for
+        // backup too (fs/backup.zig); the thread starts with the listener.
+        var folder_backup: ?*fs.FolderBackup = null;
+        if (store) |s| if (shares) |index| if (swarm) |folder| {
+            const state_path = try std.fmt.allocPrint(allocator, "{s}.backups", .{cfg.storage.storage_path});
+            defer allocator.free(state_path);
+            folder_backup = try fs.FolderBackup.create(allocator, std.Io.Threaded.global_single_threaded.io(), s, index, trust_store, block_manager, &folder.backup_enabled, state_path);
+        };
+        errdefer if (folder_backup) |b| b.destroy();
         discovery_node.device_identity = device_identity;
 
         connection_manager.setDeviceAuthenticator(.{
@@ -215,6 +228,7 @@ pub const Node = struct {
             .shares = shares,
             .swarm = swarm,
             .read_ahead = read_ahead,
+            .folder_backup = folder_backup,
             .bootstrap_running = bootstrap_running,
             .bootstrap_thread = null,
         };
@@ -234,6 +248,7 @@ pub const Node = struct {
         self.connection_manager.stop();
         self.discovery_node.drainHandlers();
         self.connection_manager.relay_dialer = null;
+        if (self.folder_backup) |b| b.destroy();
         if (self.shares) |index| index.destroy();
         if (self.swarm) |folder| folder.destroy();
         if (self.read_ahead) |ra| ra.destroy();
@@ -333,6 +348,7 @@ pub const Node = struct {
     pub fn listen(self: *Node, running: *std.atomic.Value(bool), cfg: config.Config) !void {
         try self.connection_manager.start();
         try self.connection_manager.listen(cfg, running);
+        if (self.folder_backup) |b| b.start() catch |err| std.debug.print("backup: thread not started: {any}\n", .{err});
         if (self.store != null and self.cache_thread == null) {
             self.cache_running.store(true, .release);
             self.cache_thread = std.Thread.spawn(.{}, runCacheSort, .{self}) catch null;
@@ -417,6 +433,7 @@ pub const Node = struct {
     /// ManagerStopping until the connection manager can restart.
     pub fn stopListener(self: *Node) void {
         self.stopCacheThread();
+        if (self.folder_backup) |b| b.stop();
         self.bootstrap_running.store(false, .release);
         self.connection_manager.stop();
     }
@@ -665,6 +682,7 @@ test {
         @import("env.zig"),
         @import("errors.zig"),
         @import("fs/filestore.zig"),
+        @import("fs/backup.zig"),
         @import("fs/manifest.zig"),
         @import("fs/swarm.zig"),
         @import("fs/remote.zig"),

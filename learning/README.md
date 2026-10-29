@@ -104,6 +104,7 @@ no TLS or crypto libraries. The app adds Oriel.
 8.  **[Chapter 5: Folders](./fs/overview.md)**
     *   [5.1: Shared Folders and the Filestore](./fs/shares.md)
     *   [5.2: The Swarm Folder](./fs/swarm.md)
+    *   [5.3: Folder Backup](./fs/backup.md)
     *   [5.3: The FUSE Mount](./fs/fuse.md)
 
 ### Part VI: Devices & Security (`src/device/`)

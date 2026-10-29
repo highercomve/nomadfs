@@ -25,6 +25,7 @@ test {
     _ = @import("cluster/rotation_test.zig");
     _ = @import("cluster/tickets_test.zig");
     _ = @import("cluster/swarm_backup_test.zig");
+    _ = @import("cluster/folder_backup_test.zig");
     _ = @import("cluster/readahead_test.zig");
     _ = @import("cluster/fuse_inodes_test.zig");
     _ = @import("cluster/fuse_mt_test.zig");

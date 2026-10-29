@@ -655,6 +655,7 @@ pub const Mount = struct {
 
     fn applyShares(self: *Mount, peer: NodeID, shares: Remote.Shares) void {
         defer self.allocator.free(shares.nickname);
+        defer self.allocator.free(shares.backup);
         self.lock.lock();
         defer self.lock.unlock();
 
