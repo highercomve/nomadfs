@@ -347,7 +347,7 @@ pub const Node = struct {
 
     /// Marker in the cache directory: the one-time sort is done.
     const cache_sorted_marker = ".sorted-v1";
-    /// Longest wait for every share's first scan before sorting anyway.
+    /// Longest wait for a share that has no root and isn't being scanned.
     const cache_sort_wait_ns: u64 = 30 * std.time.ns_per_min;
 
     fn runCacheSort(self: *Node) void {
@@ -356,8 +356,17 @@ pub const Node = struct {
         if (store.cache_dir.statFile(io, cache_sorted_marker, .{})) |_| return else |_| {}
         var waited: u64 = 0;
         const step = 100 * std.time.ns_per_ms;
-        // A share's parent blocks are known once its first scan has a root.
-        while (!self.sharesScanned() and waited < cache_sort_wait_ns) : (waited += step) {
+        // A share's parent blocks are known once its first scan is done. A
+        // scan still running is waited for however long it takes (a media
+        // disk hashes for hours): sorting meanwhile would move the blocks it
+        // writes. Only a share that never gets a root (its folder is gone) is
+        // given up on, after cache_sort_wait_ns.
+        while (true) : (waited += step) {
+            switch (self.sharesState()) {
+                .scanned => break,
+                .indexing => {},
+                .missing_roots => if (waited >= cache_sort_wait_ns) break,
+            }
             if (!self.cache_running.load(.acquire)) return;
             sync.sleep(step);
         }
@@ -369,12 +378,16 @@ pub const Node = struct {
         if (store.cache_dir.createFile(io, cache_sorted_marker, .{})) |f| f.close(io) else |_| {}
     }
 
-    fn sharesScanned(self: *Node) bool {
-        const shares = self.shares orelse return true;
-        const snap = shares.snapshot(self.allocator) catch return false;
+    fn sharesState(self: *Node) enum { scanned, indexing, missing_roots } {
+        const shares = self.shares orelse return .scanned;
+        const snap = shares.snapshot(self.allocator) catch return .indexing;
         defer fs.ShareIndex.freeSnapshot(self.allocator, snap);
-        for (snap) |sh| if (sh.root == null or sh.indexing) return false;
-        return true;
+        var missing = false;
+        for (snap) |sh| {
+            if (sh.indexing) return .indexing;
+            if (sh.root == null) missing = true;
+        }
+        return if (missing) .missing_roots else .scanned;
     }
 
     /// Blocks stored before the read cache existed sit with the kept ones.

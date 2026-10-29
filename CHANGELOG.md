@@ -3,6 +3,14 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.2.1 - 2026-10-28
+
+### Fixed
+
+- The one-time move of old blocks into the read cache waits for every share's first scan to
+  finish, however long it takes, instead of giving up after 30 minutes. A large share still
+  hashing could otherwise have had some of its own blocks moved into the cache.
+
 ## 0.2.0 - 2026-10-28
 
 ### Added
