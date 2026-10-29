@@ -135,23 +135,55 @@ pub const Identity = struct {
         return fromSeed(seed_bytes) catch error.InvalidKeyFile;
     }
 
-    /// Writes a new identity. Never overwrites an existing one.
+    /// Writes a new identity. Never overwrites an existing one, and never
+    /// leaves a partial file under `path`: the bytes go to `<path>.tmp`,
+    /// are synced, and are renamed into place only if `path` doesn't exist.
+    /// (Not O_TMPFILE + linkat: Android's SELinux denies apps `link`.)
     pub fn saveToFile(self: Identity, path: []const u8) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
-            .permissions = key_file_permissions,
-        });
-        defer atomic.deinit(io);
+        const cwd = std.Io.Dir.cwd();
+        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp_path = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
 
         var buf: [file_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &buf);
         @memcpy(buf[0..magic.len], magic);
         buf[magic.len..].* = self.seed();
-        try atomic.file.writePositionalAll(io, &buf, 0);
-        try atomic.file.sync(io);
-        try atomic.link(io);
+        {
+            var file = try cwd.createFile(io, tmp_path, .{ .truncate = true, .permissions = key_file_permissions });
+            defer file.close(io);
+            errdefer cwd.deleteFile(io, tmp_path) catch {};
+            try file.setPermissions(io, key_file_permissions);
+            try file.writePositionalAll(io, &buf, 0);
+            try file.sync(io);
+        }
+        errdefer cwd.deleteFile(io, tmp_path) catch {};
+        try publishNoReplace(io, tmp_path, path);
     }
 };
+
+/// Renames `tmp_path` to `path`, failing with error.PathAlreadyExists when
+/// `path` exists, so a concurrent first run can't replace an identity.
+fn publishNoReplace(io: std.Io, tmp_path: []const u8, path: []const u8) !void {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var from: [std.fs.max_path_bytes:0]u8 = undefined;
+        var to: [std.fs.max_path_bytes:0]u8 = undefined;
+        const from_z = try std.fmt.bufPrintZ(&from, "{s}", .{tmp_path});
+        const to_z = try std.fmt.bufPrintZ(&to, "{s}", .{path});
+        const rc = linux.renameat2(linux.AT.FDCWD, from_z.ptr, linux.AT.FDCWD, to_z.ptr, .{ .NOREPLACE = true });
+        switch (linux.errno(rc)) {
+            .SUCCESS => return,
+            .EXIST => return error.PathAlreadyExists,
+            // Old kernels and some filesystems lack renameat2: check, then rename.
+            .NOSYS, .INVAL => {},
+            else => return error.Unexpected,
+        }
+    }
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.access(io, path, .{})) |_| return error.PathAlreadyExists else |_| {}
+    try cwd.rename(tmp_path, cwd, path, io);
+}
 
 test "identity: seed round-trips and signatures verify" {
     const seed = [_]u8{0x42} ** seed_len;

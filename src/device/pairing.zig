@@ -156,7 +156,7 @@ const field_count = 7;
 
 /// Extracts and validates fields, leaving signature verification to the caller.
 fn parseFields(uri: []const u8) !Ticket {
-    if (!std.mem.startsWith(u8, uri, uri_prefix)) return Error.InvalidTicket;
+    if (!std.ascii.startsWithIgnoreCase(uri, uri_prefix)) return Error.InvalidTicket;
     if (uri.len > max_uri_len) return Error.InvalidTicket;
 
     var values: [field_count]?[]const u8 = .{null} ** field_count;

@@ -148,9 +148,12 @@ pub const Stream = struct {
     pub fn write(self: Stream, buffer: []const u8) !usize {
         if (builtin.os.tag == .linux) {
             while (true) {
+                // A raw syscall: its result carries -errno, so it needs
+                // linux.errno. posix.errno reads libc's errno when libc is
+                // linked (Android) and would take a failure for success.
                 const rc = std.os.linux.sendto(@intCast(self.inner.socket.handle), buffer.ptr, buffer.len, std.os.linux.MSG.NOSIGNAL, null, 0);
-                if (std.posix.errno(rc) == .INTR) continue;
-                return switch (std.posix.errno(rc)) {
+                if (std.os.linux.errno(rc) == .INTR) continue;
+                return switch (std.os.linux.errno(rc)) {
                     .SUCCESS => @intCast(rc),
                     .BADF, .PIPE => error.BrokenPipe,
                     .AGAIN => error.WouldBlock,
@@ -217,8 +220,9 @@ pub const Server = struct {
             var sa: std.os.linux.sockaddr.storage = undefined;
             var len: std.os.linux.socklen_t = @sizeOf(@TypeOf(sa));
             const rc = while (true) {
+                // Raw syscall: linux.errno, not posix.errno (see write).
                 const result = std.os.linux.accept4(self.inner.socket.handle, @ptrCast(&sa), &len, std.os.linux.SOCK.CLOEXEC);
-                switch (std.posix.errno(result)) {
+                switch (std.os.linux.errno(result)) {
                     .SUCCESS => break result,
                     .INTR => continue,
                     .BADF, .INVAL, .NOTSOCK => return error.FileDescriptorClosed,
@@ -229,7 +233,7 @@ pub const Server = struct {
             };
             const addr: Address = if (sa.family == std.posix.AF.INET6) addr6: {
                 const ip6: *const std.os.linux.sockaddr.in6 = @ptrCast(&sa);
-                break :addr6 Address.initIp6(ip6.addr, std.mem.bigToNative(u16, ip6.port), @intCast(std.mem.bigToNative(u32, ip6.flowinfo)), ip6.scope_id);
+                break :addr6 Address.initIp6(ip6.addr, std.mem.bigToNative(u16, ip6.port), @truncate(std.mem.bigToNative(u32, ip6.flowinfo) & 0xFFFFF), ip6.scope_id);
             } else Address.fromPosix(@as(*const std.posix.sockaddr.in, @ptrCast(&sa)).*);
             break :blk std.Io.net.Stream{ .socket = .{ .handle = @intCast(rc), .address = addr.ip } };
         } else try self.inner.accept(io);

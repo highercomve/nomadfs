@@ -54,7 +54,9 @@ pub const Code = struct {
     /// Parses an invite code; `addr` points into `text`.
     pub fn parse(text: []const u8) !Code {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
-        if (!std.mem.startsWith(u8, trimmed, scheme)) return error.InvalidInvite;
+        // Schemes are case-insensitive, and phone keyboards capitalize the
+        // first letter of a typed code.
+        if (!std.ascii.startsWithIgnoreCase(trimmed, scheme)) return error.InvalidInvite;
         var addr: ?[]const u8 = null;
         var token: ?[token_len]u8 = null;
         var params = std.mem.splitScalar(u8, trimmed[scheme.len..], '&');
@@ -349,6 +351,10 @@ test "invite: code round trip and rejection" {
     const parsed = try Code.parse(text);
     try std.testing.expectEqualStrings("192.168.1.20:14701", parsed.addr);
     try std.testing.expectEqualSlices(u8, &token, &parsed.token);
+    // As a phone keyboard types it: first letter capitalized.
+    var typed_buf: [128]u8 = undefined;
+    const typed = try std.fmt.bufPrint(&typed_buf, "N{s}", .{text[1..]});
+    try std.testing.expectEqualStrings("192.168.1.20:14701", (try Code.parse(typed)).addr);
     try std.testing.expectError(error.InvalidInvite, Code.parse("nomadfs://join?key=00"));
     try std.testing.expectError(error.InvalidInvite, Code.parse("nomadfs://invite?addr=1.2.3.4:5&token=abcd"));
     // Different tokens never share a PSK.
