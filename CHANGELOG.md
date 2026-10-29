@@ -3,6 +3,43 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.3.0 - 2026-10-29
+
+A clean break: **every device needs 0.3.0**. The app has a new ID
+(`com.foreachdeveloper.nomadfs`): on Android, uninstall the old NomadFS, install this one and
+pair the phone again; on the desktop, install it from the release (installed 0.2.x apps won't
+offer this update). Devices on 0.2.x can't sync the swarm folder with 0.3.0 devices.
+
+### Added
+
+- **Reads from every device that has the file, at once.** A new distribution layer picks, for
+  each piece of a file, the device expected to answer first, by measured speed and current
+  load: a stream draws from every holder, mostly the fastest, and keeps going when one is slow
+  or goes away. A device that doesn't have the file is remembered, not asked for every piece.
+- **Copies on more devices.** **Node & trust → Keep each swarm file on** (or `--copies N`): one
+  signed setting for the whole swarm keeps each swarm folder file on N devices, chosen per file
+  among those that accept copies; every device works out the same choice on its own. Phones
+  don't accept copies unless **Accept copies of other devices' files** is on
+  (`accept_copies` under `[storage]`). Backup devices still keep everything.
+- **Backed-up folders open while their device is off**: a phone's photos come from the backup
+  device.
+- **Network numbers**: a device's About shows the bytes it sent and received;
+  `nomadfs --bench-read` and `--bench-idle` measure reads and idle traffic.
+- **How it works**, a new page in the docs, and a rewritten chapter of the learning book on the
+  distribution layer.
+
+### Changed
+
+- **Far less background traffic.** The swarm folder's listing (850 KB for a few thousand files)
+  was pulled from every device every 10 seconds; now only a short fingerprint is, and the
+  listing travels when it differs. An idle device went from 7–17 MB a minute to tens of KB.
+- Copies are pulled by the devices that keep them; nothing is pushed when a file is saved.
+  `swarm_replicas`, `replicas` and the `PUT_BLOCK` message are gone: a device stores only
+  blocks it asked for.
+- Lists show placeholder rows while they load, and an answer for a folder you already left no
+  longer replaces the one you're on.
+- The swarm folder's breadcrumb, search and sorting match Browse.
+
 ## 0.2.5 - 2026-10-29
 
 ### Added

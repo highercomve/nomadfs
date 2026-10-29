@@ -10,7 +10,7 @@ pub const fs = @import("fs/mod.zig");
 pub const node_info = @import("node_info.zig");
 
 /// This release; scripts/release.sh checks it matches build.zig.zon.
-pub const version = "0.2.5";
+pub const version = "0.3.0";
 
 /// C ABI bindings for mobile hosts; the shared library target points here.
 pub const mobile_api = @import("mobile/api.zig");

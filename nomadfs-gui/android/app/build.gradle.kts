@@ -14,8 +14,8 @@ android {
         applicationId = "com.foreachdeveloper.nomadfs"
         minSdk = 29
         targetSdk = 36
-        versionCode = 205
-        versionName = "0.2.5"
+        versionCode = 300
+        versionName = "0.3.0"
     }
 
     signingConfigs {
