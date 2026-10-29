@@ -57,8 +57,13 @@ run() { # <log name> <command...>: output to the log, shown on failure
 
 step "NomadFS $version -> $out"
 
+# x86_64 builds target the baseline CPU: without -Dcpu, Zig optimizes for
+# this machine (AVX-512 here), and the binaries die with SIGILL on CPUs
+# without it (a DigitalOcean droplet, older laptops).
+x86_cpu=(-Dcpu=baseline)
+
 step "Command line node"
-run cli-x86_64 zig build -Doptimize=ReleaseSafe -p "$out/build/x86_64"
+run cli-x86_64 zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl "${x86_cpu[@]}" -p "$out/build/x86_64"
 cp "$out/build/x86_64/bin/nomadfs" "$assets/nomadfs-$version-x86_64-linux"
 run cli-aarch64 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl -p "$out/build/aarch64"
 cp "$out/build/aarch64/bin/nomadfs" "$assets/nomadfs-$version-aarch64-linux"
@@ -66,12 +71,12 @@ cp "$out/build/aarch64/bin/nomadfs" "$assets/nomadfs-$version-aarch64-linux"
 step "Desktop app (AppImage, deb, rpm)"
 cd "$root/nomadfs-gui"
 rm -rf zig-out/package
-run gui-package zig build package -Doptimize=ReleaseSafe
+run gui-package zig build package -Doptimize=ReleaseSafe "${x86_cpu[@]}"
 cp zig-out/package/* "$assets/"
 
 step "Android app"
 run android-aarch64 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-android
-run android-x86_64 zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-android
+run android-x86_64 zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-android "${x86_cpu[@]}"
 (cd android && run gradle ./gradlew assembleDebug)
 cp android/app/build/outputs/apk/debug/app-debug.apk "$assets/nomadfs-$version.apk"
 
