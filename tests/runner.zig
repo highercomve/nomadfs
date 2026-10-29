@@ -21,6 +21,7 @@ test {
     _ = @import("cluster/revocation_test.zig");
     _ = @import("cluster/membership_test.zig");
     _ = @import("cluster/node_info_test.zig");
+    _ = @import("cluster/policy_test.zig");
     _ = @import("cluster/share_test.zig");
     _ = @import("cluster/swarm_test.zig");
     _ = @import("cluster/rotation_test.zig");

@@ -225,6 +225,8 @@ pub const Node = struct {
             }
         };
         errdefer if (keeper) |k| allocator.destroy(k);
+        discovery_node.policy = policy;
+        if (keeper) |k| discovery_node.on_policy_change = .{ .ctx = k, .func = wakeKeeper };
 
         // This device's say in the swarm's policy: whether it accepts copies
         // (signed again only when it changed), and --copies.
@@ -796,6 +798,11 @@ test {
     }) |module| {
         std.testing.refAllDecls(module);
     }
+}
+
+fn wakeKeeper(ctx: *anyopaque) void {
+    const k: *cluster.keeper.Keeper = @ptrCast(@alignCast(ctx));
+    k.wake();
 }
 
 /// What GET_NODE_INFO reports (node_info.zig), gathered on request.

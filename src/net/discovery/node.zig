@@ -14,6 +14,7 @@ const providers_mod = @import("providers.zig");
 const device_trust = @import("../../device/trust.zig");
 const device_rotation = @import("../../device/rotation.zig");
 const identity_mod = @import("../../device/identity.zig");
+const policy_mod = @import("../../device/policy.zig");
 
 /// Bounds on values peers can STORE here. Without them any peer could fill
 /// our memory with arbitrary values.
@@ -77,6 +78,14 @@ pub const Node = struct {
     /// Per peer device: the member list last sent to it, so pings don't
     /// re-send an unchanged list. Guarded by `mutex`.
     admit_sent: std.AutoHashMapUnmanaged(id.NodeID, AdmitSent) = .empty,
+    /// The swarm's signed settings (copies, who accepts); spread like
+    /// membership, only to peers that haven't acknowledged the current set.
+    policy: ?*policy_mod.Policy = null,
+    /// Per peer: the policy digest it last acknowledged in full. Guarded by
+    /// `mutex`.
+    policy_sent: std.AutoHashMapUnmanaged(id.NodeID, u64) = .empty,
+    /// Told when a POLICY record changed the policy (the keeper wakes).
+    on_policy_change: ?struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque) void } = null,
 
     discovery_dials: std.AutoHashMapUnmanaged(id.NodeID, i64) = .empty,
 
@@ -215,6 +224,7 @@ pub const Node = struct {
         self.providers.deinit(self.allocator);
         self.relay_misses.deinit(self.allocator);
         self.admit_sent.deinit(self.allocator);
+        self.policy_sent.deinit(self.allocator);
         self.discovery_dials.deinit(self.allocator);
     }
 
@@ -277,6 +287,8 @@ pub const Node = struct {
             // And which devices belong to the swarm: pairing with one member
             // makes a device a member everywhere.
             if (trust.count() > 0) _ = self.pushAdmissions(conn) catch {};
+            // And the swarm's settings, only when this peer lacks some.
+            _ = self.pushPolicy(conn) catch {};
         }
     }
 
@@ -752,6 +764,66 @@ pub const Node = struct {
         return honored;
     }
 
+    /// Sends every policy record to `conn`'s peer, unless it acknowledged
+    /// this exact set before: a change costs one message per record per
+    /// peer, an unchanged policy nothing. Returns how many it took.
+    pub fn pushPolicy(self: *Node, conn: network.Connection) !usize {
+        const policy = self.policy orelse return 0;
+        const peer = conn.getRemoteDeviceID() orelse return 0;
+        const digest = policy.digest();
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.policy_sent.get(peer)) |d| if (d == digest) return 0;
+        }
+        const records = try policy.records(self.allocator);
+        defer self.allocator.free(records);
+        if (records.len == 0) return 0;
+        var taken: usize = 0;
+        for (records) |r| {
+            const stream = conn.openStream() catch break;
+            defer stream.close();
+            stream.setTimeout(self.rpc_timeout_ms);
+            const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .POLICY = .{ .record = r.encode() } } };
+            msg.send(self.allocator, stream) catch break;
+            const response = rpc.Message.deserialize(self.allocator, stream.reader()) catch break;
+            defer response.deinit(self.allocator);
+            switch (response.payload) {
+                .STORE_ACK => |ack| if (ack.stored) {
+                    taken += 1;
+                },
+                else => break,
+            }
+        }
+        // Remembered only when every record was acknowledged.
+        if (taken == records.len) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.policy_sent.count() >= 256) self.policy_sent.clearRetainingCapacity();
+            self.policy_sent.put(self.allocator, peer, digest) catch {};
+        }
+        return taken;
+    }
+
+    /// POLICY: a signed swarm setting; applied when newer, acknowledged
+    /// when not older-and-invalid (device/policy.zig).
+    fn handlePolicy(self: *Node, stream: network.Stream, bytes: [policy_mod.Record.encoded_len]u8) !void {
+        var stored = false;
+        if (self.policy) |policy| if (self.trust_store) |trust| if (self.device_identity) |identity| {
+            if (policy_mod.Record.decode(&bytes)) |r| {
+                const now = std.math.cast(u64, sync.timestamp()) orelse 0;
+                const outcome = policy.apply(r, trust, identity.deviceId(), now) catch .rejected;
+                stored = outcome != .rejected;
+                if (outcome == .applied) {
+                    policy.save() catch |err| std.debug.print("policy: not saved: {any}\n", .{err});
+                    if (self.on_policy_change) |cb| cb.func(cb.ctx);
+                }
+            } else |_| {}
+        };
+        const response = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .STORE_ACK = .{ .stored = stored } } };
+        try response.send(self.allocator, stream);
+    }
+
     pub const AdmitSent = struct {
         digest: u64,
         at: i64,
@@ -861,6 +933,7 @@ pub const Node = struct {
             const conn = self.manager.connectToPeerMulti(peer.addresses[0..peer.addrs_count], self.swarm_key, peer.id) catch continue;
             defer conn.deinit();
             if ((self.pushAdmissions(conn) catch 0) > 0) reached += 1;
+            _ = self.pushPolicy(conn) catch {};
         }
         return reached;
     }
@@ -1161,6 +1234,7 @@ pub const Node = struct {
             .PUT_BLOCK => |p| try self.handlePutBlock(stream, conn, p.cid, p.data),
             .REVOKE => |p| try self.handleRevoke(stream, p.device_id, p.signer_key, p.at, p.signature),
             .ADMIT => |p| try self.handleAdmit(stream, p),
+            .POLICY => |p| try self.handlePolicy(stream, p.record),
             .ADD_PROVIDER => |p| try self.handleAddProvider(stream, conn, p.key),
             .GET_PROVIDERS => |p| try self.handleGetProviders(stream, p.key),
             .DIAL_BACK => |p| try self.handleDialBack(conn, p.port),

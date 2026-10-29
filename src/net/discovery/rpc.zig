@@ -6,6 +6,7 @@ const id = @import("../id.zig");
 const kbucket = @import("kbucket.zig");
 const providers_mod = @import("providers.zig");
 const pairing = @import("../../device/pairing.zig");
+const policy_mod = @import("../../device/policy.zig");
 const node_info = @import("../../node_info.zig");
 
 /// In-memory target for Message.serialize (Message.send).
@@ -78,6 +79,9 @@ pub const MessageType = enum(u8) {
     /// NODE_INFO; empty when the asker isn't trusted.
     GET_NODE_INFO = 25,
     NODE_INFO = 26,
+    /// A signed swarm setting (device/policy.zig). Answered with STORE_ACK,
+    /// `stored` also for one not newer than the receiver's.
+    POLICY = 27,
 };
 
 pub const FindValueResult = union(enum) {
@@ -145,6 +149,7 @@ pub const MessagePayload = union(MessageType) {
     ADMIT: Admit,
     GET_NODE_INFO: void,
     NODE_INFO: struct { info: []const u8 },
+    POLICY: struct { record: [policy_mod.Record.encoded_len]u8 },
 };
 
 /// A member's signed vouch for another device (ADMIT). The label is a fixed
@@ -288,6 +293,7 @@ pub const Message = struct {
                 try writer.writeAll(p.manifest);
             },
             .GET_NODE_INFO => {},
+            .POLICY => |p| try writer.writeAll(&p.record),
             .NODE_INFO => |p| {
                 try writer.writeInt(u32, try valueLen(p.info.len), .big);
                 try writer.writeAll(p.info);
@@ -393,6 +399,11 @@ pub const Message = struct {
             },
             .GET_SWARM => MessagePayload{ .GET_SWARM = {} },
             .GET_NODE_INFO => MessagePayload{ .GET_NODE_INFO = {} },
+            .POLICY => blk: {
+                var record: [policy_mod.Record.encoded_len]u8 = undefined;
+                try reader.readNoEof(&record);
+                break :blk MessagePayload{ .POLICY = .{ .record = record } };
+            },
             .NODE_INFO => MessagePayload{ .NODE_INFO = .{ .info = try readValueMax(allocator, reader, node_info.max_len) } },
             .ROTATE_KEY => blk: {
                 const epoch = try reader.readInt(u64, .big);
