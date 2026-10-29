@@ -331,15 +331,11 @@ $("close-node").addEventListener("click", async () => {
 // then one {name, cid} per folder below the share.
 let path = [];
 
-function renderCrumbs() {
-  $("remote-head").hidden = path.length === 0;
-  $("device-about").hidden = path.length === 0;
-  $("browse-tools").hidden = path.length === 0;
-  renderNavDevices();
-  const nav = $("crumbs");
+/** Breadcrumbs into `nav`: [{ label, go }], the last one is where we are.
+ *  Hidden at the top level, where there is nothing to go back to. */
+function drawCrumbs(nav, parts) {
   nav.replaceChildren();
-  nav.hidden = path.length === 0;
-  const parts = [{ label: "Devices" }, ...path.map((p) => ({ label: p.name }))];
+  nav.hidden = parts.length < 2;
   parts.forEach((part, i) => {
     if (i > 0) {
       const sep = document.createElement("span");
@@ -348,10 +344,20 @@ function renderCrumbs() {
       nav.appendChild(sep);
     }
     const b = document.createElement("button");
+    b.type = "button";
     b.textContent = part.label;
-    if (i < parts.length - 1) b.addEventListener("click", () => { path = path.slice(0, i); showLocation(); });
+    if (i < parts.length - 1) b.addEventListener("click", part.go);
     nav.appendChild(b);
   });
+}
+
+function renderCrumbs() {
+  $("remote-head").hidden = path.length === 0;
+  $("device-about").hidden = path.length === 0;
+  $("browse-tools").hidden = path.length === 0;
+  renderNavDevices();
+  const parts = [{ label: "Devices" }, ...path.map((p) => ({ label: p.name }))];
+  drawCrumbs($("crumbs"), parts.map((part, i) => ({ ...part, go: () => { path = path.slice(0, i); showLocation(); } })));
   syncBack();
 }
 
@@ -1035,22 +1041,9 @@ async function refreshLocation() {
 let swarmDir = ""; // "" = top; "a/b" below
 
 function swarmCrumbs() {
-  const nav = $("swarm-crumbs");
-  nav.replaceChildren();
   const parts = swarmDir ? swarmDir.split("/") : [];
-  const all = [{ label: "Swarm", dir: "" }, ...parts.map((p, i) => ({ label: p, dir: parts.slice(0, i + 1).join("/") }))];
-  all.forEach((c, i) => {
-    if (i > 0) {
-      const sep = document.createElement("span");
-      sep.className = "sep";
-      sep.textContent = "›";
-      nav.appendChild(sep);
-    }
-    const b = document.createElement("button");
-    b.textContent = c.label;
-    if (i < all.length - 1) b.addEventListener("click", () => { swarmDir = c.dir; loadSwarm(); });
-    nav.appendChild(b);
-  });
+  drawCrumbs($("swarm-crumbs"), [{ label: "Swarm", dir: "" }, ...parts.map((p, i) => ({ label: p, dir: parts.slice(0, i + 1).join("/") }))]
+    .map((c) => ({ label: c.label, go: () => { swarmDir = c.dir; loadSwarm(); } })));
   syncBack();
 }
 

@@ -1166,8 +1166,17 @@ body[data-view] main > [data-view] + [data-view],
 /* ---- Swarm folder ---- */
 body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 .swarm-status { margin: 6px 0 0; font-size: 10.5px; letter-spacing: .3px; color: var(--oasis-hi); }
-.swarm-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.swarm-toolbar .crumbs { flex: 1; min-width: 0; }
+.swarm-toolbar { display: flex; flex-direction: column; gap: 10px; margin: 2px 0 10px; }
+.swarm-toolbar .browse-tools { margin: 0; }
+/* Phones: the buttons get a row of their own, above the search. */
+.swarm-toolbar .actions { order: -1; display: flex; gap: 8px; }
+.swarm-toolbar .actions .btn { flex: 1; }
+@media (min-width: 840px) {
+  .swarm-toolbar { flex-direction: row; align-items: center; }
+  .swarm-toolbar .browse-tools { flex: 1; min-width: 0; }
+  .swarm-toolbar .actions { order: 0; }
+  .swarm-toolbar .actions .btn { flex: none; }
+}
 .row-actions { display: flex; gap: 2px; flex: none; }
 .list.rows li .col-by { display: none; }
 
