@@ -381,7 +381,7 @@ pub const SwarmFolder = struct {
         try peers.append(allocator, .{ .bytes = author });
         for (known) |p| if (!std.mem.eql(u8, &p.bytes, &author)) try peers.append(allocator, p);
         if (self.read_ahead) |ra| return ra.readAt(allocator, peers.items, cid, offset, dest);
-        var multi = remote_mod.MultiRemote{ .block_manager = bm, .store = self.store, .peers = peers.items };
+        var multi = remote_mod.MultiRemote{ .block_manager = bm, .store = self.store, .peers = peers.items, .root = cid };
         return tree.readAt(allocator, multi.loader(), cid, offset, dest);
     }
 

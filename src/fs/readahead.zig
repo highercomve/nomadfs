@@ -12,7 +12,6 @@ const sync = @import("../sync.zig");
 const cluster = @import("../cluster/mod.zig");
 const storage = @import("../storage/mod.zig");
 const NodeID = @import("../net/id.zig").NodeID;
-const remote_mod = @import("remote.zig");
 const tree = @import("tree.zig");
 
 const Cid = tree.Cid;
@@ -115,7 +114,7 @@ pub const ReadAhead = struct {
     /// Reads like tree.readAt from `peers` (tried in order), then queues the
     /// blocks ahead of it.
     pub fn readAt(self: *ReadAhead, allocator: std.mem.Allocator, peers: []const NodeID, root: Cid, offset: u64, dest: []u8) !usize {
-        var source = Source{ .ra = self, .peers = peers[0..@min(peers.len, max_peers)] };
+        var source = Source{ .ra = self, .root = root, .peers = peers[0..@min(peers.len, max_peers)] };
         const span = self.track(root, offset, dest.len);
         const n = try tree.readAt(allocator, source.loader(), root, offset, dest);
         if (n > 0 and span.len > 0) self.ahead(allocator, &source, root, offset, span) catch {};
@@ -289,7 +288,7 @@ pub const ReadAhead = struct {
                 break :blk job;
             };
             if (!self.store.has(&job.cid)) {
-                const bytes = fetch(self, job.cid, job.peers[0..job.peer_count], self.allocator) catch null;
+                const bytes = fetch(self, job.root, job.cid, job.peers[0..job.peer_count], self.allocator) catch null;
                 if (bytes) |b| self.allocator.free(b);
             }
             self.finish(job.cid);
@@ -303,24 +302,18 @@ pub const ReadAhead = struct {
         self.done.broadcast();
     }
 
-    /// Fetches `cid` from the first of `peers` that has it; the remote
-    /// loader verifies it and keeps it in the store.
-    fn fetch(self: *ReadAhead, cid: Cid, peers: []const NodeID, allocator: std.mem.Allocator) ![]u8 {
-        var last: anyerror = error.BlockNotFound;
-        for (peers) |peer| {
-            var one = remote_mod.Remote{ .block_manager = self.block_manager, .store = self.store, .peer = peer };
-            return one.loader().load(&cid, allocator) catch |err| {
-                last = err;
-                continue;
-            };
-        }
-        return last;
+    /// Fetches `cid` of the file `root` through the fetcher, which picks
+    /// among `peers` by speed and load: the workers so spread across holders.
+    fn fetch(self: *ReadAhead, root: Cid, cid: Cid, peers: []const NodeID, allocator: std.mem.Allocator) ![]u8 {
+        const fetcher = &(self.block_manager.fetcher orelse return error.StorageDisabled);
+        return fetcher.fetch(&root, &cid, peers, allocator);
     }
 
     /// The loader reads use: the local store, else wait for a worker that is
     /// fetching the block, else fetch it here.
     const Source = struct {
         ra: *ReadAhead,
+        root: Cid,
         peers: []const NodeID,
 
         fn loader(self: *Source) tree.Loader {
@@ -351,7 +344,7 @@ pub const ReadAhead = struct {
             }
             defer if (claimed) ra.finish(cid.*);
             if (try ra.store.get(cid, allocator)) |block| return @constCast(block.data);
-            return ra.fetch(cid.*, self.peers, allocator);
+            return ra.fetch(self.root, cid.*, self.peers, allocator);
         }
     };
 };

@@ -692,6 +692,7 @@ test {
     // nothing imports yet, so broken code and tests cannot hide.
     inline for (.{
         @import("cluster/block_manager.zig"),
+        @import("cluster/fetcher.zig"),
         @import("mobile/api.zig"),
         @import("cluster/quorum.zig"),
         @import("cluster/repair.zig"),

@@ -91,36 +91,27 @@ pub const Remote = struct {
     block_manager: *cluster.BlockManager,
     store: *storage.engine.StorageEngine,
     peer: NodeID,
+    /// The file being read, when known: the fetcher remembers misses per
+    /// file.
+    root: ?tree.Cid = null,
 
     pub fn loader(self: *Remote) tree.Loader {
         return .{ .ctx = self, .loadFn = load };
     }
 
+    /// Blocks come through the fetcher (cluster/fetcher.zig), from this
+    /// one device.
     fn load(ctx: *anyopaque, cid: *const tree.Cid, allocator: std.mem.Allocator) anyerror![]u8 {
         const self: *Remote = @ptrCast(@alignCast(ctx));
         if (try self.store.get(cid, allocator)) |block| return @constCast(block.data);
-
         if (health.isDown(self.peer)) return error.PeerDown;
-
-        const dht_node = self.block_manager.dht_node;
-        const conn = self.block_manager.connectTo(self.peer) catch |err| {
-            health.markDown(self.peer);
+        const fetcher = &(self.block_manager.fetcher orelse return error.StorageDisabled);
+        const bytes = fetcher.fetch(&(self.root orelse cid.*), cid, &.{self.peer}, allocator) catch |err| {
+            if (err != error.BlockNotFound) health.markDown(self.peer);
             return err;
         };
-        defer conn.deinit();
-        const remote = dht_node.fetchBlock(conn, cid.*) catch |err| {
-            if (err == error.Timeout) {
-                health.markDown(self.peer);
-            }
-            return err;
-        } orelse return error.BlockNotFound;
-        defer dht_node.allocator.free(remote);
-
-        // Fetched to be read: into the read cache, which evicts the least
-        // recently read blocks. putCached rejects bytes that don't hash to `cid`.
-        try self.store.putCached(.{ .cid = cid.*, .data = remote });
         health.markUp(self.peer);
-        return allocator.dupe(u8, remote);
+        return bytes;
     }
 
     pub const Shares = struct {
@@ -164,13 +155,13 @@ pub const Remote = struct {
     }
 };
 
-/// A Loader over several devices: the local store first, then each peer
-/// in order until one serves the block (the device that added a swarm
-/// file, then anyone who may have cached it).
+/// A Loader over several devices that may hold the file `root` (the device
+/// that added a swarm file first): the fetcher picks among them per block.
 pub const MultiRemote = struct {
     block_manager: *cluster.BlockManager,
     store: *storage.engine.StorageEngine,
     peers: []const NodeID,
+    root: tree.Cid,
 
     pub fn loader(self: *MultiRemote) tree.Loader {
         return .{ .ctx = self, .loadFn = load };
@@ -178,16 +169,8 @@ pub const MultiRemote = struct {
 
     fn load(ctx: *anyopaque, cid: *const tree.Cid, allocator: std.mem.Allocator) anyerror![]u8 {
         const self: *MultiRemote = @ptrCast(@alignCast(ctx));
-        if (try self.store.get(cid, allocator)) |block| return @constCast(block.data);
-        var last: anyerror = error.BlockNotFound;
-        for (self.peers) |peer| {
-            var one = Remote{ .block_manager = self.block_manager, .store = self.store, .peer = peer };
-            return Remote.load(&one, cid, allocator) catch |err| {
-                last = err;
-                continue;
-            };
-        }
-        return last;
+        const fetcher = &(self.block_manager.fetcher orelse return error.StorageDisabled);
+        return fetcher.fetch(&self.root, cid, self.peers, allocator);
     }
 };
 

@@ -5,6 +5,7 @@ const NodeID = @import("../net/id.zig").NodeID;
 const storage = @import("../storage/mod.zig");
 const quorum = @import("quorum.zig");
 const RepairManager = @import("repair.zig").RepairManager;
+const fetcher_mod = @import("fetcher.zig");
 const walk = storage.dag.walk;
 
 /// Stores files as Merkle DAGs and moves them between nodes.
@@ -26,6 +27,9 @@ pub const BlockManager = struct {
     quorum: quorum.QuorumConfig,
     layout: storage.dag.Layout = .Balanced,
     replication: u8,
+    /// Where each block of a read comes from (fetcher.zig); null without a
+    /// store.
+    fetcher: ?fetcher_mod.Fetcher = null,
 
     pub const Config = struct {
         network: *network.manager.ConnectionManager,
@@ -50,6 +54,7 @@ pub const BlockManager = struct {
             .quorum = config.quorum,
             .replication = config.replication,
         };
+        if (config.storage) |s| self.fetcher = fetcher_mod.Fetcher.init(s, .{ .ctx = self, .getFn = getBlockFrom });
         return self;
     }
 
@@ -215,6 +220,24 @@ pub const BlockManager = struct {
         defer conn.deinit();
 
         _ = try RepairManager.sync(self.allocator, self.dht_node, store, conn, root);
+    }
+
+    /// A connection to a device already in the routing table, without a DHT
+    /// lookup: reads must not wait on the network to find a holder.
+    pub fn connectKnown(self: *BlockManager, peer_id: NodeID) !network.Connection {
+        if (self.net.existingConnection(peer_id)) |conn| return conn;
+        const peer = self.knownPeer(peer_id) orelse return error.ProviderUnreachable;
+        return self.net.connectToPeerMulti(peer.addresses[0..peer.addrs_count], self.dht_node.swarm_key, peer_id);
+    }
+
+    /// The fetcher's network side: one GET_BLOCK to `peer`.
+    fn getBlockFrom(ctx: *anyopaque, peer: NodeID, cid: *const fetcher_mod.Cid, allocator: std.mem.Allocator) anyerror!?[]u8 {
+        const self: *BlockManager = @ptrCast(@alignCast(ctx));
+        const conn = try self.connectKnown(peer);
+        defer conn.deinit();
+        const data = (try self.dht_node.fetchBlock(conn, cid.*)) orelse return null;
+        defer self.dht_node.allocator.free(data);
+        return try allocator.dupe(u8, data);
     }
 
     fn findPeer(self: *BlockManager, peer_id: NodeID) !dht.kbucket.PeerInfo {

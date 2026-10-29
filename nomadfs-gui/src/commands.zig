@@ -1285,13 +1285,13 @@ pub fn fileDetails(gpa: std.mem.Allocator, args: FileDetailsArgs) !FileDetails {
     var multi: fs.remote.MultiRemote = undefined;
     var peers: std.ArrayList(nomadfs.net.id.NodeID) = .empty;
     const loader = if (args.peer) |p| blk: {
-        remote = .{ .block_manager = bm, .store = store, .peer = .{ .bytes = try parseHex32(p) } };
+        remote = .{ .block_manager = bm, .store = store, .peer = .{ .bytes = try parseHex32(p) }, .root = root };
         break :blk remote.loader();
     } else blk: {
         if (args.author_id) |a| if (a.len == 64) try peers.append(gpa, .{ .bytes = try parseHex32(a) });
         const known = fs.remote.knownPeers(bm, gpa) catch &.{};
         for (known) |k| try peers.append(gpa, k);
-        multi = .{ .block_manager = bm, .store = store, .peers = peers.items };
+        multi = .{ .block_manager = bm, .store = store, .peers = peers.items, .root = root };
         break :blk multi.loader();
     };
 
