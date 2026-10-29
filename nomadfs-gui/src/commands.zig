@@ -1110,7 +1110,10 @@ pub const BackupInfo = struct {
     bytes: u64 = 0,
     unreachable_files: usize = 0,
     last_round: u64 = 0,
+    replicas: u8 = 0,
 };
+
+pub const SwarmReplicasArgs = struct { config_path: []const u8, replicas: u8 };
 
 const backup_supported = !builtin.abi.isAndroid();
 
@@ -1123,6 +1126,7 @@ pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
         defer g_mutex.unlock();
         if (swarmFolder()) |folder| {
             const st = folder.backupStatus();
+            const reps = folder.swarm_replicas;
             return .{
                 .supported = true,
                 .enabled = st.enabled,
@@ -1132,12 +1136,13 @@ pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
                 .bytes = st.bytes,
                 .unreachable_files = st.unreachable_files,
                 .last_round = st.last_round,
+                .replicas = reps,
             };
         } else |_| {}
     }
     var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
     defer config.deinit(gpa);
-    return .{ .supported = true, .enabled = config.storage.swarm_backup, .running = false };
+    return .{ .supported = true, .enabled = config.storage.swarm_backup, .running = false, .replicas = config.storage.swarm_replicas };
 }
 
 /// `swarm_backup_set { config_path, on }`: saved in the config
@@ -1152,6 +1157,26 @@ pub fn swarmBackupSet(gpa: std.mem.Allocator, args: BackupArgs) !BackupInfo {
         g_mutex.lock();
         defer g_mutex.unlock();
         if (swarmFolder()) |folder| try folder.setBackup(args.on) else |_| {}
+    }
+    return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
+}
+
+/// `swarm_replicas_set { config_path, replicas }`: saved in the config
+/// (`swarm_replicas`), and applied to the running swarm folder at once.
+pub fn swarmReplicasSet(gpa: std.mem.Allocator, args: SwarmReplicasArgs) !BackupInfo {
+    if (args.replicas > config_mod.max_replicas) return error.ReplicasOutOfRange;
+    var buf: [32]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buf, "swarm_replicas = {d}", .{args.replicas});
+    try editConfig(gpa, args.config_path, .{
+        .drop_keys = &.{"swarm_replicas"},
+        .append = &.{line},
+    });
+    {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        if (swarmFolder()) |folder| {
+            folder.swarm_replicas = args.replicas;
+        } else |_| {}
     }
     return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
 }

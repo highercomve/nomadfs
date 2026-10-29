@@ -41,7 +41,7 @@ pub const Commands = struct {
     /// worker thread: they share one lock, and a command waiting on it on
     /// the UI thread would freeze the window (node_open behind a share scan
     /// did, for 20 s on a phone). Only quick config-file reads stay inline.
-    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_read_range", "swarm_download", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set", "media_url", "about_info", "update_info", "note_store", "cache_info", "cache_clear", "cache_set_limit", "share_backup_set", "backup_status", "file_details" } ++ updates.Updater.async_commands;
+    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_read_range", "swarm_download", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set", "swarm_replicas_set", "media_url", "about_info", "update_info", "note_store", "cache_info", "cache_clear", "cache_set_limit", "share_backup_set", "backup_status", "file_details" } ++ updates.Updater.async_commands;
 
     /// `invoke("invite_create", { config_path })`: one-time invite code.
     pub fn invite_create(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.InviteInfo {
@@ -202,6 +202,12 @@ pub const Commands = struct {
     /// whole swarm folder on this device.
     pub fn swarm_backup_set(gpa: std.mem.Allocator, args: commands.BackupArgs) !commands.BackupInfo {
         return commands.swarmBackupSet(gpa, args);
+    }
+
+    /// `invoke("swarm_replicas_set", { config_path, replicas })`: push
+    /// new/updated swarm folder files to N peer devices.
+    pub fn swarm_replicas_set(gpa: std.mem.Allocator, args: commands.SwarmReplicasArgs) !commands.BackupInfo {
+        return commands.swarmReplicasSet(gpa, args);
     }
 
     /// `invoke("keep_running_status")`: Android's background mode.

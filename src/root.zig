@@ -147,6 +147,7 @@ pub const Node = struct {
             const folder = try fs.SwarmFolder.create(allocator, std.Io.Threaded.global_single_threaded.io(), s, connection_manager.node_id, cfg.node.nickname, manifest_path);
             // Set before start(): the sync thread reads it.
             folder.read_ahead = read_ahead;
+            folder.swarm_replicas = cfg.storage.swarm_replicas;
             discovery_node.swarm_source = folder.source();
             folder.start(block_manager) catch |err| std.debug.print("swarm: sync thread not started: {any}\n", .{err});
             if (cfg.storage.swarm_backup) folder.setBackup(true) catch |err| std.debug.print("swarm backup: not started: {any}\n", .{err});

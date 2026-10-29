@@ -86,6 +86,9 @@ pub const Config = struct {
         /// folder stays readable while the device that added a file is
         /// offline (an always-on desktop or server).
         swarm_backup: bool = false,
+        /// How many peer devices new or updated swarm folder files are
+        /// pushed to when saved. 0 keeps puts local.
+        swarm_replicas: u8 = 0,
         /// Most block-store space, in MiB, blocks pushed or fetched from
         /// peers may take. 0 is unlimited.
         quota_mb: u64 = 0,
@@ -296,6 +299,10 @@ fn applyConfigEntry(
         config.storage.replicas = n;
     } else if (std.mem.eql(u8, key, "swarm_backup")) {
         config.storage.swarm_backup = std.mem.eql(u8, val, "true");
+    } else if (std.mem.eql(u8, key, "swarm_replicas")) {
+        const n = try std.fmt.parseInt(u8, val, 10);
+        if (n > max_replicas) return error.ReplicasOutOfRange;
+        config.storage.swarm_replicas = n;
     } else if (std.mem.eql(u8, key, "quota_mb")) {
         const mb = try std.fmt.parseInt(u64, val, 10);
         _ = std.math.mul(u64, mb, 1024 * 1024) catch return error.QuotaOutOfRange;
@@ -413,6 +420,13 @@ test "parseConfigText parses all fields" {
     try std.testing.expect(cfg.security.require_trusted_devices);
     try std.testing.expectEqual(@as(u8, 2), cfg.storage.replicas);
     try std.testing.expectEqual(@as(u64, 512), cfg.storage.quota_mb);
+}
+
+test "config: swarm_replicas parses properly" {
+    const a = std.testing.allocator;
+    var cfg = try parseConfigText(a, "nickname = alpha\nswarm_key = " ++ "ab" ** 32 ++ "\nstorage_path = /tmp/a\nswarm_replicas = 3\n");
+    defer cfg.deinit(a);
+    try std.testing.expectEqual(@as(u8, 3), cfg.storage.swarm_replicas);
 }
 
 test "config: a quota that overflows bytes is refused" {

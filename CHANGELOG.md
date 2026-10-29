@@ -3,6 +3,13 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.2.3 - 2026-10-29
+
+### Added
+
+- **Swarm folder replication**: Configure `swarm_replicas = N` in `[storage]` or `--swarm-replicas N` to push new and edited files in the swarm folder to up to N online peers immediately upon save.
+- **Settings**: Added a replica count selector for the swarm folder in the desktop and mobile settings panel.
+
 ## 0.2.2 - 2026-10-29
 
 ### Fixed

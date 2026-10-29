@@ -1948,6 +1948,7 @@ function renderBackup(st) {
   $("backup-section").hidden = !st.supported;
   if (!st.supported) return;
   $("swarm-backup").checked = st.enabled;
+  if ($("swarm-replicas")) $("swarm-replicas").value = String(st.replicas ?? 0);
   let text = "";
   if (st.enabled && !st.running) text = "Starts with the node.";
   else if (st.enabled && st.last_round === 0) text = "Starting the first backup…";
@@ -1970,6 +1971,16 @@ $("swarm-backup").addEventListener("change", async (e) => {
   } catch (err) {
     e.target.checked = !on;
     snack(`Couldn't change it: ${err}`);
+  }
+});
+
+$("swarm-replicas").addEventListener("change", async (e) => {
+  const replicas = Number(e.target.value);
+  try {
+    renderBackup(await invoke("swarm_replicas_set", { config_path: await ensureConfig(), replicas }));
+    snack(`Swarm replication set to ${replicas} peer(s)`);
+  } catch (err) {
+    snack(`Couldn't set replication: ${err}`);
   }
 });
 

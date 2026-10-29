@@ -59,6 +59,9 @@ pub const SwarmFolder = struct {
     /// Files no reachable device could serve in the last round.
     backup_unreachable: usize = 0,
     backup_last_round: u64 = 0,
+    /// Number of peer devices to replicate newly added/updated files to.
+    /// When > 0, addFile pushes the file DAG to up to this many peers.
+    swarm_replicas: u8 = 0,
 
     pub fn create(allocator: std.mem.Allocator, io: std.Io, store: *storage.engine.StorageEngine, self_id: NodeID, self_name: []const u8, file_path: []const u8) !*SwarmFolder {
         const self = try allocator.create(SwarmFolder);
@@ -166,6 +169,14 @@ pub const SwarmFolder = struct {
         defer self.mutex.unlock();
         _ = try self.manifest.edit(path, .{ .cid = root[0..32].*, .size = reader.offset, .mtime = self.now() }, self.self_id.bytes, self.self_name);
         try self.saveLocked();
+
+        if (self.swarm_replicas > 0) {
+            if (self.block_manager) |bm| {
+                _ = bm.replicate(root, self.swarm_replicas) catch |err| {
+                    std.debug.print("swarm: replicate failed: {any}\n", .{err});
+                };
+            }
+        }
     }
 
     /// Root CIDs of the files this device must keep: the ones it wrote or

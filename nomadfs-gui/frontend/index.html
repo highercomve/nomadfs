@@ -94,6 +94,16 @@
           <input type="checkbox" id="swarm-backup" role="switch">
         </label>
         <p id="backup-state" class="supporting small"></p>
+        <div class="toggle-row" style="margin-top: 12px;">
+          <span>Replicate new files to peers</span>
+          <select id="swarm-replicas" aria-label="Swarm folder replication count">
+            <option value="0">Local only (0 peers)</option>
+            <option value="1">1 peer</option>
+            <option value="2">2 peers</option>
+            <option value="3">3 peers</option>
+          </select>
+        </div>
+        <p class="supporting small">Number of online swarm devices new or edited swarm folder files are pushed to immediately.</p>
       </section>
 
       <!-- Android: keep running in the background -->
