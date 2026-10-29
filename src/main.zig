@@ -606,6 +606,19 @@ fn benchReadCommand(allocator: std.mem.Allocator, config: config_mod.Config, raw
         std.process.exit(1);
     };
 
+    // A device behind NAT is reached only once it connects to this one
+    // (a relay in the cloud): wait for the author, so the clock times the
+    // read, not the reconnection.
+    const author: nomadfs.net.id.NodeID = .{ .bytes = entry.version.device };
+    const connect_deadline = nomadfs.sync.monotonicMillis() + @as(i64, wait_seconds) * std.time.ms_per_s;
+    while (nomadfs.sync.monotonicMillis() < connect_deadline) {
+        if (node.connection_manager.existingConnection(author)) |conn| {
+            conn.deinit();
+            break;
+        }
+        nomadfs.sync.sleep(200 * std.time.ns_per_ms);
+    }
+
     if (cold) {
         if (node.store) |s| {
             _ = s.clearCache() catch {};
