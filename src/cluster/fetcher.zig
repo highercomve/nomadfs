@@ -13,8 +13,8 @@
 //!   it, for 60 s, so a device without the file costs a few round trips,
 //!   not one per block.
 //!
-//! It never runs a DHT lookup: only devices already in the routing table are
-//! dialed, so a read never waits on the network to find a holder.
+//! Devices in the routing table are dialed directly; one not met yet is
+//! looked up through the DHT once, and backs off if it can't be reached.
 
 const std = @import("std");
 const sync = @import("../sync.zig");

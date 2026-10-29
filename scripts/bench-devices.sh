@@ -43,7 +43,9 @@ run_on() {
       ssh_q plex "systemctl --user stop nomadfs; ~/.local/bin/nomadfs $(quote "${bench_args[@]}") --config ~/.nomadfs/nomadfs.conf 2>/tmp/bench.err; rc=\$?; systemctl --user start nomadfs; exit \$rc"
       ;;
     doew)
-      ssh_q doew "systemctl stop nomadfs; /usr/local/bin/nomadfs $(quote "${bench_args[@]}") --config /etc/nomadfs/nomadfs.conf 2>/tmp/bench.err; rc=\$?; systemctl start nomadfs; exit \$rc"
+      # A relay without storage: the benchmark gets a store in /tmp (same
+      # identity), removed afterwards.
+      ssh_q doew "sed -e 's/^enabled = false/enabled = true/' -e 's|^storage_path = .*|storage_path = \"/tmp/nomadfs-bench\"|' /etc/nomadfs/nomadfs.conf >/tmp/bench.conf && systemctl stop nomadfs; /usr/local/bin/nomadfs $(quote "${bench_args[@]}") --config /tmp/bench.conf 2>/tmp/bench.err; rc=\$?; systemctl start nomadfs; rm -rf /tmp/nomadfs-bench /tmp/nomadfs-bench.* /tmp/bench.conf; exit \$rc"
       ;;
     ridge)
       local was_running=

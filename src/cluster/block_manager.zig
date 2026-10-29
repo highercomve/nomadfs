@@ -230,10 +230,16 @@ pub const BlockManager = struct {
         return self.net.connectToPeerMulti(peer.addresses[0..peer.addrs_count], self.dht_node.swarm_key, peer_id);
     }
 
-    /// The fetcher's network side: one GET_BLOCK to `peer`.
+    /// The fetcher's network side: one GET_BLOCK to `peer`. A holder not in
+    /// the routing table yet (a node just started, the author not met) is
+    /// looked up once; if that fails, the fetcher's backoff keeps it from
+    /// being tried again for a while.
     fn getBlockFrom(ctx: *anyopaque, peer: NodeID, cid: *const fetcher_mod.Cid, allocator: std.mem.Allocator) anyerror!?[]u8 {
         const self: *BlockManager = @ptrCast(@alignCast(ctx));
-        const conn = try self.connectKnown(peer);
+        const conn = self.connectKnown(peer) catch |err| switch (err) {
+            error.ProviderUnreachable => try self.connectTo(peer),
+            else => return err,
+        };
         defer conn.deinit();
         const data = (try self.dht_node.fetchBlock(conn, cid.*)) orelse return null;
         defer self.dht_node.allocator.free(data);
