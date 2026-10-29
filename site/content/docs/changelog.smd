@@ -7,6 +7,28 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.2.5 - 2026-10-29
+
+## Added
+
+- **About a device:** the ⓘ next to a device (and in the header while browsing it) asks it about
+  itself: NomadFS version, platform, uptime, free disk space and what NomadFS uses there (kept
+  blocks, read cache, quota), connections, shared folders, the swarm folder and backups, with a
+  health check that flags low disk space, folders it can't read, no connections, a swarm folder
+  not synced lately, and backups on mobile data. A device answers only devices it's paired with.
+- **The swarm folder searches and sorts like Browse:** a search field (`/` or Ctrl+F), sortable
+  Name, Size, Modified and Added by columns on wide windows and a sort menu on phones, folders
+  first, the order remembered.
+
+## Changed
+
+- The swarm folder's breadcrumb has its own row, like Browse's; on phones **New folder** and
+  **Add file** sit in a row of their own above the search.
+
+## Fixed
+
+- Browse: the Size header lined up left of the sizes, and folder rows were offset from file rows.
+
 # 0.2.4 - 2026-10-29
 
 ## Fixed
