@@ -67,7 +67,7 @@ directory (`tree.decodeListing`).
   `/`, `\` or NUL, longer than 255 bytes); entries that can't be read (logged as
   `share: skipping …`); and subtrees deeper than `max_depth` = **32**.
 - **Reuse:** the scanner remembers each file's size, mtime (ns), CID and leaf locations. A file whose
-  size and mtime match the previous scan is not read again. Files no longer found under a share
+  size, mtime, ctime and inode match the previous scan is not read again. Files no longer found under a share
   are forgotten at the end of its scan.
 - **One set of buffers:** the chunker's buffer and the leaf buffer (`DagBuilder.Scratch`, 1 MiB
   each) are allocated once per `Scanner` and reused for every file. Allocating them per file made
@@ -79,7 +79,7 @@ What the scanner remembers is also kept on disk, in `scan-cache` in the store di
 restart doesn't re-read every shared file. It is an append-only log after a header:
 
 ```
-put:  [u8 1][u16 path_len][path][u64 size][i64 mtime_ns][cid: 32]
+put:  [u8 1][u16 path_len][path][u64 size][i64 mtime_ns][i64 ctime_ns][u64 inode][cid: 32]
 drop: [u8 2][u16 path_len][path]
 ```
 
@@ -140,8 +140,9 @@ A `Loader` returns verified bytes for a CID. `Loader.local(store)` reads the loc
 
 - **`Remote { block_manager, store, peer }`**: `load` returns the block from the local store if
   present; otherwise it connects to `peer` (`BlockManager.connectTo`), calls `dht_node.fetchBlock`,
-  and `store.put`s the result, which rejects bytes that don't hash to the CID. The store is the
-  cache: a file read once reads offline afterwards.
+  and `store.putCached`s the result, which rejects bytes that don't hash to the CID. The read cache
+  keeps what was read, so a file read once reads offline afterwards, until the least recently read
+  blocks are evicted past `cache_mb` ([the read cache](../storage/engine.md#the-read-cache)).
 - **`Remote.shares()`**: sends `GET_SHARES`, returns the nickname, the listing and the peer's authenticated device ID.
 - **`MultiRemote { peers }`**: tries the local store, then each peer in order until one serves the
   block. The swarm folder uses it ([Chapter 5.2](./swarm.md)).
@@ -171,6 +172,5 @@ sequenceDiagram
     L-->>R: bytes for the range
 ```
 
-> **Not implemented yet:** cached blocks are never evicted (no LRU cache limit), and there are no
-> directed sync or backup policies for shares (for example "back up phone photos only to the home
+> **Not implemented yet:** there are no directed sync or backup policies for shares (for example "back up phone photos only to the home
 > server"). Both are planned in [ROADMAP.md](../../ROADMAP.md) (Phase 4).

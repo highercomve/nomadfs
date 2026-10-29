@@ -58,8 +58,12 @@ in the drawer.
 
 Reading a file asks only for the blocks that cover the bytes being read. Every
 block that arrives is checked against its hash before it is kept, and kept
-blocks are cached in the local block store, so a file opened once opens again
-without the other device.
+blocks are kept in a read cache, so a file opened once opens again without the
+other device. The cache holds 2 GB by default (`cache_mb` under `[storage]`);
+when it is full, the blocks read longest ago make room. **About → Read cache**
+in the app, or `nomadfs --cache`, shows its size; **Clear cache**, or
+`nomadfs --clear-cache`, empties it. Files you wrote yourself are never part of
+the cache.
 
 The app's viewer shows images, video, audio, PDF and text, with previous and
 next through the folder (arrow keys and Esc on the desktop). It reads the file

@@ -14,8 +14,8 @@ android {
         applicationId = "net.nomadfs.app"
         minSdk = 29
         targetSdk = 36
-        versionCode = 101
-        versionName = "0.1.1"
+        versionCode = 200
+        versionName = "0.2.0"
     }
 
     signingConfigs {

@@ -398,6 +398,24 @@
             <button id="update-check" class="btn outlined">Check for updates</button>
           </div>
         </div>
+        <div id="cache-box" class="update-box">
+          <div class="grow">
+            <p class="about-group">Read cache</p>
+            <p id="cache-status" class="update-status">Files you open from other devices are kept here, so they read again without the network. The least recently read go first when it is full.</p>
+          </div>
+          <div class="update-buttons">
+            <select id="cache-limit" aria-label="Read cache limit">
+              <option value="512">512 MB</option>
+              <option value="1024">1 GB</option>
+              <option value="2048">2 GB</option>
+              <option value="5120">5 GB</option>
+              <option value="10240">10 GB</option>
+              <option value="51200">50 GB</option>
+              <option value="0">No limit</option>
+            </select>
+            <button id="cache-clear" class="btn outlined">Clear cache</button>
+          </div>
+        </div>
         <label class="toggle-row">
           <span>Check for updates automatically</span>
           <input type="checkbox" id="update-auto" role="switch">

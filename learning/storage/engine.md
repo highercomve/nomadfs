@@ -31,10 +31,16 @@ pub const StorageEngine = struct {
     pub fn put(self: *StorageEngine, block: Block) !void;
     pub fn has(self: *StorageEngine, cid: []const u8) bool;
     pub fn get(self: *StorageEngine, cid: []const u8, allocator) !?Block;
+    // The read cache (below)
+    pub fn putCached(self: *StorageEngine, block: Block) !void;
+    pub fn pin(self: *StorageEngine, cid: *const [32]u8) !void;
+    pub fn setCacheLimit(self: *StorageEngine, limit: ?u64) !void;
+    pub fn cacheStats(self: *StorageEngine) CacheStats;
+    pub fn clearCache(self: *StorageEngine) !u64;
 };
 ```
 
-That is the whole interface: there is **no delete**.
+Kept blocks are never deleted. Only the read cache evicts.
 
 ### `put`
 1.  Hashes `block.data` with SHA-256 and returns `error.HashMismatch` if it isn't `block.cid`. Nothing that doesn't match its name gets in, whether it came from the local builder or from a peer.
@@ -43,7 +49,7 @@ That is the whole interface: there is **no delete**.
 4.  Otherwise writes `<cid>.tmp`, then renames it to `<cid>`, and tracks added bytes in `used_bytes`. A crash can leave a stray `.tmp` file but never a truncated block under a valid name.
 
 ### `get`
-1.  Opens `<cid>`. If there is no such file and an `External` source is set, asks it instead (below). Returns `null` if neither has the block.
+1.  Opens `<cid>`, then `cache/<cid>` (a cache hit refreshes the file's mtime). If neither exists and an `External` source is set, asks it instead (below). Returns `null` if none has the block.
 2.  Re-hashes the bytes and returns `error.CorruptBlock` if they don't match the CID, so disk corruption is reported, not returned as data.
 
 The returned `Block.data` is owned by the caller.
@@ -87,3 +93,40 @@ Shared folders are not copied into the store. The share scanner records where ea
 
 **Next Chapters:**
 *   [Chapter 4: Block Exchange & Replication](../cluster/overview.md)
+
+## The read cache
+
+The store keeps two kinds of blocks apart:
+
+| Area | Holds | Evicted |
+|---|---|---|
+| `<storage_path>/<cid>` (kept) | This device's own data: swarm folder files it wrote, its shares' parent and dir blocks, backups, replicas pushed to it, `nomadfs_put_file` | Never |
+| `<storage_path>/cache/<cid>` (read cache) | Blocks fetched from another device only to be read (`Remote.load`: the app, the mount, read-ahead) | Least recently read first |
+
+- **`putCached`** verifies the hash like `put`, skips blocks already held in either area, and writes into
+  `cache/`. When the cache passes its limit (`cache_mb` under `[storage]`, default **2048 MiB**, `0` = no
+  limit), it deletes the least recently read blocks until it is under **90 %** of the limit, so a full
+  cache doesn't evict on every new block.
+- **Recency is the file's mtime:** a cache hit in `get` sets it to now, so mtime order is read order.
+- **`pin`** moves a cached block into the kept area, when the device takes responsibility for it: a
+  swarm backup that finds a file's blocks already cached, a repair that reuses cached blocks. A kept
+  `put` of a block that is also cached removes the cached copy.
+- **`clearCache`** deletes everything in `cache/` and nothing else. **`cacheStats`** counts the
+  directory each time, so a cache cleared by another process (the command line while the app runs)
+  reads right.
+- `quota_mb` applies to kept blocks only; the read cache has its own limit.
+
+Command line: `nomadfs --cache` shows the size and limit, `nomadfs --clear-cache` empties it. The app
+shows both under **About → Read cache**, with the limit as a setting. The C ABI has
+`nomadfs_cache_info`, `nomadfs_cache_clear` and `nomadfs_cache_set_limit`.
+
+### Blocks stored before the cache existed
+
+Before 0.2.0 every fetched block went into the kept area. On its first start a 0.2.0 node sorts them
+once (`Node.sortLegacyCache`, `src/root.zig`): after every share's first scan (at most 30 minutes),
+it collects the blocks reachable from its shares' roots and from the swarm folder files it wrote or
+backed up (`walk.addStoredReachable`, which reads stored block files only, never a shared file), and
+moves every other kept block into `cache/` (`demoteExcept`). A `cache/.sorted-v1` marker keeps it from
+running again. Blocks received as replicas can't be told from read blocks afterwards and are moved
+too; the device that wrote them still keeps its own copy.
+

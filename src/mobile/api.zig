@@ -312,6 +312,42 @@ pub export fn nomadfs_node_device_id(node: ?*NodeHandle, out: ?[*]u8, out_len: u
     return nomadfs_ok;
 }
 
+/// The read cache: bytes and blocks held, and its limit in bytes (0 when
+/// there is none). Any output pointer may be null.
+pub export fn nomadfs_cache_info(node: ?*NodeHandle, out_bytes: ?*u64, out_blocks: ?*u64, out_limit: ?*u64) c_int {
+    const self = acquireHandle(node) orelse return invalid_argument;
+    defer releaseHandle(self);
+    const store = self.node.store orelse return storage_disabled;
+    const stats = store.cacheStats();
+    if (out_bytes) |p| p.* = stats.bytes;
+    if (out_blocks) |p| p.* = stats.blocks;
+    if (out_limit) |p| p.* = stats.limit orelse 0;
+    return nomadfs_ok;
+}
+
+/// Empties the read cache; writes the bytes freed to `out_freed` (may be
+/// null). Blocks this device keeps are not touched.
+pub export fn nomadfs_cache_clear(node: ?*NodeHandle, out_freed: ?*u64) c_int {
+    const self = acquireHandle(node) orelse return invalid_argument;
+    defer releaseHandle(self);
+    const store = self.node.store orelse return storage_disabled;
+    const freed = store.clearCache() catch return internal_error;
+    if (out_freed) |p| p.* = freed;
+    return nomadfs_ok;
+}
+
+/// Sets the read cache limit for the running node, in MiB; 0 removes it.
+/// Evicts at once when the cache is over the new limit. (The config's
+/// `cache_mb` sets it at start.)
+pub export fn nomadfs_cache_set_limit(node: ?*NodeHandle, limit_mb: u64) c_int {
+    const self = acquireHandle(node) orelse return invalid_argument;
+    defer releaseHandle(self);
+    const store = self.node.store orelse return storage_disabled;
+    const bytes = std.math.mul(u64, limit_mb, 1024 * 1024) catch return invalid_argument;
+    store.setCacheLimit(if (limit_mb == 0) null else bytes) catch return internal_error;
+    return nomadfs_ok;
+}
+
 /// Releases a string returned by this API.
 pub export fn nomadfs_free(ptr: ?*anyopaque) void {
     const p = ptr orelse return;

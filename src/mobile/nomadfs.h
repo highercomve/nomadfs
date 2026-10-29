@@ -14,6 +14,8 @@
 #ifndef NOMADFS_H
 #define NOMADFS_H
 
+#include <stdint.h>
+
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -70,6 +72,18 @@ int nomadfs_get_file(NomadNode *node, const char *cid, const char *out_path);
 
 /* Writes this node's device ID (64 hex characters + NUL) into `out`. */
 int nomadfs_node_device_id(NomadNode *node, unsigned char *out, size_t out_len);
+
+/* The read cache (blocks fetched from other devices only to be read,
+ * evicted least recently used first): bytes, blocks and the limit in bytes
+ * (0 = none). Any output pointer may be NULL. */
+int nomadfs_cache_info(NomadNode *node, uint64_t *out_bytes, uint64_t *out_blocks, uint64_t *out_limit);
+
+/* Empties the read cache; the bytes freed go to `out_freed` (may be NULL).
+ * Blocks this device keeps (its writes, backups) are not touched. */
+int nomadfs_cache_clear(NomadNode *node, uint64_t *out_freed);
+
+/* Sets the running node's read cache limit in MiB; 0 removes the limit. */
+int nomadfs_cache_set_limit(NomadNode *node, uint64_t limit_mb);
 
 /* Releases a string returned by nomadfs_put_file. */
 void nomadfs_free(void *ptr);

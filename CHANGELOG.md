@@ -3,6 +3,23 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.2.0 - 2026-10-28
+
+### Added
+
+- **Read cache.** Files opened from other devices are kept in a read cache, so they open again
+  without the network, and the least recently read blocks make room when it is full. It holds
+  2 GB by default: `cache_mb` under `[storage]` (`0` = no limit), or the limit setting in the app.
+  What a device writes, backs up or receives as a replica is kept apart and never evicted.
+- **See and clear it:** **About → Read cache** in the app shows its size, with **Clear cache**;
+  on the command line, `nomadfs --cache` and `nomadfs --clear-cache`.
+- On first start, 0.2.0 moves the blocks it fetched before into the read cache, once, keeping
+  the device's own shares and swarm folder files.
+
+### Changed
+
+- `quota_mb` now applies only to the blocks a device keeps; the read cache has its own limit.
+
 ## 0.1.1 - 2026-10-28
 
 ### Fixed

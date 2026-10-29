@@ -34,6 +34,7 @@ swarm_key = "0123…cdef"          # 64 hex characters
 [storage]
 storage_path = "/home/me/.nomadfs/data"
 quota_mb = 512
+cache_mb = 2048
 
 [network]
 port = 9000
@@ -74,7 +75,8 @@ The format looks like TOML but the parser is much simpler:
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `storage_path` | path | **required** | Block store directory (one file per block). The swarm manifest is `<storage_path>.swarm.json`, the backup record `<storage_path>.swarm.json.backup`, the FUSE staging dir `<storage_path>.swarm.json.staging/`. |
-| `quota_mb` | u64 | `0` | Capacity limit for the local block store in MiB. `0` = unlimited. When the store reaches this capacity, `put` calls fail with `StorageFull`. |
+| `quota_mb` | u64 | `0` | Capacity limit, in MiB, for the blocks this device keeps (its own writes, backups, replicas). `0` = unlimited. When reached, `put` fails with `StorageFull`. |
+| `cache_mb` | u64 | `2048` | Limit, in MiB, of the read cache: blocks fetched from other devices only to be read. Past it the least recently read are deleted. `0` = no limit. See [the read cache](../storage/engine.md#the-read-cache). |
 | `enabled` | bool | `true` | Without storage there are no shares, no swarm folder, no mount (`--mount` refuses) and `BlockManager.put`/`get` fail with `StorageDisabled`. The node still joins the DHT and answers RPCs. |
 | `replicas` | u8, ≤ 20 | `0` | Peers closest to a new file's root CID that `BlockManager.put` pushes the whole DAG to (`PUT_BLOCK`). Above 20 is `ReplicasOutOfRange`. Shares and the swarm folder don't use `put`. |
 | `write_quorum` | u8 | `1` | Provider-record acknowledgements (`ADD_PROVIDER`) `BlockManager.put` needs. `0` skips the announcement, so a device with no peers can store. With `1` and no peers, `put` returns `QuorumNotReached` (blocks stay local). |

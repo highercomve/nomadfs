@@ -8,6 +8,29 @@ const env_mod = @import("../env.zig");
 /// are longer, so they never match.
 const hex_cid_len = 64;
 
+/// Subdirectory of the store holding the read cache.
+const cache_dir_name = "cache";
+
+fn isHexCid(name: []const u8) bool {
+    if (name.len != hex_cid_len) return false;
+    for (name) |c| if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return false;
+    return true;
+}
+
+/// Bytes and count of the block files directly in `dir`.
+fn sumDir(dir: std.Io.Dir) !struct { bytes: u64, blocks: u64 } {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var bytes: u64 = 0;
+    var blocks: u64 = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !isHexCid(entry.name)) continue;
+        bytes = try std.math.add(u64, bytes, (try dir.statFile(io, entry.name, .{})).size);
+        blocks += 1;
+    }
+    return .{ .bytes = bytes, .blocks = blocks };
+}
+
 pub const StorageEngine = struct {
     root_dir: std.Io.Dir,
     allocator: std.mem.Allocator,
@@ -23,6 +46,17 @@ pub const StorageEngine = struct {
     /// set: setQuota counts the existing blocks once, when a quota is first
     /// set, so an unlimited store does no counting at open or on put.
     used_bytes: u64 = 0,
+    /// The read cache: blocks fetched from other devices only to be read,
+    /// kept in `cache/` and evicted least recently used first. Everything
+    /// else (this device's writes, backups, replicas) lives in the root and
+    /// is never evicted. A block in either place counts as held.
+    cache_dir: std.Io.Dir,
+    /// Most bytes the read cache may hold, or null for no limit. Past it,
+    /// the least recently read blocks go until it is back under
+    /// 90% of the limit (lowWater).
+    cache_limit: ?u64 = null,
+    cache_bytes: u64 = 0,
+    cache_blocks: u64 = 0,
 
     pub const External = struct {
         ctx: *anyopaque,
@@ -53,15 +87,182 @@ pub const StorageEngine = struct {
 
         // Iterable so setQuota can count the blocks already stored.
         const dir = try std.Io.Dir.cwd().openDir(io, expanded_path, .{ .iterate = true });
-        return StorageEngine{
+        errdefer dir.close(io);
+        dir.createDirPath(io, cache_dir_name) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        const cache_dir = try dir.openDir(io, cache_dir_name, .{ .iterate = true });
+        var engine = StorageEngine{
             .root_dir = dir,
             .allocator = allocator,
+            .cache_dir = cache_dir,
         };
+        // The cache is bounded, so counting it at open is cheap; it keeps
+        // the size the app shows exact.
+        const totals = try sumDir(cache_dir);
+        engine.cache_bytes = totals.bytes;
+        engine.cache_blocks = totals.blocks;
+        return engine;
     }
 
     pub fn deinit(self: *StorageEngine) void {
         const io = std.Io.Threaded.global_single_threaded.io();
+        self.cache_dir.close(io);
         self.root_dir.close(io);
+    }
+
+    pub const CacheStats = struct { bytes: u64, blocks: u64, limit: ?u64 };
+
+    /// Counted from the directory, so a cache cleared by another process
+    /// (the command line while the app runs) reads right.
+    pub fn cacheStats(self: *StorageEngine) CacheStats {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (sumDir(self.cache_dir)) |t| {
+            self.cache_bytes = t.bytes;
+            self.cache_blocks = t.blocks;
+        } else |_| {}
+        return .{ .bytes = self.cache_bytes, .blocks = self.cache_blocks, .limit = self.cache_limit };
+    }
+
+    /// Caps the read cache; null removes the cap. A cap below what is cached
+    /// evicts at once.
+    pub fn setCacheLimit(self: *StorageEngine, limit: ?u64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.cache_limit = limit;
+        if (limit) |l| if (self.cache_bytes > l) try self.evictLocked(lowWater(l));
+    }
+
+    /// Deletes every block of the read cache and returns the bytes freed.
+    /// Blocks this device keeps are not touched; a deleted block is fetched
+    /// again the next time it is read.
+    pub fn clearCache(self: *StorageEngine) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const freed = self.cache_bytes;
+        var names: std.ArrayList([hex_cid_len]u8) = .empty;
+        defer names.deinit(self.allocator);
+        var it = self.cache_dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file or !isHexCid(entry.name)) continue;
+            try names.append(self.allocator, entry.name[0..hex_cid_len].*);
+        }
+        for (names.items) |*name| self.cache_dir.deleteFile(io, name) catch {};
+        self.cache_bytes = 0;
+        self.cache_blocks = 0;
+        return freed;
+    }
+
+    /// Moves a cached block out of the read cache, so it is kept: called
+    /// when this device takes responsibility for it (a backup, a repair).
+    /// Does nothing for a block that is already kept or not held.
+    pub fn pin(self: *StorageEngine, cid: *const [32]u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const hex_cid = std.fmt.bytesToHex(cid.*, .lower);
+        if (self.rootHasLocked(&hex_cid)) return;
+        const stat = self.cache_dir.statFile(io, &hex_cid, .{}) catch return;
+        try self.cache_dir.rename(&hex_cid, self.root_dir, &hex_cid, io);
+        self.cache_bytes -|= stat.size;
+        self.cache_blocks -|= 1;
+        if (self.quota != null) self.used_bytes += stat.size;
+    }
+
+    /// Stores a block fetched only to be read, in the read cache. Kept
+    /// blocks are never duplicated into the cache. Past the cache limit, the
+    /// least recently read blocks are evicted.
+    pub fn putCached(self: *StorageEngine, block: Block) !void {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(block.data, &hash, .{});
+        if (!std.mem.eql(u8, &hash, &block.cid)) return error.HashMismatch;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const hex_cid = std.fmt.bytesToHex(block.cid, .lower);
+        if (self.hasLocked(&hex_cid)) return;
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const tmp_name = hex_cid ++ ".tmp".*;
+        var file = try self.cache_dir.createFile(io, &tmp_name, .{});
+        errdefer self.cache_dir.deleteFile(io, &tmp_name) catch {};
+        {
+            defer file.close(io);
+            try file.writePositionalAll(io, block.data, 0);
+        }
+        try self.cache_dir.rename(&tmp_name, self.cache_dir, &hex_cid, io);
+        self.cache_bytes += block.data.len;
+        self.cache_blocks += 1;
+        if (self.cache_limit) |l| if (self.cache_bytes > l) try self.evictLocked(lowWater(l));
+    }
+
+    /// Moves every kept block not in `keep` into the read cache, where it
+    /// becomes evictable. Before the cache existed, blocks fetched only to be
+    /// read were stored with the kept ones; this sorts them out once.
+    pub fn demoteExcept(self: *StorageEngine, keep: *const std.AutoHashMapUnmanaged([32]u8, void)) !struct { blocks: u64, bytes: u64 } {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var names: std.ArrayList([hex_cid_len]u8) = .empty;
+        defer names.deinit(self.allocator);
+        var it = self.root_dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file or !isHexCid(entry.name)) continue;
+            var cid: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&cid, entry.name) catch continue;
+            if (keep.contains(cid)) continue;
+            try names.append(self.allocator, entry.name[0..hex_cid_len].*);
+        }
+        var moved: u64 = 0;
+        var bytes: u64 = 0;
+        for (names.items) |*name| {
+            const stat = self.root_dir.statFile(io, name, .{}) catch continue;
+            self.root_dir.rename(name, self.cache_dir, name, io) catch continue;
+            moved += 1;
+            bytes += stat.size;
+        }
+        self.cache_bytes += bytes;
+        self.cache_blocks += moved;
+        if (self.quota != null) self.used_bytes -|= bytes;
+        if (self.cache_limit) |l| if (self.cache_bytes > l) try self.evictLocked(lowWater(l));
+        return .{ .blocks = moved, .bytes = bytes };
+    }
+
+    /// Deletes the least recently read cache blocks until the cache holds at
+    /// most `target` bytes. A read refreshes a block's mtime, so mtime order
+    /// is recency order. Caller holds the lock.
+    fn evictLocked(self: *StorageEngine, target: u64) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const Entry = struct { name: [hex_cid_len]u8, mtime: i96, size: u64 };
+        var entries: std.ArrayList(Entry) = .empty;
+        defer entries.deinit(self.allocator);
+        var it = self.cache_dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file or !isHexCid(entry.name)) continue;
+            const stat = self.cache_dir.statFile(io, entry.name, .{}) catch continue;
+            try entries.append(self.allocator, .{ .name = entry.name[0..hex_cid_len].*, .mtime = stat.mtime.nanoseconds, .size = stat.size });
+        }
+        std.mem.sort(Entry, entries.items, {}, struct {
+            fn older(_: void, a: Entry, b: Entry) bool {
+                return a.mtime < b.mtime;
+            }
+        }.older);
+        for (entries.items) |*e| {
+            if (self.cache_bytes <= target) break;
+            self.cache_dir.deleteFile(io, &e.name) catch continue;
+            self.cache_bytes -|= e.size;
+            self.cache_blocks -|= 1;
+        }
+    }
+
+    /// Eviction stops below the limit, so a cache at its limit doesn't evict
+    /// on every new block.
+    fn lowWater(limit: u64) u64 {
+        return limit - limit / 10;
     }
 
     /// Caps the bytes of block files kept here; null removes the cap. Turning
@@ -92,7 +293,7 @@ pub const StorageEngine = struct {
         defer self.mutex.unlock();
 
         const hex_cid = std.fmt.bytesToHex(block.cid, .lower);
-        if (self.hasLocked(&hex_cid)) return;
+        if (self.rootHasLocked(&hex_cid)) return;
 
         const size: u64 = block.data.len;
         if (self.quota) |limit| {
@@ -109,6 +310,12 @@ pub const StorageEngine = struct {
         }
         try self.root_dir.rename(&tmp_name, self.root_dir, &hex_cid, io);
         if (self.quota != null) self.used_bytes += size;
+        // Kept now: a cached copy would only count twice.
+        if (self.cache_dir.statFile(io, &hex_cid, .{})) |stat| {
+            self.cache_dir.deleteFile(io, &hex_cid) catch return;
+            self.cache_bytes -|= stat.size;
+            self.cache_blocks -|= 1;
+        } else |_| {}
     }
 
     pub fn has(self: *StorageEngine, cid: []const u8) bool {
@@ -125,25 +332,21 @@ pub const StorageEngine = struct {
     }
 
     fn hasLocked(self: *StorageEngine, hex_cid: []const u8) bool {
+        if (self.rootHasLocked(hex_cid)) return true;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        _ = self.cache_dir.statFile(io, hex_cid, .{}) catch return false;
+        return true;
+    }
+
+    fn rootHasLocked(self: *StorageEngine, hex_cid: []const u8) bool {
         const io = std.Io.Threaded.global_single_threaded.io();
         _ = self.root_dir.statFile(io, hex_cid, .{}) catch return false;
         return true;
     }
 
-    /// Total size of the block files in the directory. Caller holds the lock.
+    /// Total size of the kept block files. Caller holds the lock.
     fn sumBlocksLocked(self: *StorageEngine) !u64 {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        var total: u64 = 0;
-        var it = self.root_dir.iterate();
-        while (try it.next(io)) |entry| {
-            if (entry.kind != .file or entry.name.len != hex_cid_len) continue;
-            for (entry.name) |c| {
-                if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) break;
-            } else {
-                total = try std.math.add(u64, total, (try self.root_dir.statFile(io, entry.name, .{})).size);
-            }
-        }
-        return total;
+        return (try sumDir(self.root_dir)).bytes;
     }
 
     /// The bytes of a block stored here (not `external`), unverified, or
@@ -186,7 +389,15 @@ pub const StorageEngine = struct {
 
         const io = std.Io.Threaded.global_single_threaded.io();
         var file = self.root_dir.openFile(io, hex_cid, .{}) catch |err| switch (err) {
-            error.FileNotFound => return null,
+            error.FileNotFound => cached: {
+                const f = self.cache_dir.openFile(io, hex_cid, .{}) catch |e| switch (e) {
+                    error.FileNotFound => return null,
+                    else => return e,
+                };
+                // A read makes the block the most recently used.
+                f.setTimestampsNow(io) catch {};
+                break :cached f;
+            },
             else => return err,
         };
         defer file.close(io);
@@ -227,7 +438,9 @@ test "put refuses a block that would pass the quota and writes nothing" {
     // Only the two stored blocks are in the directory: the refused put left no temporary file.
     var count: usize = 0;
     var it = engine.root_dir.iterate();
-    while (try it.next(io)) |_| count += 1;
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .file) count += 1;
+    }
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
@@ -294,4 +507,98 @@ test "external source is called without the engine lock" {
     const got = (try engine.get(&block.cid, allocator)) orelse return error.TestUnexpectedResult;
     defer allocator.free(got.data);
     try std.testing.expectEqualStrings(payload, got.data);
+}
+
+test "read cache evicts the least recently read block first" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const test_path = "test_storage_engine_lru";
+    std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+
+    var engine = try StorageEngine.init(allocator, test_path);
+    defer engine.deinit();
+    try engine.setCacheLimit(30);
+
+    const a = Block.new("aaaaaaaaaa");
+    const b = Block.new("bbbbbbbbbb");
+    const c = Block.new("cccccccccc");
+    try engine.putCached(a);
+    sync.sleep(20 * std.time.ns_per_ms);
+    try engine.putCached(b);
+    sync.sleep(20 * std.time.ns_per_ms);
+    try engine.putCached(c);
+    sync.sleep(20 * std.time.ns_per_ms);
+    // Reading `a` makes it the most recently used: `b` is now the oldest.
+    const got = (try engine.get(&a.cid, allocator)).?;
+    allocator.free(got.data);
+    sync.sleep(20 * std.time.ns_per_ms);
+
+    const d = Block.new("dddddddddd");
+    try engine.putCached(d); // 40 bytes > 30: evict down to 27.
+    try std.testing.expect(!engine.has(&b.cid));
+    try std.testing.expect(!engine.has(&c.cid));
+    try std.testing.expect(engine.has(&a.cid));
+    try std.testing.expect(engine.has(&d.cid));
+    try std.testing.expectEqual(@as(u64, 20), engine.cacheStats().bytes);
+}
+
+test "kept blocks are never cached twice, pinned blocks leave the cache, clear keeps them" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const test_path = "test_storage_engine_pin";
+    std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+
+    var engine = try StorageEngine.init(allocator, test_path);
+    defer engine.deinit();
+
+    const kept = Block.new("kept block");
+    const read = Block.new("read block");
+    const pinned = Block.new("pinned blk");
+    try engine.put(kept);
+    try engine.putCached(kept); // already kept: no cached copy
+    try engine.putCached(read);
+    try engine.putCached(pinned);
+    try std.testing.expectEqual(@as(u64, 2), engine.cacheStats().blocks);
+
+    try engine.pin(&pinned.cid);
+    try std.testing.expectEqual(@as(u64, 1), engine.cacheStats().blocks);
+
+    // A kept put of a cached block moves it out of the cache.
+    try engine.putCached(Block.new("both ways."));
+    try engine.put(Block.new("both ways."));
+    try std.testing.expectEqual(@as(u64, 1), engine.cacheStats().blocks);
+
+    try std.testing.expectEqual(@as(u64, 10), try engine.clearCache());
+    try std.testing.expect(!engine.has(&read.cid));
+    try std.testing.expect(engine.has(&kept.cid));
+    try std.testing.expect(engine.has(&pinned.cid));
+    try std.testing.expectEqual(@as(u64, 0), engine.cacheStats().bytes);
+}
+
+test "demoteExcept moves only blocks outside the keep set into the cache" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const test_path = "test_storage_engine_demote";
+    std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+
+    var engine = try StorageEngine.init(allocator, test_path);
+    defer engine.deinit();
+    const mine = Block.new("my own block");
+    const old_read = Block.new("old read blk");
+    try engine.put(mine);
+    try engine.put(old_read); // stored before the cache existed
+
+    var keep: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer keep.deinit(allocator);
+    try keep.put(allocator, mine.cid, {});
+    const moved = try engine.demoteExcept(&keep);
+    try std.testing.expectEqual(@as(u64, 1), moved.blocks);
+    try std.testing.expectEqual(@as(u64, 1), engine.cacheStats().blocks);
+
+    _ = try engine.clearCache();
+    try std.testing.expect(engine.has(&mine.cid));
+    try std.testing.expect(!engine.has(&old_read.cid));
 }

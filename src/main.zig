@@ -12,7 +12,7 @@ const DevicePaths = device.paths.Paths;
 /// rotates, and an old QR code should not grant access forever.
 const ticket_lifetime_seconds = 24 * 60 * 60;
 
-const Command = enum { run, pair, trust, devices, revoke, mount, invite };
+const Command = enum { run, pair, trust, devices, revoke, mount, invite, cache, clear_cache };
 
 const Options = struct {
     command: Command = .run,
@@ -59,6 +59,8 @@ pub fn main(init: std.process.Init) !void {
         .run => try runNode(allocator, config),
         .mount => try mountCommand(allocator, config, options.mountpoint.?),
         .invite => try inviteCommand(allocator, config, options.address),
+        .cache => try cacheCommand(allocator, config, false),
+        .clear_cache => try cacheCommand(allocator, config, true),
     }
 }
 
@@ -84,6 +86,10 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Optio
             options.revoke_query = try nextValue(args, &i, "--revoke");
         } else if (std.mem.eql(u8, arg, "--invite")) {
             try selectCommand(options, .invite);
+        } else if (std.mem.eql(u8, arg, "--cache")) {
+            try selectCommand(options, .cache);
+        } else if (std.mem.eql(u8, arg, "--clear-cache")) {
+            try selectCommand(options, .clear_cache);
         } else if (std.mem.eql(u8, arg, "--mount")) {
             try selectCommand(options, .mount);
             options.mountpoint = try nextValue(args, &i, "--mount");
@@ -123,7 +129,7 @@ fn nextValue(args: []const []const u8, index: *usize, flag: []const u8) ![]const
 
 fn selectCommand(options: *Options, command: Command) !void {
     if (options.command != .run) {
-        std.debug.print("Error: only one of --pair, --trust, --devices, --revoke or --mount may be used\n", .{});
+        std.debug.print("Error: only one of --pair, --trust, --devices, --revoke, --mount, --invite, --cache or --clear-cache may be used\n", .{});
         std.process.exit(1);
     }
     options.command = command;
@@ -141,6 +147,7 @@ fn printHelp() void {
         \\  nomadfs --revoke <device-id-or-fingerprint> [config_path]
         \\  nomadfs --mount <dir> [config_path]
         \\  nomadfs --invite [--address ip] [config_path]
+        \\  nomadfs --cache | --clear-cache [config_path]
         \\
         \\Options:
         \\  --config <path>    Path to the configuration file
@@ -161,6 +168,11 @@ fn printHelp() void {
         \\  --mount <dir>      Run the node and mount every device's shares at
         \\                     <dir>/<device>/<share>, read-only; files download
         \\                     on demand (Linux, needs fusermount3)
+        \\  --cache            Show the read cache: blocks fetched from other devices
+        \\                     to be read, evicted least recently used first past
+        \\                     `cache_mb` under [storage] (default 2048, 0 = no limit)
+        \\  --clear-cache      Empty the read cache; what this device keeps (its
+        \\                     writes, backups) is not touched
         \\  --help, -h         Show this help message
         \\
     , .{});
@@ -401,6 +413,39 @@ fn trustCommand(allocator: std.mem.Allocator, config: config_mod.Config, uri: []
         fingerprint,
         paths.trust,
     });
+}
+
+/// `--cache` / `--clear-cache`: works on the store directly, so it runs
+/// while a node is running too (the node recounts before it reports).
+fn cacheCommand(allocator: std.mem.Allocator, config: config_mod.Config, clear: bool) !void {
+    if (!config.storage.enabled) {
+        std.debug.print("Storage is disabled in this configuration.\n", .{});
+        return;
+    }
+    var store = try nomadfs.storage.engine.StorageEngine.init(allocator, config.storage.storage_path);
+    defer store.deinit();
+    if (clear) {
+        const freed = try store.clearCache();
+        var buf: [32]u8 = undefined;
+        std.debug.print("Cleared the read cache: freed {s}.\n", .{formatBytes(&buf, freed)});
+        return;
+    }
+    const stats = store.cacheStats();
+    var used_buf: [32]u8 = undefined;
+    var limit_buf: [32]u8 = undefined;
+    const limit = if (config.storage.cache_mb == 0) "no limit" else formatBytes(&limit_buf, config.storage.cache_mb * 1024 * 1024);
+    std.debug.print("Read cache: {s} in {d} blocks (limit {s})\n", .{ formatBytes(&used_buf, stats.bytes), stats.blocks, limit });
+}
+
+fn formatBytes(buf: []u8, bytes: u64) []const u8 {
+    const units = [_][]const u8{ "B", "KiB", "MiB", "GiB", "TiB" };
+    var value: f64 = @floatFromInt(bytes);
+    var unit: usize = 0;
+    while (value >= 1024 and unit + 1 < units.len) : (unit += 1) value /= 1024;
+    return (if (unit == 0)
+        std.fmt.bufPrint(buf, "{d} B", .{bytes})
+    else
+        std.fmt.bufPrint(buf, "{d:.1} {s}", .{ value, units[unit] })) catch "?";
 }
 
 fn devicesCommand(allocator: std.mem.Allocator, config: config_mod.Config) !void {

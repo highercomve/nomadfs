@@ -177,5 +177,5 @@ it over the original.
   `cp -p`) are accepted but not stored; the modes shown are fixed.
 - `d_ino` values in directory listings are not the inode numbers `stat` reports (like libfuse without `use_ino`).
 
-> **Not implemented yet:** a size-limited (LRU) block cache for mounted devices. Fetched blocks
-> currently stay in the store indefinitely. Planned in [ROADMAP.md](../../ROADMAP.md) (Phase 4).
+Blocks read through the mount go to the store's read cache, which keeps the most recently read up
+to `cache_mb` ([the read cache](../storage/engine.md#the-read-cache)).

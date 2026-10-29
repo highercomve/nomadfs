@@ -116,8 +116,9 @@ pub const Remote = struct {
         } orelse return error.BlockNotFound;
         defer dht_node.allocator.free(remote);
 
-        // put() rejects bytes that do not hash to `cid`.
-        try self.store.put(.{ .cid = cid.*, .data = remote });
+        // Fetched to be read: into the read cache, which evicts the least
+        // recently read blocks. putCached rejects bytes that don't hash to `cid`.
+        try self.store.putCached(.{ .cid = cid.*, .data = remote });
         health.markUp(self.peer);
         return allocator.dupe(u8, remote);
     }

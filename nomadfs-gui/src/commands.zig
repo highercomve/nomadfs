@@ -372,8 +372,8 @@ fn noteName(gpa: std.mem.Allocator, text: []const u8, unix_s: u64) ![]u8 {
     const md = day.calculateMonthDay();
     const secs = es.getDaySeconds();
     return std.fmt.allocPrint(gpa, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}-{d:0>2}-{d:0>2} {s}.txt", .{
-        day.year,                   md.month.numeric(),           md.day_index + 1,
-        secs.getHoursIntoDay(),     secs.getMinutesIntoHour(),    secs.getSecondsIntoMinute(),
+        day.year,                                 md.month.numeric(),        md.day_index + 1,
+        secs.getHoursIntoDay(),                   secs.getMinutesIntoHour(), secs.getSecondsIntoMinute(),
         if (trimmed.len > 0) trimmed else "note",
     });
 }
@@ -1972,6 +1972,65 @@ test "commands: remote device fields populate trust, label and mount_name" {
 }
 
 // ---- About ----
+
+// ---- Read cache ----
+
+pub const CacheInfo = struct {
+    /// Bytes and blocks held in the read cache.
+    bytes: u64,
+    blocks: u64,
+    /// The limit in MiB, 0 when there is none.
+    limit_mb: u64,
+};
+
+pub const CacheLimitArgs = struct { config_path: []const u8, limit_mb: u64 };
+
+/// The running node's store, or the one the config names (closed by the
+/// caller) when no node runs.
+fn withStore(gpa: std.mem.Allocator, config: config_mod.Config, owned: *?nomadfs.storage.engine.StorageEngine) !*nomadfs.storage.engine.StorageEngine {
+    if (g_node) |handle| if (handle.node.store) |s| return s;
+    if (!config.storage.enabled) return error.StorageDisabled;
+    owned.* = try nomadfs.storage.engine.StorageEngine.init(gpa, config.storage.storage_path);
+    return &owned.*.?;
+}
+
+/// `invoke("cache_info", { config_path })`: the read cache's size and limit.
+pub fn cacheInfo(gpa: std.mem.Allocator, args: ListArgs) !CacheInfo {
+    var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
+    defer config.deinit(gpa);
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    var owned: ?nomadfs.storage.engine.StorageEngine = null;
+    defer if (owned) |*o| o.deinit();
+    const stats = (try withStore(gpa, config, &owned)).cacheStats();
+    return .{ .bytes = stats.bytes, .blocks = stats.blocks, .limit_mb = config.storage.cache_mb };
+}
+
+/// `invoke("cache_clear", { config_path })`: empties the read cache and
+/// returns the bytes freed. Blocks this device keeps are not touched.
+pub fn cacheClear(gpa: std.mem.Allocator, args: ListArgs) !u64 {
+    var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
+    defer config.deinit(gpa);
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    var owned: ?nomadfs.storage.engine.StorageEngine = null;
+    defer if (owned) |*o| o.deinit();
+    return (try withStore(gpa, config, &owned)).clearCache();
+}
+
+/// `invoke("cache_set_limit", { config_path, limit_mb })`: saves `cache_mb`
+/// and applies it to the running node at once (0 = no limit).
+pub fn cacheSetLimit(gpa: std.mem.Allocator, args: CacheLimitArgs) !void {
+    _ = std.math.mul(u64, args.limit_mb, 1024 * 1024) catch return error.InvalidLimit;
+    var line_buf: [48]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "cache_mb = {d}", .{args.limit_mb});
+    try editConfig(gpa, args.config_path, .{ .drop_keys = &.{"cache_mb"}, .append = &.{line} });
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    if (g_node) |handle| if (handle.node.store) |s| {
+        try s.setCacheLimit(if (args.limit_mb == 0) null else args.limit_mb * 1024 * 1024);
+    };
+}
 
 pub const AboutInfo = struct {
     // Versions and how this build was made.

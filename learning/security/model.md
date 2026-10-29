@@ -60,7 +60,7 @@ tombstone in the local trust store is rejected with `UntrustedDevice`.
 | Data read from a stolen disk | None | Not protected |
 | Sybil / DHT flooding by a key holder | None: any key holder can join the routing table | Risk |
 | Eclipse | K-buckets keep long-lived peers; nothing else | Risk |
-| Resource exhaustion | Handshake timeout (10 s), 64 Yamux streams × 1 MiB window per session (up to 64 MiB buffered), storage quota (`quota_mb`), capped block transfer size (`max_put_block_len`), bounded manifest/trust store/ticket sizes | Partial; no rate limiting |
+| Resource exhaustion | Handshake timeout (10 s), 64 Yamux streams × 1 MiB window per session (up to 64 MiB buffered), storage quota (`quota_mb`), read cache limit (`cache_mb`, LRU), capped block transfer size (`max_put_block_len`), bounded manifest/trust store/ticket sizes | Partial; no rate limiting |
 
 ## 4. Cryptography
 

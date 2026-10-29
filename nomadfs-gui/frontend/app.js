@@ -1758,6 +1758,52 @@ $("update-auto").addEventListener("change", (e) => {
 setTimeout(() => updateAutoOn() && checkUpdate(true), 15000);
 setInterval(() => updateAutoOn() && checkUpdate(true), UPDATE_EVERY_MS);
 
+// ---- Read cache (About) ----
+
+async function loadCache() {
+  let c;
+  try {
+    c = await invoke("cache_info", { config_path: await ensureConfig() });
+  } catch (err) {
+    $("cache-status").textContent = `Couldn't read the cache: ${err}`;
+    return;
+  }
+  const limit = c.limit_mb ? formatSize(c.limit_mb * 1024 * 1024) : "no limit";
+  $("cache-status").textContent = `${formatSize(c.bytes)} of ${limit} · ${c.blocks} blocks. Files you open from other devices are kept here; the least recently read go first when it is full.`;
+  const sel = $("cache-limit");
+  const want = String(c.limit_mb);
+  if (![...sel.options].some((o) => o.value === want)) {
+    const o = document.createElement("option");
+    o.value = want;
+    o.textContent = formatSize(c.limit_mb * 1024 * 1024);
+    sel.append(o);
+  }
+  sel.value = want;
+}
+
+$("cache-clear").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  try {
+    const freed = await invoke("cache_clear", { config_path: await ensureConfig() });
+    snack(`Cleared the read cache: ${formatSize(freed)} freed.`);
+  } catch (err) {
+    snack(`Couldn't clear the cache: ${err}`);
+  }
+  btn.disabled = false;
+  loadCache();
+});
+
+$("cache-limit").addEventListener("change", async (e) => {
+  try {
+    await invoke("cache_set_limit", { config_path: await ensureConfig(), limit_mb: Number(e.target.value) });
+    snack("Read cache limit saved.");
+  } catch (err) {
+    snack(`Couldn't change the limit: ${err}`);
+  }
+  loadCache();
+});
+
 async function loadAbout() {
   let a;
   try {
@@ -1767,6 +1813,7 @@ async function loadAbout() {
     return;
   }
   $("about-version").textContent = a.nomadfs;
+  loadCache();
   const groups = [
     ["Versions", [
       ["NomadFS", a.nomadfs],

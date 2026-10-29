@@ -97,7 +97,11 @@ pub const RepairManager = struct {
         cid: codec.Cid,
         fetched: *usize,
     ) ![]u8 {
-        if (try store.get(&cid, allocator)) |block| return @constCast(block.data);
+        if (try store.get(&cid, allocator)) |block| {
+            // Held, maybe only in the read cache: keep it, it is ours now.
+            try store.pin(&cid);
+            return @constCast(block.data);
+        }
 
         // fetchBlock allocates with the node's allocator.
         const remote = (try node.fetchBlock(peer, cid)) orelse return error.BlockNotFound;

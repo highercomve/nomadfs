@@ -106,6 +106,24 @@ pub fn isComplete(allocator: std.mem.Allocator, store: *StorageEngine, root: []c
     return true;
 }
 
+/// Adds to `set` every block reachable from `root` that is held here as a
+/// block file, reading only those files: a shared file's leaves live in the
+/// file itself and are skipped, not read. For sorting what the store keeps.
+pub fn addStoredReachable(allocator: std.mem.Allocator, store: *StorageEngine, root: *const Cid, set: *CidSet) !void {
+    var stack: std.ArrayList(Cid) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, root.*);
+    while (stack.pop()) |cid| {
+        if ((try set.getOrPut(allocator, cid)).found_existing) continue;
+        const bytes = (try store.getLocal(&cid, allocator)) orelse continue;
+        defer allocator.free(bytes);
+        switch (codec.decode(bytes) catch continue) {
+            .leaf => {},
+            inline .parent, .dir => |links| try pushChildren(allocator, &stack, links),
+        }
+    }
+}
+
 /// Collects every CID reachable from `root` (inclusive). Caller deinits.
 pub fn collectReachable(allocator: std.mem.Allocator, store: *StorageEngine, root: []const u8) !CidSet {
     var stack: std.ArrayList(Cid) = .empty;

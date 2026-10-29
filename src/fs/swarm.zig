@@ -168,6 +168,25 @@ pub const SwarmFolder = struct {
         try self.saveLocked();
     }
 
+    /// Root CIDs of the files this device must keep: the ones it wrote or
+    /// last changed, and, on a backup device, every file it has copied.
+    /// Caller frees.
+    pub fn keptRoots(self: *SwarmFolder, allocator: std.mem.Allocator) ![][32]u8 {
+        var roots: std.ArrayList([32]u8) = .empty;
+        errdefer roots.deinit(allocator);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.manifest.entries.values()) |e| {
+            if (e.deleted or e.kind != .file) continue;
+            if (std.mem.eql(u8, &e.version.device, &self.self_id.bytes)) try roots.append(allocator, e.cid);
+        }
+        self.backup_mutex.lock();
+        defer self.backup_mutex.unlock();
+        var it = self.backed_up.keyIterator();
+        while (it.next()) |cid| try roots.append(allocator, cid.*);
+        return roots.toOwnedSlice(allocator);
+    }
+
     pub fn makeDir(self: *SwarmFolder, dir: []const u8, name: []const u8) !void {
         const path = try join(self.allocator, dir, name);
         defer self.allocator.free(path);
@@ -564,7 +583,10 @@ pub const SwarmFolder = struct {
     fn copyFile(self: *SwarmFolder, bm: *cluster.BlockManager, w: BackupWant, peers: []const NodeID) bool {
         if (storage.dag.walk.collectReachable(self.allocator, self.store, &w.cid)) |set| {
             var cids = set;
-            cids.deinit(self.allocator);
+            defer cids.deinit(self.allocator);
+            // Held already, perhaps only because it was read: a backup keeps it.
+            var it = cids.keyIterator();
+            while (it.next()) |cid| self.store.pin(cid) catch return false;
             return true;
         } else |_| {}
         if (self.copyFrom(bm, w.author, w.cid)) return true;

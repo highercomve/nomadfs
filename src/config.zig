@@ -86,6 +86,10 @@ pub const Config = struct {
         /// Most block-store space, in MiB, blocks pushed or fetched from
         /// peers may take. 0 is unlimited.
         quota_mb: u64 = 0,
+        /// Most space, in MiB, blocks fetched from other devices only to be
+        /// read may take; past it the least recently read are evicted.
+        /// 0 is unlimited.
+        cache_mb: u64 = 2048,
     };
 
     pub const SecurityConfig = struct {
@@ -277,6 +281,10 @@ fn applyConfigEntry(
         const mb = try std.fmt.parseInt(u64, val, 10);
         _ = std.math.mul(u64, mb, 1024 * 1024) catch return error.QuotaOutOfRange;
         config.storage.quota_mb = mb;
+    } else if (std.mem.eql(u8, key, "cache_mb")) {
+        const mb = try std.fmt.parseInt(u64, val, 10);
+        _ = std.math.mul(u64, mb, 1024 * 1024) catch return error.QuotaOutOfRange;
+        config.storage.cache_mb = mb;
     } else if (std.mem.eql(u8, key, "port")) {
         config.network.port = try std.fmt.parseInt(u16, val, 10);
     } else if (std.mem.eql(u8, key, "upnp_enabled")) {

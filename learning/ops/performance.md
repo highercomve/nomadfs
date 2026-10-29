@@ -19,6 +19,7 @@ time, and what they mean in practice.
 | Connection pool cap | ≤ 256 connections | `src/net/transport/manager.zig` `max_connections` |
 | RPC handler cap | ≤ 256 concurrent handlers | `src/net/discovery/node.zig` `max_handlers` |
 | Block store quota | configurable (`quota_mb`), 0 = unlimited | `src/config.zig`, `src/storage/engine.zig` |
+| Read cache | `cache_mb`, default 2048 MiB, LRU by mtime, evicts to 90 % | `src/storage/engine.zig` |
 | Idle connection reaped after | 5 min (checked every 10 s) | `src/net/transport/manager.zig` |
 | K-bucket size / lookup parallelism | K = 20 / α = 3 | `src/net/discovery/kbucket.zig`, `lookup.zig` |
 | Share rescan | every 30 s; unchanged size+mtime skipped | `src/fs/shares.zig`, `scan.zig` |
@@ -70,8 +71,7 @@ whatever vector instructions the target allows; build with
 ## 5. Not Implemented Yet
 
 Planned in [ROADMAP.md](../../ROADMAP.md) or obvious next steps, none present
-today: an LRU cache policy and eviction for fetched blocks (the store only
-grows), parallel or pipelined block fetches, Yamux keep-alive PINGs for NAT
+today: parallel or pipelined block fetches, Yamux keep-alive PINGs for NAT
 bindings, and a relay for devices that can't reach each other directly.
 
 ---

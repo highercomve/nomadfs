@@ -48,6 +48,9 @@ pub const Node = struct {
     /// previews, the swarm folder); null without block storage.
     read_ahead: ?*fs.ReadAhead,
     bootstrap_thread: ?std.Thread = null,
+    /// Sorts blocks stored before the read cache existed, once (sortLegacyCache).
+    cache_thread: ?std.Thread = null,
+    cache_running: std.atomic.Value(bool) = .init(false),
     bootstrap_running: *std.atomic.Value(bool),
     /// Devices met before, with all their addresses; re-dialed to rejoin
     /// the swarm from any network (Tailscale away from home). Used only by
@@ -76,6 +79,7 @@ pub const Node = struct {
         if (store) |s| if (cfg.storage.quota_mb > 0) {
             try s.setQuota(cfg.storage.quota_mb * 1024 * 1024);
         };
+        if (store) |s| try s.setCacheLimit(if (cfg.storage.cache_mb == 0) null else cfg.storage.cache_mb * 1024 * 1024);
 
         const discovery_node = try allocator.create(DiscoveryNode);
         discovery_node.* = DiscoveryNode.init(
@@ -217,6 +221,7 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        self.stopCacheThread();
         self.bootstrap_running.store(false, .release);
         if (self.bootstrap_thread) |t| {
             t.join();
@@ -328,6 +333,69 @@ pub const Node = struct {
     pub fn listen(self: *Node, running: *std.atomic.Value(bool), cfg: config.Config) !void {
         try self.connection_manager.start();
         try self.connection_manager.listen(cfg, running);
+        if (self.store != null and self.cache_thread == null) {
+            self.cache_running.store(true, .release);
+            self.cache_thread = std.Thread.spawn(.{}, runCacheSort, .{self}) catch null;
+        }
+    }
+
+    fn stopCacheThread(self: *Node) void {
+        self.cache_running.store(false, .release);
+        if (self.cache_thread) |t| t.join();
+        self.cache_thread = null;
+    }
+
+    /// Marker in the cache directory: the one-time sort is done.
+    const cache_sorted_marker = ".sorted-v1";
+    /// Longest wait for every share's first scan before sorting anyway.
+    const cache_sort_wait_ns: u64 = 30 * std.time.ns_per_min;
+
+    fn runCacheSort(self: *Node) void {
+        const store = self.store orelse return;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        if (store.cache_dir.statFile(io, cache_sorted_marker, .{})) |_| return else |_| {}
+        var waited: u64 = 0;
+        const step = 100 * std.time.ns_per_ms;
+        // A share's parent blocks are known once its first scan has a root.
+        while (!self.sharesScanned() and waited < cache_sort_wait_ns) : (waited += step) {
+            if (!self.cache_running.load(.acquire)) return;
+            sync.sleep(step);
+        }
+        if (!self.cache_running.load(.acquire)) return;
+        self.sortLegacyCache(store) catch |err| {
+            std.debug.print("cache: sorting old blocks failed: {any}\n", .{err});
+            return;
+        };
+        if (store.cache_dir.createFile(io, cache_sorted_marker, .{})) |f| f.close(io) else |_| {}
+    }
+
+    fn sharesScanned(self: *Node) bool {
+        const shares = self.shares orelse return true;
+        const snap = shares.snapshot(self.allocator) catch return false;
+        defer fs.ShareIndex.freeSnapshot(self.allocator, snap);
+        for (snap) |sh| if (sh.root == null or sh.indexing) return false;
+        return true;
+    }
+
+    /// Blocks stored before the read cache existed sit with the kept ones.
+    /// Keeps what this device is responsible for (its shares' parent and dir
+    /// blocks, swarm folder files it wrote or backed up) and moves the rest,
+    /// blocks fetched only to be read, into the read cache.
+    fn sortLegacyCache(self: *Node, store: *storage.engine.StorageEngine) !void {
+        var keep: storage.dag.walk.CidSet = .empty;
+        defer keep.deinit(self.allocator);
+        if (self.shares) |shares| {
+            const snap = try shares.snapshot(self.allocator);
+            defer fs.ShareIndex.freeSnapshot(self.allocator, snap);
+            for (snap) |sh| if (sh.root) |r| try storage.dag.walk.addStoredReachable(self.allocator, store, &r, &keep);
+        }
+        if (self.swarm) |swarm| {
+            const roots = try swarm.keptRoots(self.allocator);
+            defer self.allocator.free(roots);
+            for (roots) |*r| try storage.dag.walk.addStoredReachable(self.allocator, store, r, &keep);
+        }
+        const moved = try store.demoteExcept(&keep);
+        std.debug.print("cache: moved {d} blocks ({d} bytes) read from other devices into the read cache\n", .{ moved.blocks, moved.bytes });
     }
 
     /// Stops the listener and closes every session, joining the listener's
@@ -335,6 +403,7 @@ pub const Node = struct {
     /// them. Stopping is not undone here: a later listen() fails with
     /// ManagerStopping until the connection manager can restart.
     pub fn stopListener(self: *Node) void {
+        self.stopCacheThread();
         self.bootstrap_running.store(false, .release);
         self.connection_manager.stop();
     }
