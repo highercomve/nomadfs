@@ -54,8 +54,8 @@ pub const SwarmFolder = struct {
     /// Runs after each sync round on the folder's thread: backed-up shares
     /// coming in (backup_import.zig). Set before start().
     after_sync: ?AfterSync = null,
-    running: std.atomic.Value(bool) = .init(false),
-    thread: ?std.Thread = null,
+    /// The background thread (sync.Worker); its loop watches worker.running.
+    worker: sync.Worker = .{},
 
     /// Backup: a copy of every live file in this device's block store.
     backup_enabled: std.atomic.Value(bool) = .init(false),
@@ -596,23 +596,17 @@ pub const SwarmFolder = struct {
 
     pub fn start(self: *SwarmFolder, block_manager: *cluster.BlockManager) !void {
         self.block_manager = block_manager;
-        if (self.running.swap(true, .acq_rel)) return;
-        self.thread = std.Thread.spawn(.{}, loop, .{self}) catch |err| {
-            self.running.store(false, .release);
-            return err;
-        };
+        try self.worker.start(loop, .{self});
     }
 
     pub fn stop(self: *SwarmFolder) void {
-        if (!self.running.swap(false, .acq_rel)) return;
-        if (self.thread) |t| t.join();
-        self.thread = null;
+        self.worker.stop();
     }
 
     fn loop(self: *SwarmFolder) void {
         const step = 200 * std.time.ns_per_ms;
         var waited: u64 = self.sync_interval_ns - 2 * std.time.ns_per_s; // first round soon
-        while (self.running.load(.acquire)) {
+        while (self.worker.isRunning()) {
             sync.sleep(step);
             waited += step;
             self.flushSave(); // edits batched in the last second

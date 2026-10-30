@@ -131,6 +131,32 @@ pub fn sleep(nanoseconds: u64) void {
 }
 
 /// Returns current Unix timestamp in seconds.
+/// One background thread: start() runs `func(args)` once (again after a
+/// stop), stop() asks it to end (its loop watches `running`) and joins it.
+/// Both are idempotent.
+pub const Worker = struct {
+    running: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    pub fn start(self: *Worker, comptime func: anytype, args: anytype) !void {
+        if (self.running.swap(true, .acq_rel)) return;
+        self.thread = std.Thread.spawn(.{}, func, args) catch |err| {
+            self.running.store(false, .release);
+            return err;
+        };
+    }
+
+    pub fn stop(self: *Worker) void {
+        if (!self.running.swap(false, .acq_rel)) return;
+        if (self.thread) |t| t.join();
+        self.thread = null;
+    }
+
+    pub fn isRunning(self: *const Worker) bool {
+        return self.running.load(.acquire);
+    }
+};
+
 /// Unix time in seconds; 0 for a clock set before 1970 (never panics).
 pub fn nowSeconds() u64 {
     return std.math.cast(u64, timestamp()) orelse 0;

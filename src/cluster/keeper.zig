@@ -162,9 +162,9 @@ pub const Keeper = struct {
     store: *storage.engine.StorageEngine,
     providers: [max_providers]?Provider = .{null} ** max_providers,
     interval_ns: u64 = 60 * std.time.ns_per_s,
-    running: std.atomic.Value(bool) = .init(false),
+    /// The background thread (sync.Worker); its loop watches worker.running.
+    worker: sync.Worker = .{},
     woken: std.atomic.Value(bool) = .init(false),
-    thread: ?std.Thread = null,
     /// Serializes rounds (the thread, runNow from tests and the app).
     round_mutex: sync.Mutex = .{},
 
@@ -182,18 +182,12 @@ pub const Keeper = struct {
     }
 
     pub fn start(self: *Keeper) !void {
-        if (self.running.swap(true, .acq_rel)) return;
-        self.thread = std.Thread.spawn(.{}, loop, .{self}) catch |err| {
-            self.running.store(false, .release);
-            return err;
-        };
+        try self.worker.start(loop, .{self});
     }
 
     /// Stops the thread; a copy in progress stops at its next block.
     pub fn stop(self: *Keeper) void {
-        if (!self.running.swap(false, .acq_rel)) return;
-        if (self.thread) |t| t.join();
-        self.thread = null;
+        self.worker.stop();
     }
 
     /// Run a round soon (something changed: a file was added, membership).
@@ -204,7 +198,7 @@ pub const Keeper = struct {
     fn loop(self: *Keeper) void {
         const step = 200 * std.time.ns_per_ms;
         var waited: u64 = self.interval_ns - 5 * std.time.ns_per_s; // first round soon
-        while (self.running.load(.acquire)) {
+        while (self.worker.isRunning()) {
             sync.sleep(step);
             waited += step;
             if (waited < self.interval_ns and !self.woken.swap(false, .acq_rel)) continue;
@@ -225,8 +219,8 @@ pub const Keeper = struct {
             wants.clearRetainingCapacity();
             try p.wantsFn(p.ctx, self.allocator, &wants, wants_per_round);
             for (wants.items) |*w| {
-                if (!self.running.load(.acquire)) return held;
-                const ok = if (copy(self.allocator, self.fetcher, self.store, w.root, w.holders(), &self.running)) |c| blk: {
+                if (!self.worker.isRunning()) return held;
+                const ok = if (copy(self.allocator, self.fetcher, self.store, w.root, w.holders(), &self.worker.running)) |c| blk: {
                     if (c.blocks > 0) std.debug.print("keeper: kept {x} ({d} blocks, {d} KiB fetched)\n", .{ w.root[0..4], c.blocks, c.bytes >> 10 });
                     break :blk true;
                 } else |err| blk: {
@@ -375,7 +369,7 @@ test "keeper: a round copies each provider's wants and reports them" {
     var w: Wants = .{ .roots = .{ root, missing }, .peer = peer };
     var k = Keeper.init(testing.allocator, &f, &b);
     try k.register(.{ .ctx = &w, .wantsFn = Wants.wants, .doneFn = Wants.done });
-    k.running.store(true, .release); // a round without the thread
+    k.worker.running.store(true, .release); // a round without the thread
     try testing.expectEqual(@as(usize, 1), try k.round());
     try testing.expectEqual(@as(usize, 1), w.ok);
     try testing.expectEqual(@as(usize, 1), w.failed);

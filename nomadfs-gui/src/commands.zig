@@ -888,6 +888,7 @@ fn readBase64(gpa: std.mem.Allocator, source: nomadfs.Node.FileSource, offset: u
 
 // ---- Swarm folder: one folder every device reads and writes ----
 
+// @atlas allow: duplicate_shape: SwarmFolder.Item for the page: CIDs as hex text.
 pub const SwarmItem = struct {
     name: []const u8,
     path: []const u8,
@@ -1167,6 +1168,7 @@ pub fn fileDetails(gpa: std.mem.Allocator, args: FileDetailsArgs) !FileDetails {
 pub const DeviceInfoArgs = struct { peer: ?[]const u8 = null };
 
 /// node_info.Info with its texts as strings, for JSON.
+// @atlas allow: duplicate_shape: node_info.Info for the page: texts as strings.
 pub const DeviceInfo = struct {
     version: []const u8,
     platform: []const u8,
@@ -1743,13 +1745,7 @@ test "commands: remote device fields populate trust, label and mount_name" {
 
 // ---- Read cache ----
 
-pub const CacheInfo = struct {
-    /// Bytes and blocks held in the read cache.
-    bytes: u64,
-    blocks: u64,
-    /// The limit in MiB, 0 when there is none.
-    limit_mb: u64,
-};
+pub const CacheInfo = nomadfs.settings.CacheInfo;
 
 pub const CacheLimitArgs = struct { config_path: []const u8, limit_mb: u64 };
 
@@ -1760,8 +1756,7 @@ pub fn cacheInfo(gpa: std.mem.Allocator, args: ListArgs) !CacheInfo {
     defer config.deinit(gpa);
     g_mutex.lock();
     defer g_mutex.unlock();
-    const info = try nomadfs.settings.cacheInfo(gpa, config, runningNode());
-    return .{ .bytes = info.bytes, .blocks = info.blocks, .limit_mb = info.limit_mb };
+    return nomadfs.settings.cacheInfo(gpa, config, runningNode());
 }
 
 /// `invoke("cache_clear", { config_path })`: empties the read cache and

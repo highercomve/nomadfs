@@ -32,10 +32,15 @@ fn connectGateway(addr: compat.Address) !compat.Stream {
     return stream;
 }
 
-/// Reads an HTTP response (until EOF) into `out`, capped at max_description_len.
+/// Reads an HTTP response (until EOF) into `out`, capped at
+/// max_description_len and at twice the HTTP timeout overall: each read
+/// has its own timeout, and a gateway trickling bytes would otherwise keep
+/// it going for hours.
 fn readResponse(allocator: std.mem.Allocator, stream: compat.Stream, out: *std.ArrayList(u8)) !void {
     var read_buf: [1024]u8 = undefined;
+    const deadline = sync.monotonicMillis() + 2 * @as(i64, nat_http_timeout_ms);
     while (out.items.len <= nat_max_description_len) {
+        if (sync.monotonicMillis() > deadline) return error.Timeout;
         const n = stream.read(&read_buf) catch break;
         if (n == 0) break;
         try out.appendSlice(allocator, read_buf[0..n]);

@@ -47,8 +47,8 @@ pub const ShareIndex = struct {
     /// How soon a first scan lists what it has, then how often it updates.
     progress_first_ns: u64 = 1 * std.time.ns_per_s,
     progress_interval_ns: u64 = 10 * std.time.ns_per_s,
-    running: std.atomic.Value(bool) = .init(false),
-    thread: ?std.Thread = null,
+    /// The background thread (sync.Worker); its loop watches worker.running.
+    worker: sync.Worker = .{},
     /// Names of the shares marked for backup (they go into the swarm
     /// folder, backup_import.zig), whether or not they are shared right
     /// now. Owned; guarded by `mutex`.
@@ -377,17 +377,11 @@ pub const ShareIndex = struct {
 
     /// Starts the periodic rescan thread (idempotent).
     pub fn start(self: *ShareIndex) !void {
-        if (self.running.swap(true, .acq_rel)) return;
-        self.thread = std.Thread.spawn(.{}, rescanLoop, .{self}) catch |err| {
-            self.running.store(false, .release);
-            return err;
-        };
+        try self.worker.start(rescanLoop, .{self});
     }
 
     pub fn stop(self: *ShareIndex) void {
-        if (!self.running.swap(false, .acq_rel)) return;
-        if (self.thread) |t| t.join();
-        self.thread = null;
+        self.worker.stop();
     }
 
     fn rescanLoop(self: *ShareIndex) void {
@@ -395,7 +389,7 @@ pub const ShareIndex = struct {
         // Scan at once: registered shares are unlisted until scanned.
         self.rescanAll();
         var waited: u64 = 0;
-        while (self.running.load(.acquire)) {
+        while (self.worker.isRunning()) {
             sync.sleep(step);
             waited += step;
             if (waited < self.rescan_interval_ns) continue;
