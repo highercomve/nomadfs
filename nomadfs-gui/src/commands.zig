@@ -657,28 +657,25 @@ pub fn shareBackupSet(gpa: std.mem.Allocator, args: ShareBackupArgs) !void {
 
 pub const BackupStatus = struct {
     share: []const u8,
-    copies: []fs.backup.Copy,
-    /// This device is on Wi-Fi (or not a phone): marked shares are offered.
+    /// Where it is in the swarm folder: `<device>/<share>`.
+    path: []const u8,
+    /// Files there now.
+    files: usize,
+    /// The swarm backup devices, each keeping every swarm file.
+    keepers: [][]const u8,
+    /// This device is on Wi-Fi (or not a phone): new files go in.
     unmetered: bool,
 };
 
-/// `invoke("backup_status")`: for each share marked for backup, which
-/// backup devices hold a copy and whether it's up to date (fs/backup.zig).
+/// `invoke("backup_status")`: for each share marked for backup, where it is
+/// in the swarm folder and which backup devices keep it (Node.backupStatus).
 pub fn backupStatus(gpa: std.mem.Allocator) ![]BackupStatus {
-    const node = blk: {
-        g_mutex.lock();
-        defer g_mutex.unlock();
-        const handle = g_node orelse return error.NotRunning;
-        // Asking every device takes a while: keep the node alive without
-        // holding g_mutex (nodeClose waits for media users).
-        _ = g_media_users.fetchAdd(1, .acq_rel);
-        break :blk &handle.node;
-    };
+    const handle = mediaAcquire() orelse return error.NotRunning;
     defer mediaRelease();
-    const kept = try node.backupCopies(gpa);
-    const out = try gpa.alloc(BackupStatus, kept.len);
+    const st = try handle.node.backupStatus(gpa);
+    const out = try gpa.alloc(BackupStatus, st.shares.len);
     const unmetered = nomadfs.net.local_addrs.onUnmeteredNetwork();
-    for (kept, out) |k, *o| o.* = .{ .share = k.share, .copies = k.copies, .unmetered = unmetered };
+    for (st.shares, out) |s, *o| o.* = .{ .share = s.share, .path = s.path, .files = s.files, .keepers = st.keepers, .unmetered = unmetered };
     return out;
 }
 
@@ -1265,7 +1262,6 @@ pub const DeviceInfo = struct {
     swarm_backup: bool,
     swarm_backed_up: u32,
     swarm_unreachable: u32,
-    held_backups: u32,
     unmetered: bool,
     bytes_sent: u64,
     bytes_received: u64,

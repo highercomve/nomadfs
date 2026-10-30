@@ -73,7 +73,7 @@ test {
         @import("env.zig"),
         @import("errors.zig"),
         @import("fs/filestore.zig"),
-        @import("fs/backup.zig"),
+        @import("fs/backup_import.zig"),
         @import("fs/inspect.zig"),
         @import("fs/manifest.zig"),
         @import("fs/swarm.zig"),

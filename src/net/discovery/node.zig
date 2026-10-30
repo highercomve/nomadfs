@@ -106,9 +106,6 @@ pub const Node = struct {
     pub const ShareSource = struct {
         ctx: *anyopaque,
         listFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
-        /// The SHARES `backup` field (fs/backup.zig), caller-owned; null
-        /// when the source has none.
-        backupFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 = null,
         /// The swarm manifest's digest (GET_SWARM answers nothing when the
         /// asker has the same).
         digestFn: ?*const fn (ctx: *anyopaque) [32]u8 = null,
@@ -709,8 +706,6 @@ pub const Node = struct {
         nickname: []u8,
         /// Encoded dir block; validate with codec.decode.
         listing: []u8,
-        /// The `backup` field (fs/backup.zig decodes it); may be empty.
-        backup: []u8,
     };
 
     /// Asks `conn`'s peer which folders it shares. Both slices of the reply
@@ -728,7 +723,7 @@ pub const Node = struct {
 
         const response = try rpc.Message.deserialize(self.allocator, stream.reader());
         switch (response.payload) {
-            .SHARES => |p| return .{ .nickname = @constCast(p.nickname), .listing = @constCast(p.listing), .backup = @constCast(p.backup) },
+            .SHARES => |p| return .{ .nickname = @constCast(p.nickname), .listing = @constCast(p.listing) },
             else => {
                 response.deinit(self.allocator);
                 return error.InvalidResponse;
@@ -1665,15 +1660,9 @@ pub const Node = struct {
         else
             try self.allocator.dupe(u8, &empty_listing);
         defer self.allocator.free(listing);
-        // The backup field is extra: failing to build it must not hide the shares.
-        const backup: []u8 = if (self.share_source) |source| (if (source.backupFn) |f| f(source.ctx, self.allocator) catch |err| blk: {
-            std.debug.print("SHARES: backup info unavailable: {any}\n", .{err});
-            break :blk &.{};
-        } else &.{}) else &.{};
-        defer self.allocator.free(backup);
         const response = rpc.Message{
             .sender_id = self.manager.node_id,
-            .payload = .{ .SHARES = .{ .nickname = self.nickname, .listing = listing, .backup = backup } },
+            .payload = .{ .SHARES = .{ .nickname = self.nickname, .listing = listing } },
         };
         try response.send(self.allocator, stream);
     }

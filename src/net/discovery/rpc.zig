@@ -147,10 +147,7 @@ pub const MessagePayload = union(MessageType) {
         at: u64,
     },
     GET_SHARES: void,
-    /// `backup`: which shares the device asks backup devices to keep, and
-    /// which backups it holds for others (fs/backup.zig encodes it; empty
-    /// when there's nothing to say).
-    SHARES: struct { nickname: []const u8, listing: []const u8, backup: []const u8 = &.{} },
+    SHARES: struct { nickname: []const u8, listing: []const u8 },
     /// `have`: the digest of the asker's manifest (Manifest.digest).
     GET_SWARM: struct { have: [32]u8 },
     SWARM: struct { manifest: []const u8 },
@@ -180,10 +177,6 @@ pub const Admit = struct {
         return self.label[0..self.label_len];
     }
 };
-
-/// Longest SHARES `backup` field (fs/backup.zig encodeInfo): 255 wanted
-/// names and 255 held backups come to about 150 KiB.
-pub const max_backup_info_len = 256 * 1024;
 
 /// Longest device label an ADMIT carries: the pairing nickname limit.
 pub const max_admit_label = pairing.max_nickname_len;
@@ -287,8 +280,6 @@ pub const Message = struct {
                 try writeNickname(p.nickname, writer);
                 try writer.writeInt(u32, try valueLen(p.listing.len), .big);
                 try writer.writeAll(p.listing);
-                try writer.writeInt(u32, try valueLen(p.backup.len), .big);
-                try writer.writeAll(p.backup);
             },
             .GET_SWARM => |p| try writer.writeAll(&p.have),
             .ROTATE_KEY => |p| {
@@ -403,7 +394,7 @@ pub const Message = struct {
                 if (!isValidNickname(nickname)) return error.InvalidNickname;
                 const listing = try readValueMax(allocator, reader, max_block_len);
                 errdefer allocator.free(listing);
-                break :blk MessagePayload{ .SHARES = .{ .nickname = nickname, .listing = listing, .backup = try readValueMax(allocator, reader, max_backup_info_len) } };
+                break :blk MessagePayload{ .SHARES = .{ .nickname = nickname, .listing = listing } };
             },
             .GET_SWARM => blk: {
                 var have: [32]u8 = undefined;
@@ -558,7 +549,6 @@ pub const Message = struct {
             .SHARES => |p| {
                 allocator.free(p.nickname);
                 allocator.free(p.listing);
-                allocator.free(p.backup);
             },
             .SWARM => |p| allocator.free(p.manifest),
             .NODE_INFO => |p| allocator.free(p.info),

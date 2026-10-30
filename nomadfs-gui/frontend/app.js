@@ -1387,22 +1387,16 @@ async function loadBackupStatus() {
     const li = [...$("shares-list").children].find((el) => el.dataset.share === s.share);
     const meta = li && li.querySelectorAll(".meta")[1];
     if (!meta) continue;
-    if (s.copies.length === 0) {
-      meta.textContent = s.unmetered ? "Backup: no backup device has a copy yet" : "Backup: waiting for Wi-Fi";
-      continue;
-    }
-    const names = s.copies.map((c) => c.device).join(" · ");
-    const behind = s.copies.filter((c) => !c.current).length;
-    meta.textContent = behind === 0
-      ? `Backed up on ${names}`
-      : `Backed up on ${names} · ${s.unmetered ? "new files being copied" : "new files wait for Wi-Fi"}`;
+    const where = `In the swarm folder at ${s.path} (${s.files} file${s.files === 1 ? "" : "s"})`;
+    const kept = s.keepers.length ? `kept by ${s.keepers.join(" · ")}` : "no backup device met yet";
+    meta.textContent = s.unmetered ? `${where} · ${kept}` : `${where} · new files wait for Wi-Fi`;
   }
 }
 
 async function setShareBackup(name, on) {
   try {
     await invoke("share_backup_set", { config_path: await ensureConfig(), name, on });
-    snack(on ? `${name} will be backed up by the swarm's backup devices` : `Stopped backing up ${name}; copies already made stay`);
+    snack(on ? `${name} goes into the swarm folder; the backup devices keep it` : `Stopped backing up ${name}; copies already made stay`);
   } catch (err) {
     snack(`Couldn't change the backup: ${err}`);
   }
@@ -2636,7 +2630,6 @@ async function openDeviceInfo(title, peer) {
   netStat(String(i.shares), "shared folders");
   netStat(String(i.swarm_files), "swarm folder files");
   netStat(i.swarm_backup ? "On" : "Off", "swarm backup");
-  if (i.held_backups) netStat(String(i.held_backups), "folder backups kept for others");
   netStat(i.unmetered ? "Yes" : "No", "on Wi-Fi or wired");
   netStat(formatSize(i.bytes_sent), "sent");
   netStat(formatSize(i.bytes_received), "received");

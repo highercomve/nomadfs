@@ -4,124 +4,99 @@ const TestPeer = @import("test_helpers").TestPeer;
 const DhtNode = nomadfs.net.discovery.Node;
 const StorageEngine = nomadfs.storage.engine.StorageEngine;
 const BlockManager = nomadfs.cluster.BlockManager;
-const Identity = nomadfs.device.identity.Identity;
-const TrustStore = nomadfs.device.trust.Store;
 const fs = nomadfs.fs;
 
-fn identityWith(seed_byte: u8) !Identity {
-    return Identity.fromSeed([_]u8{seed_byte} ** nomadfs.device.identity.seed_len);
+fn always() bool {
+    return true;
 }
 
-test "folder backup: a backup device keeps a member's marked folder, deletions included" {
-    std.debug.print("\n=== Running Test: cluster: folder backup ===\n", .{});
+test "folder backup: a marked folder goes into the swarm folder and every backup device keeps it once" {
+    std.debug.print("\n=== Running Test: cluster: folder backup through the swarm folder ===\n", .{});
     const allocator = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const cwd = std.Io.Dir.cwd();
 
-    const phone_dir = "test_fbackup_store_phone";
-    const backup_dir = "test_fbackup_store_backup";
-    const folder = "test_fbackup_camera";
-    const trust_path = "test_fbackup_trust.store";
-    const state_path = "test_fbackup_store_backup.backups";
-    for ([_][]const u8{ phone_dir, backup_dir, folder }) |d| cwd.deleteTree(io, d) catch {};
-    defer for ([_][]const u8{ phone_dir, backup_dir, folder }) |d| cwd.deleteTree(io, d) catch {};
-    cwd.deleteFile(io, trust_path) catch {};
-    defer cwd.deleteFile(io, trust_path) catch {};
-    cwd.deleteFile(io, state_path) catch {};
-    defer cwd.deleteFile(io, state_path) catch {};
+    const dirs = [_][]const u8{ "test_fbackup_phone", "test_fbackup_server", "test_fbackup_camera" };
+    for (dirs) |d| cwd.deleteTree(io, d) catch {};
+    defer for (dirs) |d| cwd.deleteTree(io, d) catch {};
+    try cwd.createDirPath(io, "test_fbackup_camera");
+    const first = "first photo";
+    const second = "second photo, a little longer";
+    try cwd.writeFile(io, .{ .sub_path = "test_fbackup_camera/IMG_0001.jpg", .data = first });
+    try cwd.writeFile(io, .{ .sub_path = "test_fbackup_camera/IMG_0002.jpg", .data = second });
 
-    try cwd.createDirPath(io, folder);
-    try cwd.writeFile(io, .{ .sub_path = folder ++ "/IMG_0001.jpg", .data = "first photo" });
-    try cwd.writeFile(io, .{ .sub_path = folder ++ "/IMG_0002.jpg", .data = "second photo" });
-
-    var phone_store = try StorageEngine.init(allocator, phone_dir);
+    var phone_store = try StorageEngine.init(allocator, "test_fbackup_phone");
     defer phone_store.deinit();
-    var backup_store = try StorageEngine.init(allocator, backup_dir);
-    defer backup_store.deinit();
+    var server_store = try StorageEngine.init(allocator, "test_fbackup_server");
+    defer server_store.deinit();
 
     var phone = try TestPeer.init(allocator, 13192);
     defer phone.deinit();
-    var backup = try TestPeer.init(allocator, 13193);
-    defer backup.deinit();
-
-    const phone_id = try identityWith(0xA1);
-    const backup_id = try identityWith(0xA2);
-    var trust = try TrustStore.load(allocator, trust_path, null);
-    defer trust.deinit();
-    _ = try trust.upsert(phone_id.publicKey(), phone.manager.identity_key.public_key, "Pixel", 1);
-    phone.manager.setDeviceAuthenticator(.{ .identity = phone_id });
-    backup.manager.setDeviceAuthenticator(.{ .identity = backup_id, .trust = &trust });
-
+    var server = try TestPeer.init(allocator, 13193);
+    defer server.deinit();
     var phone_dht = DhtNode.init(allocator, phone.manager, phone.config.node.swarm_key);
     defer phone_dht.deinit();
-    var backup_dht = DhtNode.init(allocator, backup.manager, backup.config.node.swarm_key);
-    defer backup_dht.deinit();
+    var server_dht = DhtNode.init(allocator, server.manager, server.config.node.swarm_key);
+    defer server_dht.deinit();
     phone_dht.block_store = &phone_store;
-    phone_dht.nickname = "Pixel";
-    backup_dht.block_store = &backup_store;
+    server_dht.block_store = &server_store;
 
-    const phone_index = try fs.ShareIndex.create(allocator, io, &phone_store);
-    defer phone_index.destroy();
-    try phone_index.add("Camera", folder);
-    try phone_index.setBackup("Camera", true);
-    phone_dht.share_source = phone_index.source();
-    const backup_index = try fs.ShareIndex.create(allocator, io, &backup_store);
-    defer backup_index.destroy();
-    backup_dht.share_source = backup_index.source();
+    // The phone shares its camera folder, marked for backup.
+    const index = try fs.ShareIndex.create(allocator, io, &phone_store);
+    defer index.destroy();
+    try index.add("Camera", "test_fbackup_camera");
+    try index.setBackup("Camera", true);
+    const phone_swarm = try fs.SwarmFolder.create(allocator, io, &phone_store, phone.manager.node_id, "Pixel", "test_fbackup_phone/swarm.json");
+    defer phone_swarm.destroy();
+    const server_swarm = try fs.SwarmFolder.create(allocator, io, &server_store, server.manager.node_id, "Plex", "test_fbackup_server/swarm.json");
+    defer server_swarm.destroy();
+    phone_dht.swarm_source = phone_swarm.source();
+    server_dht.swarm_source = server_swarm.source();
+    const import = try fs.BackupImport.create(allocator, io, phone_swarm, index, &phone_store, "Pixel", "test_fbackup_phone/imported", always);
+    defer import.destroy();
 
     phone.manager.setConnectionHandler(&phone_dht, DhtNode.serve);
-    backup.manager.setConnectionHandler(&backup_dht, DhtNode.serve);
+    server.manager.setConnectionHandler(&server_dht, DhtNode.serve);
     defer phone.stop();
-    defer backup.stop();
+    defer server.stop();
     try phone.start();
-    try backup.start();
+    try server.start();
     nomadfs.sync.sleep(100 * std.time.ns_per_ms);
     {
-        const conn = try backup.manager.connectToPeer(phone.listen_addr, backup.config.node.swarm_key, phone.manager.node_id);
+        const conn = try server.manager.connectToPeer(phone.listen_addr, server.config.node.swarm_key, phone.manager.node_id);
         defer conn.deinit();
-        try backup_dht.ping(conn);
+        try server_dht.ping(conn);
     }
+    const phone_bm = try BlockManager.init(allocator, .{ .network = phone.manager, .dht = &phone_dht, .storage = &phone_store });
+    defer phone_bm.deinit();
+    const server_bm = try BlockManager.init(allocator, .{ .network = server.manager, .dht = &server_dht, .storage = &server_store });
+    defer server_bm.deinit();
+    phone_swarm.block_manager = phone_bm;
+    server_swarm.block_manager = server_bm;
 
-    const bm = try BlockManager.init(allocator, .{ .network = backup.manager, .dht = &backup_dht, .storage = &backup_store });
-    defer bm.deinit();
-    var enabled = std.atomic.Value(bool).init(true);
-    const folder_backup = try fs.FolderBackup.create(allocator, io, &backup_store, backup_index, &trust, bm, &enabled, state_path);
-    defer folder_backup.destroy();
-    folder_backup.running.store(true, .release);
+    // The phone's photos appear in the swarm folder, under its name.
+    try std.testing.expectEqual(@as(usize, 2), try import.run());
+    try std.testing.expect(phone_swarm.fileInfo("Pixel/Camera/IMG_0001.jpg") != null);
 
-    // First round: the whole folder is copied and listed as a backup share.
-    try std.testing.expectEqual(@as(usize, 1), try folder_backup.round());
-    var held = try backup_index.heldSnapshot(allocator);
-    try std.testing.expectEqual(@as(usize, 1), held.len);
-    try std.testing.expectEqualStrings("Pixel · Camera (backup)", held[0].display);
-    const loader = fs.tree.Loader.local(&backup_store);
-    const first = try fs.tree.resolve(allocator, loader, held[0].root, "IMG_0001.jpg");
-    var buf: [64]u8 = undefined;
-    const n = try fs.tree.readAt(allocator, loader, first.cid, 0, &buf);
-    try std.testing.expectEqualStrings("first photo", buf[0..n]);
-    fs.ShareIndex.freeHeldSnapshot(allocator, held);
+    // The backup device learns them and keeps every one.
+    try std.testing.expect(try server_swarm.syncNow() > 0);
+    server_swarm.backup_enabled.store(true, .release);
+    try server_swarm.backupRound();
+    var status = server_swarm.backupStatus();
+    try std.testing.expectEqual(@as(usize, 2), status.files);
+    try std.testing.expectEqual(@as(usize, 2), status.backed_up);
+    // Stored once: what it keeps is exactly the photos' bytes.
+    try std.testing.expectEqual(@as(u64, first.len + second.len), status.bytes);
 
-    // Nothing changed: nothing to do.
-    try std.testing.expectEqual(@as(usize, 0), try folder_backup.round());
-
-    // A photo is deleted and one added on the phone: the backup keeps both.
-    try cwd.deleteFile(io, folder ++ "/IMG_0001.jpg");
-    try cwd.writeFile(io, .{ .sub_path = folder ++ "/IMG_0003.jpg", .data = "third photo" });
-    phone_index.rescanAll();
-    try std.testing.expectEqual(@as(usize, 1), try folder_backup.round());
-    held = try backup_index.heldSnapshot(allocator);
-    defer fs.ShareIndex.freeHeldSnapshot(allocator, held);
-    var listing = try fs.tree.listDir(allocator, loader, &held[0].root);
-    defer listing.deinit();
-    try std.testing.expectEqual(@as(usize, 3), listing.entries.len);
-    try std.testing.expect(listing.find("IMG_0001.jpg") != null);
-
-    // The backup device tells the swarm what it holds.
-    const info_bytes = try backup_index.backupInfo(allocator);
-    defer allocator.free(info_bytes);
-    var info = try fs.backup.decodeInfo(allocator, info_bytes);
-    defer info.deinit();
-    try std.testing.expectEqual(@as(usize, 1), info.held.len);
-    try std.testing.expectEqual(phone_id.deviceId().bytes, info.held[0].owner);
-    try std.testing.expectEqualStrings("Camera", info.held[0].share);
+    // Freed on the phone: still in the swarm folder, still kept.
+    try cwd.deleteFile(io, "test_fbackup_camera/IMG_0001.jpg");
+    try cwd.writeFile(io, .{ .sub_path = "test_fbackup_camera/IMG_0003.jpg", .data = "third" });
+    try index.add("Camera", "test_fbackup_camera"); // rescan
+    try std.testing.expectEqual(@as(usize, 1), try import.run());
+    _ = try server_swarm.syncNow();
+    try server_swarm.backupRound();
+    status = server_swarm.backupStatus();
+    try std.testing.expectEqual(@as(usize, 3), status.files);
+    try std.testing.expectEqual(@as(usize, 3), status.backed_up);
+    try std.testing.expect(server_swarm.fileInfo("Pixel/Camera/IMG_0001.jpg") != null);
 }

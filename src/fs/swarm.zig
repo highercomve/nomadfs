@@ -48,6 +48,9 @@ pub const SwarmFolder = struct {
     sync_interval_ns: u64 = 10 * std.time.ns_per_s,
     /// Serialises sync rounds (the loop and syncNow).
     sync_mutex: sync.Mutex = .{},
+    /// Runs after each sync round on the folder's thread: backed-up shares
+    /// coming in (backup_import.zig). Set before start().
+    after_sync: ?AfterSync = null,
     running: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
@@ -586,7 +589,46 @@ pub const SwarmFolder = struct {
             if (waited < self.sync_interval_ns) continue;
             waited = 0;
             _ = self.syncNow() catch {};
+            if (self.after_sync) |h| h.runFn(h.ctx);
         }
+    }
+
+    pub const AfterSync = struct { ctx: *anyopaque, runFn: *const fn (ctx: *anyopaque) void };
+
+    pub const Import = struct { path: []const u8, cid: [32]u8, size: u64, mtime: u64 };
+
+    /// Live files at or below `path` (a folder).
+    pub fn filesUnder(self: *SwarmFolder, path: []const u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var n: usize = 0;
+        for (self.manifest.entries.values()) |e| {
+            if (e.deleted or e.kind != .file) continue;
+            if (std.mem.startsWith(u8, e.path, path) and e.path.len > path.len and e.path[path.len] == '/') n += 1;
+        }
+        return n;
+    }
+
+    /// Adds files whose blocks this device already has (a backed-up share's,
+    /// scanned into the store), in one edit and one save. A path that holds
+    /// the same content already is left alone. Returns how many were added.
+    pub fn importFiles(self: *SwarmFolder, files: []const Import) !usize {
+        defer self.flushSave(); // after the unlock: writes outside the lock
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var added: usize = 0;
+        for (files) |f| {
+            if (!manifest_mod.validPath(f.path)) continue;
+            if (self.manifest.get(f.path)) |e| if (!e.deleted and std.mem.eql(u8, &e.cid, &f.cid)) continue;
+            _ = try self.manifest.edit(f.path, .{ .cid = f.cid, .size = f.size, .mtime = f.mtime }, self.self_id.bytes, self.self_name);
+            added += 1;
+        }
+        if (added > 0) {
+            try self.saveLocked();
+            // Copies are kept by the devices that keep them (their keepers).
+            if (self.keeper) |k| k.wake();
+        }
+        return added;
     }
 
     // ---- Backup ----

@@ -30,6 +30,7 @@ pub const Node = struct {
     block_manager: *cluster.BlockManager,
     ring: *HashRing,
     device_paths: device.paths.Paths,
+    backup_import: ?*fs.BackupImport,
     /// device/paths.zig lockNode: held until deinit's end.
     lock: std.Io.File,
     device_identity: device.identity.Identity,
@@ -37,7 +38,6 @@ pub const Node = struct {
     /// Folders this device shares; null without block storage.
     shares: ?*fs.ShareIndex,
     /// Keeps members' folders marked for backup on a swarm backup device.
-    folder_backup: ?*fs.FolderBackup = null,
     /// The swarm-wide settings every device agrees on (copies, who accepts).
     policy: *device.policy.Policy,
     /// This device's membership: tickets, invites, trusting and revoking,
@@ -151,6 +151,11 @@ pub const Node = struct {
         }
         errdefer if (read_ahead) |ra| ra.destroy();
 
+        // Declared before the swarm folder: freed after it (errdefers run in
+        // reverse), once its thread, which runs the import, has stopped.
+        var backup_import: ?*fs.BackupImport = null;
+        errdefer if (backup_import) |b| b.destroy();
+
         var swarm: ?*fs.SwarmFolder = null;
         if (store) |s| {
             const manifest_path = try std.fmt.allocPrint(allocator, "{s}.swarm.json", .{cfg.storage.storage_path});
@@ -159,6 +164,18 @@ pub const Node = struct {
             // Set before start(): the sync thread reads it.
             folder.read_ahead = read_ahead;
             discovery_node.swarm_source = folder.source();
+            // Shares marked for backup go into the swarm folder, under this
+            // device's name (fs/backup_import.zig).
+            if (shares) |index| {
+                const imported_path = try std.fmt.allocPrint(allocator, "{s}.backup-imported", .{cfg.storage.storage_path});
+                defer allocator.free(imported_path);
+                const imp = fs.BackupImport.create(allocator, std.Io.Threaded.global_single_threaded.io(), folder, index, s, cfg.node.nickname, imported_path, net.local_addrs.onUnmeteredNetwork) catch |err| {
+                    folder.destroy(); // not `swarm` yet: its errdefer won't
+                    return err;
+                };
+                backup_import = imp;
+                folder.after_sync = imp.hook();
+            }
             folder.start(block_manager) catch |err| std.debug.print("swarm: sync thread not started: {any}\n", .{err});
             if (cfg.storage.swarm_backup) folder.setBackup(true) catch |err| std.debug.print("swarm backup: not started: {any}\n", .{err});
             swarm = folder;
@@ -200,15 +217,14 @@ pub const Node = struct {
         discovery_node.revocation_sink = .{ .ctx = block_manager, .revokedFn = membershipRevoked };
         trust_store.revoked_hook = .{ .ctx = block_manager, .revokedFn = membershipRevoked };
 
-        // A swarm backup device keeps the members' folders marked for
-        // backup too (fs/backup.zig); the thread starts with the listener.
-        var folder_backup: ?*fs.FolderBackup = null;
-        if (store) |s| if (shares) |index| if (swarm) |folder| {
+        // Folder backups a backup device kept on its own before they went
+        // into the swarm folder move there, once (fs/backup_import.zig).
+        if (store) |s| if (swarm) |folder| {
             const state_path = try std.fmt.allocPrint(allocator, "{s}.backups", .{cfg.storage.storage_path});
             defer allocator.free(state_path);
-            folder_backup = try fs.FolderBackup.create(allocator, std.Io.Threaded.global_single_threaded.io(), s, index, trust_store, block_manager, &folder.backup_enabled, state_path);
+            _ = fs.backup_import.migrateOldBackups(allocator, std.Io.Threaded.global_single_threaded.io(), folder, s, trust_store, state_path) catch |err|
+                std.debug.print("backup: moving the old folder backups failed (kept for next start): {any}\n", .{err});
         };
-        errdefer if (folder_backup) |b| b.destroy();
         discovery_node.device_identity = device_identity;
 
         const policy_path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(device_paths.trust) orelse ".", "swarm.policy" });
@@ -309,7 +325,6 @@ pub const Node = struct {
             .shares = shares,
             .swarm = swarm,
             .read_ahead = read_ahead,
-            .folder_backup = folder_backup,
             .policy = policy,
             .membership = membership,
             .membership_nickname = membership_nickname,
@@ -317,6 +332,7 @@ pub const Node = struct {
             .bootstrap_running = bootstrap_running,
             .bootstrap_thread = null,
             .lock = lock,
+            .backup_import = backup_import,
         };
     }
 
@@ -337,14 +353,13 @@ pub const Node = struct {
         // Every background thread stops before anything they use is freed:
         // a sync round wakes the keeper, read-ahead workers read shared
         // files through the store, backups read the swarm folder.
-        if (self.folder_backup) |b| b.stop();
         if (self.swarm) |folder| folder.stop();
         if (self.shares) |index| index.stop();
         if (self.keeper) |k| k.stop();
         if (self.read_ahead) |ra| ra.destroy(); // joins its workers
         // Then freed, users before what they use.
-        if (self.folder_backup) |b| b.destroy();
         if (self.swarm) |folder| folder.destroy();
+        if (self.backup_import) |b| b.destroy(); // its thread (the swarm's) is stopped
         if (self.shares) |index| index.destroy();
         if (self.keeper) |k| self.allocator.destroy(k);
 
@@ -531,12 +546,26 @@ pub const Node = struct {
         try index.setBackup(name, on);
     }
 
-    /// Which backup devices hold this device's marked shares (fs/backup.zig).
-    /// Allocated in `allocator`: pass an arena.
-    pub fn backupCopies(self: *Node, allocator: std.mem.Allocator) ![]fs.backup.ShareCopies {
-        const index = self.shares orelse return error.StorageDisabled;
-        if (self.store == null) return error.StorageDisabled;
-        return fs.backup.copiesOf(allocator, self.block_manager, index, self.trust_store, self.device_identity.deviceId().bytes);
+    pub const BackupStatus = struct {
+        /// The shares marked for backup, where they are in the swarm folder.
+        shares: []fs.backup_import.BackupImport.ShareStatus,
+        /// The swarm backup devices met (each keeps every swarm file).
+        keepers: [][]const u8,
+    };
+
+    /// Where this device's marked shares are kept: in the swarm folder,
+    /// copied by every swarm backup device. Allocated in `allocator`: pass
+    /// an arena.
+    pub fn backupStatus(self: *Node, allocator: std.mem.Allocator) !BackupStatus {
+        const imp = self.backup_import orelse return error.StorageDisabled;
+        var keepers: std.ArrayList([]const u8) = .empty;
+        const entries = try self.trust_store.copyEntries(allocator);
+        for (entries) |e| {
+            const transport = net.id.NodeID.fromPublicKey(e.transport_key);
+            const roles = self.discovery_node.peerRoles(transport) orelse continue;
+            if (roles & net.discovery.rpc.Roles.swarm_backup != 0) try keepers.append(allocator, try allocator.dupe(u8, e.labelSlice()));
+        }
+        return .{ .shares = try imp.status(allocator), .keepers = try keepers.toOwnedSlice(allocator) };
     }
 
     /// The read cache's size and limit.
@@ -564,7 +593,6 @@ pub const Node = struct {
     pub fn listen(self: *Node, running: *std.atomic.Value(bool), cfg: config.Config) !void {
         try self.connection_manager.start();
         try self.connection_manager.listen(cfg, running);
-        if (self.folder_backup) |b| b.start() catch |err| std.debug.print("backup: thread not started: {any}\n", .{err});
         if (self.keeper) |k| k.start() catch |err| std.debug.print("keeper: thread not started: {any}\n", .{err});
         if (self.store != null and self.cache_thread == null) {
             self.cache_running.store(true, .release);
@@ -634,10 +662,6 @@ pub const Node = struct {
             const snap = try shares.snapshot(self.allocator);
             defer fs.ShareIndex.freeSnapshot(self.allocator, snap);
             for (snap) |sh| if (sh.root) |r| try storage.dag.walk.addStoredReachable(self.allocator, store, &r, &keep);
-            // Folder backups kept for other devices.
-            const held = try shares.heldSnapshot(self.allocator);
-            defer fs.ShareIndex.freeHeldSnapshot(self.allocator, held);
-            for (held) |h| try storage.dag.walk.addStoredReachable(self.allocator, store, &h.root, &keep);
         }
         if (self.swarm) |swarm| {
             const roots = try swarm.keptRoots(self.allocator);
@@ -655,7 +679,6 @@ pub const Node = struct {
     pub fn stopListener(self: *Node) void {
         self.stopCacheThread();
         if (self.keeper) |k| k.stop();
-        if (self.folder_backup) |b| b.stop();
         self.bootstrap_running.store(false, .release);
         self.connection_manager.stop();
     }
@@ -930,9 +953,6 @@ pub const InfoProvider = struct {
                 if (sh.scan_error != null) out.shares_failing += 1;
                 if (sh.root == null or sh.indexing) out.shares_indexing += 1;
             }
-            const held = try index.heldSnapshot(allocator);
-            defer fs.ShareIndex.freeHeldSnapshot(allocator, held);
-            out.held_backups = std.math.lossyCast(u32, held.len);
         }
         if (self.swarm) |folder| {
             const st = folder.status();

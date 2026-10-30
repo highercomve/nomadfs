@@ -10,7 +10,6 @@ const NodeID = @import("../net/id.zig").NodeID;
 const DhtNode = @import("../net/discovery/mod.zig").Node;
 const storage = @import("../storage/mod.zig");
 const sync = @import("../sync.zig");
-const backup = @import("backup.zig");
 const tree = @import("tree.zig");
 const readahead_mod = @import("readahead.zig");
 
@@ -64,13 +63,10 @@ pub const Remote = struct {
         nickname: []u8,
         listing: tree.Listing,
         device_id: ?NodeID = null,
-        /// The SHARES `backup` field, undecoded (fs/backup.zig).
-        backup: []u8 = &.{},
 
         pub fn deinit(self: Shares, allocator: std.mem.Allocator) void {
             allocator.free(self.nickname);
             self.listing.deinit();
-            allocator.free(self.backup);
         }
     };
 
@@ -84,38 +80,17 @@ pub const Remote = struct {
         const reply = try dht_node.fetchShares(conn);
         defer dht_node.allocator.free(reply.listing);
         defer dht_node.allocator.free(reply.nickname);
-        defer dht_node.allocator.free(reply.backup);
 
         const nickname = try allocator.dupe(u8, reply.nickname);
         errdefer allocator.free(nickname);
         const device_id = conn.getRemoteDeviceID();
-        const reply_backup = try allocator.dupe(u8, reply.backup);
-        errdefer allocator.free(reply_backup);
         const res = Shares{
             .nickname = nickname,
             .listing = try tree.decodeListing(allocator, reply.listing),
             .device_id = device_id,
-            .backup = reply_backup,
         };
         if (bm.fetcher) |*f| f.markUp(self.peer);
-        self.noteSaidKept(bm, reply_backup);
         return res;
-    }
-
-    /// What the reply's `backup` field said (fs/backup.zig): this peer
-    /// keeps copies of those owners' folders. The holder registry records
-    /// each one (cluster/holders.zig), so reads can go to the copy when
-    /// its owner is offline. Best effort: errors are all ignored.
-    fn noteSaidKept(self: *Remote, bm: *cluster.BlockManager, bytes: []const u8) void {
-        const dht_node = bm.dht_node;
-        const trust = dht_node.trust_store orelse return;
-        const holders_ptr = if (bm.holders) |*h| h else return;
-        var info = backup.decodeInfo(dht_node.allocator, bytes) catch return;
-        defer info.deinit();
-        for (info.held) |h| {
-            const entry = trust.lookup(.{ .bytes = h.owner }) orelse continue;
-            holders_ptr.noteKeeps(self.peer, NodeID.fromPublicKey(entry.transport_key));
-        }
     }
 };
 

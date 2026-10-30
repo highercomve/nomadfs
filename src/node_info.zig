@@ -49,8 +49,6 @@ pub const Info = struct {
     swarm_backed_up: u32 = 0,
     /// Swarm files no reachable device could serve in the last round.
     swarm_unreachable: u32 = 0,
-    /// Folder backups kept here for other devices.
-    held_backups: u32 = 0,
     /// On Wi-Fi or wired (phones); always true elsewhere.
     unmetered: bool = true,
     bytes_sent: u64 = 0,
@@ -172,7 +170,7 @@ pub fn nowSeconds() u64 {
 
 test "node info: round trip, and an older device's shorter info" {
     const a = std.testing.allocator;
-    var info: Info = .{ .uptime_s = 42, .disk_total = 1 << 40, .disk_free = 1 << 30, .peers = 3, .swarm_backup = true, .held_backups = 2, .unmetered = false, .bytes_sent = 123456, .bytes_received = 654321 };
+    var info: Info = .{ .uptime_s = 42, .disk_total = 1 << 40, .disk_free = 1 << 30, .peers = 3, .swarm_backup = true, .unmetered = false, .bytes_sent = 123456, .bytes_received = 654321 };
     info.version = Info.Text.init("0.2.5");
     info.platform = Info.Text.init(platform());
     const bytes = try encode(a, info);
@@ -181,7 +179,6 @@ test "node info: round trip, and an older device's shorter info" {
     try std.testing.expectEqualStrings("0.2.5", got.version.slice());
     try std.testing.expectEqual(info.disk_free, got.disk_free);
     try std.testing.expect(got.swarm_backup and !got.unmetered);
-    try std.testing.expectEqual(@as(u32, 2), got.held_backups);
     try std.testing.expectEqual(@as(u64, 123456), got.bytes_sent);
     try std.testing.expectEqual(@as(u64, 654321), got.bytes_received);
 
