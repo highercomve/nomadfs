@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const oriel = @import("oriel");
 const app = @import("oriel_app");
 const commands = @import("commands.zig");
+const downloads = @import("downloads.zig");
 const tray = @import("tray.zig");
 const background = @import("background.zig");
 const media = @import("media.zig");
@@ -32,6 +33,8 @@ fn initDataDirs() void {
 pub const Events = struct {
     /// While `updater_install` downloads (updates.zig).
     @"updater://progress": struct { downloaded: u64, total: ?u64 },
+    /// While a download copies, and when it ends (downloads.zig).
+    @"download://progress": downloads.Progress,
 };
 
 /// @atlas allow: the webview calls these by name
@@ -42,7 +45,7 @@ pub const Commands = struct {
     /// worker thread: they share one lock, and a command waiting on it on
     /// the UI thread would freeze the window (node_open behind a share scan
     /// did, for 20 s on a phone). Only quick config-file reads stay inline.
-    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_move", "swarm_read_range", "swarm_download", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set", "swarm_copies_set", "accept_copies_set", "media_url", "about_info", "update_info", "note_store", "cache_info", "cache_clear", "cache_set_limit", "share_backup_set", "backup_status", "file_details", "device_info" } ++ updates.Updater.async_commands;
+    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_move", "swarm_read_range", "swarm_download", "downloads_list", "download_cancel", "download_remove", "downloads_clear", "downloads_dir", "download_read_range", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set", "swarm_copies_set", "accept_copies_set", "media_url", "about_info", "update_info", "note_store", "cache_info", "cache_clear", "cache_set_limit", "share_backup_set", "backup_status", "file_details", "device_info" } ++ updates.Updater.async_commands;
 
     /// `invoke("invite_create", { config_path })`: one-time invite code.
     pub fn invite_create(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.InviteInfo {
@@ -113,9 +116,39 @@ pub const Commands = struct {
         return commands.swarmReadRange(gpa, args);
     }
 
-    /// `invoke("swarm_download", { cid, author_id, name })`.
-    pub fn swarm_download(gpa: std.mem.Allocator, args: commands.SwarmDownloadArgs) !commands.DownloadResult {
-        return commands.swarmDownload(gpa, args);
+    /// `invoke("swarm_download", "downloads_list", "download_cancel", "download_remove", "downloads_clear", "downloads_dir", "download_read_range", { cid, author_id, name })`.
+    pub fn swarm_download(gpa: std.mem.Allocator, args: downloads.SwarmArgs) !downloads.Info {
+        return downloads.fromSwarm(gpa, args);
+    }
+
+    /// `invoke("downloads_list")`: every download, newest first.
+    pub fn downloads_list(gpa: std.mem.Allocator) ![]downloads.Info {
+        return downloads.list(gpa);
+    }
+
+    /// `invoke("download_cancel", { id })`.
+    pub fn download_cancel(args: downloads.IdArgs) !void {
+        return downloads.cancel(args.id);
+    }
+
+    /// `invoke("download_remove", { id, delete_file })`.
+    pub fn download_remove(args: downloads.RemoveArgs) !void {
+        return downloads.remove(args.id, args.delete_file);
+    }
+
+    /// `invoke("downloads_dir")`: the folder downloads go to (created).
+    pub fn downloads_dir(gpa: std.mem.Allocator) ![]const u8 {
+        return downloads.folder(gpa);
+    }
+
+    /// `invoke("downloads_clear")`: forgets finished downloads (files stay).
+    pub fn downloads_clear() void {
+        downloads.clearFinished();
+    }
+
+    /// `invoke("download_read_range", { id, offset, len })`.
+    pub fn download_read_range(gpa: std.mem.Allocator, args: downloads.RangeArgs) ![]const u8 {
+        return downloads.readRange(gpa, args);
     }
 
     /// `invoke("read_range", { peer, cid, offset, len })`: base64 bytes of
@@ -352,8 +385,8 @@ pub const Commands = struct {
     }
 
     /// `invoke("download", { peer, cid, name })`: fetch a file on demand.
-    pub fn download(gpa: std.mem.Allocator, args: commands.DownloadArgs) !commands.DownloadResult {
-        return commands.download(gpa, args);
+    pub fn download(gpa: std.mem.Allocator, args: downloads.DeviceArgs) !downloads.Info {
+        return downloads.fromDevice(gpa, args);
     }
 
     /// `invoke("join_info", { config_path })`: this device's name and address.
@@ -403,6 +436,7 @@ fn setup() !void {
 
 pub fn main(init: std.process.Init) !u8 {
     initDataDirs();
+    commands.before_node_close = downloads.cancelAll;
     return oriel.main(init, .{ .commands = Commands, .events = Events }, .{
         .app = app.build,
         // With a tray, closing the window hides it; Quit is in the tray.

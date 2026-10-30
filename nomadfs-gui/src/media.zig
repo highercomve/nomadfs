@@ -7,7 +7,8 @@
 //!
 //! URLs: `<base><token>/<kind>/<device>/<cid>/<size>/f.<ext>`. `kind` is
 //! `d` (a device's share; `device` is that device) or `s` (the swarm folder;
-//! `device` is who added the file). The random token makes the URLs
+//! `device` is who added the file). A finished download plays from its saved
+//! file instead: `<base><token>/l/<download id>/<size>/f.<ext>`. The random token makes the URLs
 //! unguessable to other programs on the machine; the extension gives the
 //! MIME type.
 
@@ -16,6 +17,7 @@ const builtin = @import("builtin");
 const oriel = @import("oriel");
 const nomadfs = @import("nomadfs");
 const commands = @import("commands.zig");
+const downloads = @import("downloads.zig");
 
 const is_android = builtin.abi.isAndroid();
 const gpa = std.heap.smp_allocator;
@@ -40,11 +42,13 @@ const Source = if (is_android) oriel.media_scheme.Source else oriel.media_server
 const source: Source = .{ .ctx = undefined, .sizeFn = sizeOf, .readFn = readAt };
 
 pub const UrlArgs = struct {
-    /// "device" (a device's share) or "swarm" (the swarm folder).
+    /// "device" (a device's share), "swarm" (the swarm folder) or
+    /// "download" (a finished download's saved file).
     kind: []const u8,
-    /// The device sharing the file, or (swarm) the one that added it, hex.
+    /// The device sharing the file, or (swarm) the one that added it, hex;
+    /// a download's id.
     id: []const u8,
-    cid: []const u8,
+    cid: []const u8 = "",
     size: u64,
     name: []const u8,
     /// For another app (VLC, ...): an http://127.0.0.1 URL on every
@@ -58,8 +62,10 @@ pub const UrlArgs = struct {
 /// `<video>`/`<audio>` streams the file from.
 pub fn url(alloc: std.mem.Allocator, args: UrlArgs) ![]const u8 {
     try ensureStarted();
-    const k: u8 = if (std.mem.eql(u8, args.kind, "swarm")) 's' else if (std.mem.eql(u8, args.kind, "device")) 'd' else return error.InvalidArgument;
-    if (!isHex64(args.id) or !isHex64(args.cid)) return error.InvalidArgument;
+    const k: u8 = if (std.mem.eql(u8, args.kind, "swarm")) 's' else if (std.mem.eql(u8, args.kind, "device")) 'd' else if (std.mem.eql(u8, args.kind, "download")) 'l' else return error.InvalidArgument;
+    if (k == 'l') {
+        _ = std.fmt.parseInt(u32, args.id, 10) catch return error.InvalidArgument;
+    } else if (!isHex64(args.id) or !isHex64(args.cid)) return error.InvalidArgument;
     // Only the extension matters (the MIME type); keep it to [a-z0-9].
     var ext_buf: [8]u8 = undefined;
     var ext_len: usize = 0;
@@ -83,6 +89,7 @@ pub fn url(alloc: std.mem.Allocator, args: UrlArgs) ![]const u8 {
         try httpBase()
     else
         g_base;
+    if (k == 'l') return std.fmt.allocPrint(alloc, "{s}{s}/l/{s}/{d}/f.{s}", .{ base, &g_token, args.id, args.size, ext });
     return std.fmt.allocPrint(alloc, "{s}{s}/{c}/{s}/{s}/{d}/f.{s}", .{ base, &g_token, k, args.id, args.cid, args.size, ext });
 }
 
@@ -175,17 +182,23 @@ fn startHttpLocked(io: std.Io) !void {
     }
 }
 
-const Target = struct { kind: u8, id: [32]u8, cid: [32]u8, size: u64 };
+const Target = struct { kind: u8, id: [32]u8, cid: [32]u8, size: u64, download: u32 = 0 };
 
-/// `<token>/<kind>/<id>/<cid>/<size>/<name>`; null for anything else.
+/// `<token>/<kind>/<id>/<cid>/<size>/<name>`, or `<token>/l/<download
+/// id>/<size>/<name>`; null for anything else.
 fn parse(path: []const u8) ?Target {
     var it = std.mem.splitScalar(u8, path, '/');
     const token = it.next() orelse return null;
     if (!g_started or token.len != g_token.len) return null;
     if (!std.crypto.timing_safe.eql([32]u8, token[0..32].*, g_token)) return null;
     const kind = it.next() orelse return null;
-    if (kind.len != 1 or (kind[0] != 'd' and kind[0] != 's')) return null;
+    if (kind.len != 1 or (kind[0] != 'd' and kind[0] != 's' and kind[0] != 'l')) return null;
     var out: Target = .{ .kind = kind[0], .id = undefined, .cid = undefined, .size = 0 };
+    if (kind[0] == 'l') {
+        out.download = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+        out.size = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+        return out;
+    }
     const id = it.next() orelse return null;
     const cid = it.next() orelse return null;
     _ = std.fmt.hexToBytes(&out.id, id) catch return null;
@@ -204,6 +217,7 @@ fn readAt(_: *anyopaque, path: []const u8, offset: u64, dest: []u8) anyerror!usi
     const t = parse(path) orelse return error.FileNotFound;
     if (offset >= t.size) return 0;
     const want = dest[0..@intCast(@min(dest.len, t.size - offset))];
+    if (t.kind == 'l') return downloads.readSaved(t.download, offset, want);
     const handle = commands.mediaAcquire() orelse return error.NotRunning;
     defer commands.mediaRelease();
     const file: nomadfs.Node.FileSource = if (t.kind == 's')

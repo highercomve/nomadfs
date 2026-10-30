@@ -34,6 +34,11 @@
         <svg viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-1 5.83V10H7.83A3 3 0 1 0 6 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 0 0 9.83 12h4.34A3 3 0 0 0 16 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 1 0 16.17 10H13V7.83A3 3 0 0 0 12 2z"/></svg>
         <span>Swarm folder</span>
       </button>
+      <button class="nav-item" data-view="downloads">
+        <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+        <span>Downloads</span>
+        <span class="nav-badge" data-downloads-badge hidden></span>
+      </button>
       <button class="nav-item" data-view="shares">
         <svg viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-5 3c1.1 0 2 .9 2 2s-.9 2-2 2-2-.9-2-2 .9-2 2-2zm4 8h-8v-1c0-1.33 2.67-2 4-2s4 .67 4 2v1z"/></svg>
         <span>Shared folders</span>
@@ -185,6 +190,24 @@
           <div id="swarm-head" class="table-head"></div>
           <ul id="swarm-list" class="list rows"></ul>
         </div>
+      </section>
+
+      <!-- Downloads -->
+      <section class="card" id="downloads-section" data-view="downloads">
+        <div class="card-head">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+          <div class="grow">
+            <h2>Downloads</h2>
+            <p class="supporting">Files you downloaded from other devices and the swarm folder. Play them from here, open them in another app, or open the folder they're in.</p>
+            <p id="downloads-where" class="meta"></p>
+          </div>
+        </div>
+        <div class="actions downloads-actions">
+          <button id="downloads-folder" type="button" class="btn outlined">Open folder</button>
+          <button id="downloads-clear" type="button" class="btn text">Clear finished</button>
+        </div>
+        <p id="downloads-empty" class="empty-state" hidden>Nothing downloaded yet. Use Download on a file (or right-click it) in Browse or the swarm folder.</p>
+        <ul id="downloads-list" class="list rows"></ul>
       </section>
 
       <!-- Shared folders -->
@@ -448,6 +471,7 @@
       <button class="bar-item" data-view="shares"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-5 3c1.1 0 2 .9 2 2s-.9 2-2 2-2-.9-2-2 .9-2 2-2zm4 8h-8v-1c0-1.33 2.67-2 4-2s4 .67 4 2v1z"/></svg></span><span>Shared</span></button>
       <button class="bar-item" data-view="connect"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg></span><span>Connect</span></button>
       <button class="bar-item" data-view="swarm"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-1 5.83V10H7.83A3 3 0 1 0 6 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 0 0 9.83 12h4.34A3 3 0 0 0 16 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 1 0 16.17 10H13V7.83A3 3 0 0 0 12 2z"/></svg></span><span>Swarm</span></button>
+      <button class="bar-item" data-view="downloads"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg><span class="bar-badge" data-downloads-badge hidden></span></span><span>Downloads</span></button>
       <button class="bar-item" id="bar-more" type="button"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></span><span>More</span></button>
     </nav>
 

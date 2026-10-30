@@ -79,6 +79,12 @@ next through the folder (arrow keys and Esc on the desktop). It reads the file
 in 4 MiB pieces, so it shows progress and works the same on Android.
 **Download** saves a copy in `~/Downloads/NomadFS` (the shared `Download/NomadFS` folder on Android); a name that exists already gets a number.
 
+Downloads run in the background. The **Downloads** view (in the navigation bar on phones, the
+sidebar on the desktop) shows each one's progress and where it was saved. From there you can play
+a finished file, open it in another app, or open its folder in the Files app or the file manager.
+Right-click it (long-press on a phone) to copy its path, take it off the list or delete it. A failed
+download says why and can be started again; the list is kept when the app restarts.
+
 The **ⓘ** button next to a file shows how NomadFS stores it: its content ID,
 how many chunks it was cut into and how big they are, the tree of blocks above
 them, and a map of the chunks colored by where this device has each one (kept,

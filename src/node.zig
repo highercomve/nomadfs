@@ -504,11 +504,19 @@ pub const Node = struct {
         return fs.inspect.inspect(allocator, from.loader(), root);
     }
 
+    /// Follows a saveFile copy: `on_bytes` after every chunk with the bytes
+    /// written so far; `cancel` set stops it with error.Canceled.
+    pub const SaveProgress = struct {
+        ctx: ?*anyopaque = null,
+        on_bytes: ?*const fn (ctx: ?*anyopaque, done: u64) void = null,
+        cancel: ?*const std.atomic.Value(bool) = null,
+    };
+
     /// Copies a file to `path`, which must not exist (deleted again if the
     /// copy fails). Returns its size. `size` is what the listing says: a
     /// peer's tree describing more (repeated leaves can describe terabytes)
     /// fails with error.FileTooLarge instead of filling the disk.
-    pub fn saveFile(self: *Node, allocator: std.mem.Allocator, source: FileSource, path: []const u8, size: u64) !u64 {
+    pub fn saveFile(self: *Node, allocator: std.mem.Allocator, source: FileSource, path: []const u8, size: u64, progress: SaveProgress) !u64 {
         const io = std.Io.Threaded.global_single_threaded.io();
         var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
         defer file.close(io);
@@ -523,6 +531,8 @@ pub const Node = struct {
             if (offset + n > size) return error.FileTooLarge;
             try file.writePositionalAll(io, chunk[0..n], offset);
             offset += n;
+            if (progress.on_bytes) |f| f(progress.ctx, offset);
+            if (progress.cancel) |c| if (c.load(.acquire)) return error.Canceled;
         }
         return offset;
     }

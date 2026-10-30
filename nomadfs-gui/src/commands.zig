@@ -125,11 +125,16 @@ pub fn mediaAcquire() ?*mobile.NodeHandle {
     return handle;
 }
 
+/// Stops what reads through the node for long (downloads), set by main.
+pub var before_node_close: ?*const fn () void = null;
+
 pub fn mediaRelease() void {
     _ = g_media_users.fetchSub(1, .acq_rel);
 }
 
 pub fn nodeClose() void {
+    // Before the lock: a copy waiting to pin the node needs it to stop.
+    if (before_node_close) |stop| stop();
     g_mutex.lock();
     defer g_mutex.unlock();
     stopMountLocked(); // the mount reads through this node
@@ -736,40 +741,13 @@ pub fn browse(gpa: std.mem.Allocator, args: BrowseArgs) ![]BrowseEntry {
     return out;
 }
 
-pub const DownloadArgs = struct { peer: []const u8, cid: []const u8, name: []const u8, size: u64 };
-pub const DownloadResult = struct { path: []const u8, size: u64 };
-
-/// `invoke("download", { peer, cid, name })`: copies one file from a
-/// device's share into Downloads/NomadFS and returns where it landed.
-pub fn download(gpa: std.mem.Allocator, args: DownloadArgs) !DownloadResult {
-    const source: nomadfs.Node.FileSource = .{ .share = .{ .peer = .{ .bytes = try parseHex32(args.peer) }, .cid = try parseHex32(args.cid) } };
-    return saveDownload(gpa, source, args.name, args.size);
-}
-
-/// Copies a file into Downloads/NomadFS under a name not taken yet.
-/// The node is pinned, not g_mutex held: a download from a slow device
-/// doesn't stall the rest of the app.
-fn saveDownload(gpa: std.mem.Allocator, source: nomadfs.Node.FileSource, name: []const u8, size: u64) !DownloadResult {
-    if (!nomadfs.storage.dag.codec.isValidName(name)) return error.InvalidName;
-    const handle = mediaAcquire() orelse return error.NotRunning;
-    defer mediaRelease();
-    const node = &handle.node;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const dir = try downloadsDir(gpa);
-    defer gpa.free(dir);
-    try std.Io.Dir.cwd().createDirPath(io, dir);
-    const path = try uniquePath(gpa, dir, name);
-    errdefer gpa.free(path);
-    return .{ .path = path, .size = try node.saveFile(gpa, source, path, size) };
-}
-
 /// `handle`: pinned (mediaAcquire) or under g_mutex.
 fn remoteFor(handle: *mobile.NodeHandle, peer_hex: []const u8) !fs.Remote {
     if (handle.node.store == null) return error.StorageDisabled;
     return .{ .block_manager = handle.node.block_manager, .peer = .{ .bytes = try parseHex32(peer_hex) } };
 }
 
-fn parseHex32(text: []const u8) ![32]u8 {
+pub fn parseHex32(text: []const u8) ![32]u8 {
     if (text.len != 64) return error.InvalidArgument;
     var out: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, text) catch return error.InvalidArgument;
@@ -779,33 +757,6 @@ fn parseHex32(text: []const u8) ![32]u8 {
 fn hexAlloc(gpa: std.mem.Allocator, bytes: *const [32]u8) ![]const u8 {
     const hex = std.fmt.bytesToHex(bytes.*, .lower);
     return gpa.dupe(u8, &hex);
-}
-
-/// Downloads/NomadFS: the shared Download folder on Android (readable by
-/// other apps; needs all-files access), $HOME/Downloads elsewhere.
-fn downloadsDir(gpa: std.mem.Allocator) ![]const u8 {
-    if (builtin.abi.isAndroid()) return gpa.dupe(u8, "/storage/emulated/0/Download/NomadFS");
-    const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
-    const home = nomadfs.env.getEnv(gpa, home_env) orelse return error.HomeNotFound;
-    defer gpa.free(home);
-    return std.fs.path.join(gpa, &.{ home, "Downloads", "NomadFS" });
-}
-
-/// `dir/name`, or `dir/name (n).ext` when that exists already.
-fn uniquePath(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) ![]const u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const ext = std.fs.path.extension(name);
-    const stem = name[0 .. name.len - ext.len];
-    var n: u32 = 0;
-    while (n < 1000) : (n += 1) {
-        const candidate = if (n == 0)
-            try std.fs.path.join(gpa, &.{ dir, name })
-        else
-            try std.fmt.allocPrint(gpa, "{s}/{s} ({d}){s}", .{ dir, stem, n, ext });
-        _ = std.Io.Dir.cwd().statFile(io, candidate, .{}) catch return candidate;
-        gpa.free(candidate);
-    }
-    return error.PathAlreadyExists;
 }
 
 pub const ReadRangeArgs = struct { peer: []const u8, cid: []const u8, offset: u64, len: u32 };
@@ -831,9 +782,13 @@ fn readBase64(gpa: std.mem.Allocator, source: nomadfs.Node.FileSource, offset: u
     const buf = try gpa.alloc(u8, len);
     defer gpa.free(buf);
     const n = try node.readFile(gpa, source, offset, buf);
+    return base64Alloc(gpa, buf[0..n]);
+}
+
+pub fn base64Alloc(gpa: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     const encoder = std.base64.standard.Encoder;
-    const out = try gpa.alloc(u8, encoder.calcSize(n));
-    return encoder.encode(out, buf[0..n]);
+    const out = try gpa.alloc(u8, encoder.calcSize(bytes.len));
+    return encoder.encode(out, bytes);
 }
 
 // ---- Swarm folder: one folder every device reads and writes ----
@@ -1193,13 +1148,6 @@ pub const SwarmRangeArgs = struct { cid: []const u8, author_id: []const u8, offs
 /// `swarm_read_range`: base64 bytes of a swarm file, for previews.
 pub fn swarmReadRange(gpa: std.mem.Allocator, args: SwarmRangeArgs) ![]const u8 {
     return readBase64(gpa, .{ .swarm = .{ .cid = try parseHex32(args.cid), .author = try parseHex32(args.author_id) } }, args.offset, args.len);
-}
-
-pub const SwarmDownloadArgs = struct { cid: []const u8, author_id: []const u8, name: []const u8, size: u64 };
-
-/// `swarm_download`: copies a swarm file into Downloads/NomadFS.
-pub fn swarmDownload(gpa: std.mem.Allocator, args: SwarmDownloadArgs) !DownloadResult {
-    return saveDownload(gpa, .{ .swarm = .{ .cid = try parseHex32(args.cid), .author = try parseHex32(args.author_id) } }, args.name, args.size);
 }
 
 // ---- Mounting (desktop Linux) ----

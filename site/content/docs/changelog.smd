@@ -7,6 +7,28 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.3.7 - 2026-10-30
+
+Adds a Downloads view: see where each download was saved, follow its progress, and play it or
+open it from there. Devices on 0.3.6 and 0.3.7 work together.
+
+## Added
+
+- **Downloads** in the navigation bar (phones) and the sidebar (desktop). Downloads run in the
+  background with a live progress bar and a Cancel button; the tab shows how many are running.
+- Finished downloads play and preview from the saved file, open in another app, or show their
+  folder (the Files app on Android, the file manager on the desktop). The right-click (long-press)
+  menu also copies the path, removes the entry from the list, or deletes the file.
+- Failed and canceled downloads say why and can be downloaded again.
+- The list is kept across restarts; a download cut off when the app stopped is marked interrupted
+  and its partial file deleted.
+
+## Changed
+
+- Starting a download no longer waits for it to finish: a notice says it started and another when it
+  is done, and both open Downloads.
+- Closing the node cancels downloads in progress instead of waiting for them.
+
 # 0.3.6 - 2026-10-30
 
 Adds separate copyable links for this device, the local network, and Tailscale. The network link

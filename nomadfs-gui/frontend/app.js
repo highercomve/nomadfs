@@ -14,7 +14,7 @@ function snack(msg, ms = 3000, onClick = null) {
   const bar = $("snackbar");
   bar.textContent = msg;
   bar.classList.toggle("clickable", !!onClick);
-  bar.title = onClick ? "Open the folder" : "";
+  bar.title = onClick ? "Click to open" : "";
   bar.onclick = onClick ? () => { bar.classList.remove("show"); onClick(); } : null;
   bar.classList.add("show");
   clearTimeout(snackTimer);
@@ -362,6 +362,7 @@ function setView(view) {
   try { localStorage.setItem("view", view); } catch {}
   if (view === "settings") { $("devices-refresh").click(); loadBackup(); }
   if (view === "swarm") loadSwarm();
+  if (view === "downloads") loadDownloads();
   if (view === "text") loadSwarmNotes();
   if (view === "about") loadAbout();
   renderNavDevices();
@@ -951,30 +952,22 @@ async function showLocation() {
   browseTable.show(entries);
 }
 
-const downloading = new Set();
-
-/** "Saved to …"; on the desktop a click opens the folder it landed in. */
-function savedSnack(file) {
-  if (!canOpenPaths) return snack(`Saved to ${file}`, 5000);
-  const dir = file.slice(0, file.lastIndexOf("/")) || "/";
-  snack(`Saved to ${file} · click to open the folder`, 8000, () => {
-    invoke("open_path", { path: dir }).catch((err) => snack(`Couldn't open the folder: ${err}`));
-  });
-}
-
-async function downloadFile(device, entry, btn) {
-  if (downloading.has(entry.cid)) return;
-  downloading.add(entry.cid);
-  if (btn) btn.classList.add("spin");
-  snack(`Downloading ${entry.name} (${formatSize(entry.size)})…`, 60000);
+/** Starts a download (it runs in the background; Downloads follows it). */
+async function startDownload(command, args) {
+  const running = [...downloads.values()].find((d) => d.state === "running" && d.cid === args.cid);
+  if (running) return snack(`${args.name} is already downloading`, 4000, () => setView("downloads"));
   try {
-    const res = await invoke("download", { peer: device.peer, cid: entry.cid, name: entry.name, size: entry.size });
-    savedSnack(res.path);
+    const d = await invoke(command, args);
+    downloads.set(d.id, d);
+    renderDownloads();
+    snack(`Downloading ${d.name} · tap to see it in Downloads`, 5000, () => setView("downloads"));
   } catch (err) {
     snack(`Download failed: ${err}`);
   }
-  downloading.delete(entry.cid);
-  if (btn) btn.classList.remove("spin");
+}
+
+function downloadFile(device, entry) {
+  return startDownload("download", { peer: device.peer, cid: entry.cid, name: entry.name, size: entry.size });
 }
 
 // ---- Preview ----
@@ -1456,22 +1449,182 @@ function swarmRow(it, files) {
   });
 }
 
-async function swarmDownload(it, btn) {
-  if (downloading.has(it.cid)) return;
-  downloading.add(it.cid);
-  if (btn) btn.classList.add("spin");
-  snack(`Downloading ${it.name} (${formatSize(it.size)})…`, 60000);
-  try {
-    const res = await invoke("swarm_download", { cid: it.cid, author_id: it.author_id, name: it.name, size: it.size });
-    savedSnack(res.path);
-  } catch (err) {
-    snack(`${err}`.includes("BlockNotFound") || `${err}`.includes("AllAddressesFailed")
-      ? `${it.name} isn't reachable: the device that added it is offline.`
-      : `Download failed: ${err}`);
-  }
-  downloading.delete(it.cid);
-  if (btn) btn.classList.remove("spin");
+function swarmDownload(it) {
+  return startDownload("swarm_download", { cid: it.cid, author_id: it.author_id, name: it.name, size: it.size });
 }
+
+// ---- Downloads: what was saved, where, and how far a copy has got ----
+
+const downloads = new Map(); // id → a download, as downloads_list gives it
+const onAndroid = /Android/.test(navigator.userAgent);
+
+/** A finished download plays and previews from its saved file. */
+const downloadSource = {
+  read: (e, offset, len) => invoke("download_read_range", { id: e.id, offset, len }),
+  mediaUrl: (e, external = false) => invoke("media_url", { kind: "download", id: String(e.id), size: e.size, name: e.name, external }),
+  download: (e) => showInFolder(e.folder),
+};
+
+let downloadsFolder = "";
+
+async function loadDownloads() {
+  try {
+    const list = await invoke("downloads_list", null);
+    downloads.clear();
+    for (const d of list) downloads.set(d.id, d);
+    downloadsFolder ||= await invoke("downloads_dir", null);
+    $("downloads-where").textContent = `Saved in ${downloadsFolder}`;
+  } catch (err) {
+    $("downloads-where").textContent = `${err}`;
+  }
+  renderDownloads();
+}
+
+window.oriel.listen?.("download://progress", ({ id, done, size, state, error }) => {
+  const d = downloads.get(id);
+  if (!d) return loadDownloads();
+  const was = d.state;
+  Object.assign(d, { done, size, state, error });
+  if (state !== "running") {
+    d.exists = state === "done";
+    if (was === "running" && state === "done") snack(`${d.name} downloaded · tap to open Downloads`, 6000, () => setView("downloads"));
+    if (was === "running" && state === "failed") snack(`${d.name} failed: ${error}`, 6000, () => setView("downloads"));
+    return renderDownloads();
+  }
+  updateDownloadRow(d);
+});
+
+/** The folder in the system's file manager (Files on Android). */
+async function showInFolder(folder) {
+  try {
+    if (onAndroid) {
+      const rel = folder.replace(/^\/storage\/emulated\/0\/?/, "");
+      const uri = `content://com.android.externalstorage.documents/document/primary%3A${encodeURIComponent(rel)}`;
+      await window.oriel.openExternal(uri, { type: "vnd.android.document/directory" });
+    } else {
+      await invoke("open_path", { path: folder });
+    }
+  } catch (err) {
+    snack(`Couldn't open the folder: ${err}`);
+  }
+}
+
+/** The saved file in the app the system picks for it. */
+function openDownloadElsewhere(d) {
+  if (onAndroid || !canOpenPaths) return openInApp(downloadSource, d);
+  invoke("open_path", { path: d.path }).catch((err) => snack(`Couldn't open it: ${err}`));
+}
+
+function downloadProgressText(d) {
+  if (!d.size) return `${formatSize(d.done)}`;
+  const pct = Math.min(100, Math.floor((d.done / d.size) * 100));
+  return `${formatSize(d.done)} of ${formatSize(d.size)} · ${pct}%`;
+}
+
+function downloadMeta(d) {
+  if (d.state === "running") return downloadProgressText(d);
+  if (d.state === "done") return d.exists ? `${formatSize(d.size)} · ${formatDate(d.finished)} · ${d.path}` : `Moved or deleted · was ${d.path}`;
+  if (d.state === "canceled") return `Canceled · ${formatSize(d.done)} of ${formatSize(d.size)}`;
+  return `Failed: ${d.error || "unknown error"}`;
+}
+
+function retryDownload(d) {
+  return d.kind === "swarm"
+    ? startDownload("swarm_download", { cid: d.cid, author_id: d.source_id, name: d.name, size: d.size })
+    : startDownload("download", { peer: d.source_id, cid: d.cid, name: d.name, size: d.size });
+}
+
+async function removeDownload(d, deleteFile) {
+  if (deleteFile && !(await askDialog({ title: `Delete ${d.name}?`, text: `${d.path} will be deleted from this device.`, confirm: "Delete", danger: true }))) return;
+  try {
+    await invoke("download_remove", { id: d.id, delete_file: deleteFile });
+    downloads.delete(d.id);
+    renderDownloads();
+  } catch (err) {
+    snack(`Couldn't remove it: ${err}`);
+  }
+}
+
+function playable(d) { return d.state === "done" && d.exists; }
+
+function downloadRow(d, files) {
+  const running = d.state === "running";
+  const ok = playable(d);
+  const actions = running
+    ? [{ icon: "remove", label: `Cancel ${d.name}`, run: () => invoke("download_cancel", { id: d.id }).catch((err) => snack(`${err}`)) }]
+    : ok
+      ? [
+        { icon: "open_in", label: "Open in another app", run: () => openDownloadElsewhere(d) },
+        { icon: "folder", label: "Show in folder", run: () => showInFolder(d.folder) },
+      ]
+      : [
+        { icon: "download", label: `Download ${d.name} again`, run: () => retryDownload(d) },
+        { icon: "remove", label: "Remove from the list", run: () => removeDownload(d, false) },
+      ];
+  const menu = running ? [actions[0]] : [
+    ...(ok ? [
+      { icon: "open_in", label: "Open in another app", run: () => openDownloadElsewhere(d) },
+      { icon: "folder", label: "Show in folder", run: () => showInFolder(d.folder) },
+      { icon: "copy", label: "Copy path", run: () => copyText(d.path, "Path copied") },
+    ] : [{ icon: "download", label: "Download again", run: () => retryDownload(d) }]),
+    "-",
+    { icon: "remove", label: "Remove from the list", run: () => removeDownload(d, false) },
+    ...(ok ? [{ icon: "trash", label: "Delete the file", run: () => removeDownload(d, true), danger: true }] : []),
+  ];
+  const li = row({
+    menu,
+    icon: iconFor(d.name, false),
+    headline: d.name,
+    meta: downloadMeta(d),
+    onClick: ok ? () => openPreview(downloadSource, files, files.indexOf(d)) : null,
+    actions,
+  });
+  li.dataset.download = d.id;
+  const meta = li.querySelector(".meta");
+  if (d.state === "failed") meta.classList.add("dl-failed");
+  if (running) {
+    const bar = document.createElement("span");
+    bar.className = "dl-progress";
+    meta.after(bar);
+    paintProgress(li, d);
+  }
+  return li;
+}
+
+function paintProgress(li, d) {
+  const bar = li.querySelector(".dl-progress");
+  if (!bar) return;
+  bar.classList.toggle("indeterminate", !d.size);
+  bar.style.setProperty("--p", d.size ? `${Math.min(100, (d.done / d.size) * 100)}%` : "0%");
+}
+
+/** A running copy's row, updated in place (no re-render every tick). */
+function updateDownloadRow(d) {
+  const li = $("downloads-list").querySelector(`li[data-download="${d.id}"]`);
+  if (!li) return renderDownloads();
+  li.querySelector(".meta").textContent = downloadProgressText(d);
+  paintProgress(li, d);
+}
+
+function renderDownloads() {
+  const all = [...downloads.values()].sort((a, b) => b.id - a.id);
+  const running = all.filter((d) => d.state === "running").length;
+  for (const badge of document.querySelectorAll("[data-downloads-badge]")) {
+    badge.hidden = running === 0;
+    badge.textContent = String(running);
+  }
+  if (document.body.dataset.view !== "downloads") return;
+  const files = all.filter(playable);
+  $("downloads-list").replaceChildren(...all.map((d) => downloadRow(d, files)));
+  $("downloads-empty").hidden = all.length > 0;
+  $("downloads-clear").hidden = !all.some((d) => d.state !== "running");
+}
+
+$("downloads-folder").addEventListener("click", () => showInFolder(downloadsFolder));
+$("downloads-clear").addEventListener("click", async () => {
+  await invoke("downloads_clear", null).catch((err) => snack(`${err}`));
+  loadDownloads();
+});
 
 /** A small dialog: ask for a name, or confirm. Resolves null on cancel. */
 function askDialog({ title, text = "", value = null, confirm = "OK", danger = false }) {
@@ -2623,6 +2776,7 @@ async function boot() {
   try { view = localStorage.getItem("view") || view; } catch {}
   setView(view);
   refreshState();
+  if (view !== "downloads") loadDownloads(); // the running count on its tab
   await nodeState();
   loadMount();
   const storage = await storageSetup();

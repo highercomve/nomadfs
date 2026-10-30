@@ -70,6 +70,12 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
   10 minutes, swarm backup files nobody could serve, mobile data).
 - **Swarm folder**: the shared folder every device writes ([Chapter 5.2](../fs/swarm.md)), with
   add, new folder, rename, delete, the author of each file, and the last sync.
+- **Downloads**: what **Download** saved (`nomadfs-gui/src/downloads.zig`). Each copy runs on its
+  own thread through `Node.saveFile`, whose `SaveProgress` hook reports bytes written and checks a
+  cancel flag; the page follows `download://progress` events. The list lives in `downloads.json`
+  beside the config. A finished download previews from its saved file (`download_read_range`, and the
+  media server's `l` URLs), opens in another app, or opens its folder (`open_path` on the desktop; on
+  Android an `ACTION_VIEW` of the folder's document URI, which Files handles).
 - **Shared folders**: pick a folder with the system picker (GTK on Linux, the Storage Access
   Framework on Android), name it, share it. Shares are saved in the app's configuration. A new
   share reads "Indexing… N files so far" while its first scan runs; other devices already see what

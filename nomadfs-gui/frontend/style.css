@@ -397,6 +397,7 @@ body[data-view="connect"] main > [data-view="connect"],
 body[data-view="text"] main > [data-view="text"],
 body[data-view="settings"] main > [data-view="settings"],
 body[data-view="mount"] main > [data-view="mount"],
+body[data-view="downloads"] main > [data-view="downloads"],
 body[data-view="about"] main > [data-view="about"] { display: flex; }
 body[data-view="settings"] main > footer { display: block; }
 
@@ -942,6 +943,7 @@ h2 { font-size: 19px; font-weight: 650; letter-spacing: -.25px; font-variation-s
 }
 #remote-section h2::before { content: "01 · browse"; }
 #swarm-section h2::before { content: "02 · swarm"; }
+#downloads-section h2::before { content: "↓ · downloads"; }
 #shares-section h2::before { content: "03 · shared folders"; }
 #mount-section h2::before { content: "04 · mount"; }
 #join-section h2::before { content: "05 · connect"; }
@@ -1590,3 +1592,23 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 .row-menu-item:hover, .row-menu-item:focus-visible { background: rgb(255 255 255 / .07); outline: none; }
 .row-menu-item.danger { color: var(--md-error, #ffb4ab); }
 .row-menu-sep { border: 0; border-top: 1px solid rgb(255 255 255 / .08); margin: 6px 0; }
+
+/* ---- Downloads ---- */
+#downloads-where { margin: 6px 0 0; font: 10.5px/1.5 var(--mono); color: var(--dust); word-break: break-all; }
+.downloads-actions { display: flex; gap: 8px; margin: 2px 0 10px; }
+.dl-progress { display: block; height: 4px; margin-top: 6px; border-radius: 2px; background: var(--md-surface-container-high); overflow: hidden; }
+.dl-progress::after { content: ""; display: block; height: 100%; width: var(--p, 0%); background: var(--amber); transition: width .25s; }
+.dl-progress.indeterminate::after { width: 40%; animation: indeterminate 1.1s ease-in-out infinite; }
+.list.rows li .meta.dl-failed { color: var(--md-error); }
+.nav-badge, .bar-badge {
+  min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px;
+  background: var(--amber); color: #1a1205;
+  font: 600 10px/16px var(--mono); text-align: center;
+}
+.nav-badge { margin-left: auto; }
+.bar-pill { position: relative; }
+.bar-badge { position: absolute; top: -2px; right: 10px; }
+.nav-badge[hidden], .bar-badge[hidden] { display: none; }
+/* Six destinations: each tab may shrink below its label's natural width. */
+.bar-item { min-width: 0; letter-spacing: .3px; }
+.bar-item .bar-pill { width: 52px; }
