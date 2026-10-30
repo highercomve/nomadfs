@@ -324,10 +324,7 @@ pub fn lanAddress(buf: *[16]u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ a[0], a[1], a[2], a[3] }) catch null;
 }
 
-fn nowSeconds() u64 {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    return @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
-}
+const nowSeconds = @import("../sync.zig").nowSeconds;
 
 fn writeBlob(w: anytype, bytes: []const u8) !void {
     if (bytes.len > max_ticket_len) return error.TicketTooLong;

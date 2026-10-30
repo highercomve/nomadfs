@@ -440,14 +440,33 @@ pub fn conflictPath(allocator: std.mem.Allocator, path: []const u8, author: []co
     }
     const who = if (who_len == 0) "another device" else who_buf[0..who_len];
     const name = try std.fmt.allocPrint(allocator, "{s}{s} (conflict from {s}){s}", .{ dir, stem, who, ext });
-    if (!validPath(name)) {
-        allocator.free(name);
-        return std.fmt.allocPrint(allocator, "{s}conflict{s}", .{ dir, ext });
-    }
-    return name;
+    if (validPath(name)) return name;
+    allocator.free(name);
+    const short = try std.fmt.allocPrint(allocator, "{s}conflict{s}", .{ dir, ext });
+    if (validPath(short)) return short;
+    allocator.free(short);
+    // Always valid, the same on every device: the original name (a valid
+    // path) with its first character marked, so the same length.
+    const marked = try allocator.dupe(u8, path);
+    marked[dir.len] = if (marked[dir.len] == '~') '_' else '~';
+    return marked;
 }
 
 // ---- Tests ----
+
+test "manifest: a conflict copy's name is always a valid path" {
+    const a = std.testing.allocator;
+    // A short name at the path limit: too long for " (conflict from …)"
+    // and for "conflict.jpg".
+    const part = "d" ** 250;
+    const path = part ++ "/" ++ part ++ "/" ++ part ++ "/" ++ part ++ "/" ++ ("e" ** 14) ++ "/a.jpg";
+    try std.testing.expectEqual(@as(usize, max_path_len), path.len);
+    try std.testing.expect(validPath(path));
+    const c = try conflictPath(a, path, "Google Pixel 8");
+    defer a.free(c);
+    try std.testing.expect(validPath(c));
+    try std.testing.expect(!std.mem.eql(u8, c, path));
+}
 
 const testing = std.testing;
 const dev_a: DeviceId = [_]u8{0xAA} ** 32;

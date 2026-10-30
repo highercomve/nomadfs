@@ -121,7 +121,7 @@ pub fn resolve(allocator: std.mem.Allocator, loader: Loader, root: Cid, path: []
 pub fn readAt(allocator: std.mem.Allocator, loader: Loader, root: Cid, offset: u64, dest: []u8) !usize {
     var copied: usize = 0;
     while (copied < dest.len) {
-        const n = try readLeafAt(allocator, loader, root, offset + copied, dest[copied..]);
+        const n = try readLeafAt(allocator, loader, root, offset +| copied, dest[copied..]);
         if (n == 0) break;
         copied += n;
     }

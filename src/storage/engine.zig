@@ -94,6 +94,7 @@ pub const StorageEngine = struct {
             else => return err,
         };
         const cache_dir = try dir.openDir(io, cache_dir_name, .{ .iterate = true });
+        errdefer cache_dir.close(io);
         var engine = StorageEngine{
             .root_dir = dir,
             .allocator = allocator,

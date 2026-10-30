@@ -560,12 +560,7 @@ fn revokeCommand(allocator: std.mem.Allocator, config: config_mod.Config, query:
     });
 }
 
-fn nowSeconds() u64 {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const timestamp = std.Io.Clock.real.now(io);
-    const seconds = @divFloor(timestamp.nanoseconds, std.time.ns_per_s);
-    return @intCast(seconds);
-}
+const nowSeconds = nomadfs.sync.nowSeconds;
 
 fn writeStdout(bytes: []const u8) !void {
     const io = std.Io.Threaded.global_single_threaded.io();

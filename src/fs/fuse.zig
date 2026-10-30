@@ -526,13 +526,16 @@ pub const Mount = struct {
         self.pool.mutex.lock();
         defer self.pool.mutex.unlock();
         if (self.pool.count >= worker_max or self.stopping.load(.acquire)) return;
+        // Room first: a thread that runs is always tracked, so it's joined.
+        self.pool.threads.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            std.debug.print("fuse: no room to track a worker: {any}\n", .{err});
+            return;
+        };
         const thread = std.Thread.spawn(.{}, workerMain, .{self}) catch |err| {
             std.debug.print("fuse: failed to spawn worker: {any}\n", .{err});
             return;
         };
-        self.pool.threads.append(self.allocator, thread) catch |err| {
-            std.debug.print("fuse: failed to track worker thread: {any}\n", .{err});
-        };
+        self.pool.threads.appendAssumeCapacity(thread);
         self.pool.count += 1;
     }
 
@@ -965,10 +968,7 @@ pub const Mount = struct {
         return path;
     }
 
-    fn nowSeconds() u64 {
-        const t = sync.timestamp();
-        return @intCast(@max(0, t));
-    }
+    const nowSeconds = sync.nowSeconds;
 
     fn writingHandle(self: *Mount, ino: u64) ?*Handle {
         return self.handles.getPtr(self.writing.get(ino) orelse return null);

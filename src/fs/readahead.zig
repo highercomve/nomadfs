@@ -128,7 +128,7 @@ pub const ReadAhead = struct {
     fn track(self: *ReadAhead, root: Cid, offset: u64, len: usize) Span {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const end = offset + len;
+        const end = offset +| len;
         const now = sync.monotonicMillis();
         self.pruneStaleStreamsLocked(now);
         const entry = self.streams.getOrPut(self.allocator, root) catch return .{ .from = end, .len = 0, .cursor = 0 };
@@ -136,7 +136,7 @@ pub const ReadAhead = struct {
         const st = entry.value_ptr;
 
         var cur: *Cursor = for (&st.cursors) |*slot| {
-            if (slot.*) |*c| if (offset + near_back >= c.next and offset <= c.next + near_forward) break c;
+            if (slot.*) |*c| if (offset +| near_back >= c.next and offset <= c.next +| near_forward) break c;
         } else blk: {
             // A new reader, or a seek: start small in a free slot, else in
             // the one read least recently (its queued work goes with it).
@@ -165,7 +165,7 @@ pub const ReadAhead = struct {
         if (offset >= cur.next and cur.used_at != now) cur.window = @min(cur.window * 2, max_window);
         cur.used_at = now;
         cur.next = @max(cur.next, end);
-        const want = cur.next + cur.window;
+        const want = cur.next +| cur.window;
         if (cur.queued_until >= want) return .{ .from = end, .len = 0, .cursor = cur.id };
         const from = @max(cur.queued_until, cur.next);
         cur.queued_until = want;

@@ -164,9 +164,7 @@ pub fn disk(path: []const u8) ?Disk {
     return .{ .total = st.f_blocks *| unit, .free = st.f_bavail *| unit };
 }
 
-pub fn nowSeconds() u64 {
-    return std.math.cast(u64, sync.timestamp()) orelse 0;
-}
+pub const nowSeconds = sync.nowSeconds;
 
 test "node info: round trip, and an older device's shorter info" {
     const a = std.testing.allocator;

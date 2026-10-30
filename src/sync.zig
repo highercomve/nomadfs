@@ -131,6 +131,11 @@ pub fn sleep(nanoseconds: u64) void {
 }
 
 /// Returns current Unix timestamp in seconds.
+/// Unix time in seconds; 0 for a clock set before 1970 (never panics).
+pub fn nowSeconds() u64 {
+    return std.math.cast(u64, timestamp()) orelse 0;
+}
+
 pub fn timestamp() i64 {
     const io = std.Io.Threaded.global_single_threaded.io();
     return std.Io.Clock.real.now(io).toSeconds();

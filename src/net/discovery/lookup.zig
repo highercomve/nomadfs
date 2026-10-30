@@ -8,6 +8,9 @@ const network = @import("../transport/mod.zig");
 pub const Alpha = 3;
 
 /// State for an iterative lookup of a NodeID.
+/// Most peers one lookup asks (a few rounds of Alpha around the K closest).
+pub const max_queries = 4 * kbucket.K;
+
 pub const LookupState = struct {
     allocator: std.mem.Allocator,
     target: id.NodeID,
@@ -92,6 +95,7 @@ pub const LookupState = struct {
         var count: usize = 0;
         var result: std.ArrayListUnmanaged(kbucket.PeerInfo) = .empty;
         errdefer result.deinit(self.allocator);
+        if (self.askedLocked() >= max_queries) return result.toOwnedSlice(self.allocator);
 
         for (self.best_peers.items) |*p| {
             if (!p.queried and !self.in_flight.contains(p.info.id)) {
@@ -152,6 +156,11 @@ pub const LookupState = struct {
         }
     }
 
+    /// Peers asked so far, answered, failed or in flight. Caller holds `mutex`.
+    fn askedLocked(self: *LookupState) usize {
+        return self.queried.count() + self.failed.count() + self.in_flight.count();
+    }
+
     pub fn isFinished(self: *LookupState) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -165,6 +174,9 @@ pub const LookupState = struct {
         // 3. Or the K closest peers have all replied.
 
         if (self.in_flight.count() > 0) return false;
+        // Bounded: a network that keeps answering with new peers (churn, or
+        // a hostile one) can't keep a lookup going forever.
+        if (self.askedLocked() >= max_queries) return true;
 
         var queried_count: usize = 0;
         var unqueried_found = false;

@@ -20,10 +20,7 @@ pub const version = node_info.version;
 pub const mobile_api = @import("mobile/api.zig");
 
 /// Seconds resolution used by tickets, the trust store and revocations.
-pub fn nowSeconds() u64 {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    return @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
-}
+pub const nowSeconds = sync.nowSeconds;
 
 // Force the C ABI surface into every artifact of this module, so the shared
 // library keeps its exports even though nothing below references it.
