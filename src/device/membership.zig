@@ -340,7 +340,9 @@ test "membership: trust a ticket, refuse an older one, revoke by fingerprint" {
     // This device's own ticket, as another device would trust it.
     const mine = try m.ticket("", 1000);
     try testing.expectEqualStrings("Desk", mine.nicknameSlice());
-    try testing.expectEqualStrings("127.0.0.1:14700", mine.addressesSlice());
+    // Without explicit addresses, every one this machine has, on the node port.
+    try testing.expect(mine.addressesSlice().len > 0);
+    try testing.expect(std.mem.endsWith(u8, mine.addressesSlice(), ":14700"));
 
     // The phone's ticket: trusted, saved, hook told.
     var uri_buf: [pairing.max_uri_len]u8 = undefined;
