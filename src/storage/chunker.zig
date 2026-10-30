@@ -137,7 +137,9 @@ pub const Chunker = struct {
     }
 };
 
-const SliceReader = struct {
+/// Reads from a byte slice; the reader the chunker takes for data already
+/// in memory.
+pub const SliceReader = struct {
     buffer: []const u8,
     pos: usize = 0,
 

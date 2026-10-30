@@ -53,6 +53,9 @@ pub const View = union(Tag) {
     dir: EntryIterator,
 };
 
+/// A link of a parent block, borrowed from the encoded bytes. DagLink is
+/// the owned form the builder encodes from.
+// @atlas allow: borrowed view with a fixed-size CID; DagLink owns its slices
 pub const LinkView = struct {
     cid: *const Cid,
     size: u64,
@@ -61,26 +64,17 @@ pub const LinkView = struct {
 
 /// Iterates links of a parent block that decode() already validated, so
 /// iteration cannot fail.
-pub const LinkIterator = struct {
-    bytes: []const u8,
-    count: u16,
-    index: u16 = 0,
-    pos: usize = 0,
+pub const LinkIterator = RecordIterator(LinkView, readLink);
 
-    pub fn next(self: *LinkIterator) ?LinkView {
-        if (self.index == self.count) return null;
-        const at = self.bytes[self.pos..];
-        const name_len = std.mem.readInt(u16, at[cid_len + 8 ..][0..2], .big);
-        const link = LinkView{
-            .cid = at[0..cid_len],
-            .size = std.mem.readInt(u64, at[cid_len..][0..8], .big),
-            .name = at[link_header_len..][0..name_len],
-        };
-        self.pos += link_header_len + name_len;
-        self.index += 1;
-        return link;
-    }
-};
+fn readLink(at: []const u8, len: *usize) LinkView {
+    const name_len = std.mem.readInt(u16, at[cid_len + 8 ..][0..2], .big);
+    len.* = link_header_len + name_len;
+    return .{
+        .cid = at[0..cid_len],
+        .size = std.mem.readInt(u64, at[cid_len..][0..8], .big),
+        .name = at[link_header_len..][0..name_len],
+    };
+}
 
 pub const EntryView = struct {
     cid: *const Cid,
@@ -91,28 +85,39 @@ pub const EntryView = struct {
 };
 
 /// Iterates entries of a dir block that decode() already validated.
-pub const EntryIterator = struct {
-    bytes: []const u8,
-    count: u16,
-    index: u16 = 0,
-    pos: usize = 0,
+pub const EntryIterator = RecordIterator(EntryView, readEntry);
 
-    pub fn next(self: *EntryIterator) ?EntryView {
-        if (self.index == self.count) return null;
-        const at = self.bytes[self.pos..];
-        const name_len = std.mem.readInt(u16, at[entry_header_len - 2 ..][0..2], .big);
-        const entry = EntryView{
-            .cid = at[0..cid_len],
-            .size = std.mem.readInt(u64, at[cid_len..][0..8], .big),
-            .kind = @enumFromInt(at[cid_len + 8]),
-            .mtime = std.mem.readInt(u64, at[cid_len + 9 ..][0..8], .big),
-            .name = at[entry_header_len..][0..name_len],
-        };
-        self.pos += entry_header_len + name_len;
-        self.index += 1;
-        return entry;
-    }
-};
+fn readEntry(at: []const u8, len: *usize) EntryView {
+    const name_len = std.mem.readInt(u16, at[entry_header_len - 2 ..][0..2], .big);
+    len.* = entry_header_len + name_len;
+    return .{
+        .cid = at[0..cid_len],
+        .size = std.mem.readInt(u64, at[cid_len..][0..8], .big),
+        .kind = @enumFromInt(at[cid_len + 8]),
+        .mtime = std.mem.readInt(u64, at[cid_len + 9 ..][0..8], .big),
+        .name = at[entry_header_len..][0..name_len],
+    };
+}
+
+/// Walks `count` records packed back to back in `bytes`. `readAt` decodes
+/// the record at the start of its slice and sets its encoded length.
+fn RecordIterator(comptime Record: type, comptime readAt: fn (at: []const u8, len: *usize) Record) type {
+    return struct {
+        bytes: []const u8,
+        count: u16,
+        index: u16 = 0,
+        pos: usize = 0,
+
+        pub fn next(self: *@This()) ?Record {
+            if (self.index == self.count) return null;
+            var len: usize = 0;
+            const record = readAt(self.bytes[self.pos..], &len);
+            self.pos += len;
+            self.index += 1;
+            return record;
+        }
+    };
+}
 
 /// Whether `name` is a single path component a filesystem can hold: not
 /// empty, not "." or "..", no '/' and no NUL.

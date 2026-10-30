@@ -55,17 +55,7 @@ pub fn freeDiff(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) 
 
 const DagBuilder = @import("builder.zig").DagBuilder;
 
-const SliceReader = struct {
-    buffer: []const u8,
-    pos: usize = 0,
-
-    pub fn read(self: *@This(), dest: []u8) !usize {
-        const n = @min(dest.len, self.buffer.len - self.pos);
-        @memcpy(dest[0..n], self.buffer[self.pos..][0..n]);
-        self.pos += n;
-        return n;
-    }
-};
+const SliceReader = @import("../chunker.zig").SliceReader;
 
 fn buildFile(engine: *StorageEngine, data: []const u8) ![]const u8 {
     var builder = DagBuilder{ .allocator = std.testing.allocator, .store = engine, .layout = .Balanced };

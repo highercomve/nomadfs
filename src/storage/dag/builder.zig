@@ -226,19 +226,6 @@ pub const DagBuilder = struct {
     }
 };
 
-const BufferReader = struct {
-    buffer: []const u8,
-    pos: usize = 0,
-
-    pub fn read(self: *@This(), dest: []u8) !usize {
-        if (self.pos >= self.buffer.len) return 0;
-        const n = @min(dest.len, self.buffer.len - self.pos);
-        @memcpy(dest[0..n], self.buffer[self.pos .. self.pos + n]);
-        self.pos += n;
-        return n;
-    }
-};
-
 test "DagBuilder build (Balanced) functionality" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -257,7 +244,7 @@ test "DagBuilder build (Balanced) functionality" {
     };
 
     const data = "This is a test string to be chunked and DAG-ified.";
-    var reader = BufferReader{ .buffer = data };
+    var reader = chunker.SliceReader{ .buffer = data };
 
     const cid = try builder.build(&reader);
     defer allocator.free(cid);
@@ -283,7 +270,7 @@ test "DagBuilder build (Linear) functionality" {
     };
 
     const data = "This is a test string to be chunked and DAG-ified.";
-    var reader = BufferReader{ .buffer = data };
+    var reader = chunker.SliceReader{ .buffer = data };
 
     const cid = try builder.build(&reader);
     defer allocator.free(cid);
@@ -293,7 +280,7 @@ test "DagBuilder build (Linear) functionality" {
 
 fn buildOnce(allocator: std.mem.Allocator, engine: *StorageEngine, layout: Layout, data: []const u8) !void {
     var builder = DagBuilder{ .allocator = allocator, .store = engine, .layout = layout };
-    var reader = BufferReader{ .buffer = data };
+    var reader = chunker.SliceReader{ .buffer = data };
     const cid = try builder.build(&reader);
     allocator.free(cid);
 }
@@ -363,7 +350,7 @@ test "DagBuilder handles an empty file" {
 
     for ([_]Layout{ .Balanced, .Linear }) |layout| {
         var builder = DagBuilder{ .allocator = testing.allocator, .store = &engine, .layout = layout };
-        var reader = BufferReader{ .buffer = "" };
+        var reader = chunker.SliceReader{ .buffer = "" };
         const cid = try builder.build(&reader);
         defer testing.allocator.free(cid);
 
