@@ -33,7 +33,10 @@
     // internet connectivity.
     .dependencies = .{
         // `zig build atlas`: code map, duplication and layer checks.
-        .zigatlas = .{ .path = "../zigatlas" },
+        .zigatlas = .{
+            .url = "git+https://github.com/highercomve/zigatlas.git?ref=v0.1.0#cdc7a116886946fb399bb3937497eb7519d5927f",
+            .hash = "zigatlas-0.1.0-zbV5qzaiAgCJtloEGjUzhQbkQPCetuwYa1Cc-MvrgGlH",
+        },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding
