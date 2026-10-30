@@ -248,6 +248,18 @@ fn loadConfig(allocator: std.mem.Allocator, config_path: ?[]const u8) !config_mo
     };
 }
 
+/// Node.init, saying so when another node (the app, a service) already
+/// runs on this config.
+fn startNode(allocator: std.mem.Allocator, config: config_mod.Config) !nomadfs.Node {
+    return nomadfs.Node.init(allocator, config) catch |err| {
+        if (err == error.NodeAlreadyRunning) {
+            std.debug.print("Error: a NomadFS node already runs on this configuration (the app or a service).\nStop it first, or use another --config.\n", .{});
+            std.process.exit(1);
+        }
+        return err;
+    };
+}
+
 /// The run loop's flag; cleared to stop (or restart) the node.
 var node_running = std.atomic.Value(bool).init(true);
 var restart_requested = std.atomic.Value(bool).init(false);
@@ -277,7 +289,7 @@ fn runOnce(allocator: std.mem.Allocator, config: config_mod.Config, config_path:
     std.debug.print("Listening on port: {d}\n", .{config.network.port});
     if (config.storage.swarm_backup) std.debug.print("Backing up the swarm folder on this device\n", .{});
 
-    var node = try nomadfs.Node.init(allocator, config);
+    var node = try startNode(allocator, config);
     defer node.deinit();
     // Without --config there is no file to save a rotated key in.
     if (config_path) |path| try rotation.watch(&node, path);
@@ -313,7 +325,7 @@ fn mountLinux(allocator: std.mem.Allocator, config: config_mod.Config, mountpoin
         std.process.exit(1);
     }
 
-    var node = try nomadfs.Node.init(allocator, config);
+    var node = try startNode(allocator, config);
     defer node.deinit();
     std.debug.print("NomadFS {s}: device {x}\n", .{ config.node.nickname, node.device_identity.deviceId().bytes[0..6] });
     node.bootstrap(config.network.bootstrap_peers, config.node.swarm_key) catch |err| {
@@ -552,7 +564,7 @@ fn writeStdout(bytes: []const u8) !void {
 }
 
 fn benchReadCommand(allocator: std.mem.Allocator, config: config_mod.Config, raw_path: []const u8, wait_seconds: u32, cold: bool) !void {
-    var node = try nomadfs.Node.init(allocator, config);
+    var node = try startNode(allocator, config);
     defer node.deinit();
 
     var running = std.atomic.Value(bool).init(true);
@@ -699,7 +711,7 @@ fn benchReadCommand(allocator: std.mem.Allocator, config: config_mod.Config, raw
 }
 
 fn benchIdleCommand(allocator: std.mem.Allocator, config: config_mod.Config, seconds: u32) !void {
-    var node = try nomadfs.Node.init(allocator, config);
+    var node = try startNode(allocator, config);
     defer node.deinit();
 
     var running = std.atomic.Value(bool).init(true);

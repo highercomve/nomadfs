@@ -12,6 +12,25 @@ const env_mod = @import("../env.zig");
 pub const identity_filename = "device.key";
 pub const trust_filename = "trust.store";
 pub const peers_filename = "known_peers";
+/// Held (an exclusive lock) by the one node running on these files.
+pub const lock_filename = "node.lock";
+
+/// Locks the device's files for a running node: one node per config, since
+/// two would each save the trust store, policy, known peers and folders
+/// from their own memory. Released when the file is closed (or the process
+/// dies). error.NodeAlreadyRunning when another node holds it.
+pub fn lockNode(allocator: std.mem.Allocator, key_path: ?[]const u8) !std.Io.File {
+    var paths = try Paths.resolve(allocator, key_path);
+    defer paths.deinit(allocator);
+    const dir = std.fs.path.dirname(paths.identity) orelse ".";
+    const path = try std.fs.path.join(allocator, &.{ dir, lock_filename });
+    defer allocator.free(path);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
+        error.WouldBlock => error.NodeAlreadyRunning,
+        else => err,
+    };
+}
 
 pub const Paths = struct {
     identity: []u8,
@@ -86,4 +105,18 @@ test "paths: bare key path falls back to the working directory" {
     defer paths.deinit(testing.allocator);
     try testing.expectEqualStrings("device.key", paths.identity);
     try testing.expectEqualStrings("trust.store", paths.trust);
+}
+
+test "paths: one node at a time holds the device's files" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = "test_node_lock";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const key = dir ++ "/node.key";
+    const first = try lockNode(std.testing.allocator, key);
+    try std.testing.expectError(error.NodeAlreadyRunning, lockNode(std.testing.allocator, key));
+    first.close(io);
+    const again = try lockNode(std.testing.allocator, key); // released with the file
+    again.close(io);
 }

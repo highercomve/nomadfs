@@ -74,6 +74,16 @@ pub fn isRunning() bool {
 }
 
 /// `invoke("node_open", { config_path })`: opens and starts listening.
+/// Why the node didn't start: another node (a `nomadfs` service, a mount)
+/// already runs on this config, or the config is wrong.
+fn whyNotStarted(gpa: std.mem.Allocator, config_path: []const u8) anyerror {
+    var config = config_mod.parseConfig(gpa, config_path) catch return error.ConfigInvalid;
+    defer config.deinit(gpa);
+    const lock = nomadfs.device.paths.lockNode(gpa, config.node.key_path) catch |err| return err;
+    lock.close(std.Io.Threaded.global_single_threaded.io());
+    return error.ConfigInvalid;
+}
+
 pub fn nodeOpen(gpa: std.mem.Allocator, args: NodeOpenArgs) !void {
     g_mutex.lock();
     defer g_mutex.unlock();
@@ -82,7 +92,7 @@ pub fn nodeOpen(gpa: std.mem.Allocator, args: NodeOpenArgs) !void {
     const path = try gpa.dupeZ(u8, args.config_path);
     defer gpa.free(path);
 
-    const node = mobile.nomadfs_node_new(path.ptr) orelse return error.ConfigInvalid;
+    const node = mobile.nomadfs_node_new(path.ptr) orelse return whyNotStarted(gpa, args.config_path);
     // A trusted device may rotate the swarm key: adopt it.
     g_rotation.watch(&node.node, args.config_path) catch |err|
         std.debug.print("rotation: not watching: {any}\n", .{err});

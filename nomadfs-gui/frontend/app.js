@@ -306,7 +306,9 @@ async function startNode() {
   try {
     await invoke("node_open", { config_path: await ensureConfig() });
   } catch (err) {
-    snack(`Open failed: ${err}`);
+    snack(String(err).includes("NodeAlreadyRunning")
+      ? "Another NomadFS node already runs on this device (a service or the command line): stop it first."
+      : `Open failed: ${err}`);
   }
   await nodeState();
   if (running) {

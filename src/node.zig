@@ -30,6 +30,8 @@ pub const Node = struct {
     block_manager: *cluster.BlockManager,
     ring: *HashRing,
     device_paths: device.paths.Paths,
+    /// device/paths.zig lockNode: held until deinit's end.
+    lock: std.Io.File,
     device_identity: device.identity.Identity,
     trust_store: *device.trust.Store,
     /// Folders this device shares; null without block storage.
@@ -66,6 +68,9 @@ pub const Node = struct {
     redial: std.AutoHashMapUnmanaged(net.id.NodeID, Redial) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !Node {
+        // First: nothing is opened or written while another node runs here.
+        const lock = try device.paths.lockNode(allocator, cfg.node.key_path);
+        errdefer lock.close(std.Io.Threaded.global_single_threaded.io());
         const connection_manager = try allocator.create(ConnectionManager);
         errdefer allocator.destroy(connection_manager);
         connection_manager.* = try ConnectionManager.init(allocator, cfg.network.transport, cfg.node.key_path);
@@ -305,6 +310,7 @@ pub const Node = struct {
             .keeper = keeper,
             .bootstrap_running = bootstrap_running,
             .bootstrap_thread = null,
+            .lock = lock,
         };
     }
 
@@ -355,6 +361,8 @@ pub const Node = struct {
         }
         self.connection_manager.deinit();
         self.allocator.destroy(self.connection_manager);
+        // Last: another node may start once everything is saved and closed.
+        self.lock.close(std.Io.Threaded.global_single_threaded.io());
     }
 
     pub const Delivery = struct {
