@@ -186,18 +186,9 @@ pub fn parseConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
 }
 
 fn readConfigFile(allocator: std.mem.Allocator, path: []const u8, buffer: []u8) ![]const u8 {
-    var expanded_path: []const u8 = path;
-    var owned_path: ?[]const u8 = null;
+    const owned_path = try env_mod.expandHome(allocator, path);
     defer if (owned_path) |p| allocator.free(p);
-
-    if (std.mem.startsWith(u8, path, "~")) {
-        const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
-        if (env_mod.getEnv(allocator, home_env)) |home| {
-            defer allocator.free(home);
-            owned_path = try std.fs.path.join(allocator, &.{ home, path[1..] });
-            expanded_path = owned_path.?;
-        }
-    }
+    const expanded_path = owned_path orelse path;
 
     const io = std.Io.Threaded.global_single_threaded.io();
     var file = try std.Io.Dir.cwd().openFile(io, expanded_path, .{});

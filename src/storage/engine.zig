@@ -67,18 +67,9 @@ pub const StorageEngine = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !StorageEngine {
-        var expanded_path: []const u8 = path;
-        var owned_path: ?[]const u8 = null;
+        const owned_path = try env_mod.expandHome(allocator, path);
         defer if (owned_path) |p| allocator.free(p);
-
-        if (std.mem.startsWith(u8, path, "~")) {
-            const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
-            if (env_mod.getEnv(allocator, home_env)) |home| {
-                defer allocator.free(home);
-                owned_path = try std.fs.path.join(allocator, &.{ home, path[1..] });
-                expanded_path = owned_path.?;
-            }
-        }
+        const expanded_path = owned_path orelse path;
 
         const io = std.Io.Threaded.global_single_threaded.io();
         std.Io.Dir.cwd().createDirPath(io, expanded_path) catch |err| switch (err) {

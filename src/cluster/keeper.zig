@@ -269,11 +269,7 @@ const SliceReader = struct {
     }
 };
 
-fn freshStore(path: []const u8) !storage.engine.StorageEngine {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    std.Io.Dir.cwd().deleteTree(io, path) catch {};
-    return storage.engine.StorageEngine.init(testing.allocator, path);
-}
+const freshStore = fetcher_mod.testStore;
 
 fn cleanup(path: []const u8) void {
     std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), path) catch {};

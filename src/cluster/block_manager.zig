@@ -161,6 +161,7 @@ pub const BlockManager = struct {
         return ids;
     }
 
+    // @atlas allow: the wire answer (listing bytes); fs.remote.Shares decodes it
     pub const SharesReply = struct {
         nickname: []u8,
         /// Encoded dir block.

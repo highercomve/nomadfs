@@ -41,3 +41,14 @@ test "env.getEnv retrieves HOME" {
         try std.testing.expect(home.?.len > 0);
     }
 }
+
+/// `path` with a leading `~` replaced by the home directory (HOME, or
+/// USERPROFILE on Windows); null when there's nothing to expand. Caller
+/// frees.
+pub fn expandHome(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    if (!std.mem.startsWith(u8, path, "~")) return null;
+    const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+    const home = getEnv(allocator, home_env) orelse return null;
+    defer allocator.free(home);
+    return try std.fs.path.join(allocator, &.{ home, path[1..] });
+}
