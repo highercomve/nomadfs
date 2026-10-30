@@ -62,6 +62,9 @@ pub const NodeHandle = struct {
     mutex: sync.Mutex = .{},
     node: nomadfs.Node,
     config: nomadfs.config.Config,
+    /// The config file (owned): settings changed through the API are saved
+    /// there too (settings.zig).
+    config_path: []u8,
     /// Owned copies of the bootstrap URLs the running bootstrap thread may
     /// still be reading. Freed after `node.deinit()` joins that thread.
     urls: []const []const u8 = &.{},
@@ -132,16 +135,18 @@ pub export fn nomadfs_version() [*:0]const u8 {
     return version;
 }
 
-fn nodeNewInternal(config_value: nomadfs.config.Config) !*NodeHandle {
+fn nodeNewInternal(config_value: nomadfs.config.Config, config_path: []const u8) !*NodeHandle {
     var config = config_value;
     errdefer config.deinit(allocator);
+    const path = try allocator.dupe(u8, config_path);
+    errdefer allocator.free(path);
     var node = try nomadfs.Node.init(allocator, config);
     errdefer node.deinit();
     const running = try allocator.create(std.atomic.Value(bool));
     errdefer allocator.destroy(running);
     running.* = std.atomic.Value(bool).init(false);
     const self = try allocator.create(NodeHandle);
-    self.* = .{ .node = node, .config = config, .running = running };
+    self.* = .{ .node = node, .config = config, .config_path = path, .running = running };
     registerHandle(self);
     return self;
 }
@@ -149,7 +154,7 @@ fn nodeNewInternal(config_value: nomadfs.config.Config) !*NodeHandle {
 pub export fn nomadfs_node_new(config_path: ?[*:0]const u8) ?*NodeHandle {
     const path = spanSlice(config_path) orelse return null;
     const config = nomadfs.config.parseConfig(allocator, path) catch return null;
-    return nodeNewInternal(config) catch null;
+    return nodeNewInternal(config, path) catch null;
 }
 
 pub export fn nomadfs_node_free(node: ?*NodeHandle) void {
@@ -157,6 +162,7 @@ pub export fn nomadfs_node_free(node: ?*NodeHandle) void {
     self.running.store(false, .release);
     self.node.deinit();
     self.config.deinit(allocator);
+    allocator.free(self.config_path);
     for (self.urls) |url| allocator.free(url);
     if (self.urls.len > 0) allocator.free(self.urls);
     allocator.destroy(self.running);
@@ -317,10 +323,12 @@ pub export fn nomadfs_node_device_id(node: ?*NodeHandle, out: ?[*]u8, out_len: u
 pub export fn nomadfs_cache_info(node: ?*NodeHandle, out_bytes: ?*u64, out_blocks: ?*u64, out_limit: ?*u64) c_int {
     const self = acquireHandle(node) orelse return invalid_argument;
     defer releaseHandle(self);
-    const stats = self.node.cacheStats() catch return storage_disabled;
-    if (out_bytes) |p| p.* = stats.bytes;
-    if (out_blocks) |p| p.* = stats.blocks;
-    if (out_limit) |p| p.* = stats.limit orelse 0;
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const info = nomadfs.settings.cacheInfo(allocator, self.config, &self.node) catch return storage_disabled;
+    if (out_bytes) |p| p.* = info.bytes;
+    if (out_blocks) |p| p.* = info.blocks;
+    if (out_limit) |p| p.* = info.limit_mb * 1024 * 1024;
     return nomadfs_ok;
 }
 
@@ -329,18 +337,22 @@ pub export fn nomadfs_cache_info(node: ?*NodeHandle, out_bytes: ?*u64, out_block
 pub export fn nomadfs_cache_clear(node: ?*NodeHandle, out_freed: ?*u64) c_int {
     const self = acquireHandle(node) orelse return invalid_argument;
     defer releaseHandle(self);
-    const freed = self.node.clearCache() catch |err| return if (err == error.StorageDisabled) storage_disabled else internal_error;
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const freed = nomadfs.settings.cacheClear(allocator, self.config, &self.node) catch |err| return if (err == error.StorageDisabled) storage_disabled else internal_error;
     if (out_freed) |p| p.* = freed;
     return nomadfs_ok;
 }
 
-/// Sets the read cache limit for the running node, in MiB; 0 removes it.
-/// Evicts at once when the cache is over the new limit. (The config's
-/// `cache_mb` sets it at start.)
+/// Sets the read cache limit, in MiB; 0 removes it. Evicts at once when
+/// the cache is over the new limit, and saves it in the config (`cache_mb`)
+/// so it holds after a restart (settings.cacheLimit).
 pub export fn nomadfs_cache_set_limit(node: ?*NodeHandle, limit_mb: u64) c_int {
     const self = acquireHandle(node) orelse return invalid_argument;
     defer releaseHandle(self);
-    self.node.setCacheLimit(limit_mb) catch |err| return switch (err) {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    nomadfs.settings.cacheLimit(allocator, self.config_path, &self.node, limit_mb) catch |err| return switch (err) {
         error.StorageDisabled => storage_disabled,
         error.InvalidLimit => invalid_argument,
         else => internal_error,
@@ -537,7 +549,7 @@ test "mobile: listener startup failure never reports success on later runs" {
     try writeConfig(path, "fail", 13202, dir ++ "/data", dir);
     var config = try nomadfs.config.parseConfig(allocator, path);
     config.network.transport = .quic;
-    const handle = try nodeNewInternal(config);
+    const handle = try nodeNewInternal(config, "");
     defer nomadfs_node_free(handle);
     try testing.expectEqual(unavailable, nomadfs_node_run(handle));
     try testing.expectEqual(unavailable, nomadfs_node_run(handle));
