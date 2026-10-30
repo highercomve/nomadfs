@@ -1808,6 +1808,7 @@ pub fn isMounted(allocator: std.mem.Allocator, path: []const u8) bool {
 /// Clears any stale mount at `path` left by a dead process, and ensures
 /// the mount directory exists.
 pub fn prepareMountpoint(allocator: std.mem.Allocator, path: []const u8) !void {
+    if (path.len == 0) return error.InvalidPath;
     if (isMounted(allocator, path)) {
         const z = try allocator.dupeZ(u8, path);
         defer allocator.free(z);
@@ -1822,6 +1823,19 @@ pub fn prepareMountpoint(allocator: std.mem.Allocator, path: []const u8) !void {
     }
     const io = std.Io.Threaded.global_single_threaded.io();
     try std.Io.Dir.cwd().createDirPath(io, path);
+}
+
+/// Waits (at most 5 s) until the kernel lists the mount at `path`, for a
+/// mount served on another thread; error.MountFailed once `served` is set
+/// (the serve call returned: the mount was refused) or time runs out.
+pub fn waitMounted(allocator: std.mem.Allocator, path: []const u8, served: *const std.atomic.Value(bool)) !void {
+    var waited: u32 = 0;
+    while (waited < 50) : (waited += 1) {
+        if (served.load(.acquire)) return error.MountFailed;
+        if (isMounted(allocator, path)) return;
+        sync.sleep(100 * std.time.ns_per_ms);
+    }
+    return error.MountFailed;
 }
 
 // ---- Tests ----

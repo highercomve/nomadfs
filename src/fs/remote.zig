@@ -186,6 +186,13 @@ pub const Device = struct {
     label: []const u8,
     mount_name: []const u8,
 
+    /// Its authenticated identity's fingerprint ("aaaa-bbbb-cccc-dddd",
+    /// as the device list shows it), or "" when it presented none.
+    pub fn fingerprint(self: *const Device, buf: *[19]u8) []const u8 {
+        const did = self.device_id orelse return "";
+        return @import("../device/identity.zig").Identity.formatFingerprint(did.bytes[0..8].*, buf);
+    }
+
     pub fn deinit(self: Device, allocator: std.mem.Allocator) void {
         allocator.free(self.nickname);
         allocator.free(self.label);

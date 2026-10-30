@@ -695,74 +695,24 @@ pub fn remoteDevices(gpa: std.mem.Allocator) ![]RemoteDevice {
     const handle = mediaAcquire() orelse return error.NotRunning;
     defer mediaRelease();
     if (handle.node.store == null) return error.StorageDisabled;
-    const bm = handle.node.block_manager;
-
-    const dev_list = try fs.remote.devices(gpa, bm, handle.node.trust_store);
-    defer fs.remote.deinitDevices(gpa, dev_list);
-
-    const out = try gpa.alloc(RemoteDevice, dev_list.len);
-    var built: usize = 0;
-    errdefer {
-        for (out[0..built]) |d| {
-            gpa.free(d.peer);
-            gpa.free(d.nickname);
-            gpa.free(d.device_id);
-            gpa.free(d.fingerprint);
-            gpa.free(d.label);
-            gpa.free(d.mount_name);
-            for (d.shares) |s| {
-                gpa.free(s.name);
-                gpa.free(s.cid);
-            }
-            gpa.free(d.shares);
-        }
-        gpa.free(out);
-    }
-
-    for (dev_list, out) |d, *o| {
-        const id_bytes = if (d.device_id) |did| did.bytes else d.peer.bytes;
-        var fp_buf: [19]u8 = undefined;
-        const fp_str = if (d.device_id != null)
-            Identity.formatFingerprint(id_bytes[0..8].*, &fp_buf)
-        else
-            "";
-        const dev_id_hex = if (d.device_id != null)
-            try hexAlloc(gpa, &id_bytes)
-        else
-            try gpa.dupe(u8, "");
-
+    const list = try fs.remote.devices(gpa, handle.node.block_manager, handle.node.trust_store);
+    // `gpa` is the request's arena (Oriel): the page's copy is all it keeps.
+    const out = try gpa.alloc(RemoteDevice, list.len);
+    for (list, out) |*d, *o| {
         const shares = try gpa.alloc(RemoteShare, d.shares.len);
-        var shares_built: usize = 0;
-        errdefer {
-            for (shares[0..shares_built]) |s| {
-                gpa.free(s.name);
-                gpa.free(s.cid);
-            }
-            gpa.free(shares);
-        }
-        for (d.shares, shares) |s, *os| {
-            os.* = .{
-                .name = try gpa.dupe(u8, s.name),
-                .cid = try hexAlloc(gpa, &s.cid),
-                .size = s.size,
-                .mtime = s.mtime,
-            };
-            shares_built += 1;
-        }
-
+        for (d.shares, shares) |s, *os| os.* = .{ .name = s.name, .cid = try hexAlloc(gpa, &s.cid), .size = s.size, .mtime = s.mtime };
+        var fp_buf: [19]u8 = undefined;
         o.* = .{
             .peer = try hexAlloc(gpa, &d.peer.bytes),
-            .nickname = try gpa.dupe(u8, d.nickname),
+            .nickname = d.nickname,
             .shares = shares,
-            .device_id = dev_id_hex,
-            .fingerprint = try gpa.dupe(u8, fp_str),
+            .device_id = if (d.device_id) |did| try hexAlloc(gpa, &did.bytes) else "",
+            .fingerprint = try gpa.dupe(u8, d.fingerprint(&fp_buf)),
             .trusted = d.trusted,
-            .label = try gpa.dupe(u8, d.label),
-            .mount_name = try gpa.dupe(u8, d.mount_name),
+            .label = d.label,
+            .mount_name = d.mount_name,
         };
-        built += 1;
     }
-
     return out;
 }
 
@@ -1315,32 +1265,21 @@ pub const MountArgs = struct { path: []const u8 };
 /// an app reads them. Returns once the kernel shows the mount.
 pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
     if (!can_mount) return error.MountUnsupported;
-    if (args.path.len == 0 or args.path[0] != '/') return error.InvalidPath;
-
     g_mutex.lock();
     defer g_mutex.unlock();
     reapMountLocked();
     if (g_mount != null) return error.AlreadyMounted;
     const handle = g_node orelse return error.NotRunning;
-    if (handle.node.store == null) return error.StorageDisabled;
-    if (can_mount) try fs.fuse.prepareMountpoint(gpa, args.path);
-
+    try fs.fuse.prepareMountpoint(gpa, args.path);
     const job = try startMountJob(handle, args.path);
+    // From here the job is g_mount's: a failed mount is reaped, once.
     g_mount = job;
-
-    // Wait (bounded) for the kernel to list the mount, or the thread to fail.
-    // Past this point the job is g_mount's: a failure reaps it, nothing else
-    // frees it.
-    var waited: u32 = 0;
-    while (waited < 50) : (waited += 1) {
-        if (job.done.load(.acquire)) break;
-        if (can_mount and fs.fuse.isMounted(gpa, args.path)) return;
-        nomadfs.sync.sleep(100 * std.time.ns_per_ms);
-    }
-    if (job.done.load(.acquire)) {
-        reapMountLocked();
-        return error.MountFailed;
-    }
+    fs.fuse.waitMounted(gpa, args.path, &job.done) catch |err| {
+        // Still serving after the wait: leave it, it may yet appear.
+        if (!job.done.load(.acquire)) return;
+        reapMountLocked(); // frees `job`
+        return err;
+    };
 }
 
 /// Sets up the mount job and starts its serve thread; every step unwinds
