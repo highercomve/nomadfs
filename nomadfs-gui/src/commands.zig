@@ -395,13 +395,17 @@ test "commands: note names sort by time and start with the first line" {
 pub fn getText(gpa: std.mem.Allocator, args: GetTextArgs) ![]const u8 {
     if (args.cid.len != 64) return error.InvalidArgument;
 
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    const node = g_node orelse return error.NotRunning;
+    // Pinned, not g_mutex held, while it fetches.
+    const node = mediaAcquire() orelse return error.NotRunning;
+    defer mediaRelease();
 
     const io = std.Io.Threaded.global_single_threaded.io();
     var buf: [64]u8 = undefined;
-    const out_path = try nextTickPath(&buf, "-out.bin");
+    const out_path = blk: {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        break :blk try nextTickPath(&buf, "-out.bin");
+    };
     defer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
 
     const cid_z = try gpa.dupeZ(u8, args.cid);
@@ -703,9 +707,9 @@ pub const RemoteDevice = struct {
 /// `invoke("remote_devices")`: every reachable device and what it shares.
 /// Devices that don't answer are left out.
 pub fn remoteDevices(gpa: std.mem.Allocator) ![]RemoteDevice {
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    const handle = g_node orelse return error.NotRunning;
+    // Asks every device: pinned, not g_mutex held, so the app stays usable.
+    const handle = mediaAcquire() orelse return error.NotRunning;
+    defer mediaRelease();
     if (handle.node.store == null) return error.StorageDisabled;
     const bm = handle.node.block_manager;
 
@@ -738,13 +742,17 @@ pub fn remoteDevices(gpa: std.mem.Allocator) ![]RemoteDevice {
 
     const trust_store = handle.node.trust_store;
 
-    for (peers) |peer| {
-        var remote = fs.Remote{ .block_manager = bm, .peer = peer };
-        const shares = remote.shares(gpa) catch |err| {
-            std.debug.print("remote_devices: {x} unavailable: {any}\n", .{ peer.bytes[0..4], err });
-            continue;
-        };
-        defer shares.listing.deinit();
+    // All at once: a device that doesn't answer costs one timeout, not one
+    // each. The probes run on threads, so not in the request arena.
+    const probe_alloc = std.heap.smp_allocator;
+    const probed = try fs.remote.sharesOfAll(probe_alloc, bm, peers);
+    defer {
+        for (probed) |p| if (p.shares) |sh| sh.deinit(probe_alloc);
+        probe_alloc.free(probed);
+    }
+    for (probed) |probe| {
+        const peer = probe.peer;
+        const shares = probe.shares orelse continue;
         const list = try gpa.alloc(RemoteShare, shares.listing.entries.len);
         for (shares.listing.entries, list) |e, *o| {
             o.* = .{ .name = try gpa.dupe(u8, e.name), .cid = try hexAlloc(gpa, &e.cid), .size = e.size, .mtime = e.mtime };
@@ -767,7 +775,7 @@ pub fn remoteDevices(gpa: std.mem.Allocator) ![]RemoteDevice {
         try results.append(gpa, .{
             .peer = peer,
             .device_id = dev_id_opt,
-            .nickname = shares.nickname,
+            .nickname = try gpa.dupe(u8, shares.nickname),
             .shares = list,
             .trusted = is_trusted,
             .label = label,
@@ -830,9 +838,10 @@ pub const BrowseEntry = struct { name: []const u8, cid: []const u8, size: u64, m
 /// `invoke("browse", { peer, cid })`: lists a directory of a device's
 /// share. Only that directory's block is fetched.
 pub fn browse(gpa: std.mem.Allocator, args: BrowseArgs) ![]BrowseEntry {
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    var remote = try remoteFor(args.peer);
+    // Pinned, not g_mutex held: a slow device doesn't stall the app.
+    const handle = mediaAcquire() orelse return error.NotRunning;
+    defer mediaRelease();
+    var remote = try remoteFor(handle, args.peer);
     const cid = try parseHex32(args.cid);
     const listing = try fs.tree.listDir(gpa, remote.loader(), &cid);
     defer gpa.free(listing.entries);
@@ -843,34 +852,35 @@ pub fn browse(gpa: std.mem.Allocator, args: BrowseArgs) ![]BrowseEntry {
     return out;
 }
 
-pub const DownloadArgs = struct { peer: []const u8, cid: []const u8, name: []const u8 };
+pub const DownloadArgs = struct { peer: []const u8, cid: []const u8, name: []const u8, size: u64 };
 pub const DownloadResult = struct { path: []const u8, size: u64 };
 
 /// `invoke("download", { peer, cid, name })`: copies one file from a
 /// device's share into Downloads/NomadFS and returns where it landed.
 pub fn download(gpa: std.mem.Allocator, args: DownloadArgs) !DownloadResult {
     const source: nomadfs.Node.FileSource = .{ .share = .{ .peer = .{ .bytes = try parseHex32(args.peer) }, .cid = try parseHex32(args.cid) } };
-    return saveDownload(gpa, source, args.name);
+    return saveDownload(gpa, source, args.name, args.size);
 }
 
 /// Copies a file into Downloads/NomadFS under a name not taken yet.
-fn saveDownload(gpa: std.mem.Allocator, source: nomadfs.Node.FileSource, name: []const u8) !DownloadResult {
+/// The node is pinned, not g_mutex held: a download from a slow device
+/// doesn't stall the rest of the app.
+fn saveDownload(gpa: std.mem.Allocator, source: nomadfs.Node.FileSource, name: []const u8, size: u64) !DownloadResult {
     if (!nomadfs.storage.dag.codec.isValidName(name)) return error.InvalidName;
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    const node = runningNode() orelse return error.NotRunning;
+    const handle = mediaAcquire() orelse return error.NotRunning;
+    defer mediaRelease();
+    const node = &handle.node;
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try downloadsDir(gpa);
     defer gpa.free(dir);
     try std.Io.Dir.cwd().createDirPath(io, dir);
     const path = try uniquePath(gpa, dir, name);
     errdefer gpa.free(path);
-    return .{ .path = path, .size = try node.saveFile(gpa, source, path) };
+    return .{ .path = path, .size = try node.saveFile(gpa, source, path, size) };
 }
 
-/// Caller holds g_mutex.
-fn remoteFor(peer_hex: []const u8) !fs.Remote {
-    const handle = g_node orelse return error.NotRunning;
+/// `handle`: pinned (mediaAcquire) or under g_mutex.
+fn remoteFor(handle: *mobile.NodeHandle, peer_hex: []const u8) !fs.Remote {
     if (handle.node.store == null) return error.StorageDisabled;
     return .{ .block_manager = handle.node.block_manager, .peer = .{ .bytes = try parseHex32(peer_hex) } };
 }
@@ -929,9 +939,11 @@ pub fn readRange(gpa: std.mem.Allocator, args: ReadRangeArgs) ![]const u8 {
 /// Base64 bytes of a file, for previews.
 fn readBase64(gpa: std.mem.Allocator, source: nomadfs.Node.FileSource, offset: u64, len: u32) ![]const u8 {
     if (len == 0 or len > max_range_len) return error.InvalidArgument;
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    const node = runningNode() orelse return error.NotRunning;
+    // Pinned, not g_mutex held: a preview from a slow device doesn't stall
+    // the rest of the app.
+    const handle = mediaAcquire() orelse return error.NotRunning;
+    defer mediaRelease();
+    const node = &handle.node;
     const buf = try gpa.alloc(u8, len);
     defer gpa.free(buf);
     const n = try node.readFile(gpa, source, offset, buf);
@@ -1295,11 +1307,11 @@ pub fn swarmReadRange(gpa: std.mem.Allocator, args: SwarmRangeArgs) ![]const u8 
     return readBase64(gpa, .{ .swarm = .{ .cid = try parseHex32(args.cid), .author = try parseHex32(args.author_id) } }, args.offset, args.len);
 }
 
-pub const SwarmDownloadArgs = struct { cid: []const u8, author_id: []const u8, name: []const u8 };
+pub const SwarmDownloadArgs = struct { cid: []const u8, author_id: []const u8, name: []const u8, size: u64 };
 
 /// `swarm_download`: copies a swarm file into Downloads/NomadFS.
 pub fn swarmDownload(gpa: std.mem.Allocator, args: SwarmDownloadArgs) !DownloadResult {
-    return saveDownload(gpa, .{ .swarm = .{ .cid = try parseHex32(args.cid), .author = try parseHex32(args.author_id) } }, args.name);
+    return saveDownload(gpa, .{ .swarm = .{ .cid = try parseHex32(args.cid), .author = try parseHex32(args.author_id) } }, args.name, args.size);
 }
 
 // ---- Mounting (desktop Linux) ----

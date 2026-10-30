@@ -722,7 +722,7 @@ async function downloadFile(device, entry, btn) {
   if (btn) btn.classList.add("spin");
   snack(`Downloading ${entry.name} (${formatSize(entry.size)})…`, 60000);
   try {
-    const res = await invoke("download", { peer: device.peer, cid: entry.cid, name: entry.name });
+    const res = await invoke("download", { peer: device.peer, cid: entry.cid, name: entry.name, size: entry.size });
     savedSnack(res.path);
   } catch (err) {
     snack(`Download failed: ${err}`);
@@ -1201,7 +1201,7 @@ async function swarmDownload(it, btn) {
   if (btn) btn.classList.add("spin");
   snack(`Downloading ${it.name} (${formatSize(it.size)})…`, 60000);
   try {
-    const res = await invoke("swarm_download", { cid: it.cid, author_id: it.author_id, name: it.name });
+    const res = await invoke("swarm_download", { cid: it.cid, author_id: it.author_id, name: it.name, size: it.size });
     savedSnack(res.path);
   } catch (err) {
     snack(`${err}`.includes("BlockNotFound") || `${err}`.includes("AllAddressesFailed")

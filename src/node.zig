@@ -454,8 +454,10 @@ pub const Node = struct {
     }
 
     /// Copies a file to `path`, which must not exist (deleted again if the
-    /// copy fails). Returns its size.
-    pub fn saveFile(self: *Node, allocator: std.mem.Allocator, source: FileSource, path: []const u8) !u64 {
+    /// copy fails). Returns its size. `size` is what the listing says: a
+    /// peer's tree describing more (repeated leaves can describe terabytes)
+    /// fails with error.FileTooLarge instead of filling the disk.
+    pub fn saveFile(self: *Node, allocator: std.mem.Allocator, source: FileSource, path: []const u8, size: u64) !u64 {
         const io = std.Io.Threaded.global_single_threaded.io();
         var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
         defer file.close(io);
@@ -467,6 +469,7 @@ pub const Node = struct {
         while (true) {
             const n = try self.readFile(allocator, source, offset, chunk);
             if (n == 0) break;
+            if (offset + n > size) return error.FileTooLarge;
             try file.writePositionalAll(io, chunk[0..n], offset);
             offset += n;
         }

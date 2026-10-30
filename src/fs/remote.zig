@@ -158,6 +158,46 @@ pub fn readShareAt(
 }
 
 /// Every peer the routing table knows (caller frees).
+pub const Probed = struct {
+    peer: NodeID,
+    /// Null when the device didn't answer.
+    shares: ?Remote.Shares = null,
+};
+
+/// Devices asked at once by sharesOfAll.
+pub const max_parallel_probes = 16;
+
+/// Asks every peer what it shares, all at once (in rounds of
+/// max_parallel_probes threads), so devices that don't answer cost one
+/// timeout in all instead of one each. `allocator` must be thread-safe;
+/// free each `shares` with its deinit, and the slice.
+pub fn sharesOfAll(allocator: std.mem.Allocator, block_manager: *cluster.BlockManager, peers: []const NodeID) ![]Probed {
+    const out = try allocator.alloc(Probed, peers.len);
+    for (peers, out) |p, *o| o.* = .{ .peer = p };
+    const Probe = struct {
+        fn run(a: std.mem.Allocator, bm: *cluster.BlockManager, slot: *Probed) void {
+            var remote = Remote{ .block_manager = bm, .peer = slot.peer };
+            slot.shares = remote.shares(a) catch |err| blk: {
+                std.debug.print("shares: {x} unavailable: {any}\n", .{ slot.peer.bytes[0..4], err });
+                break :blk null;
+            };
+        }
+    };
+    var start: usize = 0;
+    while (start < out.len) : (start += max_parallel_probes) {
+        const round = out[start..@min(out.len, start + max_parallel_probes)];
+        var threads: [max_parallel_probes]?std.Thread = @splat(null);
+        for (round, 0..) |*slot, i| {
+            threads[i] = std.Thread.spawn(.{}, Probe.run, .{ allocator, block_manager, slot }) catch blk: {
+                Probe.run(allocator, block_manager, slot); // no thread: ask inline
+                break :blk null;
+            };
+        }
+        for (threads[0..round.len]) |t| if (t) |th| th.join();
+    }
+    return out;
+}
+
 pub fn knownPeers(block_manager: *cluster.BlockManager, allocator: std.mem.Allocator) ![]NodeID {
     const dht_node = block_manager.dht_node;
     dht_node.mutex.lock();
