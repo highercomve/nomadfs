@@ -710,122 +710,72 @@ pub fn remoteDevices(gpa: std.mem.Allocator) ![]RemoteDevice {
     if (handle.node.store == null) return error.StorageDisabled;
     const bm = handle.node.block_manager;
 
-    const peers = try fs.remote.knownPeers(bm, gpa);
-    defer gpa.free(peers);
+    const dev_list = try fs.remote.devices(gpa, bm, handle.node.trust_store);
+    defer fs.remote.deinitDevices(gpa, dev_list);
 
-    const ProbeResult = struct {
-        peer: NodeID,
-        device_id: ?NodeID,
-        nickname: []u8,
-        shares: []RemoteShare,
-        trusted: bool,
-        label: []const u8,
-        added_at: u64,
-    };
-
-    var results: std.ArrayList(ProbeResult) = .empty;
-    defer {
-        for (results.items) |r| {
-            gpa.free(r.nickname);
-            gpa.free(r.label);
-            for (r.shares) |s| {
+    const out = try gpa.alloc(RemoteDevice, dev_list.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |d| {
+            gpa.free(d.peer);
+            gpa.free(d.nickname);
+            gpa.free(d.device_id);
+            gpa.free(d.fingerprint);
+            gpa.free(d.label);
+            gpa.free(d.mount_name);
+            for (d.shares) |s| {
                 gpa.free(s.name);
                 gpa.free(s.cid);
             }
-            gpa.free(r.shares);
+            gpa.free(d.shares);
         }
-        results.deinit(gpa);
+        gpa.free(out);
     }
 
-    const trust_store = handle.node.trust_store;
-
-    // All at once: a device that doesn't answer costs one timeout, not one
-    // each. The probes run on threads, so not in the request arena.
-    const probe_alloc = std.heap.smp_allocator;
-    const probed = try fs.remote.sharesOfAll(probe_alloc, bm, peers);
-    defer {
-        for (probed) |p| if (p.shares) |sh| sh.deinit(probe_alloc);
-        probe_alloc.free(probed);
-    }
-    for (probed) |probe| {
-        const peer = probe.peer;
-        const shares = probe.shares orelse continue;
-        const list = try gpa.alloc(RemoteShare, shares.listing.entries.len);
-        for (shares.listing.entries, list) |e, *o| {
-            o.* = .{ .name = try gpa.dupe(u8, e.name), .cid = try hexAlloc(gpa, &e.cid), .size = e.size, .mtime = e.mtime };
-        }
-
-        const dev_id_opt = shares.device_id;
-        var is_trusted = false;
-        var label: []const u8 = try gpa.dupe(u8, "");
-        var added_at: u64 = 0;
-
-        if (dev_id_opt) |did| {
-            if (trust_store.lookup(did)) |entry| {
-                is_trusted = true;
-                gpa.free(label);
-                label = try gpa.dupe(u8, entry.labelSlice());
-                added_at = entry.added_at;
-            }
-        }
-
-        try results.append(gpa, .{
-            .peer = peer,
-            .device_id = dev_id_opt,
-            .nickname = try gpa.dupe(u8, shares.nickname),
-            .shares = list,
-            .trusted = is_trusted,
-            .label = label,
-            .added_at = added_at,
-        });
-    }
-
-    if (results.items.len == 0) {
-        return gpa.alloc(RemoteDevice, 0);
-    }
-
-    const assign_entries = try gpa.alloc(fs.device_names.Entry, results.items.len);
-    defer gpa.free(assign_entries);
-    const mount_names = try gpa.alloc([]u8, results.items.len);
-    defer gpa.free(mount_names);
-
-    for (results.items, 0..) |r, i| {
-        const id_bytes = if (r.device_id) |did| did.bytes else r.peer.bytes;
-        assign_entries[i] = .{
-            .device_id = id_bytes,
-            .trusted = if (r.trusted) .{ .label = r.label, .added_at = r.added_at } else null,
-            .nickname = r.nickname,
-        };
-    }
-
-    try fs.device_names.assign(gpa, assign_entries, mount_names);
-
-    const out = try gpa.alloc(RemoteDevice, results.items.len);
-    for (results.items, 0..) |r, i| {
-        const dev_id_bytes = if (r.device_id) |did| did.bytes else r.peer.bytes;
+    for (dev_list, out) |d, *o| {
+        const id_bytes = if (d.device_id) |did| did.bytes else d.peer.bytes;
         var fp_buf: [19]u8 = undefined;
-        const fp_str = if (r.device_id != null)
-            Identity.formatFingerprint(dev_id_bytes[0..8].*, &fp_buf)
+        const fp_str = if (d.device_id != null)
+            Identity.formatFingerprint(id_bytes[0..8].*, &fp_buf)
         else
             "";
-        const dev_id_hex = if (r.device_id != null)
-            try hexAlloc(gpa, &dev_id_bytes)
+        const dev_id_hex = if (d.device_id != null)
+            try hexAlloc(gpa, &id_bytes)
         else
             try gpa.dupe(u8, "");
 
-        out[i] = .{
-            .peer = try hexAlloc(gpa, &r.peer.bytes),
-            .nickname = r.nickname,
-            .shares = r.shares,
+        const shares = try gpa.alloc(RemoteShare, d.shares.len);
+        var shares_built: usize = 0;
+        errdefer {
+            for (shares[0..shares_built]) |s| {
+                gpa.free(s.name);
+                gpa.free(s.cid);
+            }
+            gpa.free(shares);
+        }
+        for (d.shares, shares) |s, *os| {
+            os.* = .{
+                .name = try gpa.dupe(u8, s.name),
+                .cid = try hexAlloc(gpa, &s.cid),
+                .size = s.size,
+                .mtime = s.mtime,
+            };
+            shares_built += 1;
+        }
+
+        o.* = .{
+            .peer = try hexAlloc(gpa, &d.peer.bytes),
+            .nickname = try gpa.dupe(u8, d.nickname),
+            .shares = shares,
             .device_id = dev_id_hex,
             .fingerprint = try gpa.dupe(u8, fp_str),
-            .trusted = r.trusted,
-            .label = r.label,
-            .mount_name = mount_names[i],
+            .trusted = d.trusted,
+            .label = try gpa.dupe(u8, d.label),
+            .mount_name = try gpa.dupe(u8, d.mount_name),
         };
+        built += 1;
     }
 
-    results.items.len = 0;
     return out;
 }
 

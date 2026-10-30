@@ -12,6 +12,8 @@ const storage = @import("../storage/mod.zig");
 const sync = @import("../sync.zig");
 const tree = @import("tree.zig");
 const readahead_mod = @import("readahead.zig");
+const device_trust = @import("../device/trust.zig");
+const device_names = @import("device_names.zig");
 
 /// A tree.Loader over the cluster layer's fetcher (cluster/fetcher.zig):
 /// the blocks of the file `root` from `holders`, best first. This module
@@ -182,4 +184,142 @@ pub fn knownPeers(block_manager: *cluster.BlockManager, allocator: std.mem.Alloc
     const ids = try allocator.alloc(NodeID, peers.len);
     for (peers, ids) |p, *out| out.* = p.id;
     return ids;
+}
+
+
+pub const DeviceShare = struct {
+    name: []const u8,
+    cid: [32]u8,
+    size: u64,
+    mtime: u64,
+};
+
+pub const Device = struct {
+    peer: NodeID,
+    device_id: ?NodeID,
+    nickname: []const u8,
+    shares: []DeviceShare,
+    trusted: bool,
+    label: []const u8,
+    mount_name: []const u8,
+
+    pub fn deinit(self: Device, allocator: std.mem.Allocator) void {
+        allocator.free(self.nickname);
+        allocator.free(self.label);
+        allocator.free(self.mount_name);
+        for (self.shares) |s| allocator.free(s.name);
+        allocator.free(self.shares);
+    }
+};
+
+pub fn deinitDevices(allocator: std.mem.Allocator, list: []Device) void {
+    for (list) |d| d.deinit(allocator);
+    allocator.free(list);
+}
+
+/// Discovers reachable peers, asks what they share in parallel, looks up their
+/// trust status, and assigns collision-free mount folder names.
+pub fn devices(
+    allocator: std.mem.Allocator,
+    block_manager: *cluster.BlockManager,
+    trust_store: ?*device_trust.Store,
+) ![]Device {
+    const peers = try knownPeers(block_manager, allocator);
+    defer allocator.free(peers);
+
+    const probe_alloc = std.heap.smp_allocator;
+    const probed = try sharesOfAll(probe_alloc, block_manager, peers);
+    defer {
+        for (probed) |p| if (p.shares) |sh| sh.deinit(probe_alloc);
+        probe_alloc.free(probed);
+    }
+
+    var answering_count: usize = 0;
+    for (probed) |p| {
+        if (p.shares != null) answering_count += 1;
+    }
+    if (answering_count == 0) return allocator.alloc(Device, 0);
+
+    const assign_entries = try allocator.alloc(device_names.Entry, answering_count);
+    defer allocator.free(assign_entries);
+    const mount_names = try allocator.alloc([]u8, answering_count);
+    defer allocator.free(mount_names);
+
+    var idx: usize = 0;
+    for (probed) |probe| {
+        const shares_val = probe.shares orelse continue;
+        const dev_id_bytes = if (shares_val.device_id) |did| did.bytes else probe.peer.bytes;
+        var trusted_info: ?device_names.TrustedInfo = null;
+        if (shares_val.device_id) |did| {
+            if (trust_store) |ts| {
+                if (ts.lookup(did)) |entry| {
+                    trusted_info = .{
+                        .label = entry.labelSlice(),
+                        .added_at = entry.added_at,
+                    };
+                }
+            }
+        }
+        assign_entries[idx] = .{
+            .device_id = dev_id_bytes,
+            .trusted = trusted_info,
+            .nickname = shares_val.nickname,
+        };
+        idx += 1;
+    }
+
+    try device_names.assign(allocator, assign_entries, mount_names);
+
+    const out = try allocator.alloc(Device, answering_count);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |d| d.deinit(allocator);
+        allocator.free(out);
+        for (mount_names[built..]) |m| allocator.free(m);
+    }
+
+    idx = 0;
+    for (probed) |probe| {
+        const shares_val = probe.shares orelse continue;
+        const list = try allocator.alloc(DeviceShare, shares_val.listing.entries.len);
+        var shares_built: usize = 0;
+        errdefer {
+            for (list[0..shares_built]) |s| allocator.free(s.name);
+            allocator.free(list);
+        }
+        for (shares_val.listing.entries, list) |e, *s| {
+            s.* = .{
+                .name = try allocator.dupe(u8, e.name),
+                .cid = e.cid,
+                .size = e.size,
+                .mtime = e.mtime,
+            };
+            shares_built += 1;
+        }
+
+        var is_trusted = false;
+        var label: []const u8 = "";
+        if (shares_val.device_id) |did| {
+            if (trust_store) |ts| {
+                if (ts.lookup(did)) |entry| {
+                    is_trusted = true;
+                    label = entry.labelSlice();
+                }
+            }
+        }
+
+        out[built] = .{
+            .peer = probe.peer,
+            .device_id = shares_val.device_id,
+            .nickname = try allocator.dupe(u8, shares_val.nickname),
+            .shares = list,
+            .trusted = is_trusted,
+            .label = try allocator.dupe(u8, label),
+            .mount_name = mount_names[idx],
+        };
+        built += 1;
+        idx += 1;
+    }
+
+    return out;
 }
