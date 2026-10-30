@@ -2258,7 +2258,7 @@ function renderBackup(st) {
   // The copies settings are for every device; backing up all of it, for desktops.
   $("backup-section").hidden = false;
   $("swarm-backup-row").hidden = !st.supported;
-  $("swarm-replicas").value = String(Math.min(Math.max(st.replicas ?? 1, 1), 4));
+  $("swarm-copies").value = String(Math.min(Math.max(st.copies ?? 1, 1), 4));
   $("accept-copies").checked = !!st.accept_copies;
   $("copies-state").textContent = st.accept_copies
     ? (st.kept_copies ? `Keeps ${st.kept_copies} file${st.kept_copies === 1 ? "" : "s"} for other devices.` : "")
@@ -2290,11 +2290,11 @@ $("swarm-backup").addEventListener("change", async (e) => {
   }
 });
 
-$("swarm-replicas").addEventListener("change", async (e) => {
-  const replicas = Number(e.target.value);
+$("swarm-copies").addEventListener("change", async (e) => {
+  const copies = Number(e.target.value);
   try {
-    renderBackup(await invoke("swarm_replicas_set", { config_path: await ensureConfig(), replicas }));
-    snack(replicas === 1 ? "Each swarm file stays where it was added (and on backup devices)" : `Each swarm file is kept on ${replicas} devices`);
+    renderBackup(await invoke("swarm_copies_set", { config_path: await ensureConfig(), copies }));
+    snack(copies === 1 ? "Each swarm file stays where it was added (and on backup devices)" : `Each swarm file is kept on ${copies} devices`);
   } catch (err) {
     snack(`Couldn't change it: ${err}`);
     loadBackup();
@@ -2746,7 +2746,7 @@ async function openDeviceInfo(title, peer) {
   stat(i.cache_limit ? `${formatSize(i.cache_bytes)} / ${formatSize(i.cache_limit)}` : formatSize(i.cache_bytes), "read cache");
   if (i.quota) stat(formatSize(i.quota), "quota for others' blocks");
   section("Storage", ...storageNodes, stats,
-    el("p", "", "Kept blocks are what the device wrote, backs up or holds as replicas; the read cache holds what it opened from others and makes room by itself."));
+    el("p", "", "Kept blocks are what the device wrote, backs up or holds as copies; the read cache holds what it opened from others and makes room by itself."));
 
   // Swarm and network
   const net = el("div", "dt-stats");

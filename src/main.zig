@@ -6,8 +6,6 @@ const device = nomadfs.device;
 const Identity = device.identity.Identity;
 const Ticket = device.pairing.Ticket;
 
-/// Pairing tickets are short-lived on purpose: the transport key inside them
-/// rotates, and an old QR code should not grant access forever.
 const Command = enum { run, pair, trust, devices, revoke, mount, invite, join, cache, clear_cache, bench_read, bench_idle };
 
 const Options = struct {
@@ -20,9 +18,9 @@ const Options = struct {
     mountpoint: ?[]const u8 = null,
     /// --share Name:/path, added to the configured shares.
     shares: std.ArrayList([]const u8) = .empty,
-    /// --swarm-backup: keep a copy of the whole swarm folder.
-    /// --swarm-replicas <N>: push new/updated swarm folder files to N peers.
+    /// --copies <N>: the swarm's copies setting, signed into its policy.
     copies: ?u8 = null,
+    /// --swarm-backup: keep a copy of the whole swarm folder.
     swarm_backup: bool = false,
     bench_read_path: ?[]const u8 = null,
     bench_wait_seconds: u32 = 30,
@@ -595,7 +593,7 @@ fn benchReadCommand(allocator: std.mem.Allocator, config: config_mod.Config, raw
     var path = raw_path;
     while (path.len > 0 and path[0] == '/') path = path[1..];
     swarm.mutex.lock();
-    const entry_opt = if (swarm.manifest.get(path)) |e| if (!e.deleted and e.kind == .file) e else null else null;
+    const entry_opt = swarm.fileInfo(path);
     swarm.mutex.unlock();
     const entry = entry_opt orelse {
         std.debug.print("Error: swarm entry '{s}' not found\n", .{raw_path});
@@ -605,7 +603,7 @@ fn benchReadCommand(allocator: std.mem.Allocator, config: config_mod.Config, raw
     // A device behind NAT is reached only once it connects to this one
     // (a relay in the cloud): wait for the author, so the clock times the
     // read, not the reconnection.
-    const author: nomadfs.net.id.NodeID = .{ .bytes = entry.version.device };
+    const author: nomadfs.net.id.NodeID = .{ .bytes = entry.author };
     const connect_deadline = nomadfs.sync.monotonicMillis() + @as(i64, wait_seconds) * std.time.ms_per_s;
     while (nomadfs.sync.monotonicMillis() < connect_deadline) {
         if (node.connection_manager.existingConnection(author)) |conn| {
@@ -637,7 +635,7 @@ fn benchReadCommand(allocator: std.mem.Allocator, config: config_mod.Config, raw
 
     const io = std.Io.Threaded.global_single_threaded.io();
     const t0 = std.Io.Clock.awake.now(io).nanoseconds;
-    const source: nomadfs.Node.FileSource = .{ .swarm = .{ .cid = entry.cid, .author = entry.version.device } };
+    const source: nomadfs.Node.FileSource = .{ .swarm = .{ .cid = entry.cid, .author = entry.author } };
     var offset: u64 = 0;
     while (offset < entry.size) {
         const to_read = @min(@as(u64, chunk_size), entry.size - offset);

@@ -1,11 +1,11 @@
 //! NomadFS commands for the Oriel page.
 //!
-//! One global node handle backs every command: the desktop app runs at
-//! most one node per process, with the same lifecycle the CLI exposes.
-//! The heavy lifting lives in the core (`nomadfs` module); the C ABI
-//! surface in `src/mobile/api.zig` is reused verbatim on Linux by marking
-//! its exports `pub`, so the GUI, the mobile bindings and the CLI all
-//! exercise the same runner.
+//! One global node handle backs every command: the app runs at most one
+//! node per process. Each command parses the page's arguments, calls the
+//! core service for the feature (settings, membership, Node's file and
+//! backup services, fs.remote), and shapes the answer for the page; the
+//! node itself is created through the C ABI in `src/mobile/api.zig`, as
+//! on the phones.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -505,19 +505,6 @@ pub fn trustDevice(gpa: std.mem.Allocator, args: TrustDeviceArgs) !void {
     };
 }
 
-/// A newer ticket for the device is already pinned: tell the page, which
-/// asks for a fresh ticket instead of overwriting the newer pin.
-fn staleTicket(err: anyerror) anyerror {
-    return if (err == error.StaleTicket) error.TicketStale else err;
-}
-
-/// This device's Ed25519 identity, as the ticket emitter uses it.
-fn deviceIdentity(gpa: std.mem.Allocator, key_path: ?[]const u8) !Identity {
-    var paths = try DevicePaths.resolve(gpa, key_path);
-    defer paths.deinit(gpa);
-    return Identity.loadOrCreate(paths.identity);
-}
-
 /// `invoke("revoke_device", { config_path, query })`.
 pub fn revokeDevice(gpa: std.mem.Allocator, args: RevokeDeviceArgs) !void {
     var m = try membershipFor(gpa, args.config_path);
@@ -957,14 +944,14 @@ pub const BackupInfo = struct {
     unreachable_files: usize = 0,
     last_round: u64 = 0,
     /// The swarm's copies setting (device/policy.zig).
-    replicas: u8 = 1,
+    copies: u8 = 1,
     /// This device keeps copies of other devices' files.
     accept_copies: bool = true,
     /// Files it keeps for others (backup or placement).
     kept_copies: usize = 0,
 };
 
-pub const SwarmReplicasArgs = struct { config_path: []const u8, replicas: u8 };
+pub const SwarmCopiesArgs = struct { config_path: []const u8, copies: u8 };
 pub const AcceptCopiesArgs = struct { config_path: []const u8, on: bool };
 
 const backup_supported = !builtin.abi.isAndroid();
@@ -982,7 +969,7 @@ pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
             const policy = handle.node.policy;
             const reps = policy.copies();
             const accept = policy.acceptsCopies(handle.node.device_identity.deviceId());
-            if (!backup_supported) return .{ .supported = false, .enabled = false, .running = true, .replicas = reps, .accept_copies = accept, .kept_copies = st.backed_up };
+            if (!backup_supported) return .{ .supported = false, .enabled = false, .running = true, .copies = reps, .accept_copies = accept, .kept_copies = st.backed_up };
             return .{
                 .supported = true,
                 .accept_copies = accept,
@@ -994,7 +981,7 @@ pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
                 .bytes = st.bytes,
                 .unreachable_files = st.unreachable_files,
                 .last_round = st.last_round,
-                .replicas = reps,
+                .copies = reps,
             };
         } else |_| {}
     }
@@ -1015,13 +1002,13 @@ pub fn swarmBackupSet(gpa: std.mem.Allocator, args: BackupArgs) !BackupInfo {
     return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
 }
 
-/// `swarm_replicas_set { config_path, replicas }`: the swarm's `copies`,
+/// `swarm_copies_set { config_path, copies }`: the swarm's `copies`,
 /// signed by this device and spread to the others (device/policy.zig).
-pub fn swarmReplicasSet(gpa: std.mem.Allocator, args: SwarmReplicasArgs) !BackupInfo {
+pub fn swarmCopiesSet(gpa: std.mem.Allocator, args: SwarmCopiesArgs) !BackupInfo {
     {
         g_mutex.lock();
         defer g_mutex.unlock();
-        try nomadfs.settings.copies(runningNode() orelse return error.NotRunning, args.replicas);
+        try nomadfs.settings.copies(runningNode() orelse return error.NotRunning, args.copies);
     }
     return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
 }
