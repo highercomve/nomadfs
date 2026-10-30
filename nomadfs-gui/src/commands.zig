@@ -423,9 +423,6 @@ pub fn pairTicket(gpa: std.mem.Allocator, args: PairTicketArgs) !PairTicketResul
     };
 }
 
-/// The membership service (device/membership.zig): the running node's, so
-/// a change takes effect in the node at once, else one opened from the
-/// configuration. `done` closes what was opened.
 /// The running node, for services that act on it when there is one.
 /// Caller holds g_mutex.
 fn runningNode() ?*nomadfs.Node {
@@ -433,6 +430,9 @@ fn runningNode() ?*nomadfs.Node {
     return &handle.node;
 }
 
+/// The membership service (device/membership.zig): the running node's, so
+/// a change takes effect in the node at once, else one opened from the
+/// configuration. `done` closes what was opened.
 const MembershipRef = struct {
     service: *Membership,
     opened: ?*Membership = null,
@@ -1711,36 +1711,25 @@ fn rememberAddresses(gpa: std.mem.Allocator, config_path: []const u8, ticket: *c
 pub const InviteAcceptArgs = struct { config_path: []const u8, code: []const u8 };
 
 /// `invite_accept { config_path, code }`: joins the inviting device's
-/// swarm through the one-time exchange, trusts it, remembers its address
-/// and restarts the node with the new swarm key.
+/// swarm through the one-time exchange (settings.joinSwarm: trusts it,
+/// saves the swarm key and its address) and restarts the node on them.
 pub fn inviteAccept(gpa: std.mem.Allocator, args: InviteAcceptArgs) ![]const u8 {
     var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
-    const port = config.network.port;
-    const identity = deviceIdentity(gpa, config.node.key_path) catch |err| {
-        config.deinit(gpa);
-        return err;
-    };
-    config.deinit(gpa);
-
-    const my_addr = try myAddresses(gpa, port);
+    defer config.deinit(gpa);
+    const my_addr = try myAddresses(gpa, config.network.port);
     defer gpa.free(my_addr);
-    const mine = try pairTicket(gpa, .{ .config_path = args.config_path, .address = my_addr });
 
-    var joined = try invite.join(gpa, args.code, mine.uri, identity);
-    defer joined.deinit(gpa);
-
+    // The node restarts on the new key anyway; closed meanwhile, the
+    // exchange holds no lock other commands need.
     const was_running = isRunning();
     if (was_running) nodeClose();
-    try config_file.setSwarmKey(gpa, args.config_path, joined.swarm_key, 0);
-    const url = try std.fmt.allocPrint(gpa, "tcp://{s}:{d}", .{ joined.host_ip, joined.node_port });
-    defer gpa.free(url);
-    try config_file.addBootstrapPeers(gpa, args.config_path, &.{url});
-    trustDevice(gpa, .{ .config_path = args.config_path, .uri = joined.ticket_uri }) catch |err|
-        std.debug.print("invite: trusting the inviter failed: {any}\n", .{err});
-    if (was_running) try nodeOpen(gpa, .{ .config_path = args.config_path });
+    defer if (was_running) nodeOpen(gpa, .{ .config_path = args.config_path }) catch |err|
+        std.debug.print("invite: restarting the node failed: {any}\n", .{err});
 
-    const ticket = Ticket.parseAt(joined.ticket_uri, nomadfs.nowSeconds()) catch return gpa.dupe(u8, "");
-    return gpa.dupe(u8, ticket.nicknameSlice());
+    var membership = try Membership.open(gpa, config);
+    defer membership.close();
+    const joined = try nomadfs.settings.joinSwarm(gpa, args.config_path, &membership, args.code, my_addr, nomadfs.nowSeconds());
+    return gpa.dupe(u8, joined.inviter.nicknameSlice());
 }
 
 // ---- Swarm key rotation ----

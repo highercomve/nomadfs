@@ -135,6 +135,41 @@ pub const Membership = struct {
         return added;
     }
 
+    pub const Joined = struct {
+        /// The inviting device, now trusted here.
+        inviter: Ticket,
+        swarm_key: [32]u8,
+        /// Where the inviter's node listens: `tcp://ip:port`.
+        peer_buf: [64]u8 = undefined,
+        peer_len: u8 = 0,
+
+        pub fn peer(self: *const Joined) []const u8 {
+            return self.peer_buf[0..self.peer_len];
+        }
+    };
+
+    /// Joins the swarm of the device that showed invite `code`: presents this
+    /// device's ticket (listing `addresses`), receives the swarm key over the
+    /// one-time exchange, and trusts the inviter. The caller saves the key
+    /// and the peer (settings.joinSwarm) and restarts the node on them.
+    pub fn join(self: *Membership, code: []const u8, addresses: []const u8, now: u64) !Joined {
+        const mine = try self.ticket(addresses, now);
+        var uri_buf: [pairing.max_uri_len]u8 = undefined;
+        var joined = try invite.join(self.allocator, code, try mine.toUri(&uri_buf), self.identity);
+        defer joined.deinit(self.allocator);
+
+        var out: Joined = .{ .inviter = undefined, .swarm_key = joined.swarm_key };
+        errdefer std.crypto.secureZero(u8, &out.swarm_key);
+        const peer = try std.fmt.bufPrint(&out.peer_buf, "tcp://{s}:{d}", .{ joined.host_ip, joined.node_port });
+        out.peer_len = @intCast(peer.len);
+        out.inviter = (self.trustUri(joined.ticket_uri, now) catch |err| switch (err) {
+            // Trusted already, with a newer ticket: nothing to add.
+            error.StaleTicket => Trusted{ .ticket = try Ticket.parseAt(joined.ticket_uri, now), .added = false },
+            else => return err,
+        }).ticket;
+        return out;
+    }
+
     pub const Revoked = struct { device: NodeID, removed: bool };
 
     /// Revokes the device `query` names (a device ID or fingerprint, as the

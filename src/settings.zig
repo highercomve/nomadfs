@@ -31,6 +31,22 @@ pub fn copies(node: *Node, n: u8) !void {
     try node.setCopies(n);
 }
 
+// ---- Joining a swarm ----
+
+const Membership = @import("device/membership.zig").Membership;
+
+/// Joins another device's swarm with its invite code (device/membership.zig)
+/// and saves the swarm key and the inviter's address. The node must be
+/// (re)started on the config afterwards: the swarm key is fixed for a run.
+pub fn joinSwarm(allocator: std.mem.Allocator, config_path: []const u8, membership: *Membership, code: []const u8, addresses: []const u8, now: u64) !Membership.Joined {
+    var joined = try membership.join(code, addresses, now);
+    errdefer std.crypto.secureZero(u8, &joined.swarm_key);
+    try config_file.setSwarmKey(allocator, config_path, joined.swarm_key, 0);
+    try config_file.addBootstrapPeers(allocator, config_path, &.{joined.peer()});
+    std.crypto.secureZero(u8, &joined.swarm_key);
+    return joined;
+}
+
 // ---- Shared folders ----
 
 /// Shares a folder, saved in the config (`share = "Name:/path"`) and, with a

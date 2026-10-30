@@ -8,7 +8,7 @@ const Ticket = device.pairing.Ticket;
 
 /// Pairing tickets are short-lived on purpose: the transport key inside them
 /// rotates, and an old QR code should not grant access forever.
-const Command = enum { run, pair, trust, devices, revoke, mount, invite, cache, clear_cache, bench_read, bench_idle };
+const Command = enum { run, pair, trust, devices, revoke, mount, invite, join, cache, clear_cache, bench_read, bench_idle };
 
 const Options = struct {
     command: Command = .run,
@@ -16,6 +16,7 @@ const Options = struct {
     address: ?[]const u8 = null,
     trust_uri: ?[]const u8 = null,
     revoke_query: ?[]const u8 = null,
+    join_code: ?[]const u8 = null,
     mountpoint: ?[]const u8 = null,
     /// --share Name:/path, added to the configured shares.
     shares: std.ArrayList([]const u8) = .empty,
@@ -62,6 +63,7 @@ pub fn main(init: std.process.Init) !void {
         .run => try runNode(allocator, config),
         .mount => try mountCommand(allocator, config, options.mountpoint.?),
         .invite => try inviteCommand(allocator, config, options.address),
+        .join => try joinCommand(allocator, config, options.config_path, options.join_code.?, options.address),
         .cache => try cacheCommand(allocator, config, false),
         .clear_cache => try cacheCommand(allocator, config, true),
         .bench_read => try benchReadCommand(allocator, config, options.bench_read_path.?, options.bench_wait_seconds, options.bench_cold),
@@ -91,6 +93,9 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Optio
             options.revoke_query = try nextValue(args, &i, "--revoke");
         } else if (std.mem.eql(u8, arg, "--invite")) {
             try selectCommand(options, .invite);
+        } else if (std.mem.eql(u8, arg, "--join")) {
+            try selectCommand(options, .join);
+            options.join_code = try nextValue(args, &i, "--join");
         } else if (std.mem.eql(u8, arg, "--cache")) {
             try selectCommand(options, .cache);
         } else if (std.mem.eql(u8, arg, "--clear-cache")) {
@@ -142,8 +147,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Optio
         }
     }
 
-    if (options.address != null and options.command != .pair and options.command != .invite) {
-        std.debug.print("Error: --address is only valid with --pair or --invite\n", .{});
+    if (options.address != null and options.command != .pair and options.command != .invite and options.command != .join) {
+        std.debug.print("Error: --address is only valid with --pair, --invite or --join\n", .{});
         std.process.exit(1);
     }
     return true;
@@ -205,6 +210,9 @@ fn printHelp() void {
         \\  --invite           Print a one-time invite code (10 min, one use) that
         \\                     lets another device join this swarm; the swarm key
         \\                     travels encrypted and is never shown
+        \\  --join <code>      Join the swarm of the device showing this invite code:
+        \\                     trusts it and saves the swarm key and its address
+        \\                     in the config (restart a running node afterwards)
         \\  --mount <dir>      Run the node and mount every device's shares at
         \\                     <dir>/<device>/<share>, read-only; files download
         \\                     on demand (Linux, needs fusermount3)
@@ -362,6 +370,30 @@ fn inviteCommand(allocator: std.mem.Allocator, config: config_mod.Config, addres
             },
         }
     }
+}
+
+fn joinCommand(allocator: std.mem.Allocator, config: config_mod.Config, config_path: ?[]const u8, code: []const u8, address: ?[]const u8) !void {
+    const path = config_path orelse {
+        std.debug.print("Error: --join needs --config <file> to save the swarm key in\n", .{});
+        std.process.exit(1);
+    };
+    var ip_buf: [16]u8 = undefined;
+    const ip = address orelse device.invite.lanAddress(&ip_buf) orelse "127.0.0.1";
+    var addr_buf: [64]u8 = undefined;
+    const node_addr = try std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ ip, config.network.port });
+
+    var membership = try device.membership.Membership.open(allocator, config);
+    defer membership.close();
+    const joined = nomadfs.settings.joinSwarm(allocator, path, &membership, code, node_addr, nowSeconds()) catch |err| {
+        std.debug.print("Error: joining failed: {any}\n", .{err});
+        return err;
+    };
+    var fp_buf: [19]u8 = undefined;
+    std.debug.print("Joined the swarm of {s} ({s}) at {s}; it is now trusted.\nRestart the node to use the new swarm key.\n", .{
+        joined.inviter.nicknameSlice(),
+        Identity.formatFingerprint(joined.inviter.fingerprint(), &fp_buf),
+        joined.peer(),
+    });
 }
 
 fn pairCommand(allocator: std.mem.Allocator, config: config_mod.Config, address: ?[]const u8) !void {
