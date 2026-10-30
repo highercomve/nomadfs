@@ -40,6 +40,9 @@ pub fn main(init: std.process.Init) !void {
     var options: Options = .{};
     if (!try parseArgs(init.arena.allocator(), args, &options)) return;
 
+    // The file found when none is given: commands that save to it (--join,
+    // --invite, a rotated key) need to know which.
+    if (options.config_path == null) options.config_path = config_mod.findConfigPath(init.arena.allocator()) catch null;
     var config = loadConfig(allocator, options.config_path) catch |err| {
         std.debug.print("Error: could not load configuration: {any}\n", .{err});
         std.process.exit(1);
@@ -291,7 +294,8 @@ fn runOnce(allocator: std.mem.Allocator, config: config_mod.Config, config_path:
 
     var node = try startNode(allocator, config);
     defer node.deinit();
-    // Without --config there is no file to save a rotated key in.
+    // Without a config file (none given, none found) there's nowhere to
+    // save a rotated key.
     if (config_path) |path| try rotation.watch(&node, path);
 
     std.debug.print("Node Initialized. Local ID: {x}\n", .{node.connection_manager.node_id.bytes});
@@ -420,7 +424,7 @@ fn inviteCommand(allocator: std.mem.Allocator, config: config_mod.Config, config
 
 fn joinCommand(allocator: std.mem.Allocator, config: config_mod.Config, config_path: ?[]const u8, code: []const u8, address: ?[]const u8) !void {
     const path = config_path orelse {
-        std.debug.print("Error: --join needs --config <file> to save the swarm key in\n", .{});
+        std.debug.print("Error: no configuration file to save the swarm key in; use --config <file>\n", .{});
         std.process.exit(1);
     };
     var ip_buf: [16]u8 = undefined;

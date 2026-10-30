@@ -344,42 +344,28 @@ fn appendBootstrapPeers(allocator: std.mem.Allocator, list: *std.ArrayListUnmana
 }
 
 pub fn findAndParseConfig(allocator: std.mem.Allocator) !Config {
-    // 1. Current working directory
-    if (parseConfig(allocator, "nomadfs.conf")) |cfg| {
-        return cfg;
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
+    const path = try findConfigPath(allocator);
+    defer allocator.free(path);
+    return parseConfig(allocator, path);
+}
 
-    // 2. Home directory: ~/.nomadfs/nomadfs.conf
+/// The configuration file used when none is given, the first that exists
+/// of: ./nomadfs.conf, ~/.nomadfs/nomadfs.conf, /etc/nomadfs/nomadfs.conf,
+/// /usr/share/nomadfs/nomadfs.conf. Caller frees.
+pub fn findConfigPath(allocator: std.mem.Allocator) ![]u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.statFile(io, "nomadfs.conf", .{})) |_| return allocator.dupe(u8, "nomadfs.conf") else |_| {}
     const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
     if (env_mod.getEnv(allocator, home_env)) |home| {
         defer allocator.free(home);
         const path = try std.fs.path.join(allocator, &.{ home, ".nomadfs", "nomadfs.conf" });
-        defer allocator.free(path);
-        if (parseConfig(allocator, path)) |cfg| {
-            return cfg;
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        }
+        if (cwd.statFile(io, path, .{})) |_| return path else |_| allocator.free(path);
     }
-
-    // 3. System-wide standard: /etc/nomadfs/nomadfs.conf
-    if (parseConfig(allocator, "/etc/nomadfs/nomadfs.conf")) |cfg| {
-        return cfg;
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
+    for ([_][]const u8{ "/etc/nomadfs/nomadfs.conf", "/usr/share/nomadfs/nomadfs.conf" }) |p| {
+        if (cwd.statFile(io, p, .{})) |_| return allocator.dupe(u8, p) else |_| {}
     }
-
-    // 4. System-wide: /usr/share/nomadfs/nomadfs.conf
-    if (parseConfig(allocator, "/usr/share/nomadfs/nomadfs.conf")) |cfg| {
-        return cfg;
-    } else |err| {
-        return err;
-    }
+    return error.FileNotFound;
 }
 
 test "parseConfigText parses all fields" {
