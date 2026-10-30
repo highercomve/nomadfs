@@ -16,6 +16,8 @@
 				<a href="$site.page('docs/connecting-devices').link()">Connecting devices</a>
 				<h4>Under the hood</h4>
 				<a href="$site.page('docs/how-it-works').link()">How it works</a>
+				<h4>About</h4>
+				<a href="$site.page('privacy').link()">Privacy policy</a>
 			</nav>
 		</aside>
 		<main class="doc">

@@ -2447,6 +2447,10 @@ async function checkUpdate(quiet) {
   renderUpdate("Checking for updates…");
   try {
     upd.info ||= await invoke("update_info", null);
+    if (upd.info.mode === "store") {
+      renderUpdate(`NomadFS ${upd.info.current}. Google Play keeps it up to date.`);
+      return;
+    }
     const r = await invoke("updater_check", null);
     upd.version = r.available ? r.version : null;
     renderUpdate(upd.version

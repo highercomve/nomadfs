@@ -5,7 +5,8 @@
 //!
 //! - AppImage (Linux): downloads the new AppImage, swaps it in, restarts.
 //! - Android: the APK isn't replaced by the app; the page opens the new
-//!   APK's download in the browser, which installs it.
+//!   APK's download in the browser, which installs it. The Google Play
+//!   build (`-Dplay-store=true`) checks nothing: Play updates it.
 //! - deb, rpm or a copy built from source: the package manager or the
 //!   user updates it; the page links the release.
 
@@ -35,7 +36,8 @@ pub const Updater = oriel.updater.Commands(.{
 pub const Info = struct {
     /// "install": updates itself (AppImage). "download": the page opens
     /// the new APK. "manual": updated outside the app (deb, rpm, a build
-    /// from source); the page links the release.
+    /// from source); the page links the release. "store": Google Play
+    /// updates it; the page doesn't check.
     mode: []const u8,
     current: []const u8,
     /// The release page, for "manual".
@@ -46,7 +48,9 @@ pub const Info = struct {
 
 /// `invoke("update_info")`: how this copy updates.
 pub fn info(gpa: std.mem.Allocator, io: std.Io) Info {
-    const mode = if (is_android)
+    const mode = if (is_android and about.play_store)
+        "store"
+    else if (is_android)
         "download"
     else if (builtin.os.tag == .linux and (oriel.updater.runningAsAppImage(io, gpa) catch false))
         "install"

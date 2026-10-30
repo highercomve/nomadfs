@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="500" viewBox="0 0 1024 500">
+<defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0b0e16"/><stop offset="1" stop-color="#1a2131"/></linearGradient></defs>
+<rect width="1024" height="500" fill="url(#bg)"/>
+<path d="M0 410 Q 256 370 512 400 T 1024 380" fill="none" stroke="#2a3346" stroke-width="2"/>
+<path d="M0 440 Q 300 405 560 432 T 1024 418" fill="none" stroke="#232b3c" stroke-width="2"/>
+<g transform="translate(64 70) scale(1.1)">
+  
+  <defs>
+    <linearGradient id="d-dune" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F6B042"/>
+      <stop offset="1" stop-color="#E8833A"/>
+    </linearGradient>
+    <linearGradient id="d-oasis" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5CE1E6"/>
+      <stop offset="1" stop-color="#2EC4B6"/>
+    </linearGradient>
+  </defs>
+  <!-- Subtle orbital roaming paths -->
+  <path d="M 30 36 Q 64 16 98 36" fill="none" stroke="#2EC4B6" stroke-width="4.5" stroke-linecap="round" stroke-dasharray="6 8" opacity="0.85"/>
+  <path d="M 30 92 Q 64 112 98 92" fill="none" stroke="#2EC4B6" stroke-width="4.5" stroke-linecap="round" stroke-dasharray="6 8" opacity="0.85"/>
+  <!-- Vertical device pillars (left & right) -->
+  <g fill="none" stroke="#F5EFE6" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 30 92 V 36"/>
+    <path d="M 98 92 V 36"/>
+  </g>
+  <!-- Diagonal roaming stream bridge -->
+  <path d="M 30 36 L 98 92" fill="none" stroke="url(#d-dune)" stroke-width="13" stroke-linecap="round"/>
+  <!-- Corner device nodes -->
+  <circle cx="30" cy="92" r="8.5" fill="#F5EFE6"/>
+  <circle cx="98" cy="36" r="8.5" fill="#F5EFE6"/>
+  <circle cx="30" cy="36" r="10.5" fill="url(#d-dune)"/>
+  <circle cx="98" cy="92" r="10.5" fill="url(#d-dune)"/>
+  <circle cx="30" cy="36" r="4" fill="#F5EFE6"/>
+  <circle cx="98" cy="92" r="4" fill="#F5EFE6"/>
+  <!-- Central Merkle DAG block / compass core -->
+  <rect x="52" y="52" width="24" height="24" rx="6" transform="rotate(45 64 64)" fill="#12161F" stroke="url(#d-oasis)" stroke-width="5"/>
+  <circle cx="64" cy="64" r="4.5" fill="#5CE1E6"/>
+</g>
+<text x="230" y="150" font-family="Inter Display, Inter, sans-serif" font-weight="800" font-size="72" fill="#f4ead8">Nomad<tspan fill="#f6b042">FS</tspan></text>
+<text x="232" y="196" font-family="monospace" font-size="20" letter-spacing="3" fill="#8e8577">YOUR DEVICES · ONE FILESYSTEM</text>
+<text x="64" y="285" font-family="Inter, sans-serif" font-size="30" font-weight="600" fill="#f4ead8">Sync, back up and stream files</text>
+<text x="64" y="327" font-family="Inter, sans-serif" font-size="30" font-weight="600" fill="#f4ead8">between your own devices.</text>
+<text x="64" y="378" font-family="monospace" font-size="17" letter-spacing="2" fill="#5ce1e6">NO ACCOUNT · NO CLOUD · ENCRYPTED, DEVICE TO DEVICE</text>
+</svg>

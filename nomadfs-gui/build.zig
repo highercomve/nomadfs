@@ -45,6 +45,9 @@ pub fn build(b: *std.Build) void {
     about.addOption([]const u8, "version", version);
     about.addOption([]const u8, "oriel_version", zonVersion(b, dep) orelse "unknown");
     about.addOption([]const u8, "commit", gitCommit(b) orelse "unknown");
+    // -Dplay-store=true: the Google Play build. Play updates it; the app
+    // neither checks GitHub nor offers an APK (Play's policy).
+    about.addOption(bool, "play_store", b.option(bool, "play-store", "Google Play build: Play updates the Android app") orelse false);
 
     // The NomadFS core, shared with the CLI and mobile bindings.
     const nomadfs_mod = b.createModule(.{

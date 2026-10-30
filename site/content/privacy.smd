@@ -1,0 +1,55 @@
+---
+.title = "Privacy policy",
+.description = "How NomadFS handles your files, your devices and the information they exchange.",
+.date = .date("2026-10-30T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "docs.shtml",
+.custom = { "label": "privacy" },
+---
+
+Effective date: October 30, 2026.
+
+# [Who provides NomadFS]($heading.id('who'))
+
+NomadFS is an open-source application that keeps files in sync between your own devices, provided by Sergio A Marin (GitHub: highercomve). This policy covers the Android app, the desktop app, the command line node and this website. For privacy questions, email [sergio.alejandro.mz@gmail.com](mailto:sergio.alejandro.mz@gmail.com) or use [the project's issues](https://github.com/highercomve/nomadfs/issues). Issues are public; don't post private files or keys there.
+
+# [Your files stay between your devices]($heading.id('files'))
+
+NomadFS has no account and no cloud service run by the maintainer. Your devices join a swarm you create, with a swarm key that only your devices hold, and they exchange files directly with each other, or through another of your own devices acting as a relay. Nothing you store or share is uploaded to a server operated by the maintainer.
+
+- **Shared folders.** Folders you choose to share are indexed on the device that shares them. Their names, sizes and dates are visible to your other devices; a file's contents travel only when one of your devices opens or downloads it.
+- **The swarm folder and backups.** Files you add to the swarm folder, or folders you mark for backup, are copied to your other devices that keep copies (for example a home server you set up as a backup).
+- **Downloads.** Files you download are saved on your device, in the Download/NomadFS folder on Android or Downloads/NomadFS on the desktop.
+
+Connections between devices are encrypted and authenticated (a Noise handshake with keys tied to your swarm), and only devices that hold your swarm key and that you have paired can join.
+
+# [Device information]($heading.id('device-information'))
+
+Your devices exchange the information they need to find and trust each other: a device name you can change, a device identifier and its public key, network addresses (local network, VPN such as Tailscale, or public), the app's version, the roles a device takes (such as keeping backups) and storage use. This stays within your swarm. Invite codes and QR codes you create carry what another device needs to join; share them only with your own devices.
+
+# [Permissions on Android]($heading.id('permissions'))
+
+- **All files access** lets NomadFS share the folders you pick, back them up, and save downloads to the shared Download folder, where other apps can open them.
+- **Camera** is used only to scan an invite QR code, when you choose to.
+- **Notifications and a foreground service** keep the node running in the background, when you turn that on, so your devices stay in sync.
+- **Network access** connects your devices.
+
+You can revoke these permissions in Android settings; the features that need them stop working.
+
+# [Information stored on your device]($heading.id('stored'))
+
+NomadFS stores its configuration, your device's keys, your trusted devices, the swarm key, file indexes, the blocks of files your device keeps or has read (a read cache you can clear), and the list of your downloads, on your device. Local logs may include device names, addresses and file names; they are not sent to the maintainer. Uninstalling the app or clearing its data removes them; files saved to shared folders such as Download/NomadFS stay until you delete them.
+
+# [Updates and external services]($heading.id('external'))
+
+The Android app from Google Play doesn't check for updates itself: Google Play delivers them. The desktop app, the command line node and the Android APK from GitHub check GitHub for a new release; GitHub then receives ordinary connection information such as your IP address. NomadFS includes no advertising, analytics, tracking or crash-reporting SDK.
+
+The website is hosted by Cloudflare Pages and uses no analytics or tracking cookies; Cloudflare may process connection information to serve it. See [Cloudflare's privacy policy](https://www.cloudflare.com/privacypolicy/) and, for apps installed from Google Play, [Google's privacy policy](https://policies.google.com/privacy).
+
+# [Children]($heading.id('children'))
+
+NomadFS is not directed at children and collects no personal information from anyone.
+
+# [Changes]($heading.id('changes'))
+
+Changes are published at this address with a new effective date.
