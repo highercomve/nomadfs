@@ -47,16 +47,18 @@ fn initTmpDir() void {
     }
 }
 var g_mutex: nomadfs.sync.Mutex = .{};
-/// Serialises every read-modify-write of the config file (editConfig and
-/// ensureConfig). Lock order: g_mutex first, then this one. Nothing takes
-/// g_mutex while holding it.
-var g_config_mutex: nomadfs.sync.Mutex = .{};
+/// Serialises every read-modify-write of the config file: the core editor
+/// (config_file.zig) and ensureConfig share its lock. Lock order: g_mutex
+/// first, then this one. Nothing takes g_mutex while holding it, and
+/// nothing holding it calls config_file.edit.
+const g_config_mutex = &nomadfs.config_file.mutex;
 var g_tick: u64 = 0;
 
 /// Owner-only, like `device.key` and `trust.store`: the config holds the
 /// swarm key, and the directory holds the keys. Windows keeps its defaults.
-const private_file_perms: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else @enumFromInt(0o600);
-const private_dir_perms: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else @enumFromInt(0o700);
+const config_file = nomadfs.config_file;
+const private_file_perms = config_file.private_file_perms;
+const private_dir_perms = config_file.private_dir_perms;
 
 pub const NodeOpenArgs = struct { config_path: []const u8 };
 pub const DeviceEntry = struct {
@@ -254,28 +256,9 @@ fn createConfig(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, path: []con
         "enable_mdns = false\nwrite_quorum = 0\n" ++
         // Phones keep only their own files unless the user says otherwise.
         (if (builtin.abi.isAndroid()) "accept_copies = false\n" else ""), .{ defaultNickname(&nick_buf), swarm_key, keys_path, storage_path_abs });
-    try writeConfigAtomic(gpa, io, path, text.written());
+    try config_file.writeAtomic(gpa, io, path, text.written());
 }
 
-/// Replaces the file at `path` with `text`: the text goes to a temp file in
-/// the same directory, which is fsynced and then renamed over `path`. A
-/// crash or a failed write leaves the old file whole, and the new one is
-/// owner-only.
-fn writeConfigAtomic(gpa: std.mem.Allocator, io: std.Io, path: []const u8, text: []const u8) !void {
-    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
-    defer gpa.free(tmp_path);
-    const cwd = std.Io.Dir.cwd();
-    errdefer cwd.deleteFile(io, tmp_path) catch {};
-    {
-        var file = try cwd.createFile(io, tmp_path, .{ .truncate = true, .permissions = private_file_perms });
-        defer file.close(io);
-        // A temp file left by an earlier run keeps its old mode on truncate.
-        try file.setPermissions(io, private_file_perms);
-        try file.writePositionalAll(io, text, 0);
-        try file.sync(io);
-    }
-    try cwd.rename(tmp_path, cwd, path, io);
-}
 
 /// What other devices call this one until it is renamed: the hostname on
 /// desktop Linux. Android starts as "gui" and the page renames it after the
@@ -646,18 +629,14 @@ pub fn shareAdd(gpa: std.mem.Allocator, args: ShareAddArgs) !void {
     try index.add(name, path);
     try index.start();
 
-    const line = try std.fmt.allocPrint(gpa, "share = \"{s}:{s}\"", .{ name, path });
-    defer gpa.free(line);
-    try editConfig(gpa, args.config_path, .{ .drop_share = name, .append = &.{line} });
+    try config_file.setShare(gpa, args.config_path, name, path);
     if (args.backup) try setShareBackup(gpa, args.config_path, index, name, true);
 }
 
 /// Marks or unmarks a share for backup, live and in the config.
 fn setShareBackup(gpa: std.mem.Allocator, config_path: []const u8, index: *fs.ShareIndex, name: []const u8, on: bool) !void {
     try index.setBackup(name, on);
-    const line = try std.fmt.allocPrint(gpa, "backup = \"{s}\"", .{name});
-    defer gpa.free(line);
-    try editConfig(gpa, config_path, .{ .drop_backup = name, .append = if (on) &.{line} else &.{} });
+    try config_file.setShareBackup(gpa, config_path, name, on);
 }
 
 pub const ShareBackupArgs = struct { config_path: []const u8, name: []const u8, on: bool };
@@ -750,7 +729,7 @@ pub fn shareRemove(gpa: std.mem.Allocator, args: ShareRemoveArgs) !void {
     defer g_mutex.unlock();
     const handle = g_node orelse return error.NotRunning;
     _ = (try shareIndex(handle)).remove(args.name);
-    try editConfig(gpa, args.config_path, .{ .drop_share = args.name });
+    try config_file.removeShare(gpa, args.config_path, args.name);
 }
 
 pub const RemoteShare = struct { name: []const u8, cid: []const u8, size: u64, mtime: u64 };
@@ -1129,10 +1108,7 @@ pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
 /// (`swarm_backup`), and applied to the running node at once.
 pub fn swarmBackupSet(gpa: std.mem.Allocator, args: BackupArgs) !BackupInfo {
     if (!backup_supported) return error.Unsupported;
-    try editConfig(gpa, args.config_path, .{
-        .drop_keys = &.{"swarm_backup"},
-        .append = &.{if (args.on) "swarm_backup = true" else "swarm_backup = false"},
-    });
+    try config_file.setBool(gpa, args.config_path, "swarm_backup", args.on);
     {
         g_mutex.lock();
         defer g_mutex.unlock();
@@ -1161,10 +1137,7 @@ pub fn swarmReplicasSet(gpa: std.mem.Allocator, args: SwarmReplicasArgs) !Backup
 /// copies of other devices' swarm files. Saved in the config
 /// (`accept_copies`) and signed into the swarm's policy at once.
 pub fn acceptCopiesSet(gpa: std.mem.Allocator, args: AcceptCopiesArgs) !BackupInfo {
-    try editConfig(gpa, args.config_path, .{
-        .drop_keys = &.{"accept_copies"},
-        .append = &.{if (args.on) "accept_copies = true" else "accept_copies = false"},
-    });
+    try config_file.setBool(gpa, args.config_path, "accept_copies", args.on);
     {
         g_mutex.lock();
         defer g_mutex.unlock();
@@ -1793,7 +1766,7 @@ fn rememberAddresses(gpa: std.mem.Allocator, config_path: []const u8, ticket: *c
         try urls.append(gpa, try std.fmt.allocPrint(gpa, "tcp://{s}", .{a}));
     }
     if (urls.items.len == 0) return;
-    try addBootstrapPeers(gpa, config_path, urls.items);
+    try config_file.addBootstrapPeers(gpa, config_path, urls.items);
     if (g_node) |node| {
         const csv = try std.mem.joinZ(gpa, ",", urls.items);
         defer gpa.free(csv);
@@ -1801,30 +1774,6 @@ fn rememberAddresses(gpa: std.mem.Allocator, config_path: []const u8, ticket: *c
     }
 }
 
-/// Merges `urls` into the config's bootstrap_peers (no duplicates).
-fn addBootstrapPeers(gpa: std.mem.Allocator, config_path: []const u8, urls: []const []const u8) !void {
-    var config = config_mod.parseConfig(gpa, config_path) catch return error.ConfigInvalid;
-    defer config.deinit(gpa);
-    var line: std.ArrayList(u8) = .empty;
-    defer line.deinit(gpa);
-    try line.appendSlice(gpa, "bootstrap_peers = [");
-    var first = true;
-    for (config.network.bootstrap_peers) |p| {
-        try line.print(gpa, "{s}\"{s}\"", .{ if (first) "" else ",", p });
-        first = false;
-    }
-    for (urls) |u| {
-        const dup = for (config.network.bootstrap_peers) |p| {
-            if (std.mem.eql(u8, p, u)) break true;
-        } else false;
-        if (dup) continue;
-        if (std.mem.indexOfAny(u8, u, "\"[]\n") != null) continue;
-        try line.print(gpa, "{s}\"{s}\"", .{ if (first) "" else ",", u });
-        first = false;
-    }
-    try line.append(gpa, ']');
-    try editConfig(gpa, config_path, .{ .drop_keys = &.{"bootstrap_peers"}, .append = &.{line.items} });
-}
 
 pub const InviteAcceptArgs = struct { config_path: []const u8, code: []const u8 };
 
@@ -1849,10 +1798,10 @@ pub fn inviteAccept(gpa: std.mem.Allocator, args: InviteAcceptArgs) ![]const u8 
 
     const was_running = isRunning();
     if (was_running) nodeClose();
-    try writeSwarmKey(gpa, args.config_path, joined.swarm_key, 0);
+    try config_file.setSwarmKey(gpa, args.config_path, joined.swarm_key, 0);
     const url = try std.fmt.allocPrint(gpa, "tcp://{s}:{d}", .{ joined.host_ip, joined.node_port });
     defer gpa.free(url);
-    try addBootstrapPeers(gpa, args.config_path, &.{url});
+    try config_file.addBootstrapPeers(gpa, args.config_path, &.{url});
     trustDevice(gpa, .{ .config_path = args.config_path, .uri = joined.ticket_uri }) catch |err|
         std.debug.print("invite: trusting the inviter failed: {any}\n", .{err});
     if (was_running) try nodeOpen(gpa, .{ .config_path = args.config_path });
@@ -1926,7 +1875,7 @@ fn adoptRotationWorker() void {
         } orelse continue;
         defer gpa.free(path);
 
-        writeSwarmKey(gpa, path, work_key, work_epoch) catch |err| {
+        config_file.setSwarmKey(gpa, path, work_key, work_epoch) catch |err| {
             std.debug.print("rotation: saving the new key failed: {any}\n", .{err});
             continue;
         };
@@ -1938,19 +1887,6 @@ fn adoptRotationWorker() void {
     }
 }
 
-fn writeSwarmKey(gpa: std.mem.Allocator, path: []const u8, key: [32]u8, epoch: u64) !void {
-    var hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&hex, "{s}", .{std.fmt.bytesToHex(key, .lower)}) catch unreachable;
-    defer std.crypto.secureZero(u8, &hex);
-    const key_line = try std.fmt.allocPrint(gpa, "swarm_key = \"{s}\"", .{&hex});
-    defer {
-        @memset(key_line, 0);
-        gpa.free(key_line);
-    }
-    const epoch_line = try std.fmt.allocPrint(gpa, "swarm_epoch = {d}", .{epoch});
-    defer gpa.free(epoch_line);
-    try editConfig(gpa, path, .{ .drop_keys = &.{ "swarm_key", "swarm_epoch" }, .append = &.{ key_line, epoch_line } });
-}
 
 pub const RotationEntry = struct { name: []const u8, status: []const u8 };
 
@@ -1973,7 +1909,7 @@ pub fn swarmRotateKey(gpa: std.mem.Allocator, args: ListArgs) ![]RotationEntry {
         const handle = g_node orelse return error.NotRunning;
         break :blk try handle.node.rotateSwarmKey(gpa, key, epoch);
     };
-    try writeSwarmKey(gpa, args.config_path, key, epoch);
+    try config_file.setSwarmKey(gpa, args.config_path, key, epoch);
     nodeClose();
     try nodeOpen(gpa, .{ .config_path = args.config_path });
 
@@ -1987,11 +1923,7 @@ pub const NicknameArgs = struct { config_path: []const u8, nickname: []const u8 
 /// `invoke("set_nickname", { config_path, nickname })`: how other devices
 /// list this one. Takes effect on the next node start.
 pub fn setNickname(gpa: std.mem.Allocator, args: NicknameArgs) !void {
-    const nick = std.mem.trim(u8, args.nickname, " \t");
-    if (nick.len == 0 or nick.len > 64 or std.mem.indexOfAny(u8, nick, "\"\n") != null) return error.InvalidNickname;
-    const line = try std.fmt.allocPrint(gpa, "nickname = \"{s}\"", .{nick});
-    defer gpa.free(line);
-    try editConfig(gpa, args.config_path, .{ .drop_keys = &.{"nickname"}, .append = &.{line} });
+    try config_file.setNickname(gpa, args.config_path, args.nickname);
 }
 
 fn primaryIp(buf: *[16]u8) ?[]const u8 {
@@ -2019,71 +1951,7 @@ fn myAddresses(gpa: std.mem.Allocator, port: u16) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-const ConfigEdit = struct {
-    /// Remove `key = ...` lines for these keys.
-    drop_keys: []const []const u8 = &.{},
-    /// Remove the `share = "<name>:..."` line for this share.
-    drop_share: ?[]const u8 = null,
-    /// Remove the `backup = "<name>"` line for this share.
-    drop_backup: ?[]const u8 = null,
-    append: []const []const u8 = &.{},
-};
 
-/// Rewrites the config file line by line: drops matching lines, appends
-/// new ones. Comments and unrelated settings are kept as they are.
-fn editConfig(gpa: std.mem.Allocator, path: []const u8, edit: ConfigEdit) !void {
-    g_config_mutex.lock();
-    defer g_config_mutex.unlock();
-
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const old = blk: {
-        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-        defer file.close(io);
-        const size = (try file.stat(io)).size;
-        if (size > 64 * 1024) return error.ConfigTooLarge;
-        const buf = try gpa.alloc(u8, @intCast(size));
-        errdefer gpa.free(buf);
-        _ = try file.readPositionalAll(io, buf, 0);
-        break :blk buf;
-    };
-    defer gpa.free(old);
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(gpa);
-    var lines = std.mem.splitScalar(u8, old, '\n');
-    while (lines.next()) |line| {
-        if (lines.index == null and line.len == 0) break; // trailing newline
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        const key = std.mem.trim(u8, trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '=') orelse 0], " \t");
-        var drop = false;
-        for (edit.drop_keys) |k| {
-            if (std.mem.eql(u8, key, k)) drop = true;
-        }
-        if (edit.drop_share) |name| {
-            if (std.mem.eql(u8, key, "share")) {
-                const value = std.mem.trim(u8, trimmed[std.mem.indexOfScalar(u8, trimmed, '=').? + 1 ..], " \t\"");
-                if (config_mod.Config.Share.parse(value)) |share| {
-                    if (std.mem.eql(u8, share.name, name)) drop = true;
-                } else |_| {}
-            }
-        }
-        if (edit.drop_backup) |name| {
-            if (std.mem.eql(u8, key, "backup")) {
-                const value = std.mem.trim(u8, trimmed[std.mem.indexOfScalar(u8, trimmed, '=').? + 1 ..], " \t\"");
-                if (std.mem.eql(u8, value, name)) drop = true;
-            }
-        }
-        if (drop) continue;
-        try out.appendSlice(gpa, line);
-        try out.append(gpa, '\n');
-    }
-    for (edit.append) |line| {
-        try out.appendSlice(gpa, line);
-        try out.append(gpa, '\n');
-    }
-
-    try writeConfigAtomic(gpa, io, path, out.items);
-}
 
 const testing = std.testing;
 
@@ -2142,34 +2010,6 @@ test "commands: node put/get text round trip" {
     try testing.expectEqualStrings(text, fetched);
 }
 
-test "commands: editConfig is atomic, serialized, and keeps private perms" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const dir = "/tmp/nomadfs-gui-test-editconfig";
-    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
-    try std.Io.Dir.cwd().createDirPath(io, dir);
-
-    var conf_buf: [512]u8 = undefined;
-    const conf_path = try std.fmt.bufPrint(&conf_buf, "{s}/nomadfs.conf", .{dir});
-    var file = try std.Io.Dir.cwd().createFile(io, conf_path, .{ .truncate = true, .permissions = private_file_perms });
-    try file.writePositionalAll(io, "nickname = \"alpha\"\nport = 14700\n", 0);
-    file.close(io);
-
-    const alloc = testing.allocator;
-    try editConfig(alloc, conf_path, .{ .drop_keys = &.{"nickname"}, .append = &.{"nickname = \"beta\""} });
-
-    // Verify .tmp was renamed and removed
-    var tmp_buf: [512]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{conf_path});
-    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, tmp_path, .{}));
-
-    // Verify contents
-    var read_file = try std.Io.Dir.cwd().openFile(io, conf_path, .{});
-    defer read_file.close(io);
-    var content_buf: [512]u8 = undefined;
-    const n = try read_file.readPositionalAll(io, &content_buf, 0);
-    try testing.expectEqualStrings("port = 14700\nnickname = \"beta\"\n", content_buf[0..n]);
-}
 
 test "commands: ensureConfig sets private permissions on dir and file" {
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -2283,9 +2123,7 @@ pub fn cacheClear(gpa: std.mem.Allocator, args: ListArgs) !u64 {
 /// and applies it to the running node at once (0 = no limit).
 pub fn cacheSetLimit(gpa: std.mem.Allocator, args: CacheLimitArgs) !void {
     _ = std.math.mul(u64, args.limit_mb, 1024 * 1024) catch return error.InvalidLimit;
-    var line_buf: [48]u8 = undefined;
-    const line = try std.fmt.bufPrint(&line_buf, "cache_mb = {d}", .{args.limit_mb});
-    try editConfig(gpa, args.config_path, .{ .drop_keys = &.{"cache_mb"}, .append = &.{line} });
+    try config_file.setInt(gpa, args.config_path, "cache_mb", args.limit_mb);
     g_mutex.lock();
     defer g_mutex.unlock();
     if (g_node) |handle| if (handle.node.store) |s| {
