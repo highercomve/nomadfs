@@ -1,7 +1,7 @@
 # Chapter 7: The App (`nomadfs-gui/`)
 
 NomadFS ships one app for the Linux desktop and Android phones, built with
-[Oriel](https://oriel.foreachdeveloper.com) (`nomadfs-gui/build.zig.zon` pins Oriel **v0.20.4**;
+[Oriel](https://oriel.foreachdeveloper.com) (`nomadfs-gui/build.zig.zon` pins Oriel **v0.20.5**;
 minimum Zig 0.16.0). Oriel pairs a Zig backend with the system web view (WebKitGTK on Linux, the
 Android WebView on phones). The page is plain HTML and JavaScript with no build step
 (`frontend/index.html`, `frontend/app.js`, `frontend/style.css`).
@@ -54,7 +54,10 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
   badge; unpaired devices show their short fingerprint and a "Not paired" badge, with any claimed
   nickname qualified in secondary text. The viewer previews images, video, audio, PDF and text, reading
   in pieces with `readRange`; **Download** saves to `~/Downloads/NomadFS` (Android:
-  `Download/NomadFS`). On touch screens a sideways swipe in the viewer opens the next or previous
+  `Download/NomadFS`). The viewer's ⋮ menu is the file's row menu (each source's `menu(e)`). A
+  video plays in Oriel's native player embedded under the viewer's bar (`oriel.video.play` with
+  `rect`, kept in place by `setRect`), with its own fullscreen button; the page hides it with
+  `setVisible(false)` while a menu or dialog is over it. On touch screens a sideways swipe in the viewer opens the next or previous
   file. Refresh walks the open path again by name from the device's current share list, since a
   share's root changes with every edit. A file's **ⓘ** opens its details (`file_details`):
   `fs.inspect.inspect` (`src/fs/inspect.zig`) loads the parent blocks only and lists the leaves from

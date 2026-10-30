@@ -252,6 +252,7 @@ footer { text-align: center; font-size: 12px; color: var(--md-on-surface-variant
 /* Snackbar */
 #snackbar {
   position: fixed;
+  z-index: 40; /* above the viewer and dialogs */
   left: 50%;
   bottom: calc(16px + env(safe-area-inset-bottom));
   transform: translate(-50%, 24px);
@@ -1616,3 +1617,8 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 /* Six destinations: each tab may shrink below its label's natural width. */
 .bar-item { min-width: 0; letter-spacing: .3px; }
 .bar-item .bar-pill { width: 52px; }
+
+/* ---- The viewer: the native player's place, and toasts over its bar ---- */
+.preview-body .pv-native { position: absolute; inset: 0; background: #000; }
+/* The native player draws over the viewer's body: toasts go over the bar. */
+body.pv-open #snackbar { top: calc(12px + env(safe-area-inset-top)); bottom: auto; }

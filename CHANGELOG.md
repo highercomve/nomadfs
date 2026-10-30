@@ -3,6 +3,31 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.3.10 - 2026-10-30
+
+The file viewer plays videos in place, under its own bar, with a fullscreen button, and has every
+action the file lists have. Devices on 0.3.9 and 0.3.10 work together.
+
+### Added
+
+- **Videos play inside the viewer.** The native player sits under the viewer's bar, so the file's
+  name, previous and next, and its menu stay at hand. Its fullscreen button covers the screen (on a
+  phone, a landscape video turns sideways); Back, Esc or the button come back.
+- **The viewer's ⋮ menu** has what right-clicking the file in its list offers: open in another app,
+  download, details, the links, and for the swarm folder rename, move and delete (those close the
+  viewer). For a download: open in another app, show in folder, copy the path, remove, delete.
+
+### Fixed
+
+- Downloading from the viewer gave no feedback: the "Downloading…" notice was hidden behind it. It
+  now shows over the viewer's bar, and tapping it opens Downloads.
+- A menu or dialog opened over a playing video was hidden behind the player; the player now steps
+  aside while one shows.
+
+### Changed
+
+- Uses Oriel 0.20.5 (the embedded video player).
+
 ## 0.3.9 - 2026-10-30
 
 The command line updates itself: `nomadfs --upgrade`. Devices on 0.3.8 and 0.3.9 work together.

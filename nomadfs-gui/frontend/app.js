@@ -58,6 +58,7 @@ const ICONS = {
   open_in: "M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0-2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z",
   link: "M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z",
   move: "M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2zm4 13v-3h-4v-2h4V9l4 4-4 4z",
+  more: "M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z",
   remove: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z",
 };
 
@@ -218,6 +219,7 @@ function showMenu(x, y, items) {
     menuEl.appendChild(b);
   }
   document.body.appendChild(menuEl);
+  syncVideoCover();
   // Inside the window, near the pointer.
   const r = menuEl.getBoundingClientRect();
   menuEl.style.left = `${Math.max(8, Math.min(x, innerWidth - r.width - 8))}px`;
@@ -226,8 +228,10 @@ function showMenu(x, y, items) {
 }
 
 function closeMenu() {
-  menuEl?.remove();
+  if (!menuEl) return;
+  menuEl.remove();
   menuEl = null;
+  syncVideoCover();
 }
 
 document.addEventListener("pointerdown", (e) => { if (menuEl && !menuEl.contains(e.target)) closeMenu(); }, true);
@@ -902,7 +906,7 @@ function browseRow(e, files) {
       date: formatDate(e.mtime),
     },
     onClick: () => openPreview(deviceSource(device), files, files.indexOf(e)),
-    menu: fileMenu(deviceSource(device), e, { cid: e.cid, peer: device.peer }),
+    menu: deviceSource(device).menu(e),
     actions: [
       { icon: "info", label: `Details of ${e.name}`, run: () => openDetails(e.name, { cid: e.cid, peer: device.peer }) },
       { icon: "download", label: "Download", run: fetchIt },
@@ -952,15 +956,21 @@ async function showLocation() {
   browseTable.show(entries);
 }
 
+/** Downloads, from wherever the app is (the viewer closes). */
+function goToDownloads() {
+  closePreview();
+  setView("downloads");
+}
+
 /** Starts a download (it runs in the background; Downloads follows it). */
 async function startDownload(command, args) {
   const running = [...downloads.values()].find((d) => d.state === "running" && d.cid === args.cid);
-  if (running) return snack(`${args.name} is already downloading`, 4000, () => setView("downloads"));
+  if (running) return snack(`${args.name} is already downloading`, 4000, goToDownloads);
   try {
     const d = await invoke(command, args);
     downloads.set(d.id, d);
     renderDownloads();
-    snack(`Downloading ${d.name} · tap to see it in Downloads`, 5000, () => setView("downloads"));
+    snack(`Downloading ${d.name} · tap to see it in Downloads`, 5000, goToDownloads);
   } catch (err) {
     snack(`Download failed: ${err}`);
   }
@@ -999,17 +1009,20 @@ let pv = null; // { source, files, index, token, url }
 
 /** Where a preview reads from: a device's share... */
 function deviceSource(device) {
-  return {
+  const source = {
     read: (e, offset, len) => invoke("read_range", { peer: device.peer, cid: e.cid, offset, len }),
     mediaUrl: (e, external = false, network = "") => invoke("media_url", { kind: "device", id: device.peer, cid: e.cid, size: e.size, name: e.name, external, network }),
     download: (e, btn) => downloadFile(device, e, btn),
+    menu: (e) => fileMenu(source, e, { cid: e.cid, peer: device.peer }),
   };
+  return source;
 }
 /** ...or the swarm folder (the device that added it, then anyone). */
 const swarmSource = {
   read: (e, offset, len) => invoke("swarm_read_range", { cid: e.cid, author_id: e.author_id, offset, len }),
   mediaUrl: (e, external = false, network = "") => invoke("media_url", { kind: "swarm", id: e.author_id, cid: e.cid, size: e.size, name: e.name, external, network }),
   download: (e, btn) => swarmDownload(e, btn),
+  menu: (it) => swarmMenu(it),
 };
 
 function previewMessage(icon, text, extra) {
@@ -1034,6 +1047,7 @@ function decodeBase64(b64) {
 function openPreview(source, files, index) {
   pv = { source, files, index, token: 0, url: null };
   $("preview").hidden = false;
+  document.body.classList.add("pv-open");
   showPreview();
   syncBack();
 }
@@ -1050,12 +1064,13 @@ function stopMedia() {
 function closePreview() {
   if (!pv) return;
   stopMedia();
-  nativeVideo?.close().catch(() => {});
+  stopNative();
   pv.token++;
   if (pv.url) URL.revokeObjectURL(pv.url);
   pv = null;
   $("pv-body").replaceChildren();
   $("preview").hidden = true;
+  document.body.classList.remove("pv-open");
   syncBack();
 }
 
@@ -1078,20 +1093,62 @@ async function streamPreview(entry, kind, token) {
   inPagePlayer(kind, url, token);
 }
 
-/** Plays in the native player; the preview offers to play it again once
- * it's closed. Falls back to the page's player if the native one fails. */
+// The native player, embedded in the viewer under its bar: { slot, observer }.
+// Its fullscreen button covers the screen; Esc or Back come back here.
+let pvNative = null;
+
+/** Plays in the native player over the viewer's body (the bar stays the
+ * page's: name, previous and next, the ⋮ menu). Falls back to the page's
+ * player if the native one fails. */
 async function playNative(entry, url, token) {
-  const again = document.createElement("button");
-  again.className = "btn filled";
-  again.textContent = "Play again";
-  again.addEventListener("click", () => playNative(entry, url, token));
-  previewMessage("video", "Playing in the video player. Esc or its close button comes back here.", again);
+  stopNative();
+  const slot = document.createElement("div");
+  slot.className = "pv-native";
+  $("pv-body").replaceChildren(slot);
+  const rect = () => slot.getBoundingClientRect();
+  const observer = new ResizeObserver(() => { if (pvNative?.slot === slot) nativeVideo.setRect(rect()).catch(() => {}); });
+  pvNative = { slot, observer, entry, url, token };
   try {
-    await nativeVideo.play({ url, title: entry.name });
+    await nativeVideo.play({ url, title: entry.name, rect: rect() });
+    observer.observe(slot);
+    syncVideoCover();
   } catch (err) {
+    if (pvNative?.slot === slot) pvNative = null;
     if (pv && token === pv.token) inPagePlayer("video", url, token);
   }
 }
+
+/** Closes the embedded player, if one plays (the viewer moved on or closed). */
+function stopNative() {
+  if (!pvNative) return;
+  pvNative.observer.disconnect();
+  pvNative = null;
+  nativeVideo?.close().catch(() => {});
+}
+
+// Closed under the viewer (its Activity went away): offer to play it again.
+window.oriel.listen?.("video:closed", () => {
+  if (!pvNative || !pv || pvNative.token !== pv.token) return;
+  const { entry, url, token, observer } = pvNative;
+  observer.disconnect();
+  pvNative = null;
+  const again = document.createElement("button");
+  again.className = "btn filled";
+  again.textContent = "Play";
+  again.addEventListener("click", () => playNative(entry, url, token));
+  previewMessage("video", "The video player closed.", again);
+});
+
+/** Native views draw above the page: while a menu or dialog shows over the
+ * viewer, the player hides (and keeps its place). */
+function syncVideoCover() {
+  if (!pvNative) return;
+  const covered = !!menuEl || !$("details").hidden || !$("ask").hidden;
+  if (covered === pvNative.covered) return;
+  pvNative.covered = covered;
+  nativeVideo.setVisible(!covered).catch(() => {});
+}
+for (const id of ["details", "ask"]) new MutationObserver(syncVideoCover).observe($(id), { attributes: true, attributeFilter: ["hidden"] });
 
 window.oriel.listen?.("video:error", ({ message }) => {
   if (pv) snack(`This video can't play: ${message || "unsupported format"}. Download it to open it in another app.`, 6000);
@@ -1113,6 +1170,7 @@ function inPagePlayer(kind, url, token) {
 
 async function showPreview() {
   stopMedia();
+  stopNative();
   const token = ++pv.token;
   if (pv.url) { URL.revokeObjectURL(pv.url); pv.url = null; }
   const entry = pv.files[pv.index];
@@ -1190,7 +1248,14 @@ $("pv-close").addEventListener("click", closePreview);
 $("preview").addEventListener("click", (e) => { if (e.target === $("preview")) closePreview(); });
 $("pv-prev").addEventListener("click", () => { if (pv && pv.index > 0) { pv.index--; showPreview(); } });
 $("pv-next").addEventListener("click", () => { if (pv && pv.index < pv.files.length - 1) { pv.index++; showPreview(); } });
-$("pv-download").addEventListener("click", () => { if (pv) pv.source.download(pv.files[pv.index], null); });
+// The open file's menu: what its row's right-click offers. An edit
+// (rename, move, delete) closes the viewer: the file it shows changed.
+$("pv-menu").addEventListener("click", () => {
+  if (!pv) return;
+  const r = $("pv-menu").getBoundingClientRect();
+  const items = pv.source.menu(pv.files[pv.index]).map((it) => it === "-" || !it.changes ? it : { ...it, run: () => { closePreview(); it.run(); } });
+  showMenu(r.right - 220, r.bottom + 4, items);
+});
 
 // Swipe left or right on a touch screen for the next or previous file. The
 // photo follows the finger; a short or mostly vertical drag springs back.
@@ -1424,14 +1489,8 @@ function swarmRow(it, files) {
   ];
   if (!it.dir) actions.unshift({ icon: "download", label: "Download", run: (btn) => swarmDownload(it, btn) });
   if (!it.dir && it.cid) actions.unshift({ icon: "info", label: `Details of ${it.name}`, run: () => openDetails(it.name, { cid: it.cid, author_id: it.author_id }) });
-  const edits = [
-    { icon: "edit", label: "Rename", run: () => swarmRenamePrompt(it) },
-    { icon: "move", label: "Move to…", run: () => swarmMovePrompt(it) },
-    { icon: "trash", label: "Delete", run: () => swarmDeleteConfirm(it), danger: true },
-  ];
-  const menu = it.dir || !it.cid ? edits : [...fileMenu(swarmSource, it, { cid: it.cid, author_id: it.author_id }), "-", ...edits];
   return row({
-    menu,
+    menu: swarmMenu(it),
     icon: it.dir ? "folder" : iconFor(it.name, false),
     iconClass: it.dir ? "folder" : "",
     headline: it.name,
@@ -1449,6 +1508,16 @@ function swarmRow(it, files) {
   });
 }
 
+/** A swarm item's menu: a file's actions, then the edits (a folder has only those). */
+function swarmMenu(it) {
+  const edits = [
+    { icon: "edit", label: "Rename", run: () => swarmRenamePrompt(it), changes: true },
+    { icon: "move", label: "Move to…", run: () => swarmMovePrompt(it), changes: true },
+    { icon: "trash", label: "Delete", run: () => swarmDeleteConfirm(it), danger: true, changes: true },
+  ];
+  return it.dir || !it.cid ? edits : [...fileMenu(swarmSource, it, { cid: it.cid, author_id: it.author_id }), "-", ...edits];
+}
+
 function swarmDownload(it) {
   return startDownload("swarm_download", { cid: it.cid, author_id: it.author_id, name: it.name, size: it.size });
 }
@@ -1462,6 +1531,7 @@ const downloadSource = {
   read: (e, offset, len) => invoke("download_read_range", { id: e.id, offset, len }),
   mediaUrl: (e, external = false) => invoke("media_url", { kind: "download", id: String(e.id), size: e.size, name: e.name, external }),
   download: () => showDownloadsFolder(),
+  menu: (d) => downloadMenu(d),
 };
 
 let downloadsFolder = "";
@@ -1486,8 +1556,8 @@ window.oriel.listen?.("download://progress", ({ id, done, size, state, error }) 
   Object.assign(d, { done, size, state, error });
   if (state !== "running") {
     d.exists = state === "done";
-    if (was === "running" && state === "done") snack(`${d.name} downloaded · tap to open Downloads`, 6000, () => setView("downloads"));
-    if (was === "running" && state === "failed") snack(`${d.name} failed: ${error}`, 6000, () => setView("downloads"));
+    if (was === "running" && state === "done") snack(`${d.name} downloaded · tap to open Downloads`, 6000, goToDownloads);
+    if (was === "running" && state === "failed") snack(`${d.name} failed: ${error}`, 6000, goToDownloads);
     return renderDownloads();
   }
   updateDownloadRow(d);
@@ -1549,18 +1619,8 @@ function downloadRow(d, files) {
         { icon: "download", label: `Download ${d.name} again`, run: () => retryDownload(d) },
         { icon: "remove", label: "Remove from the list", run: () => removeDownload(d, false) },
       ];
-  const menu = running ? [actions[0]] : [
-    ...(ok ? [
-      { icon: "open_in", label: "Open in another app", run: () => openDownloadElsewhere(d) },
-      { icon: "folder", label: "Show in folder", run: showDownloadsFolder },
-      { icon: "copy", label: "Copy path", run: () => copyText(d.path, "Path copied") },
-    ] : [{ icon: "download", label: "Download again", run: () => retryDownload(d) }]),
-    "-",
-    { icon: "remove", label: "Remove from the list", run: () => removeDownload(d, false) },
-    ...(ok ? [{ icon: "trash", label: "Delete the file", run: () => removeDownload(d, true), danger: true }] : []),
-  ];
   const li = row({
-    menu,
+    menu: downloadMenu(d),
     icon: iconFor(d.name, false),
     headline: d.name,
     meta: downloadMeta(d),
@@ -1568,6 +1628,28 @@ function downloadRow(d, files) {
     actions,
   });
   li.dataset.download = d.id;
+  return decorateDownloadRow(li, d);
+}
+
+/** A download's menu (its row's right-click, the viewer's ⋮). */
+function downloadMenu(d) {
+  const ok = playable(d);
+  if (d.state === "running") return [{ icon: "remove", label: "Cancel", run: () => invoke("download_cancel", { id: d.id }).catch((err) => snack(`${err}`)) }];
+  return [
+    ...(ok ? [
+      { icon: "open_in", label: "Open in another app", run: () => openDownloadElsewhere(d) },
+      { icon: "folder", label: "Show in folder", run: showDownloadsFolder },
+      { icon: "copy", label: "Copy path", run: () => copyText(d.path, "Path copied") },
+    ] : [{ icon: "download", label: "Download again", run: () => retryDownload(d) }]),
+    "-",
+    { icon: "remove", label: "Remove from the list", run: () => removeDownload(d, false), changes: true },
+    ...(ok ? [{ icon: "trash", label: "Delete the file", run: () => removeDownload(d, true), danger: true, changes: true }] : []),
+  ];
+}
+
+/** A failed download's red line; a running one's progress bar. */
+function decorateDownloadRow(li, d) {
+  const running = d.state === "running";
   const meta = li.querySelector(".meta");
   if (d.state === "failed") meta.classList.add("dl-failed");
   if (running) {
