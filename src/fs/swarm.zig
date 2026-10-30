@@ -176,6 +176,23 @@ pub const SwarmFolder = struct {
         try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), self.file_path, self.io);
     }
 
+    /// Sets a live file's or folder's modified time (touch -d, cp -p, rsync
+    /// -t through the mount): a new version, so it spreads like an edit.
+    pub fn setMtime(self: *SwarmFolder, path: []const u8, mtime: u64) !void {
+        defer self.flushSave(); // after the unlock: writes outside the lock
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const e = self.manifest.get(path) orelse return error.FileNotFound;
+        if (e.deleted) return error.FileNotFound;
+        if (e.mtime == mtime) return;
+        _ = try self.manifest.edit(path, .{ .kind = e.kind, .cid = e.cid, .size = e.size, .mtime = mtime }, self.self_id.bytes, self.self_name);
+        try self.saveLocked();
+    }
+
+    fn secondsOf(t: std.Io.Timestamp) u64 {
+        return @intCast(@max(0, @divFloor(t.nanoseconds, std.time.ns_per_s)));
+    }
+
     fn now(self: *SwarmFolder) u64 {
         const t = std.Io.Timestamp.now(self.io, .real).nanoseconds;
         return @intCast(@max(0, @divFloor(t, std.time.ns_per_s)));
@@ -189,14 +206,21 @@ pub const SwarmFolder = struct {
     // ---- Edits (this device) ----
 
     /// Adds (or replaces) `dir/name` with the contents of the local file
-    /// at `local_path`. The bytes go into this device's block store.
+    /// at `local_path`. The bytes go into this device's block store. The
+    /// file keeps its own modified time (`mtime` overrides it), so folders
+    /// sort by when files changed, not when they were added.
     pub fn addFile(self: *SwarmFolder, dir: []const u8, name: []const u8, local_path: []const u8) !void {
+        return self.addFileAt(dir, name, local_path, null);
+    }
+
+    pub fn addFileAt(self: *SwarmFolder, dir: []const u8, name: []const u8, local_path: []const u8, mtime: ?u64) !void {
         const path = try join(self.allocator, dir, name);
         defer self.allocator.free(path);
         if (!manifest_mod.validPath(path)) return error.InvalidPath;
 
         var file = try std.Io.Dir.cwd().openFile(self.io, local_path, .{});
         defer file.close(self.io);
+        const modified = mtime orelse secondsOf((try file.stat(self.io)).mtime);
         var reader = FileReader{ .io = self.io, .file = file };
         var builder = storage.dag.DagBuilder{ .allocator = self.allocator, .store = self.store, .layout = .Balanced };
         const root = try builder.build(&reader);
@@ -205,7 +229,7 @@ pub const SwarmFolder = struct {
         defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
-        _ = try self.manifest.edit(path, .{ .cid = root[0..32].*, .size = reader.offset, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+        _ = try self.manifest.edit(path, .{ .cid = root[0..32].*, .size = reader.offset, .mtime = modified }, self.self_id.bytes, self.self_name);
         try self.saveLocked();
         // The devices that keep copies pull it (their keepers), once their
         // manifest has it: nothing is pushed from here.
@@ -874,4 +898,38 @@ test "swarm: a move replaces only an empty folder, and a file only a file" {
     try folder.addFile("", "f", file_path);
     try testing.expectError(error.NotADirectory, folder.move("E", "f", .{ .replace = true }));
     try testing.expectError(error.IsDirectory, folder.move("f", "E", .{ .replace = true }));
+}
+
+test "swarm: files keep their own modified time" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const manifest_path = try std.fs.path.join(allocator, &.{ tmp_path, "manifest.json" });
+    defer allocator.free(manifest_path);
+    var store = try storage.engine.StorageEngine.init(allocator, tmp_path);
+    defer store.deinit();
+    const folder = try SwarmFolder.create(allocator, io, &store, .{ .bytes = [_]u8{0x11} ** 32 }, "test", manifest_path);
+    defer folder.destroy();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "photo.jpg", .data = "jpeg" });
+    const src = try std.fs.path.join(allocator, &.{ tmp_path, "photo.jpg" });
+    defer allocator.free(src);
+    const stat = try std.Io.Dir.cwd().statFile(io, src, .{});
+
+    // Added: the file's own time, not the time of adding.
+    try folder.addFile("", "photo.jpg", src);
+    try testing.expectEqual(SwarmFolder.secondsOf(stat.mtime), folder.fileInfo("photo.jpg").?.mtime);
+    // An explicit one (the mount, after cp -p) wins.
+    try folder.addFileAt("", "old.jpg", src, 1_500_000_000);
+    try testing.expectEqual(@as(u64, 1_500_000_000), folder.fileInfo("old.jpg").?.mtime);
+    // touch -d on a file already there.
+    try folder.setMtime("photo.jpg", 1_400_000_000);
+    try testing.expectEqual(@as(u64, 1_400_000_000), folder.fileInfo("photo.jpg").?.mtime);
+    // A move keeps it.
+    try folder.move("photo.jpg", "moved.jpg", .{});
+    try testing.expectEqual(@as(u64, 1_400_000_000), folder.fileInfo("moved.jpg").?.mtime);
 }

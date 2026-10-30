@@ -96,6 +96,8 @@ pub const ForgetOne = extern struct { nodeid: u64, nlookup: u64 };
 
 const FATTR_SIZE = 1 << 3;
 const FATTR_FH = 1 << 6;
+const FATTR_MTIME = 1 << 5;
+const FATTR_MTIME_NOW = 1 << 8;
 const O_TRUNC = 0o1000;
 const FUSE_ATOMIC_O_TRUNC = 1 << 3;
 const FUSE_BIG_WRITES = 1 << 5;
@@ -310,6 +312,9 @@ pub const Handle = struct {
     staging: [:0]u8,
     fd: i32,
     dirty: bool,
+    /// Set through setattr while open (cp -p, futimens): the file's
+    /// modified time when committed, instead of the staging file's.
+    mtime: ?u64 = null,
 };
 
 pub const Device = struct {
@@ -1069,7 +1074,7 @@ pub const Mount = struct {
         const dir = if (slash) |sl| path[0..sl] else "";
         const name = path[if (slash) |sl| sl + 1 else 0..];
         h.dirty = false;
-        folder.addFile(dir, name, h.staging) catch |err| {
+        folder.addFileAt(dir, name, h.staging, h.mtime) catch |err| {
             h.dirty = true;
             return err;
         };
@@ -1189,12 +1194,55 @@ pub const Mount = struct {
                 };
                 self.dropHandle(f, h_removed);
             }
-        } else if (node.kind != .swarm_file and node.kind != .swarm_dir and in.valid != 0) {
-            // Times and modes on read-only parts are accepted and ignored,
-            // so cp -p and touch don't fail; nothing is stored for them.
         }
+        if (in.valid & (FATTR_MTIME | FATTR_MTIME_NOW) != 0 and (node.kind == .swarm_file or node.kind == .swarm_dir)) {
+            const mtime = if (in.valid & FATTR_MTIME_NOW != 0) nowSeconds() else in.mtime;
+            self.setSwarmMtime(header.nodeid, in, mtime) catch |err| return self.replyError(header, errnoFor(err));
+        }
+        // Times and modes elsewhere (read-only parts, modes anywhere) are
+        // accepted and ignored, so cp -p and touch don't fail.
         const updated = self.inode(header.nodeid) orelse return self.replyError(header, .NOENT);
         try self.replyStruct(header, AttrOut{ .attr_valid = cache_seconds, .attr = self.attrOf(header.nodeid, updated) });
+    }
+
+    /// A swarm file's or folder's modified time (touch -d, cp -p, rsync -t):
+    /// kept for the commit while the file is open for writing, else set in
+    /// the folder now (a new version, which spreads).
+    fn setSwarmMtime(self: *Mount, ino: u64, in: SetattrIn, mtime: u64) !void {
+        const folder = self.swarm orelse return error.ReadOnly;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const path = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.table.map.getPtr(ino)) |e| e.data.mtime = mtime;
+            const fh = if (in.valid & FATTR_FH != 0 and self.handles.contains(in.fh)) in.fh else self.writing.get(ino);
+            // Open for writing, or being committed (release): the commit
+            // (or release, right after it) applies it.
+            if (fh) |f| if (self.handles.getPtr(f)) |h| if (h.dirty) {
+                h.mtime = mtime;
+                return;
+            };
+            break :blk try self.swarmPath(arena.allocator(), ino);
+        };
+        folder.setMtime(path, mtime) catch |err| switch (err) {
+            error.FileNotFound => {}, // a folder only implied by its files
+            else => return err,
+        };
+    }
+
+    /// Sets a committed swarm file's time in the folder.
+    fn applyMtime(self: *Mount, ino: u64, mtime: u64) !void {
+        const folder = self.swarm orelse return error.ReadOnly;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const path = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.table.map.getPtr(ino)) |e| e.data.mtime = mtime;
+            break :blk try self.swarmPath(arena.allocator(), ino);
+        };
+        try folder.setMtime(path, mtime);
     }
 
     fn opRelease(self: *Mount, header: *const InHeader, body: []const u8) !void {
@@ -1210,11 +1258,18 @@ pub const Mount = struct {
             break :blk self.handles.get(in.fh) orelse return self.replyEmpty(header);
         };
         self.commit(&h) catch |err| std.debug.print("fuse: saving inode {d} failed: {any}\n", .{ h.ino, err });
-        {
+        // A time set while the commit ran (touch right after close) went to
+        // the registered handle, not this copy: apply it now the file is in.
+        const late_mtime = blk: {
             self.lock.lock();
             defer self.lock.unlock();
-            _ = self.handles.remove(in.fh);
-        }
+            const stored = self.handles.fetchRemove(in.fh) orelse break :blk null;
+            const m = stored.value.mtime orelse break :blk null;
+            if (h.mtime != null and h.mtime.? == m) break :blk null;
+            break :blk m;
+        };
+        if (late_mtime) |m| self.applyMtime(h.ino, m) catch |err|
+            std.debug.print("fuse: setting the time of inode {d} failed: {any}\n", .{ h.ino, err });
         self.dropHandle(in.fh, h);
         try self.replyEmpty(header);
     }
