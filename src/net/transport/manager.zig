@@ -56,6 +56,20 @@ pub const ConnectionManager = struct {
     /// answers (discovery/node.zig sets it; transport/relay.zig).
     relay_dialer: ?RelayDialer = null,
     traffic: TrafficCounters = .{},
+    /// Devices that just failed every address and the relay: dialing them
+    /// again fails at once until `until_ms`, so a device that is gone (an
+    /// old identity, a phone off) costs one round of timeouts, not one per
+    /// caller. Guarded by `mutex`.
+    dial_backoff: [max_dial_backoff]DialBackoff = @splat(.{}),
+
+    pub const max_dial_backoff = 64;
+    const backoff_first_ms: i64 = 30 * std.time.ms_per_s;
+    const backoff_max_ms: i64 = 10 * std.time.ms_per_min;
+    const DialBackoff = struct {
+        peer: ?id.NodeID = null,
+        until_ms: i64 = 0,
+        failures: u8 = 0,
+    };
 
     pub const RelayDialer = struct {
         ctx: *anyopaque,
@@ -433,6 +447,7 @@ pub const ConnectionManager = struct {
             .last_active = sync.timestamp(),
             .handler_thread = handler_thread,
         });
+        self.clearBackoffLocked(conn.getRemoteNodeID());
     }
 
     pub fn setConnectionHandler(self: *ConnectionManager, ctx: anytype, comptime handler: fn (@TypeOf(ctx), network.Connection) anyerror!void) void {
@@ -565,6 +580,18 @@ pub const ConnectionManager = struct {
     /// address answers and the device is known by ID, tries to reach it
     /// through another device (relay_dialer).
     pub fn connectToPeerMulti(self: *ConnectionManager, addresses: []const network.Address, swarm_key: []const u8, remote_node_id: ?id.NodeID) !network.Connection {
+        if (remote_node_id) |target| {
+            if (self.existingConnection(target)) |conn| return conn;
+            if (self.dialBackedOff(target)) return error.PeerUnreachable;
+        }
+        const conn = self.dialAny(addresses, swarm_key, remote_node_id) catch |err| {
+            if (remote_node_id) |target| self.noteDialFailed(target);
+            return err;
+        };
+        return conn;
+    }
+
+    fn dialAny(self: *ConnectionManager, addresses: []const network.Address, swarm_key: []const u8, remote_node_id: ?id.NodeID) !network.Connection {
         const direct_err = if (self.connectDirect(addresses, swarm_key, remote_node_id)) |conn| return conn else |err| err;
         const target = remote_node_id orelse return direct_err;
         const dialer = self.relay_dialer orelse return direct_err;
@@ -572,6 +599,42 @@ pub const ConnectionManager = struct {
         return dialer.dialFn(dialer.ctx, target) catch |err| {
             std.debug.print("ConnectionManager: no relay reaches {x}: {any}\n", .{ target.bytes[0..4], err });
             return direct_err;
+        };
+    }
+
+    /// Whether `peer` failed every address recently. Caller doesn't hold `mutex`.
+    fn dialBackedOff(self: *ConnectionManager, peer: id.NodeID) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now = sync.monotonicMillis();
+        for (&self.dial_backoff) |*b| if (b.peer) |p| if (p.eql(peer)) return now < b.until_ms;
+        return false;
+    }
+
+    fn noteDialFailed(self: *ConnectionManager, peer: id.NodeID) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now = sync.monotonicMillis();
+        // Its slot, else a free one, else the one that ends soonest.
+        var slot = &self.dial_backoff[0];
+        for (&self.dial_backoff) |*b| {
+            if (b.peer) |p| if (p.eql(peer)) {
+                slot = b;
+                break;
+            };
+            if (b.peer == null and slot.peer != null) slot = b;
+            if (b.peer != null and slot.peer != null and b.until_ms < slot.until_ms) slot = b;
+        }
+        const failures: u8 = if (slot.peer != null and slot.peer.?.eql(peer)) slot.failures +| 1 else 1;
+        const shift: u6 = @intCast(@min(failures - 1, 5));
+        slot.* = .{ .peer = peer, .failures = failures, .until_ms = now + @min(backoff_first_ms << shift, backoff_max_ms) };
+    }
+
+    /// A connection to `peer` exists (dialed or accepted): it's reachable.
+    /// Caller holds `mutex`.
+    fn clearBackoffLocked(self: *ConnectionManager, peer: id.NodeID) void {
+        for (&self.dial_backoff) |*b| if (b.peer) |p| if (p.eql(peer)) {
+            b.* = .{};
         };
     }
 
@@ -787,4 +850,19 @@ test "listen is idempotent and can restart after stop" {
     try manager.listen(cfg, null);
     try std.testing.expect(manager.accept_thread != null and manager.tcp_server != null);
     manager.stop();
+}
+
+test "manager: a device that failed every address is not dialed again until its backoff ends" {
+    const manager = try ConnectionManager.createExplicit(std.testing.allocator, .tcp, noise.KeyPair.generate());
+    defer manager.deinit();
+    const peer = id.NodeID{ .bytes = [_]u8{0x42} ** 32 };
+    try std.testing.expect(!manager.dialBackedOff(peer));
+    manager.noteDialFailed(peer);
+    try std.testing.expect(manager.dialBackedOff(peer));
+    // Fails at once, without dialing (no address would answer anyway).
+    try std.testing.expectError(error.PeerUnreachable, manager.connectToPeerMulti(&.{}, "", peer));
+    manager.mutex.lock();
+    manager.clearBackoffLocked(peer);
+    manager.mutex.unlock();
+    try std.testing.expect(!manager.dialBackedOff(peer));
 }
