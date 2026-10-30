@@ -8,6 +8,7 @@ const providers_mod = @import("providers.zig");
 const pairing = @import("../../device/pairing.zig");
 const policy_mod = @import("../../device/policy.zig");
 const node_info = @import("../../node_info.zig");
+const codec = @import("../../storage/dag/codec.zig");
 
 /// In-memory target for Message.serialize (Message.send).
 const MessageBuffer = struct {
@@ -348,7 +349,7 @@ pub const Message = struct {
                 // Only the two tags the serializer writes; anything else is
                 // not a peer list and must not be read as one.
                 switch (try reader.readByte()) {
-                    1 => break :blk MessagePayload{ .FIND_VALUE_RESPONSE = .{ .value = try readValue(allocator, reader) } },
+                    1 => break :blk MessagePayload{ .FIND_VALUE_RESPONSE = .{ .value = try readValueMax(allocator, reader, max_stored_value_len) } },
                     0 => break :blk MessagePayload{ .FIND_VALUE_RESPONSE = .{ .closer_peers = try readPeers(allocator, reader) } },
                     else => return error.InvalidMessage,
                 }
@@ -356,7 +357,7 @@ pub const Message = struct {
             .STORE => blk: {
                 var key: id.NodeID = undefined;
                 try reader.readNoEof(&key.bytes);
-                break :blk MessagePayload{ .STORE = .{ .key = key, .value = try readValue(allocator, reader) } };
+                break :blk MessagePayload{ .STORE = .{ .key = key, .value = try readValueMax(allocator, reader, max_stored_value_len) } };
             },
             .DIAL_BACK => blk: {
                 const port = try reader.readInt(u16, .big);
@@ -380,7 +381,7 @@ pub const Message = struct {
             },
             .PROVIDERS => MessagePayload{ .PROVIDERS = .{ .providers = try readProviders(allocator, reader) } },
             .BLOCK => MessagePayload{ .BLOCK = .{
-                .data = if (try readBool(reader)) try readValue(allocator, reader) else null,
+                .data = if (try readBool(reader)) try readValueMax(allocator, reader, max_block_len) else null,
             } },
             .REVOKE => blk: {
                 var device: id.NodeID = undefined;
@@ -400,7 +401,7 @@ pub const Message = struct {
                 errdefer allocator.free(nickname);
                 try reader.readNoEof(nickname);
                 if (!isValidNickname(nickname)) return error.InvalidNickname;
-                const listing = try readValue(allocator, reader);
+                const listing = try readValueMax(allocator, reader, max_block_len);
                 errdefer allocator.free(listing);
                 break :blk MessagePayload{ .SHARES = .{ .nickname = nickname, .listing = listing, .backup = try readValueMax(allocator, reader, max_backup_info_len) } };
             },
@@ -584,6 +585,15 @@ fn valueLenMax(len: usize, max: usize) !u32 {
 /// library's manifest is tens of MiB, more than other values. The folder
 /// caps its manifest below this (checked in node.zig).
 pub const max_swarm_len = 64 * 1024 * 1024;
+
+/// Each message's values are bounded before they're read, so a peer can't
+/// make a handler buffer more than its type allows (256 handlers at the
+/// general 10 MiB limit would be 2.5 GiB).
+/// A DHT value (STORE, FIND_VALUE): node.zig's StoreLimits keeps no larger.
+pub const max_stored_value_len = 64 * 1024;
+/// A block (BLOCK) or a folder listing (SHARES): the largest block, a
+/// directory block.
+pub const max_block_len = codec.max_dir_block_len;
 
 fn isPrintableAscii(byte: u8) bool {
     return byte >= 0x20 and byte <= 0x7e;

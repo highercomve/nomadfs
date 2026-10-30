@@ -17,7 +17,7 @@ const policy_mod = @import("../../device/policy.zig");
 /// Bounds on values peers can STORE here. Without them any peer could fill
 /// our memory with arbitrary values.
 pub const StoreLimits = struct {
-    max_value_len: usize = 64 * 1024,
+    max_value_len: usize = rpc.max_stored_value_len,
     max_total_bytes: usize = 64 * 1024 * 1024,
     max_keys: usize = 100_000,
 };
