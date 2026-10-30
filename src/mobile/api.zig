@@ -382,19 +382,9 @@ fn hexCid(cid: [32]u8) ![*:0]u8 {
     return out;
 }
 
-const FileReader = struct {
-    io: std.Io,
-    file: std.Io.File,
-    offset: u64 = 0,
+const FileReader = nomadfs.storage.FileReader;
 
-    pub fn read(self: *FileReader, dest: []u8) std.Io.File.ReadPositionalError!usize {
-        if (dest.len == 0) return 0;
-        const n = try self.file.readPositional(self.io, &.{dest}, self.offset);
-        self.offset += n;
-        return n;
-    }
-};
-
+// @atlas allow: the writing counterpart of storage.FileReader, same cursor fields
 const FileWriter = struct {
     io: std.Io,
     file: std.Io.File,
