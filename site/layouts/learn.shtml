@@ -16,6 +16,8 @@
 				<a href="$site.page('learn/sha-256').link()">SHA-256 &amp; CIDs</a>
 				<a href="$site.page('learn/fastcdc').link()">FastCDC</a>
 				<a href="$site.page('learn/merkle-dag').link()">Merkle DAG</a>
+				<h4>Distribution</h4>
+				<a href="$site.page('learn/fetcher').link()">Parallel chunk fetching</a>
 				<h4>Folders</h4>
 				<a href="$site.page('learn/swarm-crdt').link()">Swarm folder CRDT</a>
 				<a href="$site.page('learn/fuse').link()">FUSE, no libfuse</a>

@@ -30,18 +30,28 @@ reading from several devices at once, reaches every feature together.
 
 # [Opening a file]($heading.id('reading'))
 
-When you play a video from the swarm folder:
+When you open a photo or play a video from the swarm folder:
 
 1. **Folders** knows the file and who added it, and works out which pieces cover
    what the player asks for next. While you watch, it asks for the next few
    seconds ahead of time.
-2. **Distribution** picks, for each piece, the device expected to answer first:
-   the one that has been fastest and is least busy. With several devices holding
-   the file, the pieces come from all of them at once, most from the fastest. A
-   device that turns out not to have the file is remembered, so it isn't asked
-   again for every piece.
-3. **Transport** carries each request over an encrypted connection and checks the
-   piece's hash before it's kept.
+2. **Distribution** checks who holds the file: the device that added it, plus
+   any backup devices and placed replicas. It then picks, for each piece, the
+   device expected to answer first: `cost = (in_flight + 1) / rate`.
+   With several devices holding the file, pieces come from all of them at once,
+   most from the fastest. A device that turns out not to have the file is
+   remembered, so it isn't asked again for every piece.
+3. **Transport** carries each request over encrypted Yamux streams and checks
+   each piece's SHA-256 hash before keeping it.
+
+[Pulling a file from multiple devices in parallel: read-ahead workers spread block requests across the home server and the phone in proportion to their speed.](<$image.siteAsset('learn/multi-holder-fetch.svg').alt('Pulling a file from multiple holders in parallel: read-ahead workers spread block requests across the home server and the phone in proportion to their speed')>)
+
+For example, when a laptop reads a photo added by a phone and backed up to a
+home server, both devices hold the data. The laptop's 6 read-ahead workers
+request blocks in parallel: the home server on fast LAN answers with high
+throughput and takes the bulk of the chunks, while the phone on Wi-Fi serves
+chunks concurrently. If a device is slow or drops off, requests automatically
+shift to the other holders without interrupting the read.
 
 A [shared folder]($link.page('docs/shared-folders')) works the same way: its
 pieces come from the device sharing it, or from a backup device that keeps a copy

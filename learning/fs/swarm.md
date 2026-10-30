@@ -91,8 +91,19 @@ refused).
 | `makeDir(dir, name)` | A `.dir` entry. Folders are also implied by deeper paths (`Manifest.list`). |
 | `remove(path)` | Tombstones the path and every live entry under it. |
 | `rename(path, new_name)` / `move(path, new_path, .{ .replace })` | For each live entry under `path`: a new entry at the destination with the same CID, then a tombstone at the old path. With `replace`, whatever was at the target is tombstoned first (POSIX rename). A folder can't move inside itself. |
-| `readAt(cid, author, offset, dest)` | Names the file's likely holders (the author, the devices placement gives it, then the cluster's list: swarm backup devices, everyone else) and reads through the read-ahead; the fetcher picks a holder per block ([Chapter 4.1](../cluster/fetcher.md)). Any copy of a block will do, since every block is verified. |
+| `readAt(cid, author, offset, dest)` | Names the file's likely holders (the author, the devices placement gives it, then the cluster's list: swarm backup devices, everyone else) and reads through `ReadAhead`; the fetcher picks a holder per block ([Chapter 4.1](../cluster/fetcher.md)). Any copy of a block will do, since every block is verified. |
 | `fileInfo`, `isEmptyDir`, `stagingDir` | Helpers for the FUSE driver ([Chapter 5.3](./fuse.md)). |
+
+### Reading from multiple holders
+
+When reading a file that exists on both the original author (for example, a Phone) and on a backup
+or replica device (such as a Home Server), `holdersOf()` supplies all candidate holders to
+`ReadAhead`.
+
+With 6 parallel read-ahead workers issuing requests across Yamux multiplexed connections, blocks are
+pulled concurrently from both devices. The faster node (e.g. the Home Server on Gigabit LAN)
+answers more requests, while the slower node (e.g. the Phone on Wi-Fi) continues to serve chunks in
+parallel. Readers never wait on a single bottleneck link.
 
 ## 3. Sync: pull every 10 seconds
 

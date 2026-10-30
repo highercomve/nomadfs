@@ -68,6 +68,11 @@ two backup devices so also back each other up. It remembers what it copied
 again. Other devices need no setting: when the author is offline they read from
 the backup devices.
 
+When both the author (e.g. a phone) and a backup device (e.g. a home server)
+are online, readers pull chunks from **both** in parallel, letting the faster link
+carry most of the load without waiting on slower Wi-Fi or mobile connections
+([how it works]($link.page('docs/how-it-works').ref('reading'))).
+
 # [Copies on more devices]($heading.id('copies'))
 
 A backup device keeps everything. To keep each file on a few devices instead,

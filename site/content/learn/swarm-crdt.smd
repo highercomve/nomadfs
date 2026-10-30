@@ -4,7 +4,7 @@
 .date = .date("2026-10-27T00:00:00"),
 .authors = ["NomadFS"],
 .layout = "learn.shtml",
-.custom = { "label": "learn · folders · 07", "prev": "learn/merkle-dag", "next": "learn/fuse" },
+.custom = { "label": "learn · folders · 08", "prev": "learn/fetcher", "next": "learn/fuse" },
 ---
 
 # [What a CRDT is]($heading.id('what'))
@@ -90,8 +90,9 @@ levels made of valid names, or it is dropped, and author names are cut to
 # [Reading a swarm file]($heading.id('reading'))
 
 To read a file, NomadFS walks its tree from the root CID, fetching blocks it
-doesn't have: first from the device that made the entry's version, then from
-every other known device. Since [every block is checked against its CID]($link.page('learn/sha-256').ref('verify')),
+doesn't have. Read-ahead queries candidate holders (the author, backup devices,
+and placed replicas) and [pulls chunks from them in parallel]($link.page('learn/fetcher')).
+Since [every block is checked against its CID]($link.page('learn/sha-256').ref('verify')),
 any copy of a block is as good as the original.
 
 # [Backup devices]($heading.id('backup'))

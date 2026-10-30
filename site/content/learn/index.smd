@@ -40,6 +40,12 @@ trees.
   file trees and directory blocks, and how a read finds the one block it
   needs.
 
+# [Distribution: how chunks travel]($heading.id('distribution'))
+
+- [Parallel chunk fetching]($link.page('learn/fetcher')). How read-ahead
+  pulls chunks from multiple devices at once (the author, backup devices, and
+  placed replicas), dynamically load-balancing by link speed.
+
 # [Folders: what you see]($heading.id('folders'))
 
 - [The swarm folder CRDT]($link.page('learn/swarm-crdt')). The folder every

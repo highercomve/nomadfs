@@ -30,20 +30,33 @@ six workers and the keeper four per copy, so six blocks in flight go to the hold
 to their speed. A stalled holder accumulates requests in flight, its cost rises, and the others get
 the work. No message is sent that the read didn't need.
 
+### Multi-device parallel pulling
+
+When a file (such as a camera photo `PXL_...RAW-01.MP.jpg` taken on a phone and backed up to a
+home server) is read by another node (such as a laptop), `holdersOf()` identifies both the
+author (`Phone`) and the backup peer (`Home Server`) as candidate holders.
+
+Because read-ahead issues requests for upcoming blocks concurrently across 6 worker threads, the
+fetcher dispatches them in parallel across Yamux streams. Both nodes serve chunks simultaneously,
+with the faster link carrying the majority of the transfer:
+
 ```mermaid
 sequenceDiagram
-    participant RA as Read-ahead (6 workers)
+    participant C as Laptop (Reader, 6 workers)
     participant F as Fetcher
-    participant A as Plex (fast)
-    participant B as Ridge (slower)
-    RA->>F: block 1..6 of file R
-    F->>A: GET_BLOCK 1
-    F->>B: GET_BLOCK 2
-    F->>A: GET_BLOCK 3
-    A-->>F: 1 (rate ↑)
-    F->>A: GET_BLOCK 4
-    B-->>F: 2
-    Note over F: more blocks go to the faster holder
+    participant S as Home Server (LAN backup, fast)
+    participant P as Phone (Wi-Fi author, slower)
+    C->>F: blocks 1..6 of PXL_photo.jpg
+    F->>S: GET_BLOCK 1
+    F->>P: GET_BLOCK 2
+    F->>S: GET_BLOCK 3
+    S-->>F: block 1 (rate 45 MB/s ↑)
+    F->>S: GET_BLOCK 4
+    P-->>F: block 2 (rate 15 MB/s)
+    F->>P: GET_BLOCK 5
+    S-->>F: block 3
+    F->>S: GET_BLOCK 6
+    Note over F: chunks pulled in parallel; faster server takes more blocks
 ```
 
 ## 2. What it remembers (bounded)

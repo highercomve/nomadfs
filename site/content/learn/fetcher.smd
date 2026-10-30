@@ -1,0 +1,86 @@
+---
+.title = "Parallel chunk fetching",
+.description = "How NomadFS pulls blocks from multiple devices at once: read-ahead workers spread requests across the author and backup peers, load-balancing in proportion to measured speed.",
+.date = .date("2026-10-30T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "learn.shtml",
+.custom = { "label": "learn · distribution · 07", "prev": "learn/merkle-dag", "next": "learn/swarm-crdt" },
+---
+
+Every block a read needs from another device comes through the distribution
+layer (`src/cluster/fetcher.zig`): the Linux mount, the app's viewer, file
+downloads, the swarm folder, and background backup.
+
+When multiple devices hold a file—such as the phone that originally took a photo
+and a home server that backed it up—NomadFS doesn't restrict itself to downloading
+from one source. It pulls pieces from all available holders concurrently.
+
+# [Picking a holder]($heading.id('picking'))
+
+Callers ask for a specific block CID and provide the candidate holders: the
+original author, swarm backup peers, and replica holders.
+
+For each candidate device, the fetcher calculates:
+
+```
+cost = (requests_in_flight + 1) / measured_rate
+```
+
+The device with the lowest expected wait time is assigned the next chunk:
+
+- **`measured_rate`** is an exponentially weighted moving average (EWMA: 3/4
+  historical, 1/4 new sample) of transfer speed, sampled only on leaf blocks of
+  at least 16 KB (small index blocks measure round-trip latency, not sustained
+  throughput).
+- **Untried devices** start with an optimistic rate equal to the fastest known
+  peer (or 4 MB/s default), ensuring new peers are immediately given a chance to
+  prove their link speed.
+- **Ties** preserve the original caller preference (such as trying the local LAN
+  server or author first).
+
+# [Parallel read-ahead across Yamux]($heading.id('parallel'))
+
+A single fetch request queries one holder at a time. The multi-device speedup
+comes from the read-ahead pipeline (`src/fs/readahead.zig`):
+
+1. **6 parallel worker threads** look ahead in the file and enqueue requests for
+   consecutive blocks (e.g. blocks 0, 1, 2, 3, 4, 5).
+2. Each block is dispatched to the best available holder according to the cost
+   formula.
+3. Requests travel as lightweight messages over independent
+   [Yamux]($link.page('learn/yamux')) streams on the existing encrypted
+   connection.
+
+[Pulling a file from multiple holders in parallel: read-ahead workers spread block requests across the home server and the phone in proportion to their speed.](<$image.siteAsset('learn/multi-holder-fetch.svg').alt('Pulling a file from multiple holders in parallel: read-ahead workers spread block requests across the home server and the phone in proportion to their speed')>)
+
+In the scenario above, a laptop reads a photo (`PXL_photo.jpg`) that exists on
+both a Phone (the original author on Wi-Fi) and a Home Server (the backup peer
+on Gigabit Ethernet):
+
+- Block 0 goes to the Home Server.
+- Block 1 goes to the Phone.
+- Block 2 goes to the Home Server.
+- The Home Server completes Block 0 rapidly (45 MB/s), lowering its in-flight
+  count and increasing its measured rate. The fetcher immediately dispatches
+  Block 3 to the Home Server.
+- The Phone completes Block 1 over Wi-Fi (15 MB/s), and the fetcher dispatches
+  Block 4 to the Phone.
+
+Both devices contribute chunks in parallel. The fast LAN server handles the
+lion's share of the work without stalling on the phone's wireless link, while
+the phone's bandwidth still contributes to completing the transfer faster.
+
+# [Verification and resilience]($heading.id('resilience'))
+
+Because every block is addressed by its [SHA-256 hash]($link.page('learn/sha-256')),
+the receiving device verifies each chunk independently upon arrival before
+placing it in the local cache. It does not matter which device served a piece:
+data corruption or tampering is detected instantly.
+
+If a device stalls or disconnects:
+- Its in-flight requests accumulate, driving up its cost so other devices take
+  over upcoming blocks.
+- If a device fails to respond or reports "not found", the fetcher fails over to
+  the next holder for that specific block.
+- Failed devices back off exponentially (5 s to 60 s), and devices with 3
+  consecutive file misses are skipped for that file, avoiding wasted round trips.

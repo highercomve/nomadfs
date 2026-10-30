@@ -4,7 +4,7 @@
 .date = .date("2026-10-27T00:00:00"),
 .authors = ["NomadFS"],
 .layout = "learn.shtml",
-.custom = { "label": "learn · folders · 08", "prev": "learn/swarm-crdt" },
+.custom = { "label": "learn · folders · 09", "prev": "learn/swarm-crdt" },
 ---
 
 # [What FUSE is]($heading.id('what'))
