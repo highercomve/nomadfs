@@ -1620,6 +1620,8 @@ fn errnoFor(err: anyerror) Errno {
         error.InvalidPath, error.InvalidName => .INVAL,
         error.NameTooLong => .NAMETOOLONG,
         error.DeviceOrResourceBusy => .BUSY,
+        error.DirNotEmpty => .NOTEMPTY,
+        error.PathAlreadyExists => .EXIST,
         error.PeerDown => .IO,
         else => .IO,
     };

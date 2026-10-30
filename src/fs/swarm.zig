@@ -250,6 +250,15 @@ pub const SwarmFolder = struct {
         defer freePaths(self.allocator, in_the_way);
         if (in_the_way.len > 0) {
             if (!options.replace) return error.PathAlreadyExists;
+            // POSIX rename: a folder replaces only an empty folder, a file
+            // only a file. Replacing deletes what is there on every device.
+            const moving_dir = self.isDirLocked(path, moving);
+            const target_dir = self.isDirLocked(new_path, in_the_way);
+            if (moving_dir and !target_dir) return error.NotADirectory;
+            if (!moving_dir and target_dir) return error.IsDirectory;
+            if (target_dir) for (in_the_way) |p| {
+                if (!std.mem.eql(u8, p, new_path)) return error.DirNotEmpty;
+            };
             for (in_the_way) |p| _ = try self.manifest.edit(p, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
         }
         for (moving) |old| {
@@ -260,6 +269,13 @@ pub const SwarmFolder = struct {
             _ = try self.manifest.edit(old, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
         }
         try self.saveLocked();
+    }
+
+    /// Whether `path` is a folder, given what is live under it (itself
+    /// included).
+    fn isDirLocked(self: *SwarmFolder, path: []const u8, under: []const []const u8) bool {
+        if (self.manifest.get(path)) |e| if (!e.deleted) return e.kind == .dir;
+        return under.len > 0; // only things inside it: an implied folder
     }
 
     pub const Info = struct { cid: [32]u8, size: u64, mtime: u64, author: [32]u8 };
@@ -775,4 +791,39 @@ test "swarm: moveCorruptAside moves corrupt manifest aside on load" {
         if (std.mem.startsWith(u8, e.name, "manifest.json.corrupt-")) found_corrupt = true;
     }
     try testing.expect(found_corrupt);
+}
+
+test "swarm: a move replaces only an empty folder, and a file only a file" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const manifest_path = try std.fs.path.join(allocator, &.{ tmp_path, "manifest.json" });
+    defer allocator.free(manifest_path);
+    var store = try storage.engine.StorageEngine.init(allocator, tmp_path);
+    defer store.deinit();
+    const folder = try SwarmFolder.create(allocator, io, &store, .{ .bytes = [_]u8{0x11} ** 32 }, "test", manifest_path);
+    defer folder.destroy();
+
+    try folder.makeDir("", "A");
+    try folder.makeDir("", "B");
+    try folder.makeDir("B", "keep");
+    try folder.makeDir("", "E");
+
+    // A folder doesn't replace a folder with things in it (ENOTEMPTY).
+    try testing.expectError(error.DirNotEmpty, folder.move("A", "B", .{ .replace = true }));
+    try testing.expect(!(try folder.isEmptyDir("B")));
+    // An empty one, it does.
+    try folder.move("A", "E", .{ .replace = true });
+    try testing.expectError(error.FileNotFound, folder.move("A", "X", .{}));
+    // A file and a folder never replace each other.
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "hello" });
+    const file_path = try std.fs.path.join(allocator, &.{ tmp_path, "f.txt" });
+    defer allocator.free(file_path);
+    try folder.addFile("", "f", file_path);
+    try testing.expectError(error.NotADirectory, folder.move("E", "f", .{ .replace = true }));
+    try testing.expectError(error.IsDirectory, folder.move("f", "E", .{ .replace = true }));
 }
