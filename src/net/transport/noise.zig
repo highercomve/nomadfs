@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const network = @import("mod.zig");
+const network = @import("interface.zig");
 const compat = @import("../compat.zig");
 const device_auth = @import("../../device/auth.zig");
 const identity_mod = @import("../../device/identity.zig");

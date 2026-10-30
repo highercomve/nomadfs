@@ -10,7 +10,7 @@
 //! travels on, so it stays up as long as the relayed one is in use.
 
 const std = @import("std");
-const network = @import("mod.zig");
+const network = @import("interface.zig");
 const noise = @import("noise.zig");
 const device_auth = @import("../../device/auth.zig");
 const YamuxSession = @import("yamux.zig").Session;
@@ -26,7 +26,7 @@ const RelayedConnectionImpl = struct {
     yamux_thread: std.Thread,
     allocator: std.mem.Allocator,
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+    refs: network.RefCount = .{},
 
     fn connection(self: *RelayedConnectionImpl) network.Connection {
         return network.Connection.init(self, &vtable);
@@ -70,8 +70,7 @@ const RelayedConnectionImpl = struct {
 
     fn isInUse(ctx: *anyopaque) bool {
         const self: *RelayedConnectionImpl = @ptrCast(@alignCast(ctx));
-        const streams = self.yamux.streamCount();
-        return self.refs.load(.acquire) > 1 or streams > 0;
+        return self.refs.shared() or self.yamux.streamCount() > 0;
     }
 
     /// Signals shutdown: ends the stream through the relay, which wakes
@@ -85,15 +84,12 @@ const RelayedConnectionImpl = struct {
 
     fn retain(ctx: *anyopaque) void {
         const self: *RelayedConnectionImpl = @ptrCast(@alignCast(ctx));
-        const prev = self.refs.fetchAdd(1, .monotonic);
-        std.debug.assert(prev > 0);
+        self.refs.retain();
     }
 
     fn deinit(ctx: *anyopaque) void {
         const self: *RelayedConnectionImpl = @ptrCast(@alignCast(ctx));
-        const prev = self.refs.fetchSub(1, .acq_rel);
-        std.debug.assert(prev > 0);
-        if (prev != 1) return;
+        if (!self.refs.release()) return;
 
         close(ctx);
         self.yamux_thread.join();

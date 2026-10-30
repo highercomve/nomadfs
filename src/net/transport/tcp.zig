@@ -1,5 +1,5 @@
 const std = @import("std");
-const network = @import("mod.zig");
+const network = @import("interface.zig");
 const noise = @import("noise.zig");
 const device_auth = @import("../../device/auth.zig");
 const YamuxSession = @import("yamux.zig").Session;
@@ -21,7 +21,7 @@ const TcpConnectionImpl = struct {
     allocator: std.mem.Allocator,
     peer_address: network.Address,
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+    refs: network.RefCount = .{},
 
     pub fn connection(self: *TcpConnectionImpl) network.Connection {
         return network.Connection.init(self, &tcp_connection_vtable);
@@ -74,8 +74,7 @@ const TcpConnectionImpl = struct {
 
     pub fn isInUse(ctx: *anyopaque) bool {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
-        const streams = self.yamux.streamCount();
-        return self.refs.load(.acquire) > 1 or streams > 0;
+        return self.refs.shared() or self.yamux.streamCount() > 0;
     }
 
     /// Signals shutdown. Safe while other threads still use the connection.
@@ -91,16 +90,13 @@ const TcpConnectionImpl = struct {
 
     pub fn retain(ctx: *anyopaque) void {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
-        const prev = self.refs.fetchAdd(1, .monotonic);
-        std.debug.assert(prev > 0);
+        self.refs.retain();
     }
 
     /// Drops one reference; the last one tears the connection down.
     pub fn deinit(ctx: *anyopaque) void {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
-        const prev = self.refs.fetchSub(1, .acq_rel);
-        std.debug.assert(prev > 0);
-        if (prev != 1) return;
+        if (!self.refs.release()) return;
 
         TcpConnectionImpl.close(ctx);
         self.yamux_thread.join();
@@ -175,13 +171,32 @@ pub const Handshakes = struct {
     }
 };
 
+/// Bytes moved over TCP, added to by every stream that points at them.
+pub const TrafficCounters = struct {
+    sent: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    received: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
+/// What the accept loop shares with the connection manager that runs it:
+/// the handshake budget, the traffic counters, a wait group its stop()
+/// waits on, and where established connections go.
+pub const Owner = struct {
+    ctx: *anyopaque,
+    handshakes: *Handshakes,
+    handshake_wg: *sync.WaitGroup,
+    traffic: *TrafficCounters,
+    /// Takes the connection's reference on success; on failure the caller
+    /// still holds it.
+    addConnection: *const fn (ctx: *anyopaque, conn: network.Connection) anyerror!void,
+};
+
 pub const TcpStream = struct {
     net_stream: network.TcpStream,
     deadline_ms: ?i64 = null,
     handshakes: ?*Handshakes = null,
     handshake_slot: usize = 0,
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    traffic: ?*network.manager.TrafficCounters = null,
+    traffic: ?*TrafficCounters = null,
 
     pub fn stream(self: *TcpStream) network.Stream {
         return network.Stream.init(self, &tcp_stream_vtable);
@@ -245,7 +260,7 @@ pub const ListenConfig = struct {
     swarm_key: []const u8,
     static_key: noise.KeyPair,
     running: ?*std.atomic.Value(bool) = null,
-    manager: ?*network.manager.ConnectionManager = null,
+    owner: ?Owner = null,
     device_auth: ?*const device_auth.Authenticator = null,
 };
 
@@ -262,7 +277,7 @@ fn acceptLoop(allocator: std.mem.Allocator, mut_server: network.Server, cfg: Lis
     // We work on a copy of the server struct, but it shares the underlying FD.
     var server = mut_server;
     var local_handshakes: Handshakes = .{};
-    const handshakes = if (cfg.manager) |m| &m.handshakes else &local_handshakes;
+    const handshakes = if (cfg.owner) |o| o.handshakes else &local_handshakes;
     defer handshakes.wg.wait();
 
     while (cfg.running == null or cfg.running.?.load(.acquire)) {
@@ -282,10 +297,10 @@ fn acceptLoop(allocator: std.mem.Allocator, mut_server: network.Server, cfg: Lis
             continue;
         };
 
-        // The manager outlives the thread: its stop() waits on
+        // The owner outlives the thread: its stop() waits on
         // handshake_wg. (A reference dropped after finish() could land
         // after the manager was freed.)
-        if (cfg.manager) |m| m.handshake_wg.start();
+        if (cfg.owner) |o| o.handshake_wg.start();
 
         const thread = std.Thread.spawn(.{}, handleIncomingConnection, .{
             allocator,
@@ -293,7 +308,7 @@ fn acceptLoop(allocator: std.mem.Allocator, mut_server: network.Server, cfg: Lis
             cfg.swarm_key,
             cfg.static_key,
             cfg.handshake_timeout_ms,
-            cfg.manager,
+            cfg.owner,
             cfg.device_auth,
             handshakes,
             slot,
@@ -301,7 +316,7 @@ fn acceptLoop(allocator: std.mem.Allocator, mut_server: network.Server, cfg: Lis
             handshakes.remove(slot);
             handshakes.wg.finish();
             conn.stream.close();
-            if (cfg.manager) |m| m.handshake_wg.finish();
+            if (cfg.owner) |o| o.handshake_wg.finish();
             continue;
         };
         thread.detach();
@@ -315,27 +330,27 @@ fn handleIncomingConnection(
     swarm_key: []const u8,
     static_key: noise.KeyPair,
     handshake_timeout_ms: u32,
-    manager: ?*network.manager.ConnectionManager,
+    owner: ?Owner,
     device_auth_opt: ?*const device_auth.Authenticator,
     handshakes: *Handshakes,
     slot: usize,
 ) void {
     defer {
         handshakes.wg.finish();
-        if (manager) |m| m.handshake_wg.finish(); // last use of the manager
+        if (owner) |o| o.handshake_wg.finish(); // last use of the owner
     }
 
-    const traffic = if (manager) |m| &m.traffic else null;
+    const traffic = if (owner) |o| o.traffic else null;
     const connection = establish(allocator, conn.stream, conn.address, swarm_key, static_key, false, handshake_timeout_ms, device_auth_opt, handshakes, slot, traffic) catch {
         return;
     };
 
-    const m = manager orelse {
+    const o = owner orelse {
         connection.deinit();
         return;
     };
-    // On success the manager owns our reference; on failure we still do.
-    m.addConnection(connection) catch |err| {
+    // On success the owner holds our reference; on failure we still do.
+    o.addConnection(o.ctx, connection) catch |err| {
         std.debug.print("Failed to register connection from {f}: {}\n", .{ conn.address, err });
         connection.deinit();
     };
@@ -363,7 +378,7 @@ pub fn connectTracked(
     handshake_timeout_ms: u32,
     device_auth_opt: ?*const device_auth.Authenticator,
     handshakes: ?*Handshakes,
-    traffic: ?*network.manager.TrafficCounters,
+    traffic: ?*TrafficCounters,
 ) !network.Connection {
     // A device has several addresses (LAN, Tailscale, ...) and the caller
     // tries them in turn: away from home the LAN one can hang until the
@@ -391,7 +406,7 @@ fn establish(
     device_auth_opt: ?*const device_auth.Authenticator,
     handshakes: ?*Handshakes,
     slot: usize,
-    traffic: ?*network.manager.TrafficCounters,
+    traffic: ?*TrafficCounters,
 ) !network.Connection {
     std.debug.assert(handshake_timeout_ms > 0);
     net_stream.setNoDelay();

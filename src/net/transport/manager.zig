@@ -1,19 +1,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const network = @import("mod.zig");
+const network = @import("interface.zig");
 const config = @import("../../config.zig");
 const tcp = @import("tcp.zig");
 const noise = @import("noise.zig");
 const nat = @import("nat.zig");
+const mdns_mod = @import("mdns.zig");
+const local_addrs = @import("../local_addrs.zig");
 const id = @import("../id.zig");
 const sync = @import("../../sync.zig");
 const env_mod = @import("../../env.zig");
 const device_auth = @import("../../device/auth.zig");
-
-pub const TrafficCounters = struct {
-    sent: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    received: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-};
 
 pub const ConnectionManager = struct {
     const ManagedConnection = struct {
@@ -44,7 +41,7 @@ pub const ConnectionManager = struct {
     handshake_timeout_ms: u32 = tcp.default_handshake_timeout_ms,
     reap_interval_ms: u64 = 10000,
     upnp: nat.UPnP,
-    mdns: ?network.mdns.MDNS = null,
+    mdns: ?mdns_mod.MDNS = null,
     ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
     handshake_wg: sync.WaitGroup = .{},
     handshakes: tcp.Handshakes = .{},
@@ -55,7 +52,7 @@ pub const ConnectionManager = struct {
     /// Reaches a device through another one when none of its addresses
     /// answers (discovery/node.zig sets it; transport/relay.zig).
     relay_dialer: ?RelayDialer = null,
-    traffic: TrafficCounters = .{},
+    traffic: tcp.TrafficCounters = .{},
     /// Devices that just failed every address and the relay: dialing them
     /// again fails at once until `until_ms`, so a device that is gone (an
     /// old identity, a phone off) costs one round of timeouts, not one per
@@ -455,6 +452,22 @@ pub const ConnectionManager = struct {
     /// Registers `conn` and starts its handler. On success the manager takes
     /// over the caller's reference; on error the caller still owns it and
     /// nothing was registered.
+    /// What the TCP accept loop needs from this manager.
+    fn tcpOwner(self: *ConnectionManager) tcp.Owner {
+        return .{
+            .ctx = self,
+            .handshakes = &self.handshakes,
+            .handshake_wg = &self.handshake_wg,
+            .traffic = &self.traffic,
+            .addConnection = addConnectionOpaque,
+        };
+    }
+
+    fn addConnectionOpaque(ctx: *anyopaque, conn: network.Connection) anyerror!void {
+        const self: *ConnectionManager = @ptrCast(@alignCast(ctx));
+        return self.addConnection(conn);
+    }
+
     pub fn addConnection(self: *ConnectionManager, conn: network.Connection) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -540,11 +553,11 @@ pub const ConnectionManager = struct {
         // Initialize mDNS
 
         if (cfg.network.enable_mdns) {
-            self.mdns = network.mdns.MDNS.init(
+            self.mdns = mdns_mod.MDNS.init(
                 self.allocator,
                 self.node_id,
                 cfg.network.port,
-                network.mdns.MDNS_PORT,
+                mdns_mod.MDNS_PORT,
                 onMdnsDiscovery,
                 self,
             );
@@ -583,7 +596,7 @@ pub const ConnectionManager = struct {
                     .swarm_key = cfg.node.swarm_key,
                     .static_key = self.identity_key,
                     .running = &self.running,
-                    .manager = self,
+                    .owner = self.tcpOwner(),
                     .device_auth = self.deviceAuthPtr(),
                 });
 
@@ -596,7 +609,7 @@ pub const ConnectionManager = struct {
                         .swarm_key = cfg.node.swarm_key,
                         .static_key = self.identity_key,
                         .running = &self.running,
-                        .manager = self,
+                        .owner = self.tcpOwner(),
                         .device_auth = self.deviceAuthPtr(),
                     },
                 });
@@ -714,14 +727,14 @@ pub const ConnectionManager = struct {
 
         const SortCtx = struct {
             pub fn lessThan(_: @This(), a: network.Address, b: network.Address) bool {
-                return network.addressPriority(a) < network.addressPriority(b);
+                return local_addrs.addressPriority(a) < local_addrs.addressPriority(b);
             }
         };
         std.mem.sort(network.Address, sorted_addrs, SortCtx{}, SortCtx.lessThan);
 
         for (sorted_addrs) |addr| {
             // Port 0, multicast, link-local and the like can't be a peer.
-            if (@import("../local_addrs.zig").classify(addr) == .invalid) continue;
+            if (local_addrs.classify(addr) == .invalid) continue;
             if (self.connectToPeer(addr, swarm_key, remote_node_id)) |conn| {
                 return conn;
             } else |err| {
@@ -849,7 +862,7 @@ test "stop joins mDNS callbacks without the pool mutex" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var manager = ConnectionManager.initExplicit(std.testing.allocator, .tcp, noise.KeyPair.generate());
     defer manager.deinit();
-    manager.mdns = network.mdns.MDNS.init(std.testing.allocator, manager.node_id, 0, 0, ConnectionManager.onMdnsDiscovery, &manager);
+    manager.mdns = mdns_mod.MDNS.init(std.testing.allocator, manager.node_id, 0, 0, ConnectionManager.onMdnsDiscovery, &manager);
     manager.mdns.?.running.store(true, .release);
     manager.mdns.?.thread = try std.Thread.spawn(.{}, struct {
         fn run(cm: *ConnectionManager) void {

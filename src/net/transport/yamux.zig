@@ -1,6 +1,6 @@
 const sync = @import("../../sync.zig");
 const std = @import("std");
-const network = @import("mod.zig");
+const network = @import("interface.zig");
 const compat = @import("../compat.zig");
 
 pub const Version = 0;
