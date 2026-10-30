@@ -942,7 +942,7 @@ pub const SwarmItem = struct {
     author: []const u8,
     author_id: []const u8,
 };
-pub const SwarmListing = struct { items: []SwarmItem, entries: usize, peers_synced: u32, last_sync: u64 };
+pub const SwarmListing = struct { items: []SwarmItem, entries: usize, peers_synced: u32, peers_failed: u32, last_sync: u64 };
 pub const SwarmDirArgs = struct { dir: []const u8 };
 
 /// Caller holds g_mutex.
@@ -971,7 +971,7 @@ pub fn swarmList(gpa: std.mem.Allocator, args: SwarmDirArgs) !SwarmListing {
         };
     }
     const st = folder.status();
-    return .{ .items = out, .entries = st.entries, .peers_synced = st.peers_synced, .last_sync = st.last_sync };
+    return .{ .items = out, .entries = st.entries, .peers_synced = st.peers_synced, .peers_failed = st.peers_failed, .last_sync = st.last_sync };
 }
 
 pub const BackupArgs = struct { config_path: []const u8, on: bool };

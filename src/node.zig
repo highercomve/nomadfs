@@ -7,6 +7,11 @@ const net = @import("net/mod.zig");
 const storage = @import("storage/mod.zig");
 const device = @import("device/mod.zig");
 const fs = @import("fs/mod.zig");
+
+// A manifest the folder keeps must fit in a SWARM reply.
+comptime {
+    std.debug.assert(fs.manifest.max_bytes <= net.discovery.rpc.max_swarm_len);
+}
 const cluster = @import("cluster/mod.zig");
 const sync = @import("sync.zig");
 const node_info = @import("node_info.zig");

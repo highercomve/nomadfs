@@ -297,7 +297,7 @@ pub const Message = struct {
                 try writer.writeAll(&p.signature);
             },
             .SWARM => |p| {
-                try writer.writeInt(u32, try valueLen(p.manifest.len), .big);
+                try writer.writeInt(u32, try valueLenMax(p.manifest.len, max_swarm_len), .big);
                 try writer.writeAll(p.manifest);
             },
             .GET_NODE_INFO => {},
@@ -426,7 +426,7 @@ pub const Message = struct {
                 try reader.readNoEof(&signature);
                 break :blk MessagePayload{ .ROTATE_KEY = .{ .epoch = epoch, .new_key = new_key, .signer_key = signer_key, .signature = signature } };
             },
-            .SWARM => MessagePayload{ .SWARM = .{ .manifest = try readValue(allocator, reader) } },
+            .SWARM => MessagePayload{ .SWARM = .{ .manifest = try readValueMax(allocator, reader, max_swarm_len) } },
             .RELAY_CONNECT => blk: {
                 var target: id.NodeID = undefined;
                 try reader.readNoEof(&target.bytes);
@@ -572,9 +572,18 @@ const read_chunk_len = 64 * 1024;
 /// Length prefix of a value the receiver accepts (readValue). A value over
 /// Message.max_value_len fails here instead of being sent and then rejected.
 fn valueLen(len: usize) !u32 {
-    if (len > Message.max_value_len) return error.ValueTooLarge;
+    return valueLenMax(len, Message.max_value_len);
+}
+
+fn valueLenMax(len: usize, max: usize) !u32 {
+    if (len > max) return error.ValueTooLarge;
     return std.math.cast(u32, len) orelse error.ValueTooLarge;
 }
+
+/// The largest swarm folder manifest a SWARM reply carries: a whole photo
+/// library's manifest is tens of MiB, more than other values. The folder
+/// caps its manifest below this (checked in node.zig).
+pub const max_swarm_len = 64 * 1024 * 1024;
 
 fn isPrintableAscii(byte: u8) bool {
     return byte >= 0x20 and byte <= 0x7e;

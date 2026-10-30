@@ -1103,7 +1103,8 @@ function swarmStatusText(st) {
   if (!running) return "Node stopped";
   const devices = st.peers_synced === 1 ? "1 device" : `${st.peers_synced} devices`;
   const when = st.last_sync ? timeAgo(st.last_sync * 1000) : "not yet";
-  return `${st.entries} item${st.entries === 1 ? "" : "s"} · synced with ${devices} · ${when}`;
+  const failed = st.peers_failed ? ` · ${st.peers_failed} couldn't sync` : "";
+  return `${st.entries} item${st.entries === 1 ? "" : "s"} · synced with ${devices} · ${when}${failed}`;
 }
 
 let swarmNav = 0;

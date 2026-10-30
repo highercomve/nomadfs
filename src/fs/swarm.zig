@@ -40,6 +40,7 @@ pub const SwarmFolder = struct {
     manifest: Manifest,
     last_sync: u64 = 0,
     peers_synced: u32 = 0,
+    peers_failed: u32 = 0,
     sync_interval_ns: u64 = 10 * std.time.ns_per_s,
     /// Serialises sync rounds (the loop and syncNow).
     sync_mutex: sync.Mutex = .{},
@@ -437,7 +438,9 @@ pub const SwarmFolder = struct {
         return self.manifest.encode(allocator);
     }
 
-    pub const Status = struct { entries: usize, peers_synced: u32, last_sync: u64 };
+    /// `peers_failed`: reached in the last round, but their manifest couldn't
+    /// be read or merged (too large, corrupt): edits stop flowing from them.
+    pub const Status = struct { entries: usize, peers_synced: u32, peers_failed: u32, last_sync: u64 };
 
     pub fn status(self: *SwarmFolder) Status {
         self.mutex.lock();
@@ -446,7 +449,7 @@ pub const SwarmFolder = struct {
         for (self.manifest.entries.values()) |e| {
             if (!e.deleted) live += 1;
         }
-        return .{ .entries = live, .peers_synced = self.peers_synced, .last_sync = self.last_sync };
+        return .{ .entries = live, .peers_synced = self.peers_synced, .peers_failed = self.peers_failed, .last_sync = self.last_sync };
     }
 
     /// Pulls every reachable peer's manifest and merges it. Returns how
@@ -460,6 +463,7 @@ pub const SwarmFolder = struct {
 
         var changed: usize = 0;
         var reached: u32 = 0;
+        var failed: u32 = 0;
         for (peers) |peer| {
             const conn = bm.connectTo(peer) catch continue;
             defer conn.deinit();
@@ -470,17 +474,26 @@ pub const SwarmFolder = struct {
                 defer self.mutex.unlock();
                 break :blk self.manifest.digest();
             };
-            const bytes = bm.dht_node.fetchSwarm(conn, have) catch continue;
+            const bytes = bm.dht_node.fetchSwarm(conn, have) catch |err| {
+                std.debug.print("swarm: no manifest from {x}: {any}\n", .{ peer.bytes[0..4], err });
+                failed += 1;
+                continue;
+            };
             defer bm.dht_node.allocator.free(bytes);
             reached += 1;
             if (bytes.len == 0) continue;
             self.mutex.lock();
             defer self.mutex.unlock();
-            changed += self.manifest.mergeEncoded(bytes) catch continue;
+            changed += self.manifest.mergeEncoded(bytes) catch |err| {
+                std.debug.print("swarm: {x}'s manifest can't be merged: {any}\n", .{ peer.bytes[0..4], err });
+                failed += 1;
+                continue;
+            };
         }
         self.mutex.lock();
         defer self.mutex.unlock();
         self.peers_synced = reached;
+        self.peers_failed = failed;
         self.last_sync = self.now();
         if (changed > 0) {
             self.saveLocked() catch |err| std.debug.print("swarm: saving the manifest failed: {any}\n", .{err});
