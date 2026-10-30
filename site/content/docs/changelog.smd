@@ -7,6 +7,23 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.3.5 - 2026-10-30
+
+A maintenance release: no change in how NomadFS behaves. Devices on 0.3.4 and 0.3.5 work
+together.
+
+## Changed
+
+- The app's device list and mount start only shape what the core answers: the core formats
+  device fingerprints and waits for a mount to appear.
+
+## For developers
+
+- Discovery's membership news and relaying no longer import the DHT node: they are
+  `Gossip(Node)` and `Relay(Node)`, so the files depend on each other one way.
+- The last repeated code went: one `~` expansion (`env.expandHome`), one peer sample for the
+  gossip sweeps, one test store helper. `zig build atlas`: 0 errors, 2 warnings.
+
 # 0.3.4 - 2026-10-30
 
 Folder backups now go into the swarm folder, and this release takes in a full code review:
