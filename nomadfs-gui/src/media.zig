@@ -122,14 +122,11 @@ fn readAt(_: *anyopaque, path: []const u8, offset: u64, dest: []u8) anyerror!usi
     const want = dest[0..@intCast(@min(dest.len, t.size - offset))];
     const handle = commands.mediaAcquire() orelse return error.NotRunning;
     defer commands.mediaRelease();
-    const node = &handle.node;
-    if (t.kind == 's') {
-        const folder = node.swarm orelse return error.StorageDisabled;
-        return folder.readAt(gpa, t.cid, t.id, offset, want);
-    }
-    const peer: nomadfs.net.id.NodeID = .{ .bytes = t.id };
-    if (node.store == null) return error.StorageDisabled;
-    return nomadfs.fs.remote.readShareAt(gpa, node.block_manager, node.read_ahead, peer, t.cid, offset, want);
+    const file: nomadfs.Node.FileSource = if (t.kind == 's')
+        .{ .swarm = .{ .cid = t.cid, .author = t.id } }
+    else
+        .{ .share = .{ .peer = .{ .bytes = t.id }, .cid = t.cid } };
+    return handle.node.readFile(gpa, file, offset, want);
 }
 
 fn isHex64(s: []const u8) bool {

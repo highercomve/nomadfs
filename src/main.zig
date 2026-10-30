@@ -621,10 +621,11 @@ fn benchReadCommand(allocator: std.mem.Allocator, config: config_mod.Config, raw
 
     const io = std.Io.Threaded.global_single_threaded.io();
     const t0 = std.Io.Clock.awake.now(io).nanoseconds;
+    const source: nomadfs.Node.FileSource = .{ .swarm = .{ .cid = entry.cid, .author = entry.version.device } };
     var offset: u64 = 0;
     while (offset < entry.size) {
         const to_read = @min(@as(u64, chunk_size), entry.size - offset);
-        const n = try swarm.readAt(allocator, entry.cid, entry.version.device, offset, buf[0..@intCast(to_read)]);
+        const n = try node.readFile(allocator, source, offset, buf[0..@intCast(to_read)]);
         if (n == 0) break;
         offset += n;
     }

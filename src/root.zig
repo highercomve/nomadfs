@@ -438,6 +438,45 @@ pub const Node = struct {
         self.bootstrap_running.store(false, .release);
     }
 
+    // ---- Reading files ----
+
+    /// A file to read: a swarm folder file (its CID and the device that
+    /// wrote that version), or a file a device shares.
+    pub const FileSource = union(enum) {
+        swarm: struct { cid: [32]u8, author: [32]u8 },
+        share: struct { peer: net.id.NodeID, cid: [32]u8 },
+    };
+
+    /// Reads up to `dest.len` bytes at `offset`; 0 at the end. Blocks come
+    /// from wherever they are held (cluster/fetcher.zig).
+    pub fn readFile(self: *Node, allocator: std.mem.Allocator, source: FileSource, offset: u64, dest: []u8) !usize {
+        if (self.store == null) return error.StorageDisabled;
+        return switch (source) {
+            .swarm => |f| (self.swarm orelse return error.StorageDisabled).readAt(allocator, f.cid, f.author, offset, dest),
+            .share => |f| fs.remote.readShareAt(allocator, self.block_manager, self.read_ahead, f.peer, f.cid, offset, dest),
+        };
+    }
+
+    /// Copies a file to `path`, which must not exist (deleted again if the
+    /// copy fails). Returns its size.
+    pub fn saveFile(self: *Node, allocator: std.mem.Allocator, source: FileSource, path: []const u8) !u64 {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
+        defer file.close(io);
+        errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        const chunk = try allocator.alloc(u8, 1024 * 1024);
+        defer allocator.free(chunk);
+        var offset: u64 = 0;
+        // Bounded by the file's size: every round reads more of it, or ends.
+        while (true) {
+            const n = try self.readFile(allocator, source, offset, chunk);
+            if (n == 0) break;
+            try file.writePositionalAll(io, chunk[0..n], offset);
+            offset += n;
+        }
+        return offset;
+    }
+
     // ---- Settings applied to the running node (settings.zig saves them) ----
 
     /// Keep a copy of every swarm folder file here, or not; peers learn it

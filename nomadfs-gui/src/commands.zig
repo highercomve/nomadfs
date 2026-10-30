@@ -839,35 +839,23 @@ pub const DownloadResult = struct { path: []const u8, size: u64 };
 /// `invoke("download", { peer, cid, name })`: copies one file from a
 /// device's share into Downloads/NomadFS and returns where it landed.
 pub fn download(gpa: std.mem.Allocator, args: DownloadArgs) !DownloadResult {
-    if (!nomadfs.storage.dag.codec.isValidName(args.name)) return error.InvalidName;
+    const source: nomadfs.Node.FileSource = .{ .share = .{ .peer = .{ .bytes = try parseHex32(args.peer) }, .cid = try parseHex32(args.cid) } };
+    return saveDownload(gpa, source, args.name);
+}
+
+/// Copies a file into Downloads/NomadFS under a name not taken yet.
+fn saveDownload(gpa: std.mem.Allocator, source: nomadfs.Node.FileSource, name: []const u8) !DownloadResult {
+    if (!nomadfs.storage.dag.codec.isValidName(name)) return error.InvalidName;
     g_mutex.lock();
     defer g_mutex.unlock();
-    const remote = try remoteFor(args.peer);
-    const cid = try parseHex32(args.cid);
-
+    const node = runningNode() orelse return error.NotRunning;
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try downloadsDir(gpa);
     defer gpa.free(dir);
     try std.Io.Dir.cwd().createDirPath(io, dir);
-    const path = try uniquePath(gpa, dir, args.name);
+    const path = try uniquePath(gpa, dir, name);
     errdefer gpa.free(path);
-
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
-    defer file.close(io);
-    errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-
-    const chunk = try gpa.alloc(u8, 1024 * 1024);
-    defer gpa.free(chunk);
-    var offset: u64 = 0;
-    while (true) {
-        // Likely holders, per chunk with the registry as current as shares
-        // heard since the download started.
-        const n = try nomadfs.fs.remote.readShareAt(gpa, remote.block_manager.?, g_node.?.node.read_ahead, remote.peer, cid, offset, chunk);
-        if (n == 0) break;
-        try file.writePositionalAll(io, chunk[0..n], offset);
-        offset += n;
-    }
-    return .{ .path = path, .size = offset };
+    return .{ .path = path, .size = try node.saveFile(gpa, source, path) };
 }
 
 /// Caller holds g_mutex.
@@ -925,22 +913,18 @@ pub const max_range_len: u32 = 4 * 1024 * 1024;
 /// a device's share, base64-encoded for the page, which builds a preview
 /// from consecutive ranges. Only the blocks covering the range are fetched.
 pub fn readRange(gpa: std.mem.Allocator, args: ReadRangeArgs) ![]const u8 {
-    if (args.len == 0 or args.len > max_range_len) return error.InvalidArgument;
+    return readBase64(gpa, .{ .share = .{ .peer = .{ .bytes = try parseHex32(args.peer) }, .cid = try parseHex32(args.cid) } }, args.offset, args.len);
+}
+
+/// Base64 bytes of a file, for previews.
+fn readBase64(gpa: std.mem.Allocator, source: nomadfs.Node.FileSource, offset: u64, len: u32) ![]const u8 {
+    if (len == 0 or len > max_range_len) return error.InvalidArgument;
     g_mutex.lock();
     defer g_mutex.unlock();
-    const remote = try remoteFor(args.peer);
-    const cid = try parseHex32(args.cid);
-    const buf = try gpa.alloc(u8, args.len);
+    const node = runningNode() orelse return error.NotRunning;
+    const buf = try gpa.alloc(u8, len);
     defer gpa.free(buf);
-    const n = try nomadfs.fs.remote.readShareAt(
-        gpa,
-        remote.block_manager.?,
-        g_node.?.node.read_ahead,
-        remote.peer,
-        cid,
-        args.offset,
-        buf,
-    );
+    const n = try node.readFile(gpa, source, offset, buf);
     const encoder = std.base64.standard.Encoder;
     const out = try gpa.alloc(u8, encoder.calcSize(n));
     return encoder.encode(out, buf[0..n]);
@@ -1298,48 +1282,14 @@ pub const SwarmRangeArgs = struct { cid: []const u8, author_id: []const u8, offs
 
 /// `swarm_read_range`: base64 bytes of a swarm file, for previews.
 pub fn swarmReadRange(gpa: std.mem.Allocator, args: SwarmRangeArgs) ![]const u8 {
-    if (args.len == 0 or args.len > max_range_len) return error.InvalidArgument;
-    const cid = try parseHex32(args.cid);
-    const author = try parseHex32(args.author_id);
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    const buf = try gpa.alloc(u8, args.len);
-    defer gpa.free(buf);
-    const n = try (try swarmFolder()).readAt(gpa, cid, author, args.offset, buf);
-    const encoder = std.base64.standard.Encoder;
-    const out = try gpa.alloc(u8, encoder.calcSize(n));
-    return encoder.encode(out, buf[0..n]);
+    return readBase64(gpa, .{ .swarm = .{ .cid = try parseHex32(args.cid), .author = try parseHex32(args.author_id) } }, args.offset, args.len);
 }
 
 pub const SwarmDownloadArgs = struct { cid: []const u8, author_id: []const u8, name: []const u8 };
 
 /// `swarm_download`: copies a swarm file into Downloads/NomadFS.
 pub fn swarmDownload(gpa: std.mem.Allocator, args: SwarmDownloadArgs) !DownloadResult {
-    if (!nomadfs.storage.dag.codec.isValidName(args.name)) return error.InvalidName;
-    const cid = try parseHex32(args.cid);
-    const author = try parseHex32(args.author_id);
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    const folder = try swarmFolder();
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const dir = try downloadsDir(gpa);
-    defer gpa.free(dir);
-    try std.Io.Dir.cwd().createDirPath(io, dir);
-    const path = try uniquePath(gpa, dir, args.name);
-    errdefer gpa.free(path);
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
-    defer file.close(io);
-    errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    const chunk = try gpa.alloc(u8, 1024 * 1024);
-    defer gpa.free(chunk);
-    var offset: u64 = 0;
-    while (true) {
-        const n = try folder.readAt(gpa, cid, author, offset, chunk);
-        if (n == 0) break;
-        try file.writePositionalAll(io, chunk[0..n], offset);
-        offset += n;
-    }
-    return .{ .path = path, .size = offset };
+    return saveDownload(gpa, .{ .swarm = .{ .cid = try parseHex32(args.cid), .author = try parseHex32(args.author_id) } }, args.name);
 }
 
 // ---- Mounting (desktop Linux) ----
