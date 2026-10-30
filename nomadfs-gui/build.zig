@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     // What About shows: this app's version, the Oriel it is built with (read
     // from the package itself, so a local fork reports its own) and the
     // commit it was built from.
-    const version = "0.3.1";
+    const version = "0.3.2";
     const about = b.addOptions();
     about.addOption([]const u8, "version", version);
     about.addOption([]const u8, "oriel_version", zonVersion(b, dep) orelse "unknown");

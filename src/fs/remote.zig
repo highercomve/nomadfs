@@ -244,6 +244,11 @@ pub fn devices(
     defer allocator.free(assign_entries);
     const mount_names = try allocator.alloc([]u8, answering_count);
     defer allocator.free(mount_names);
+    const trust_entries = try allocator.alloc(device_trust.Entry, answering_count);
+    defer allocator.free(trust_entries);
+    const has_trust = try allocator.alloc(bool, answering_count);
+    defer allocator.free(has_trust);
+    @memset(has_trust, false);
 
     var idx: usize = 0;
     for (probed) |probe| {
@@ -253,9 +258,11 @@ pub fn devices(
         if (shares_val.device_id) |did| {
             if (trust_store) |ts| {
                 if (ts.lookup(did)) |entry| {
+                    trust_entries[idx] = entry;
+                    has_trust[idx] = true;
                     trusted_info = .{
-                        .label = entry.labelSlice(),
-                        .added_at = entry.added_at,
+                        .label = trust_entries[idx].labelSlice(),
+                        .added_at = trust_entries[idx].added_at,
                     };
                 }
             }
@@ -297,23 +304,14 @@ pub fn devices(
             shares_built += 1;
         }
 
-        var is_trusted = false;
-        var label: []const u8 = "";
-        if (shares_val.device_id) |did| {
-            if (trust_store) |ts| {
-                if (ts.lookup(did)) |entry| {
-                    is_trusted = true;
-                    label = entry.labelSlice();
-                }
-            }
-        }
+        const label = if (has_trust[idx]) trust_entries[idx].labelSlice() else "";
 
         out[built] = .{
             .peer = probe.peer,
             .device_id = shares_val.device_id,
             .nickname = try allocator.dupe(u8, shares_val.nickname),
             .shares = list,
-            .trusted = is_trusted,
+            .trusted = has_trust[idx],
             .label = try allocator.dupe(u8, label),
             .mount_name = mount_names[idx],
         };
