@@ -31,6 +31,9 @@ var g_server: oriel.media_server.Server = undefined;
 /// (the scheme serves only this app's WebView).
 var g_http_base_buf: [64]u8 = undefined;
 var g_http_base: []const u8 = "";
+var g_network_server: oriel.media_server.Server = undefined;
+var g_network_started = false;
+var g_network_port: u16 = 0;
 
 // One type, re-exported by both (media_server doesn't exist on Android).
 const Source = if (is_android) oriel.media_scheme.Source else oriel.media_server.Source;
@@ -47,6 +50,8 @@ pub const UrlArgs = struct {
     /// For another app (VLC, ...): an http://127.0.0.1 URL on every
     /// platform, not the WebView-only scheme Android previews use.
     external: bool = false,
+    /// "lan" or "tailscale": make a URL for another device on that network.
+    network: []const u8 = "",
 };
 
 /// `invoke("media_url", { kind, id, cid, size, name })`: a URL the page's
@@ -67,7 +72,17 @@ pub fn url(alloc: std.mem.Allocator, args: UrlArgs) ![]const u8 {
         ext_len += 1;
     };
     const ext = if (ext_len > 0) ext_buf[0..ext_len] else "bin";
-    const base = if (args.external) try httpBase() else g_base;
+    var network_base_buf: [64]u8 = undefined;
+    const base = if (std.mem.eql(u8, args.network, "lan"))
+        try networkBase(&network_base_buf, .lan)
+    else if (std.mem.eql(u8, args.network, "tailscale"))
+        try networkBase(&network_base_buf, .tailscale)
+    else if (args.network.len > 0)
+        return error.InvalidArgument
+    else if (args.external)
+        try httpBase()
+    else
+        g_base;
     return std.fmt.allocPrint(alloc, "{s}{s}/{c}/{s}/{s}/{d}/f.{s}", .{ base, &g_token, k, args.id, args.cid, args.size, ext });
 }
 
@@ -95,6 +110,52 @@ fn httpBase() ![]const u8 {
     defer g_mutex.unlock();
     if (g_http_base.len == 0) try startHttpLocked(std.Io.Threaded.global_single_threaded.io());
     return g_http_base;
+}
+
+const Network = enum { lan, tailscale };
+
+/// Starts an all-interface listener only when a network link is requested,
+/// then returns this device's address on the selected network.
+fn networkBase(buf: *[64]u8, network: Network) ![]const u8 {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    if (!g_network_started) {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var attempt: usize = 0;
+        while (attempt < 20) : (attempt += 1) {
+            var random: [2]u8 = undefined;
+            io.random(&random);
+            const port: u16 = 40000 + std.mem.readInt(u16, &random, .little) % 20000;
+            g_network_server.start(io, gpa, .{
+                .root_dir = "",
+                .port = port,
+                .source = source,
+                .network_accessible = true,
+            }) catch continue;
+            g_network_port = port;
+            g_network_started = true;
+            break;
+        }
+        if (!g_network_started) return error.AddressInUse;
+    }
+
+    var ip_buf: [16]u8 = undefined;
+    const ip = switch (network) {
+        .lan => nomadfs.device.invite.lanAddress(&ip_buf) orelse return error.NoLanAddress,
+        .tailscale => tailscaleAddress(&ip_buf, g_network_port) orelse return error.NoTailscaleAddress,
+    };
+    return std.fmt.bufPrint(buf, "http://{s}:{d}/", .{ ip, g_network_port });
+}
+
+fn tailscaleAddress(buf: *[16]u8, port: u16) ?[]const u8 {
+    var addresses: [8]nomadfs.net.compat.Address = undefined;
+    const count = nomadfs.net.local_addrs.list(&addresses, port);
+    for (addresses[0..count]) |address| switch (address.ip) {
+        .ip4 => |ip| if (ip.bytes[0] == 100 and ip.bytes[1] >= 64 and ip.bytes[1] < 128)
+            return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3] }) catch null,
+        .ip6 => {},
+    };
+    return null;
 }
 
 /// Starts the HTTP server on 127.0.0.1, on a free port: a few random ones

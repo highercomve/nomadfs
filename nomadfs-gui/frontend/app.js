@@ -250,13 +250,15 @@ function mimeFor(name) {
   })[ext] || "application/octet-stream";
 }
 
-/** The menu items every file has: open elsewhere, download, details, link. */
+/** The menu items every file has: open elsewhere, download, details, and copyable links. */
 function fileMenu(source, e, details) {
   return [
     { icon: "open_in", label: "Open in another app", run: () => openInApp(source, e) },
     { icon: "download", label: "Download", run: () => source.download(e) },
     { icon: "info", label: "Details", run: () => openDetails(e.name, details) },
-    { icon: "link", label: "Copy link", run: () => copyLink(source, e) },
+    { icon: "link", label: "Copy link on this device", run: () => copyLink(source, e) },
+    { icon: "link", label: "Copy link on local network", run: () => copyLink(source, e, "lan") },
+    { icon: "link", label: "Copy Tailscale link", run: () => copyLink(source, e, "tailscale") },
   ];
 }
 
@@ -270,11 +272,15 @@ async function openInApp(source, e) {
   }
 }
 
-async function copyLink(source, e) {
+async function copyLink(source, e, network = "") {
   try {
-    copyText(await source.mediaUrl(e, true), "Link copied: it plays while NomadFS runs on this device");
+    const url = await source.mediaUrl(e, true, network);
+    const where = network === "lan" ? "on the local network" : network === "tailscale" ? "over Tailscale" : "on this device";
+    copyText(url, `Link copied for ${where}`);
   } catch (err) {
-    snack(`No link: ${err}`);
+    const unavailable = String(err).includes("NoLanAddress") ? "No local network address is available" :
+      String(err).includes("NoTailscaleAddress") ? "No Tailscale address is available" : `No link: ${err}`;
+    snack(unavailable);
   }
 }
 
@@ -1002,14 +1008,14 @@ let pv = null; // { source, files, index, token, url }
 function deviceSource(device) {
   return {
     read: (e, offset, len) => invoke("read_range", { peer: device.peer, cid: e.cid, offset, len }),
-    mediaUrl: (e, external = false) => invoke("media_url", { kind: "device", id: device.peer, cid: e.cid, size: e.size, name: e.name, external }),
+    mediaUrl: (e, external = false, network = "") => invoke("media_url", { kind: "device", id: device.peer, cid: e.cid, size: e.size, name: e.name, external, network }),
     download: (e, btn) => downloadFile(device, e, btn),
   };
 }
 /** ...or the swarm folder (the device that added it, then anyone). */
 const swarmSource = {
   read: (e, offset, len) => invoke("swarm_read_range", { cid: e.cid, author_id: e.author_id, offset, len }),
-  mediaUrl: (e, external = false) => invoke("media_url", { kind: "swarm", id: e.author_id, cid: e.cid, size: e.size, name: e.name, external }),
+  mediaUrl: (e, external = false, network = "") => invoke("media_url", { kind: "swarm", id: e.author_id, cid: e.cid, size: e.size, name: e.name, external, network }),
   download: (e, btn) => swarmDownload(e, btn),
 };
 

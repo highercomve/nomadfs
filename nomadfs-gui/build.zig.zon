@@ -1,15 +1,15 @@
 .{
     .name = .nomadfs_gui,
-    .version = "0.3.5",
+    .version = "0.3.6",
     // Derived from the package name; changing it has security and trust implications.
     .fingerprint = 0x5f521d4994d41c7c,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // Oriel v0.20.0. To build against a local checkout instead:
+        // Oriel v0.20.2. To build against a local checkout instead:
         // zig build --fork=../../oriel
         .oriel = .{
-            .url = "https://github.com/highercomve/Oriel/archive/refs/tags/v0.20.0.tar.gz",
-            .hash = "oriel-0.20.0-K1NO5cmz_QCcSreZ76kLSUfaH7MmTaX2llc5vgztChrI",
+            .url = "https://github.com/highercomve/Oriel/archive/refs/tags/v0.20.2.tar.gz",
+            .hash = "oriel-0.20.2-K1NO5ZXd_QAI6XFZ_LIUy7krp_RYNWzdvnbFGhTjh87w",
         },
         // The NomadFS core: same sources the CLI, the C ABI and the mobile
         // bindings build from.

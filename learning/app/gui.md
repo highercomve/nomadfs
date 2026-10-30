@@ -1,7 +1,7 @@
 # Chapter 7: The App (`nomadfs-gui/`)
 
 NomadFS ships one app for the Linux desktop and Android phones, built with
-[Oriel](https://oriel.foreachdeveloper.com) (`nomadfs-gui/build.zig.zon` pins Oriel **v0.20.0**;
+[Oriel](https://oriel.foreachdeveloper.com) (`nomadfs-gui/build.zig.zon` pins Oriel **v0.20.2**;
 minimum Zig 0.16.0). Oriel pairs a Zig backend with the system web view (WebKitGTK on Linux, the
 Android WebView on phones). The page is plain HTML and JavaScript with no build step
 (`frontend/index.html`, `frontend/app.js`, `frontend/style.css`).

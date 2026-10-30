@@ -3,6 +3,17 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.3.6 - 2026-10-30
+
+Adds separate copyable links for this device, the local network, and Tailscale.
+The network link listener starts only when requested. Devices on 0.3.5 and 0.3.6 work together.
+
+### Added
+
+- File actions can copy a link addressed to the LAN IP or the device's Tailscale IP, as well as
+  the existing device-local link. The URL streams through the same capability-protected media
+  endpoint; it works while NomadFS is running on the device that created it.
+
 ## 0.3.5 - 2026-10-30
 
 A maintenance release: no change in how NomadFS behaves. Devices on 0.3.4 and 0.3.5 work
