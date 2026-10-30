@@ -12,7 +12,7 @@ const builtin = @import("builtin");
 const sync = @import("sync.zig");
 
 /// This release; scripts/release.sh checks it matches build.zig.zon.
-pub const version = "0.3.3";
+pub const version = "0.3.4";
 
 pub const format_version: u8 = 1;
 /// Longest encoded info a reader accepts.

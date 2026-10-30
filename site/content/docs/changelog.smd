@@ -7,6 +7,66 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.3.4 - 2026-10-30
+
+Folder backups now go into the swarm folder, and this release takes in a full code review:
+two data-loss bugs, a crash and a long list of reliability fixes. Devices on 0.3.3 and 0.3.4
+work together; update them all for the relay and sync fixes.
+
+## Changed
+
+- **Backed-up folders are in the swarm folder.** A folder a device marks for backup (a phone's
+  Camera) appears there as `<device>/<folder>/`, each file with its own date, and every backup
+  device keeps it like any swarm file: stored once, nothing copied on the phone. It's a backup,
+  not a mirror: freeing space on the phone keeps the photos in the swarm; a photo deleted or
+  moved in the swarm folder isn't added back. The separate "(backup)" folders are gone; a backup
+  device moves the ones it kept into the swarm folder (deleted files included) on its first start.
+- **Files keep their original dates.** Adding a file keeps its modified time, and times set
+  through the mount (`touch`, `cp -p`, `rsync -t`/`-a`) are stored and reach every device, so
+  sorting by date follows the photos, not the order they were copied.
+- **Tickets and invites list every address** (LAN and VPNs such as Tailscale) from the app and
+  the command line, so pairing works away from home too.
+- **A quiet swarm sends nothing for the swarm folder**: devices announce their folder's digest
+  in the pings they already exchange and fetch a manifest only when it differs.
+
+## Added
+
+- `nomadfs --join <code>` joins a swarm from the command line, the same way the app does.
+- The swarm folder shows when a device's changes couldn't be synced ("N couldn't sync").
+
+## Fixed
+
+- **Renaming a folder onto a folder with files in it deleted its contents on every device.** It
+  now fails with "directory not empty", as on any disk.
+- **Devices reached only through a relay stayed unreachable from outside** (a home server whose
+  link to the relay was itself relayed); the app away from home saw only the relay. Direct
+  connections are preferred and retried.
+- The app crashed when a mount failed.
+- Swarm folders stopped syncing once their manifest passed 10 MiB (about 11k-37k files); the
+  limit is now the manifest's own, 64 MiB.
+- One slow or offline device no longer freezes the app: previews, downloads, browsing and the
+  device list don't hold its lock while they wait, and the device list asks every device at once.
+- A device that answers on no address isn't redialed by every caller (up to 2 minutes).
+- Revoking a device from the command line while a node runs now closes its connections, as the
+  app's revoke does; a revocation from another device also stops reads from going to it.
+- Two nodes can no longer run on the same configuration (the app and `nomadfs --mount`, say);
+  the second one says so instead of overwriting the first one's files.
+- A rotated swarm key is adopted by nodes run from the command line too (they kept the old key),
+  with or without `--config`.
+- The mobile API saves the read cache limit; the File Details view finds a file a backup device
+  holds; a swarm conflict copy always gets a valid name.
+- Hardening against misbehaving peers: bounded walks of their file trees, per-message size limits
+  before reading, a cap on peers asked per DHT lookup, downloads stopped at the listed size, and
+  a deadline on router (UPnP) replies.
+- Shutdown stops every background thread before freeing what it uses.
+
+## For developers
+
+- One core service per feature for the command line, the app and the mobile API (membership,
+  settings, shares, backups, file reads, key rotation, joining); `zig build atlas` checks the
+  layers (0 errors); `fs` reaches the network only through `cluster`; discovery's gossip and
+  relaying are in their own files; shared transport and storage helpers replace their copies.
+
 # 0.3.0 - 2026-10-29
 
 A clean break: **every device needs 0.3.0**. The app has a new ID
