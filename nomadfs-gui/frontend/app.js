@@ -46,6 +46,7 @@ const ICONS = {
   file: "M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z",
   image: "M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z",
   video: "M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z",
+  audio: "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z",
   download: "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z",
   edit: "M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z",
   trash: "M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z",
@@ -67,11 +68,33 @@ function svg(path) {
   return el;
 }
 
+const FILE_TYPES = {
+  photo: ["jpg", "jpeg", "png", "gif", "webp", "heic", "avif", "bmp", "svg", "dng", "raw", "cr2", "nef", "arw", "tif", "tiff"],
+  video: ["mp4", "mov", "mkv", "webm", "avi", "3gp", "wmv", "flv", "m4v", "ts"],
+  audio: ["mp3", "m4a", "flac", "wav", "ogg", "aac", "opus", "wma", "aiff"],
+  document: ["pdf", "doc", "docx", "txt", "md", "rtf", "odt", "xls", "xlsx", "csv", "ppt", "pptx", "epub"],
+  archive: ["zip", "tar", "gz", "tgz", "7z", "rar", "bz2", "xz"],
+  code: ["zig", "rs", "js", "ts", "html", "css", "json", "py", "c", "cpp", "h", "sh", "yaml", "yml", "toml", "go"],
+};
+
+function fileType(name, dir) {
+  if (dir) return "Folder";
+  const ext = (name.split(".").pop() || "").toLowerCase();
+  if (FILE_TYPES.photo.includes(ext)) return "Photo";
+  if (FILE_TYPES.video.includes(ext)) return "Video";
+  if (FILE_TYPES.audio.includes(ext)) return "Audio";
+  if (FILE_TYPES.document.includes(ext)) return "Document";
+  if (FILE_TYPES.archive.includes(ext)) return "Archive";
+  if (FILE_TYPES.code.includes(ext)) return "Code";
+  return "File";
+}
+
 function iconFor(name, dir) {
   if (dir) return "folder";
-  const ext = name.split(".").pop().toLowerCase();
-  if (["jpg", "jpeg", "png", "gif", "webp", "heic", "avif", "bmp"].includes(ext)) return "image";
-  if (["mp4", "mov", "mkv", "webm", "avi", "3gp"].includes(ext)) return "video";
+  const t = fileType(name, false);
+  if (t === "Photo") return "image";
+  if (t === "Video") return "video";
+  if (t === "Audio") return "audio";
   return "file";
 }
 
@@ -88,6 +111,7 @@ function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = false, on
   const h = document.createElement("span");
   h.className = "headline";
   h.textContent = headline;
+  h.title = headline;
   text.appendChild(h);
   // `meta` may be several lines (an array), each on its own row.
   const metaLines = (Array.isArray(meta) ? meta : [meta]).map((m) => [m, monoMeta]);
@@ -99,10 +123,13 @@ function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = false, on
     text.appendChild(m);
   }
   li.appendChild(text);
-  // Wide layout: Size and Modified columns (CSS hides them on phones).
+  // Wide layout: Type, Size, Modified, Added by columns (CSS hides them on phones).
   if (cols) {
     li.classList.add("has-cols");
-    const colList = [["col-size", cols.size], ["col-date", cols.date]];
+    const colList = [];
+    if (cols.type !== undefined) colList.push(["col-type", cols.type]);
+    if (cols.size !== undefined) colList.push(["col-size", cols.size]);
+    if (cols.date !== undefined) colList.push(["col-date", cols.date]);
     if (cols.by !== undefined) colList.push(["col-by", cols.by]);
     for (const [cls, value] of colList) {
       const c = document.createElement("span");
@@ -485,10 +512,11 @@ class FileTable {
     Object.assign(this, { view, tools, head, list, columns, storageKey, renderRow, emptyText, setEmpty });
     this.entries = null;
     this.sort = { key: "name", dir: 1 };
+    this.filterType = "all";
     try { Object.assign(this.sort, JSON.parse(localStorage.getItem(storageKey) || "{}")); } catch {}
     if (!this.allColumns().some((c) => c.key === this.sort.key)) this.sort = { key: "name", dir: 1 };
     // Room for the row buttons, so the header lines up with the rows.
-    head.closest(".table-scroll").style.setProperty("--act-w", `${actions * 48}px`);
+    head.closest(".table-scroll").style.setProperty("--act-w", `${actions * 34}px`);
     this.buildTools(placeholder);
     this.buildHead();
     FileTable.all.push(this);
@@ -499,6 +527,9 @@ class FileTable {
   }
 
   buildTools(placeholder) {
+    const searchRow = document.createElement("div");
+    searchRow.className = "tools-search-row";
+
     const field = document.createElement("label");
     field.className = "search-field";
     field.append(svg(SEARCH_ICON));
@@ -510,19 +541,81 @@ class FileTable {
       if (e.key === "Escape" && input.value) { input.value = ""; this.render(); e.stopPropagation(); }
     });
     field.append(input);
+
     const select = document.createElement("select");
     select.className = "sort-select";
     select.setAttribute("aria-label", "Sort by");
     for (const c of this.allColumns()) select.append(new Option(c.label, c.key));
     select.addEventListener("change", () => this.setSort(select.value, this.sort.dir));
+
     const dir = document.createElement("button");
     dir.type = "button";
     dir.className = "icon-btn sort-dir";
     dir.setAttribute("aria-label", "Sort direction");
     dir.append(svg(SORT_DIR_ICON));
     dir.addEventListener("click", () => this.setSort(this.sort.key, -this.sort.dir));
-    this.tools.replaceChildren(field, select, dir);
-    Object.assign(this, { input, select, dirBtn: dir });
+
+    searchRow.append(field, select, dir);
+
+    const chipsBox = document.createElement("div");
+    chipsBox.className = "type-chips";
+    chipsBox.hidden = true;
+
+    this.tools.replaceChildren(searchRow, chipsBox);
+    Object.assign(this, { input, select, dirBtn: dir, chipsBox });
+  }
+
+  updateFilterChips() {
+    if (!this.entries || !this.chipsBox) return;
+    const counts = { all: this.entries.length };
+    for (const e of this.entries) {
+      const t = e.dir ? "Folder" : fileType(e.name, false);
+      counts[t] = (counts[t] || 0) + 1;
+    }
+    const categories = ["Photo", "Video", "Audio", "Document", "Archive", "Code", "Folder", "File"];
+    const activeCats = categories.filter((c) => (counts[c] || 0) > 0);
+
+    if (activeCats.length <= 1) {
+      this.chipsBox.replaceChildren();
+      this.chipsBox.hidden = true;
+      return;
+    }
+    this.chipsBox.hidden = false;
+
+    const makeChip = (id, label, count) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `type-chip${this.filterType === id ? " active" : ""}`;
+      btn.dataset.type = id;
+      const lbl = document.createElement("span");
+      lbl.textContent = label;
+      btn.appendChild(lbl);
+      const cnt = document.createElement("span");
+      cnt.className = "count";
+      cnt.textContent = count;
+      btn.appendChild(cnt);
+      btn.addEventListener("click", () => {
+        this.filterType = this.filterType === id && id !== "all" ? "all" : id;
+        this.render();
+      });
+      return btn;
+    };
+
+    const chips = [makeChip("all", "All", counts.all)];
+    const pluralLabels = {
+      Photo: "Photos",
+      Video: "Videos",
+      Audio: "Audio",
+      Document: "Documents",
+      Archive: "Archives",
+      Code: "Code",
+      Folder: "Folders",
+      File: "Files",
+    };
+    for (const c of activeCats) {
+      chips.push(makeChip(c, pluralLabels[c] || c, counts[c]));
+    }
+    this.chipsBox.replaceChildren(...chips);
   }
 
   buildHead() {
@@ -557,8 +650,12 @@ class FileTable {
     const { key, dir } = this.sort;
     let c = 0;
     if (key !== "name") {
-      const x = a[key] ?? "";
-      const y = b[key] ?? "";
+      let x = a[key] ?? "";
+      let y = b[key] ?? "";
+      if (key === "type") {
+        x = a.dir ? "Folder" : fileType(a.name, false);
+        y = b.dir ? "Folder" : fileType(b.name, false);
+      }
       c = typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y), undefined, { sensitivity: "base" });
     }
     if (c === 0) c = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
@@ -569,6 +666,7 @@ class FileTable {
   show(entries) {
     this.entries = entries;
     this.input.value = "";
+    this.filterType = "all";
     this.render();
   }
 
@@ -583,12 +681,27 @@ class FileTable {
     }
     const raw = this.input.value.trim();
     const query = raw.toLocaleLowerCase();
+    const filter = this.filterType || "all";
     const shown = this.entries
-      .filter((e) => !query || e.name.toLocaleLowerCase().includes(query))
+      .filter((e) => {
+        if (filter !== "all") {
+          const t = e.dir ? "Folder" : fileType(e.name, false);
+          if (t !== filter) return false;
+        }
+        return !query || e.name.toLocaleLowerCase().includes(query);
+      })
       .sort((a, b) => this.compare(a, b));
+
+    this.updateFilterChips();
+
     this.list.replaceChildren();
     if (!shown.length) {
-      this.setEmpty(query ? `Nothing here matches "${raw}".` : this.emptyText());
+      if (filter !== "all") {
+        const plural = { Photo: "photos", Video: "videos", Audio: "audio files", Document: "documents", Folder: "folders" }[filter] || filter.toLowerCase() + "s";
+        this.setEmpty(query ? `Nothing matches "${raw}" in ${plural}.` : `No ${plural} found in this folder.`);
+      } else {
+        this.setEmpty(query ? `Nothing here matches "${raw}".` : this.emptyText());
+      }
       return;
     }
     this.setEmpty("");
@@ -624,7 +737,11 @@ const browseTable = new FileTable({
   tools: $("browse-tools"),
   head: $("remote-head"),
   list: $("remote-list"),
-  columns: [{ key: "size", label: "Size", cls: "th-size" }, { key: "mtime", label: "Modified", cls: "th-date" }],
+  columns: [
+    { key: "type", label: "Type", cls: "th-type" },
+    { key: "size", label: "Size", cls: "th-size" },
+    { key: "mtime", label: "Modified", cls: "th-date" },
+  ],
   storageKey: "browseSort",
   actions: 2,
   setEmpty: (text) => setEmpty(text),
@@ -645,7 +762,11 @@ function browseRow(e, files) {
       iconClass: "folder",
       headline: e.name,
       meta: pending ? "Indexing…" : shares ? `${formatSize(e.size)} · updated ${formatDate(e.mtime)}` : formatSize(e.size),
-      cols: { size: pending ? "Indexing…" : formatSize(e.size), date: pending ? "" : formatDate(e.mtime) },
+      cols: {
+        type: pending ? "" : "Folder",
+        size: pending ? "Indexing…" : formatSize(e.size),
+        date: pending ? "" : formatDate(e.mtime),
+      },
       onClick: () => { path.push({ name: e.name, cid: e.cid, pending }); showLocation(); },
     });
   }
@@ -654,7 +775,11 @@ function browseRow(e, files) {
     icon: iconFor(e.name, false),
     headline: e.name,
     meta: `${formatSize(e.size)} · ${formatDate(e.mtime)}`,
-    cols: { size: formatSize(e.size), date: formatDate(e.mtime) },
+    cols: {
+      type: fileType(e.name, false),
+      size: formatSize(e.size),
+      date: formatDate(e.mtime),
+    },
     onClick: () => openPreview(deviceSource(device), files, files.indexOf(e)),
     actions: [
       { icon: "info", label: `Details of ${e.name}`, run: () => openDetails(e.name, { cid: e.cid, peer: device.peer }) },
@@ -1160,6 +1285,7 @@ const swarmTable = new FileTable({
   head: $("swarm-head"),
   list: $("swarm-list"),
   columns: [
+    { key: "type", label: "Type", cls: "th-type" },
     { key: "size", label: "Size", cls: "th-size" },
     { key: "mtime", label: "Modified", cls: "th-date" },
     { key: "author", label: "Added by", cls: "th-by" },
@@ -1187,7 +1313,12 @@ function swarmRow(it, files) {
     iconClass: it.dir ? "folder" : "",
     headline: it.name,
     meta: it.dir ? formatSize(it.size) : `${formatSize(it.size)} · ${formatDate(it.mtime)}${by ? ` · ${by}` : ""}`,
-    cols: { size: formatSize(it.size), date: formatDate(it.mtime), by },
+    cols: {
+      type: it.dir ? "Folder" : fileType(it.name, false),
+      size: formatSize(it.size),
+      date: formatDate(it.mtime),
+      by,
+    },
     onClick: it.dir
       ? () => { swarmDir = it.path; loadSwarm(); }
       : () => openPreview(swarmSource, files, files.indexOf(it)),
