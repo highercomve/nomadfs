@@ -457,7 +457,7 @@ pub const SwarmFolder = struct {
     /// The devices likely to hold a swarm file, best first: its author, the
     /// devices placement gives it (the swarm's `copies`), then the cluster's
     /// list (swarm backup devices, everyone else).
-    fn holdersOf(self: *SwarmFolder, allocator: std.mem.Allocator, cid: *const [32]u8, author: NodeID, out: *[cluster.fetcher.max_holders]NodeID) []NodeID {
+    pub fn holdersOf(self: *SwarmFolder, allocator: std.mem.Allocator, cid: *const [32]u8, author: NodeID, out: *[cluster.fetcher.max_holders]NodeID) []NodeID {
         var n: usize = 0;
         addHint(out, &n, author, self.self_id);
         if (self.placement) |p| {

@@ -103,7 +103,7 @@ pub fn holdersBuffer() [fetcher_mod.max_holders]NodeID {
 /// sharing device, then devices noted as keeping copies of its owner's
 /// folders; never empty (the peer alone when there's nothing noted, when
 /// the peer is not this node).
-fn holderListFor(block_manager: *cluster.BlockManager, peer: NodeID, out: *[fetcher_mod.max_holders]NodeID) []const NodeID {
+pub fn holderListFor(block_manager: *cluster.BlockManager, peer: NodeID, out: *[fetcher_mod.max_holders]NodeID) []const NodeID {
     if (block_manager.holders) |*holds| {
         const list = holds.forOrigin(peer, out);
         if (list.len > 0) return list;
@@ -132,7 +132,6 @@ pub fn readShareAt(
     return tree.readAt(allocator, source.loader(), root, offset, dest);
 }
 
-/// Every peer the routing table knows (caller frees).
 pub const Probed = struct {
     peer: NodeID,
     /// Null when the device didn't answer.
@@ -173,6 +172,7 @@ pub fn sharesOfAll(allocator: std.mem.Allocator, block_manager: *cluster.BlockMa
     return out;
 }
 
+/// Every peer the routing table knows (caller frees).
 pub fn knownPeers(block_manager: *cluster.BlockManager, allocator: std.mem.Allocator) ![]NodeID {
     const dht_node = block_manager.dht_node;
     dht_node.mutex.lock();

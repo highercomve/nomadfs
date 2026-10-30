@@ -479,6 +479,19 @@ pub const Node = struct {
         };
     }
 
+    /// A file's DAG and chunks (File Details), its blocks fetched from the
+    /// same holders a read would use. Loads only parent blocks.
+    pub fn inspectFile(self: *Node, allocator: std.mem.Allocator, source: FileSource) !fs.inspect.Inspection {
+        if (self.store == null) return error.StorageDisabled;
+        var buffer = fs.remote.holdersBuffer();
+        const root, const holders = switch (source) {
+            .swarm => |f| .{ f.cid, (self.swarm orelse return error.StorageDisabled).holdersOf(allocator, &f.cid, .{ .bytes = f.author }, &buffer) },
+            .share => |f| .{ f.cid, fs.remote.holderListFor(self.block_manager, f.peer, &buffer) },
+        };
+        var from = fs.remote.Source{ .block_manager = self.block_manager, .root = root, .holders = holders };
+        return fs.inspect.inspect(allocator, from.loader(), root);
+    }
+
     /// Copies a file to `path`, which must not exist (deleted again if the
     /// copy fails). Returns its size. `size` is what the listing says: a
     /// peer's tree describing more (repeated leaves can describe terabytes)

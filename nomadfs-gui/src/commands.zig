@@ -1182,22 +1182,12 @@ pub fn fileDetails(gpa: std.mem.Allocator, args: FileDetailsArgs) !FileDetails {
     const handle = mediaAcquire() orelse return error.NotRunning;
     defer mediaRelease();
     const store = handle.node.store orelse return error.StorageDisabled;
-    const bm = handle.node.block_manager;
-
-    // Its likely holders: a share's device, or a swarm file's author and
-    // the rest; the fetcher picks per block.
-    var peers: std.ArrayList(nomadfs.net.id.NodeID) = .empty;
-    if (args.peer) |p| {
-        try peers.append(gpa, .{ .bytes = try parseHex32(p) });
-    } else {
-        if (args.author_id) |a| if (a.len == 64) try peers.append(gpa, .{ .bytes = try parseHex32(a) });
-        const known = fs.remote.knownPeers(bm, gpa) catch &.{};
-        for (known) |k| try peers.append(gpa, k);
-    }
-    var source = fs.remote.Source{ .block_manager = bm, .root = root, .holders = peers.items };
-    const loader = source.loader();
-
-    const info = try fs.inspect.inspect(gpa, loader, root);
+    // From the holders a read would use (Node.inspectFile).
+    const source: nomadfs.Node.FileSource = if (args.peer) |p|
+        .{ .share = .{ .peer = .{ .bytes = try parseHex32(p) }, .cid = root } }
+    else
+        .{ .swarm = .{ .cid = root, .author = try parseHex32(args.author_id orelse return error.InvalidArgument) } };
+    const info = try handle.node.inspectFile(gpa, source);
     var d: FileDetails = .{
         .cid = try gpa.dupe(u8, args.cid),
         .size = 0,
