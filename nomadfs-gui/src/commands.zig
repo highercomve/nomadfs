@@ -1377,31 +1377,16 @@ pub const MountArgs = struct { path: []const u8 };
 pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
     if (!can_mount) return error.MountUnsupported;
     if (args.path.len == 0 or args.path[0] != '/') return error.InvalidPath;
-    const io = std.Io.Threaded.global_single_threaded.io();
 
     g_mutex.lock();
     defer g_mutex.unlock();
     reapMountLocked();
     if (g_mount != null) return error.AlreadyMounted;
     const handle = g_node orelse return error.NotRunning;
-    const store = handle.node.store orelse return error.StorageDisabled;
-    // A NomadFS mount left behind by a process that died ("transport
-    // endpoint is not connected"): detach it before mounting again.
-    if (can_mount and isMounted(gpa, args.path)) {
-        const z = try gpa.dupeZ(u8, args.path);
-        defer gpa.free(z);
-        fs.fuse.unmount(z);
-        // fusermount3 may be reaped by the toolkit before we wait on it:
-        // trust the mount table, not the exit status.
-        var tries: u32 = 0;
-        while (tries < 30 and isMounted(gpa, args.path)) : (tries += 1) {
-            nomadfs.sync.sleep(100 * std.time.ns_per_ms);
-        }
-        if (isMounted(gpa, args.path)) return error.StaleMountBusy;
-    }
-    try std.Io.Dir.cwd().createDirPath(io, args.path);
+    if (handle.node.store == null) return error.StorageDisabled;
+    if (can_mount) try fs.fuse.prepareMountpoint(gpa, args.path);
 
-    const job = try startMountJob(handle, store, args.path);
+    const job = try startMountJob(handle, args.path);
     g_mount = job;
 
     // Wait (bounded) for the kernel to list the mount, or the thread to fail.
@@ -1410,7 +1395,7 @@ pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
     var waited: u32 = 0;
     while (waited < 50) : (waited += 1) {
         if (job.done.load(.acquire)) break;
-        if (isMounted(gpa, args.path)) return;
+        if (can_mount and fs.fuse.isMounted(gpa, args.path)) return;
         nomadfs.sync.sleep(100 * std.time.ns_per_ms);
     }
     if (job.done.load(.acquire)) {
@@ -1421,21 +1406,17 @@ pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
 
 /// Sets up the mount job and starts its serve thread; every step unwinds
 /// on failure. Caller holds g_mutex.
-fn startMountJob(handle: *mobile.NodeHandle, store: *nomadfs.storage.engine.StorageEngine, mount_path: []const u8) !*MountJob {
+fn startMountJob(handle: *mobile.NodeHandle, mount_path: []const u8) !*MountJob {
     const path = try setMountPath(mount_path);
     const job = try std.heap.page_allocator.create(MountJob);
     errdefer std.heap.page_allocator.destroy(job);
     job.* = .{
-        .mount = try fs.fuse.Mount.init(std.heap.page_allocator, handle.node.block_manager, store),
+        .mount = if (can_mount) try handle.node.newMount(std.heap.page_allocator) else undefined,
         .thread = undefined,
         .path = path,
     };
     // Each failure below unwinds what the steps above set up.
     errdefer if (can_mount) job.mount.deinit();
-    if (can_mount) {
-        job.mount.swarm = handle.node.swarm;
-        job.mount.read_ahead = handle.node.read_ahead;
-    }
     g_mount_active.store(true, .release);
     errdefer g_mount_active.store(false, .release);
     job.thread = try std.Thread.spawn(.{}, serveMount, .{job});
@@ -1494,29 +1475,6 @@ fn freeMountJob(job: *MountJob) void {
     std.heap.page_allocator.destroy(job);
 }
 
-/// Whether /proc/self/mountinfo lists a NomadFS mount at `path`.
-fn isMounted(gpa: std.mem.Allocator, path: []const u8) bool {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var file = std.Io.Dir.cwd().openFile(io, "/proc/self/mountinfo", .{}) catch return false;
-    defer file.close(io);
-    const buf = gpa.alloc(u8, 1024 * 1024) catch return false;
-    defer gpa.free(buf);
-    // One positional read: readStreaming ends /proc files with an error.
-    const len = file.readPositionalAll(io, buf, 0) catch return false;
-    var lines = std.mem.splitScalar(u8, buf[0..len], '\n');
-    while (lines.next()) |line| {
-        if (std.mem.indexOf(u8, line, "fuse.nomadfs") == null) continue;
-        var fields = std.mem.splitScalar(u8, line, ' ');
-        var i: usize = 0;
-        while (fields.next()) |field| : (i += 1) {
-            if (i == 4) {
-                if (std.mem.eql(u8, field, path)) return true;
-                break;
-            }
-        }
-    }
-    return false;
-}
 
 pub const OpenPathArgs = struct { path: []const u8 };
 

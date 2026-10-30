@@ -1781,6 +1781,49 @@ pub fn unmount(mountpoint: [:0]const u8) void {
     _ = linux.wait4(@intCast(pid), &status, 0, null);
 }
 
+/// Whether /proc/self/mountinfo lists a NomadFS mount at `path`.
+pub fn isMounted(allocator: std.mem.Allocator, path: []const u8) bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = std.Io.Dir.cwd().openFile(io, "/proc/self/mountinfo", .{}) catch return false;
+    defer file.close(io);
+    const buf = allocator.alloc(u8, 1024 * 1024) catch return false;
+    defer allocator.free(buf);
+    // One positional read: readStreaming ends /proc files with an error.
+    const len = file.readPositionalAll(io, buf, 0) catch return false;
+    var lines = std.mem.splitScalar(u8, buf[0..len], '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "fuse.nomadfs") == null) continue;
+        var fields = std.mem.splitScalar(u8, line, ' ');
+        var i: usize = 0;
+        while (fields.next()) |field| : (i += 1) {
+            if (i == 4) {
+                if (std.mem.eql(u8, field, path)) return true;
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+/// Clears any stale mount at `path` left by a dead process, and ensures
+/// the mount directory exists.
+pub fn prepareMountpoint(allocator: std.mem.Allocator, path: []const u8) !void {
+    if (isMounted(allocator, path)) {
+        const z = try allocator.dupeZ(u8, path);
+        defer allocator.free(z);
+        unmount(z);
+        // fusermount3 may be reaped by the toolkit before we wait on it:
+        // trust the mount table, not the exit status.
+        var tries: u32 = 0;
+        while (tries < 30 and isMounted(allocator, path)) : (tries += 1) {
+            sync.sleep(100 * std.time.ns_per_ms);
+        }
+        if (isMounted(allocator, path)) return error.StaleMountBusy;
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try std.Io.Dir.cwd().createDirPath(io, path);
+}
+
 // ---- Tests ----
 
 test "fuse: attr size does not overflow on 2^64-1" {

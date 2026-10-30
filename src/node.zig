@@ -1,6 +1,8 @@
 //! The running node: wires storage, folders, devices, the cluster and the
 //! network together, owns their lifecycles, and is the service API the CLI,
 //! the app and the mobile API call (directly or through settings.zig).
+const builtin = @import("builtin");
+const can_mount = builtin.os.tag == .linux and !builtin.abi.isAndroid();
 const std = @import("std");
 const config = @import("config.zig");
 const net = @import("net/mod.zig");
@@ -481,6 +483,16 @@ pub const Node = struct {
 
     /// A file's DAG and chunks (File Details), its blocks fetched from the
     /// same holders a read would use. Loads only parent blocks.
+    /// Prepares a new Mount configured with this node's swarm folder and read-ahead.
+    pub fn newMount(self: *Node, allocator: std.mem.Allocator) !if (can_mount) fs.fuse.Mount else void {
+        if (!can_mount) return error.Unsupported;
+        const store = self.store orelse return error.StorageDisabled;
+        var mount = try fs.fuse.Mount.init(allocator, self.block_manager, store);
+        mount.swarm = self.swarm;
+        mount.read_ahead = self.read_ahead;
+        return mount;
+    }
+
     pub fn inspectFile(self: *Node, allocator: std.mem.Allocator, source: FileSource) !fs.inspect.Inspection {
         if (self.store == null) return error.StorageDisabled;
         var buffer = fs.remote.holdersBuffer();
