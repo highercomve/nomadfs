@@ -2,7 +2,7 @@ const compat = @import("../compat.zig");
 const Address = compat.Address;
 const std = @import("std");
 const builtin = @import("builtin");
-const network = @import("mod.zig");
+const udp = @import("udp.zig");
 const id = @import("../id.zig");
 const sync = @import("../../sync.zig");
 
@@ -21,60 +21,6 @@ pub const ip_mreq = extern struct {
 };
 
 const posix = std.posix;
-const system = posix.system;
-
-fn createSocket(domain: u32, sock_type: u32, protocol: u32) !posix.socket_t {
-    while (true) {
-        const rc = system.socket(domain, sock_type, protocol);
-        if (posix.errno(rc) == .INTR) continue;
-        return switch (posix.errno(rc)) {
-            .SUCCESS => @intCast(rc),
-            else => |err| posix.unexpectedErrno(err),
-        };
-    }
-}
-
-fn closeSocket(s: posix.socket_t) void {
-    _ = system.close(@intCast(s));
-}
-
-fn shutdownSocket(s: posix.socket_t, how: i32) void {
-    _ = system.shutdown(@intCast(s), how);
-}
-
-fn bindSocket(s: posix.socket_t, addr: *const posix.sockaddr, len: posix.socklen_t) !void {
-    while (true) {
-        const rc = system.bind(@intCast(s), addr, len);
-        if (posix.errno(rc) == .INTR) continue;
-        return switch (posix.errno(rc)) {
-            .SUCCESS => {},
-            else => |err| posix.unexpectedErrno(err),
-        };
-    }
-}
-
-fn sendtoSocket(s: posix.socket_t, buf: []const u8, flags: u32, addr: ?*const posix.sockaddr, alen: posix.socklen_t) !usize {
-    while (true) {
-        const rc = system.sendto(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
-        if (posix.errno(rc) == .INTR) continue;
-        return switch (posix.errno(rc)) {
-            .SUCCESS => @intCast(rc),
-            else => |err| posix.unexpectedErrno(err),
-        };
-    }
-}
-
-fn recvfromSocket(s: posix.socket_t, buf: []u8, flags: u32, addr: ?*posix.sockaddr, alen: ?*posix.socklen_t) !usize {
-    while (true) {
-        const rc = system.recvfrom(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
-        if (posix.errno(rc) == .INTR) continue;
-        return switch (posix.errno(rc)) {
-            .SUCCESS => @intCast(rc),
-            .AGAIN => error.WouldBlock,
-            else => |err| posix.unexpectedErrno(err),
-        };
-    }
-}
 
 pub const MDNS = struct {
     allocator: std.mem.Allocator,
@@ -117,23 +63,23 @@ pub const MDNS = struct {
     fn startPosix(self: *MDNS) !void {
         if (self.running.load(.acquire)) return;
 
-        const recv_socket = createSocket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch |err| {
+        const recv_socket = udp.createSocket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch |err| {
             std.debug.print("mDNS: Failed to create recv socket: {any}\n", .{err});
             return;
         };
-        errdefer closeSocket(recv_socket);
+        errdefer udp.closeSocket(recv_socket);
 
-        const send_socket = createSocket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch |err| {
+        const send_socket = udp.createSocket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch |err| {
             std.debug.print("mDNS: Failed to create send socket: {any}\n", .{err});
-            closeSocket(recv_socket);
+            udp.closeSocket(recv_socket);
             return;
         };
-        errdefer closeSocket(send_socket);
+        errdefer udp.closeSocket(send_socket);
 
         self.configureRecvSocket(recv_socket) catch |err| {
             std.debug.print("mDNS: Failed to bind recv socket: {any}\n", .{err});
-            closeSocket(send_socket);
-            closeSocket(recv_socket);
+            udp.closeSocket(send_socket);
+            udp.closeSocket(recv_socket);
             return;
         };
         configureSendSocket(send_socket);
@@ -154,18 +100,18 @@ pub const MDNS = struct {
     pub fn stop(self: *MDNS) void {
         if (builtin.os.tag == .windows) return;
         self.running.store(false, .release);
-        if (self.recv_socket) |s| shutdownSocket(s, posix.SHUT.RDWR);
-        if (self.send_socket) |s| shutdownSocket(s, posix.SHUT.RDWR);
+        if (self.recv_socket) |s| udp.shutdownSocket(s, posix.SHUT.RDWR);
+        if (self.send_socket) |s| udp.shutdownSocket(s, posix.SHUT.RDWR);
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
         if (self.send_socket) |s| {
-            closeSocket(s);
+            udp.closeSocket(s);
             self.send_socket = null;
         }
         if (self.recv_socket) |s| {
-            closeSocket(s);
+            udp.closeSocket(s);
             self.recv_socket = null;
         }
     }
@@ -179,7 +125,7 @@ pub const MDNS = struct {
 
         const addr = Address.parseIp("0.0.0.0", self.mdns_port) catch unreachable;
         const sa = addr.toPosix();
-        try bindSocket(recv_socket, @ptrCast(&sa), sa.len());
+        try udp.bindSocket(recv_socket, @ptrCast(&sa), sa.len());
 
         const mcast_sa = (Address.parseIp(MDNS_MULTICAST_ADDR, 0) catch unreachable).toPosix();
         const mreq = ip_mreq{
@@ -222,7 +168,7 @@ pub const MDNS = struct {
             var src_sa: posix.sockaddr.in = undefined;
             var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
 
-            const bytes_read = recvfromSocket(recv_socket, &buf, 0, @ptrCast(&src_sa), &len) catch |err| {
+            const bytes_read = udp.recvfromSocket(recv_socket, &buf, 0, @ptrCast(&src_sa), &len) catch |err| {
                 if (err != error.WouldBlock) std.debug.print("mDNS: recv error: {any}\n", .{err});
                 continue;
             };
@@ -242,7 +188,7 @@ pub const MDNS = struct {
         const msg = try std.fmt.bufPrint(&msg_buf, "{s}{{\"id\":\"{x}\",\"port\":{d}}}", .{ MAGIC_PREFIX, self.local_peer_id.bytes, self.local_tcp_port });
 
         const dest = (try Address.parseIp(MDNS_MULTICAST_ADDR, self.mdns_port)).toPosix();
-        _ = try sendtoSocket(socket, msg, 0, @ptrCast(&dest), dest.len());
+        _ = try udp.sendtoSocket(socket, msg, 0, @ptrCast(&dest), dest.len());
     }
 
     fn handlePacket(self: *MDNS, data: []const u8, src: Address) !void {

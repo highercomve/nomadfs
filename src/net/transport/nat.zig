@@ -1,50 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const network = @import("mod.zig");
+const udp = @import("udp.zig");
 const compat = @import("../compat.zig");
 const local_addrs = @import("../local_addrs.zig");
 const sync = @import("../../sync.zig");
 
 const posix = std.posix;
 const system = posix.system;
-
-fn createSocket(domain: u32, sock_type: u32, protocol: u32) !posix.socket_t {
-    while (true) {
-        const rc = system.socket(domain, sock_type, protocol);
-        if (posix.errno(rc) == .INTR) continue;
-        return switch (posix.errno(rc)) {
-            .SUCCESS => @intCast(rc),
-            else => |err| posix.unexpectedErrno(err),
-        };
-    }
-}
-
-fn closeSocket(s: posix.socket_t) void {
-    _ = system.close(@intCast(s));
-}
-
-fn sendtoSocket(s: posix.socket_t, buf: []const u8, flags: u32, addr: ?*const posix.sockaddr, alen: posix.socklen_t) !usize {
-    while (true) {
-        const rc = system.sendto(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
-        if (posix.errno(rc) == .INTR) continue;
-        return switch (posix.errno(rc)) {
-            .SUCCESS => @intCast(rc),
-            else => |err| posix.unexpectedErrno(err),
-        };
-    }
-}
-
-fn recvfromSocket(s: posix.socket_t, buf: []u8, flags: u32, addr: ?*posix.sockaddr, alen: ?*posix.socklen_t) !usize {
-    while (true) {
-        const rc = system.recvfrom(@intCast(s), buf.ptr, buf.len, flags, addr, alen);
-        if (posix.errno(rc) == .INTR) continue;
-        return switch (posix.errno(rc)) {
-            .SUCCESS => @intCast(rc),
-            .AGAIN => error.WouldBlock,
-            else => |err| posix.unexpectedErrno(err),
-        };
-    }
-}
 
 pub const nat_lease_seconds: u32 = 3600;
 pub const nat_renew_after_seconds: u32 = 1800;
@@ -541,8 +503,8 @@ pub const UPnP = struct {
         const local_nets = nets_buf[0..num_nets];
         const default_gw = getDefaultGateway();
 
-        const socket = try createSocket(posix.AF.INET, posix.SOCK.DGRAM, 0);
-        defer closeSocket(socket);
+        const socket = try udp.createSocket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+        defer udp.closeSocket(socket);
 
         const timeout = posix.timeval{ .sec = 0, .usec = 200_000 };
         posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
@@ -559,14 +521,14 @@ pub const UPnP = struct {
             "MAN: \"ssdp:discover\"\r\n" ++
             "MX: 2\r\n" ++
             "ST: {s}\r\n\r\n", .{st_igd1});
-        _ = sendtoSocket(socket, msg1, 0, @ptrCast(&dest_sa), dest_sa.len()) catch {};
+        _ = udp.sendtoSocket(socket, msg1, 0, @ptrCast(&dest_sa), dest_sa.len()) catch {};
 
         const msg2 = try std.fmt.bufPrint(&ssdp_buf, "M-SEARCH * HTTP/1.1\r\n" ++
             "HOST: 239.255.255.250:1900\r\n" ++
             "MAN: \"ssdp:discover\"\r\n" ++
             "MX: 2\r\n" ++
             "ST: {s}\r\n\r\n", .{st_igd2});
-        _ = sendtoSocket(socket, msg2, 0, @ptrCast(&dest_sa), dest_sa.len()) catch {};
+        _ = udp.sendtoSocket(socket, msg2, 0, @ptrCast(&dest_sa), dest_sa.len()) catch {};
 
         var candidates: [4]Candidate = undefined;
         var candidate_paths: [4][nat_max_url_len]u8 = undefined;
@@ -578,7 +540,7 @@ pub const UPnP = struct {
         while (sync.monotonicMillis() < deadline and candidate_count < candidates.len) {
             var src_sa: posix.sockaddr.in = undefined;
             var src_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-            const len = recvfromSocket(socket, &buf, 0, @ptrCast(&src_sa), &src_len) catch |err| {
+            const len = udp.recvfromSocket(socket, &buf, 0, @ptrCast(&src_sa), &src_len) catch |err| {
                 if (err == error.WouldBlock) continue;
                 return err;
             };
@@ -682,8 +644,8 @@ pub const UPnP = struct {
     fn getLocalIpFor(self: *UPnP, gw_ip: [4]u8) ![]const u8 {
         const gateway_addr = compat.Address.initIp4(gw_ip, 0);
 
-        const socket = try createSocket(posix.AF.INET, posix.SOCK.DGRAM, 0);
-        defer closeSocket(socket);
+        const socket = try udp.createSocket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+        defer udp.closeSocket(socket);
         const gw_sa = gateway_addr.toPosix();
         const rc = while (true) {
             const result = system.connect(@intCast(socket), @ptrCast(&gw_sa), gw_sa.len());

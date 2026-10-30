@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const network = @import("mod.zig");
+const compat = @import("../compat.zig");
 const device_auth = @import("../../device/auth.zig");
 const identity_mod = @import("../../device/identity.zig");
 const NodeID = @import("../id.zig").NodeID;
@@ -400,10 +401,16 @@ pub const NoiseStream = struct {
 
         // Device identity, signed over the handshake hash that also
         // authenticates this payload.
+        try readDeviceHello(hs, buf[80..], "Message 2 Decrypt (device hello)", "Message 2 device identity");
+    }
+
+    /// Decrypts the device hello that ends message 2 or 3 and verifies it
+    /// against the handshake hash up to the hello.
+    fn readDeviceHello(hs: *HandshakeState, ciphertext: []const u8, decrypt_step: []const u8, identity_step: []const u8) !void {
         const transcript = hs.symmetric.h;
         var hello: [device_auth.hello_len]u8 = undefined;
-        hs.symmetric.decryptAndHash(buf[80..], &hello) catch |err| return logError("Message 2 Decrypt (device hello)", err);
-        hs.remote_device_id = hs.auth.verifyHello(&hello, transcript, hs.rs.?) catch |err| return logError("Message 2 device identity", err);
+        hs.symmetric.decryptAndHash(ciphertext, &hello) catch |err| return logError(decrypt_step, err);
+        hs.remote_device_id = hs.auth.verifyHello(&hello, transcript, hs.rs.?) catch |err| return logError(identity_step, err);
     }
 
     fn consumeMessage2Prefix(hs: *HandshakeState, buf: []const u8) !void {
@@ -462,10 +469,7 @@ pub const NoiseStream = struct {
         try consumeMessage3Prefix(hs, &buf);
 
         // payload: device identity (also verifies the PSK-derived key)
-        const transcript = hs.symmetric.h;
-        var hello: [device_auth.hello_len]u8 = undefined;
-        hs.symmetric.decryptAndHash(buf[48..], &hello) catch |err| return logError("Message 3 Decrypt (payload/psk verify)", err);
-        hs.remote_device_id = hs.auth.verifyHello(&hello, transcript, hs.rs.?) catch |err| return logError("Message 3 device identity", err);
+        try readDeviceHello(hs, buf[48..], "Message 3 Decrypt (payload/psk verify)", "Message 3 device identity");
     }
 
     fn consumeMessage3Prefix(hs: *HandshakeState, buf: []const u8) !void {
@@ -492,26 +496,16 @@ pub const NoiseStream = struct {
     fn writeHandshakeMessage(inner: network.Stream, msg: []const u8) !void {
         var len_buf: [2]u8 = undefined;
         std.mem.writeInt(u16, &len_buf, @intCast(msg.len), .big);
-        try writeFull(inner, &len_buf);
-        try writeFull(inner, msg);
-    }
-
-    /// Writes all of `buffer`; a short write would desynchronize the framing.
-    fn writeFull(stream_obj: network.Stream, buffer: []const u8) !void {
-        var total_written: usize = 0;
-        while (total_written < buffer.len) {
-            const n = try stream_obj.write(buffer[total_written..]);
-            if (n == 0) return error.WriteZero;
-            total_written += n;
-        }
+        try compat.writeFull(inner, &len_buf);
+        try compat.writeFull(inner, msg);
     }
 
     fn readHandshakeMessage(inner: network.Stream, out: []u8) !void {
         var len_buf: [2]u8 = undefined;
-        try readFull(inner, &len_buf);
+        try compat.readFull(inner, &len_buf);
         const len = std.mem.readInt(u16, &len_buf, .big);
         if (len != out.len) return error.HandshakeFailed;
-        try readFull(inner, out);
+        try compat.readFull(inner, out);
     }
 
     pub fn stream(self: *NoiseStream) network.Stream {
@@ -532,7 +526,7 @@ pub const NoiseStream = struct {
 
         // Buffer is empty, read next packet
         var len_buf: [2]u8 = undefined;
-        try readFull(self.inner, &len_buf);
+        try compat.readFull(self.inner, &len_buf);
         const len = std.mem.readInt(u16, &len_buf, .big);
 
         if (len < 16) return error.PacketTooSmall;
@@ -540,7 +534,7 @@ pub const NoiseStream = struct {
 
         if (len > self.read_buffer.len) return error.PacketTooLarge;
 
-        try readFull(self.inner, self.read_buffer[0..len]);
+        try compat.readFull(self.inner, self.read_buffer[0..len]);
 
         try self.recv_cipher.decryptWithAd(&[_]u8{}, self.read_buffer[0..len], self.read_buffer[0..msg_len]);
 
@@ -555,15 +549,6 @@ pub const NoiseStream = struct {
         return to_copy;
     }
 
-    fn readFull(stream_obj: network.Stream, buffer: []u8) !void {
-        var total_read: usize = 0;
-        while (total_read < buffer.len) {
-            const n = try stream_obj.read(buffer[total_read..]);
-            if (n == 0) return error.EndOfStream;
-            total_read += n;
-        }
-    }
-
     fn write(ptr: *anyopaque, buffer: []const u8) anyerror!usize {
         const self: *NoiseStream = @ptrCast(@alignCast(ptr));
 
@@ -575,7 +560,7 @@ pub const NoiseStream = struct {
             const packet = self.write_buffer[0 .. 2 + packet_len];
             std.mem.writeInt(u16, packet[0..2], @intCast(packet_len), .big);
             try self.send_cipher.encryptWithAd(&[_]u8{}, buffer[i .. i + chunk_len], packet[2..]);
-            try writeFull(self.inner, packet);
+            try compat.writeFull(self.inner, packet);
             i += chunk_len;
         }
 

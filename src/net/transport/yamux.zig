@@ -1,6 +1,7 @@
 const sync = @import("../../sync.zig");
 const std = @import("std");
 const network = @import("mod.zig");
+const compat = @import("../compat.zig");
 
 pub const Version = 0;
 
@@ -47,24 +48,6 @@ pub const Header = struct {
         };
     }
 };
-
-fn readExactly(stream: network.Stream, buffer: []u8) !void {
-    var total_read: usize = 0;
-    while (total_read < buffer.len) {
-        const n = try stream.read(buffer[total_read..]);
-        if (n == 0) return error.EndOfStream;
-        total_read += n;
-    }
-}
-
-fn writeExactly(stream: network.Stream, buffer: []const u8) !void {
-    var total_written: usize = 0;
-    while (total_written < buffer.len) {
-        const n = try stream.write(buffer[total_written..]);
-        if (n == 0) return error.WriteZero;
-        total_written += n;
-    }
-}
 
 /// 1 MiB: the largest block (FastCDC's maximum chunk) fits in one window,
 /// so a block reply never stalls waiting for a window update.
@@ -315,7 +298,7 @@ pub const Session = struct {
 
         var header_buf: [12]u8 = undefined;
         while (true) {
-            readExactly(self.transport, &header_buf) catch |err| {
+            compat.readFull(self.transport, &header_buf) catch |err| {
                 if (err != error.EndOfStream and err != error.NotOpenForReading and err != error.ConnectionResetByPeer and err != error.BrokenPipe) {
                     std.debug.print("YamuxSession transport read error: {any}\n", .{err});
                 }
@@ -428,7 +411,7 @@ pub const Session = struct {
         var remaining: u32 = header.length;
         while (remaining > 0) {
             const n: u32 = @min(remaining, @as(u32, chunk.len));
-            try readExactly(self.transport, chunk[0..n]);
+            try compat.readFull(self.transport, chunk[0..n]);
             remaining -= n;
             if (!keep_data) continue;
 
@@ -505,7 +488,7 @@ pub const Session = struct {
         try self.write_buffer.ensureTotalCapacity(self.allocator, h_buf.len + payload.len);
         self.write_buffer.appendSliceAssumeCapacity(&h_buf);
         self.write_buffer.appendSliceAssumeCapacity(payload);
-        try writeExactly(self.transport, self.write_buffer.items);
+        try compat.writeFull(self.transport, self.write_buffer.items);
     }
 
     fn discardBytes(self: *Session, len: u32) !void {
@@ -513,7 +496,7 @@ pub const Session = struct {
         var remaining = len;
         while (remaining > 0) {
             const to_read = @min(remaining, @as(u32, @intCast(buf.len)));
-            try readExactly(self.transport, buf[0..to_read]);
+            try compat.readFull(self.transport, buf[0..to_read]);
             remaining -= to_read;
         }
     }

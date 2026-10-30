@@ -111,6 +111,28 @@ pub const Address = struct {
     }
 };
 
+/// Writes all of `buffer` to `stream`, anything with a `write` method; a
+/// short write would desynchronize the framing.
+pub fn writeFull(stream: anytype, buffer: []const u8) !void {
+    var written: usize = 0;
+    while (written < buffer.len) {
+        const n = try stream.write(buffer[written..]);
+        if (n == 0) return error.WriteZero;
+        written += n;
+    }
+}
+
+/// Fills `buffer` from `stream`, anything with a `read` method; fails with
+/// error.EndOfStream if the stream ends first.
+pub fn readFull(stream: anytype, buffer: []u8) !void {
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const n = try stream.read(buffer[total..]);
+        if (n == 0) return error.EndOfStream;
+        total += n;
+    }
+}
+
 /// TCP / Network Stream abstraction compatible with Zig 0.16.
 pub const Stream = struct {
     inner: std.Io.net.Stream,
@@ -169,12 +191,7 @@ pub const Stream = struct {
     }
 
     pub fn writeAll(self: Stream, buffer: []const u8) !void {
-        var written: usize = 0;
-        while (written < buffer.len) {
-            const n = try self.write(buffer[written..]);
-            if (n == 0) return error.WriteZero;
-            written += n;
-        }
+        return writeFull(self, buffer);
     }
 
     /// Bounds each blocking read and write to `timeout_ms`; 0 removes the
