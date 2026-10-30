@@ -1393,7 +1393,28 @@ pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
     }
     try std.Io.Dir.cwd().createDirPath(io, args.path);
 
-    const path = try setMountPath(args.path);
+    const job = try startMountJob(handle, store, args.path);
+    g_mount = job;
+
+    // Wait (bounded) for the kernel to list the mount, or the thread to fail.
+    // Past this point the job is g_mount's: a failure reaps it, nothing else
+    // frees it.
+    var waited: u32 = 0;
+    while (waited < 50) : (waited += 1) {
+        if (job.done.load(.acquire)) break;
+        if (isMounted(gpa, args.path)) return;
+        nomadfs.sync.sleep(100 * std.time.ns_per_ms);
+    }
+    if (job.done.load(.acquire)) {
+        reapMountLocked();
+        return error.MountFailed;
+    }
+}
+
+/// Sets up the mount job and starts its serve thread; every step unwinds
+/// on failure. Caller holds g_mutex.
+fn startMountJob(handle: *mobile.NodeHandle, store: *nomadfs.storage.engine.StorageEngine, mount_path: []const u8) !*MountJob {
+    const path = try setMountPath(mount_path);
     const job = try std.heap.page_allocator.create(MountJob);
     errdefer std.heap.page_allocator.destroy(job);
     job.* = .{
@@ -1410,19 +1431,7 @@ pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
     g_mount_active.store(true, .release);
     errdefer g_mount_active.store(false, .release);
     job.thread = try std.Thread.spawn(.{}, serveMount, .{job});
-    g_mount = job;
-
-    // Wait (bounded) for the kernel to list the mount, or the thread to fail.
-    var waited: u32 = 0;
-    while (waited < 50) : (waited += 1) {
-        if (job.done.load(.acquire)) break;
-        if (isMounted(gpa, args.path)) return;
-        nomadfs.sync.sleep(100 * std.time.ns_per_ms);
-    }
-    if (job.done.load(.acquire)) {
-        reapMountLocked();
-        return error.MountFailed;
-    }
+    return job;
 }
 
 fn serveMount(job: *MountJob) void {
