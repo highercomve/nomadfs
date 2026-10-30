@@ -83,9 +83,9 @@ pub fn nodeOpen(gpa: std.mem.Allocator, args: NodeOpenArgs) !void {
     defer gpa.free(path);
 
     const node = mobile.nomadfs_node_new(path.ptr) orelse return error.ConfigInvalid;
-    // A trusted device may rotate the swarm key: adopt it (see onRotation).
-    rememberConfigPath(args.config_path);
-    node.node.discovery_node.rotation_sink = .{ .ctx = &g_rotation, .applyFn = onRotation };
+    // A trusted device may rotate the swarm key: adopt it.
+    g_rotation.watch(&node.node, args.config_path) catch |err|
+        std.debug.print("rotation: not watching: {any}\n", .{err});
     if (mobile.nomadfs_node_run(node) != 0) {
         mobile.nomadfs_node_free(node);
         return error.NodeFailedToStart;
@@ -1734,81 +1734,14 @@ pub fn inviteAccept(gpa: std.mem.Allocator, args: InviteAcceptArgs) ![]const u8 
 
 // ---- Swarm key rotation ----
 
-var g_config_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-var g_config_path_len: usize = 0;
+/// Saves keys trusted devices send and restarts the node on them.
+var g_rotation: nomadfs.key_rotation.Adopter = .{ .restart = .{ .restartFn = restartNode } };
 
-fn rememberConfigPath(path: []const u8) void {
-    const n = @min(path.len, g_config_path_buf.len);
-    @memcpy(g_config_path_buf[0..n], path[0..n]);
-    g_config_path_len = n;
+fn restartNode(_: ?*anyopaque, config_path: []const u8) void {
+    nodeClose();
+    nodeOpen(std.heap.page_allocator, .{ .config_path = config_path }) catch |err|
+        std.debug.print("rotation: restart failed: {any}\n", .{err});
 }
-
-var g_rotation_mutex: nomadfs.sync.Mutex = .{};
-var g_rotation_worker_active: bool = false;
-const PendingRotation = struct { key: [32]u8 = undefined, epoch: u64 = 0 };
-var g_rotation: PendingRotation = .{};
-
-/// A trusted device sent a new swarm key (already verified by the node).
-/// Runs on a request thread: persist and restart from another thread, so
-/// this request can still be answered.
-fn onRotation(ctx: *anyopaque, new_key: [32]u8, epoch: u64) void {
-    _ = ctx;
-    g_rotation_mutex.lock();
-    defer g_rotation_mutex.unlock();
-    if (epoch <= g_rotation.epoch and g_rotation.epoch != 0) return;
-    g_rotation.key = new_key;
-    g_rotation.epoch = epoch;
-    if (!g_rotation_worker_active) {
-        g_rotation_worker_active = true;
-        if (std.Thread.spawn(.{}, adoptRotationWorker, .{})) |t| {
-            t.detach();
-        } else |err| {
-            g_rotation_worker_active = false;
-            std.crypto.secureZero(u8, &g_rotation.key);
-            g_rotation.epoch = 0;
-            std.debug.print("rotation: failed to spawn worker: {any}\n", .{err});
-        }
-    }
-}
-
-fn adoptRotationWorker() void {
-    nomadfs.sync.sleep(500 * std.time.ns_per_ms);
-    const gpa = std.heap.page_allocator;
-
-    while (true) {
-        g_rotation_mutex.lock();
-        if (g_rotation.epoch == 0) {
-            g_rotation_worker_active = false;
-            g_rotation_mutex.unlock();
-            break;
-        }
-        var work_key = g_rotation.key;
-        const work_epoch = g_rotation.epoch;
-        std.crypto.secureZero(u8, &g_rotation.key);
-        g_rotation.epoch = 0;
-        g_rotation_mutex.unlock();
-
-        defer std.crypto.secureZero(u8, &work_key);
-
-        const path = blk: {
-            g_mutex.lock();
-            defer g_mutex.unlock();
-            break :blk gpa.dupe(u8, g_config_path_buf[0..g_config_path_len]) catch null;
-        } orelse continue;
-        defer gpa.free(path);
-
-        config_file.setSwarmKey(gpa, path, work_key, work_epoch) catch |err| {
-            std.debug.print("rotation: saving the new key failed: {any}\n", .{err});
-            continue;
-        };
-        std.debug.print("rotation: adopted swarm key epoch {d}; restarting the node\n", .{work_epoch});
-        nodeClose();
-        nodeOpen(gpa, .{ .config_path = path }) catch |err| {
-            std.debug.print("rotation: restart failed: {any}\n", .{err});
-        };
-    }
-}
-
 
 pub const RotationEntry = struct { name: []const u8, status: []const u8 };
 
@@ -1817,21 +1750,12 @@ pub const RotationEntry = struct { name: []const u8, status: []const u8 };
 /// Devices that aren't paired, or are offline, keep the old key and are
 /// listed so they can be invited again.
 pub fn swarmRotateKey(gpa: std.mem.Allocator, args: ListArgs) ![]RotationEntry {
-    var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
-    const epoch = config.node.swarm_epoch + 1;
-    config.deinit(gpa);
-
-    var key: [32]u8 = undefined;
-    try std.Io.Threaded.global_single_threaded.io().randomSecure(&key);
-    defer std.crypto.secureZero(u8, &key);
-
     const report = blk: {
         g_mutex.lock();
         defer g_mutex.unlock();
         const handle = g_node orelse return error.NotRunning;
-        break :blk try handle.node.rotateSwarmKey(gpa, key, epoch);
+        break :blk try nomadfs.key_rotation.rotate(gpa, args.config_path, &handle.node);
     };
-    try config_file.setSwarmKey(gpa, args.config_path, key, epoch);
     nodeClose();
     try nodeOpen(gpa, .{ .config_path = args.config_path });
 

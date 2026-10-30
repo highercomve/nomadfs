@@ -4,6 +4,7 @@ const std = @import("std");
 pub const config = @import("config.zig");
 pub const config_file = @import("config_file.zig");
 pub const settings = @import("settings.zig");
+pub const key_rotation = @import("key_rotation.zig");
 pub const net = @import("net/mod.zig");
 pub const storage = @import("storage/mod.zig");
 pub const device = @import("device/mod.zig");
@@ -857,6 +858,7 @@ test {
         @import("config.zig"),
         @import("config_file.zig"),
         @import("settings.zig"),
+        @import("key_rotation.zig"),
         @import("node_info.zig"),
         @import("device/auth.zig"),
         @import("device/identity.zig"),

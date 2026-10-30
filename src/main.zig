@@ -45,6 +45,26 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     defer config.deinit(allocator);
+    try applyOptions(allocator, &config, options);
+
+    switch (options.command) {
+        .pair => try pairCommand(allocator, config, options.address),
+        .trust => try trustCommand(allocator, config, options.trust_uri.?),
+        .devices => try devicesCommand(allocator, config),
+        .revoke => try revokeCommand(allocator, config, options.revoke_query.?),
+        .run => try runNode(allocator, config, options),
+        .mount => try mountCommand(allocator, config, options.mountpoint.?),
+        .invite => try inviteCommand(allocator, config, options.address),
+        .join => try joinCommand(allocator, config, options.config_path, options.join_code.?, options.address),
+        .cache => try cacheCommand(allocator, config, false),
+        .clear_cache => try cacheCommand(allocator, config, true),
+        .bench_read => try benchReadCommand(allocator, config, options.bench_read_path.?, options.bench_wait_seconds, options.bench_cold),
+        .bench_idle => try benchIdleCommand(allocator, config, options.bench_idle_seconds),
+    }
+}
+
+/// What the command line adds to the config file.
+fn applyOptions(allocator: std.mem.Allocator, config: *config_mod.Config, options: Options) !void {
     for (options.shares.items) |spec| {
         const share = config_mod.Config.Share.parse(spec) catch {
             std.debug.print("Error: --share expects Name:/path, got '{s}'\n", .{spec});
@@ -54,21 +74,6 @@ pub fn main(init: std.process.Init) !void {
     }
     if (options.swarm_backup) config.storage.swarm_backup = true;
     if (options.copies) |n| config.storage.set_copies = n;
-
-    switch (options.command) {
-        .pair => try pairCommand(allocator, config, options.address),
-        .trust => try trustCommand(allocator, config, options.trust_uri.?),
-        .devices => try devicesCommand(allocator, config),
-        .revoke => try revokeCommand(allocator, config, options.revoke_query.?),
-        .run => try runNode(allocator, config),
-        .mount => try mountCommand(allocator, config, options.mountpoint.?),
-        .invite => try inviteCommand(allocator, config, options.address),
-        .join => try joinCommand(allocator, config, options.config_path, options.join_code.?, options.address),
-        .cache => try cacheCommand(allocator, config, false),
-        .clear_cache => try cacheCommand(allocator, config, true),
-        .bench_read => try benchReadCommand(allocator, config, options.bench_read_path.?, options.bench_wait_seconds, options.bench_cold),
-        .bench_idle => try benchIdleCommand(allocator, config, options.bench_idle_seconds),
-    }
 }
 
 /// Returns false when the command was fully handled (help).
@@ -243,21 +248,46 @@ fn loadConfig(allocator: std.mem.Allocator, config_path: ?[]const u8) !config_mo
     };
 }
 
-fn runNode(allocator: std.mem.Allocator, config: config_mod.Config) !void {
+/// The run loop's flag; cleared to stop (or restart) the node.
+var node_running = std.atomic.Value(bool).init(true);
+var restart_requested = std.atomic.Value(bool).init(false);
+/// Saves keys trusted devices send; the node then restarts on them.
+var rotation: nomadfs.key_rotation.Adopter = .{ .restart = .{ .restartFn = requestRestart } };
+
+fn requestRestart(_: ?*anyopaque, _: []const u8) void {
+    restart_requested.store(true, .release);
+    node_running.store(false, .release);
+}
+
+/// Runs the node until it stops; a rotated swarm key restarts it on the
+/// re-read config.
+fn runNode(allocator: std.mem.Allocator, first: config_mod.Config, options: Options) !void {
+    try runOnce(allocator, first, options.config_path);
+    while (restart_requested.swap(false, .acq_rel)) {
+        var config = try loadConfig(allocator, options.config_path);
+        defer config.deinit(allocator);
+        try applyOptions(allocator, &config, options);
+        node_running.store(true, .release);
+        try runOnce(allocator, config, options.config_path);
+    }
+}
+
+fn runOnce(allocator: std.mem.Allocator, config: config_mod.Config, config_path: ?[]const u8) !void {
     std.debug.print("NomadFS Node: {s} (Storage: {any})\n", .{ config.node.nickname, config.storage.enabled });
     std.debug.print("Listening on port: {d}\n", .{config.network.port});
     if (config.storage.swarm_backup) std.debug.print("Backing up the swarm folder on this device\n", .{});
 
     var node = try nomadfs.Node.init(allocator, config);
     defer node.deinit();
+    // Without --config there is no file to save a rotated key in.
+    if (config_path) |path| try rotation.watch(&node, path);
 
     std.debug.print("Node Initialized. Local ID: {x}\n", .{node.connection_manager.node_id.bytes});
     std.debug.print("Device ID: {x}\n", .{node.device_identity.deviceId().bytes});
-    var running = std.atomic.Value(bool).init(true);
     node.bootstrap(config.network.bootstrap_peers, config.node.swarm_key) catch |err| {
         std.debug.print("Bootstrap error: {any}\n", .{err});
     };
-    try node.run(&running, config);
+    try node.run(&node_running, config);
 }
 
 var mounted_at: [std.fs.max_path_bytes:0]u8 = undefined;
