@@ -800,6 +800,16 @@ pub const Node = struct {
             if (!self.bootstrap_running.load(.acquire)) return;
             if (e.id.eql(self.connection_manager.node_id)) continue;
             if (self.redial.get(e.id)) |r| if (r.at_ms > now) continue;
+            // Reached only through a relay: try a direct connection again,
+            // or relays can't reach that device from outside (they don't
+            // chain). Failing keeps the relayed one and costs no backoff.
+            if (self.connection_manager.onlyRelayed(e.id)) {
+                if (self.connection_manager.connectDirect(e.slice(), swarm_key, e.id)) |direct| {
+                    std.debug.print("bootstrap: {x} reached directly (was relayed)\n", .{e.id.bytes[0..4]});
+                    direct.deinit();
+                } else |_| {}
+                continue;
+            }
             const conn = self.connection_manager.connectToPeerMulti(e.slice(), swarm_key, e.id) catch {
                 const failures = if (self.redial.get(e.id)) |r| r.failures +| 1 else 1;
                 const wait_ms = @min(@as(i64, 30_000) << @intCast(@min(failures - 1, 4)), 5 * 60_000);

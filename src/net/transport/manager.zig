@@ -64,7 +64,8 @@ pub const ConnectionManager = struct {
 
     pub const max_dial_backoff = 64;
     const backoff_first_ms: i64 = 30 * std.time.ms_per_s;
-    const backoff_max_ms: i64 = 10 * std.time.ms_per_min;
+    // Short: phones change networks, and a relay link drops on LTE.
+    const backoff_max_ms: i64 = 2 * std.time.ms_per_min;
     const DialBackoff = struct {
         peer: ?id.NodeID = null,
         until_ms: i64 = 0,
@@ -396,7 +397,16 @@ pub const ConnectionManager = struct {
     /// node ID only the authenticated ID counts (another node may now sit at
     /// a known address); without one, any of `addresses` matches.
     /// Caller holds self.mutex.
+    /// A live connection to the peer, a direct one if there is one: a
+    /// relayed connection (its peer address unspecified) can't be relayed
+    /// through again, so a device reached only that way is unreachable
+    /// from outside. `direct_only` skips relayed ones altogether.
     fn findConnectionLocked(self: *ConnectionManager, addresses: []const network.Address, remote_node_id: ?id.NodeID) ?network.Connection {
+        return self.findConnectionKindLocked(addresses, remote_node_id, false);
+    }
+
+    fn findConnectionKindLocked(self: *ConnectionManager, addresses: []const network.Address, remote_node_id: ?id.NodeID, direct_only: bool) ?network.Connection {
+        var relayed: ?*ManagedConnection = null;
         for (self.connections.items) |*mc| {
             if (mc.conn.isClosed()) continue;
             const matches = if (remote_node_id) |target_id|
@@ -404,13 +414,34 @@ pub const ConnectionManager = struct {
             else for (addresses) |addr| {
                 if (addressesMatch(mc.conn.getPeerAddress(), addr)) break true;
             } else false;
-            if (matches) {
-                mc.last_active = sync.timestamp();
-                mc.conn.retain();
-                return mc.conn;
+            if (!matches) continue;
+            if (mc.conn.getPeerAddress().isUnspecified()) {
+                if (relayed == null) relayed = mc;
+                continue;
             }
+            return useLocked(mc);
         }
-        return null;
+        if (direct_only) return null;
+        return if (relayed) |mc| useLocked(mc) else null;
+    }
+
+    fn useLocked(mc: *ManagedConnection) network.Connection {
+        mc.last_active = sync.timestamp();
+        mc.conn.retain();
+        return mc.conn;
+    }
+
+    /// Whether the only connection to `peer` runs through a relay.
+    pub fn onlyRelayed(self: *ConnectionManager, peer: id.NodeID) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var any = false;
+        for (self.connections.items) |mc| {
+            if (mc.conn.isClosed() or !mc.conn.getRemoteNodeID().eql(peer)) continue;
+            if (!mc.conn.getPeerAddress().isUnspecified()) return false;
+            any = true;
+        }
+        return any;
     }
 
     fn threadWrapper(cb: *const fn (*anyopaque, network.Connection) anyerror!void, ctx: *anyopaque, conn: network.Connection) void {
@@ -673,7 +704,7 @@ pub const ConnectionManager = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.stopping) return error.ManagerStopping;
-            if (self.findConnectionLocked(addresses, remote_node_id)) |c| return c;
+            if (self.findConnectionKindLocked(addresses, remote_node_id, true)) |c| return c;
         }
 
         // 2. Try dialing each address (Sorted by Priority)
@@ -708,7 +739,7 @@ pub const ConnectionManager = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.stopping) return error.ManagerStopping;
-            if (self.findConnectionLocked(&.{address}, remote_node_id)) |c| return c;
+            if (self.findConnectionKindLocked(&.{address}, remote_node_id, true)) |c| return c;
         }
 
         switch (self.transport_type) {
