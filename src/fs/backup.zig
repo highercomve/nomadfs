@@ -278,6 +278,59 @@ fn utf8Prefix(s: []const u8, max: usize) []const u8 {
     return s[0..end];
 }
 
+// ---- Where this device's marked shares are kept ----
+
+pub const Copy = struct {
+    /// The backup device, as this device names it.
+    device: []const u8,
+    /// Its copy matches the share as it is now.
+    current: bool,
+    synced_at: u64,
+};
+pub const ShareCopies = struct { share: []const u8, copies: []Copy };
+
+/// For each share this device marks for backup, which backup devices hold a
+/// copy and whether it is up to date. Asks every reachable device (their
+/// SHARES lists say what they hold), so it takes a moment; devices that
+/// don't answer are left out. Everything is allocated in `allocator`: pass
+/// an arena.
+pub fn copiesOf(
+    allocator: std.mem.Allocator,
+    bm: *cluster.BlockManager,
+    index: *shares_mod.ShareIndex,
+    trust: *device_trust.Store,
+    my_id: [32]u8,
+) ![]ShareCopies {
+    const snap = try index.snapshot(allocator);
+    var marked: std.ArrayList(shares_mod.Share) = .empty;
+    for (snap) |s| if (index.isBackup(s.name)) try marked.append(allocator, s);
+    const copies = try allocator.alloc(std.ArrayList(Copy), marked.items.len);
+    for (copies) |*c| c.* = .empty;
+
+    const peers = remote_mod.knownPeers(bm, allocator) catch &.{};
+    for (peers) |peer| {
+        var remote = remote_mod.Remote{ .block_manager = bm, .peer = peer };
+        const listed = remote.shares(allocator) catch continue; // unreachable: left out
+        var info = decodeInfo(allocator, listed.backup) catch continue; // junk: ignored
+        defer info.deinit();
+        const device_name = blk: {
+            if (listed.device_id) |d| if (trust.lookup(d)) |e| break :blk try allocator.dupe(u8, e.labelSlice());
+            break :blk listed.nickname;
+        };
+        for (info.held) |h| {
+            if (!std.mem.eql(u8, &h.owner, &my_id)) continue;
+            for (marked.items, copies) |share, *c| {
+                if (!std.mem.eql(u8, share.name, h.share)) continue;
+                const current = if (share.root) |r| std.mem.eql(u8, &r, &h.source_root) else false;
+                try c.append(allocator, .{ .device = device_name, .current = current, .synced_at = h.synced_at });
+            }
+        }
+    }
+    const out = try allocator.alloc(ShareCopies, marked.items.len);
+    for (marked.items, out, copies) |share, *o, *c| o.* = .{ .share = share.name, .copies = c.items };
+    return out;
+}
+
 // ---- The backup device ----
 
 pub const FolderBackup = struct {

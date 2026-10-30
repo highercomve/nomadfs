@@ -5,6 +5,7 @@
 const std = @import("std");
 const config_file = @import("config_file.zig");
 const Node = @import("root.zig").Node;
+const codec = @import("storage/dag/codec.zig");
 
 pub fn swarmBackup(allocator: std.mem.Allocator, config_path: []const u8, node: ?*Node, on: bool) !void {
     try config_file.setBool(allocator, config_path, "swarm_backup", on);
@@ -30,6 +31,32 @@ pub fn copies(node: *Node, n: u8) !void {
     try node.setCopies(n);
 }
 
+// ---- Shared folders ----
+
+/// Shares a folder, saved in the config (`share = "Name:/path"`) and, with a
+/// node, scanned and offered at once. `backup` also marks it for backup.
+pub fn addShare(allocator: std.mem.Allocator, config_path: []const u8, node: ?*Node, name_in: []const u8, path_in: []const u8, backup: bool) !void {
+    const name = std.mem.trim(u8, name_in, " \t");
+    const path = std.mem.trim(u8, path_in, " \t");
+    if (!codec.isValidName(name) or std.mem.indexOfScalar(u8, name, ':') != null) return error.InvalidShareName;
+    if (path.len == 0 or std.mem.indexOfAny(u8, path, "\"\n") != null) return error.InvalidPath;
+    if (node) |n| try n.addShare(name, path);
+    try config_file.setShare(allocator, config_path, name, path);
+    if (backup) try shareBackup(allocator, config_path, node, name, true);
+}
+
+/// Stops sharing a folder and drops its backup mark.
+pub fn removeShare(allocator: std.mem.Allocator, config_path: []const u8, node: ?*Node, name: []const u8) !void {
+    if (node) |n| _ = try n.removeShare(name);
+    try config_file.removeShare(allocator, config_path, name);
+}
+
+/// Marks a share for backup, or not.
+pub fn shareBackup(allocator: std.mem.Allocator, config_path: []const u8, node: ?*Node, name: []const u8, on: bool) !void {
+    if (node) |n| try n.setShareBackup(name, on);
+    try config_file.setShareBackup(allocator, config_path, name, on);
+}
+
 // ---- The read cache ----
 
 const config_mod = @import("config.zig");
@@ -37,25 +64,28 @@ const StorageEngine = @import("storage/engine.zig").StorageEngine;
 
 pub const CacheInfo = struct { bytes: u64, blocks: u64, limit_mb: u64 };
 
-/// The read cache's size: the running node's store, or the config's opened
-/// for the call.
+/// The read cache's size: the running node's (with its live limit), or the
+/// config's store opened for the call.
 pub fn cacheInfo(allocator: std.mem.Allocator, config: config_mod.Config, node: ?*Node) !CacheInfo {
-    var owned: ?StorageEngine = null;
-    defer if (owned) |*o| o.deinit();
-    const stats = (try storeFor(allocator, config, node, &owned)).cacheStats();
+    if (node) |n| {
+        const stats = try n.cacheStats();
+        return .{ .bytes = stats.bytes, .blocks = stats.blocks, .limit_mb = (stats.limit orelse 0) / (1024 * 1024) };
+    }
+    var store = try openStore(allocator, config);
+    defer store.deinit();
+    const stats = store.cacheStats();
     return .{ .bytes = stats.bytes, .blocks = stats.blocks, .limit_mb = config.storage.cache_mb };
 }
 
 /// Empties the read cache; returns the bytes freed. Kept blocks stay.
 pub fn cacheClear(allocator: std.mem.Allocator, config: config_mod.Config, node: ?*Node) !u64 {
-    var owned: ?StorageEngine = null;
-    defer if (owned) |*o| o.deinit();
-    return (try storeFor(allocator, config, node, &owned)).clearCache();
+    if (node) |n| return n.clearCache();
+    var store = try openStore(allocator, config);
+    defer store.deinit();
+    return store.clearCache();
 }
 
-fn storeFor(allocator: std.mem.Allocator, config: config_mod.Config, node: ?*Node, owned: *?StorageEngine) !*StorageEngine {
-    if (node) |n| if (n.store) |s| return s;
+fn openStore(allocator: std.mem.Allocator, config: config_mod.Config) !StorageEngine {
     if (!config.storage.enabled) return error.StorageDisabled;
-    owned.* = try StorageEngine.init(allocator, config.storage.storage_path);
-    return &owned.*.?;
+    return StorageEngine.init(allocator, config.storage.storage_path);
 }

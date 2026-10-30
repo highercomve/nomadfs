@@ -317,8 +317,7 @@ pub export fn nomadfs_node_device_id(node: ?*NodeHandle, out: ?[*]u8, out_len: u
 pub export fn nomadfs_cache_info(node: ?*NodeHandle, out_bytes: ?*u64, out_blocks: ?*u64, out_limit: ?*u64) c_int {
     const self = acquireHandle(node) orelse return invalid_argument;
     defer releaseHandle(self);
-    const store = self.node.store orelse return storage_disabled;
-    const stats = store.cacheStats();
+    const stats = self.node.cacheStats() catch return storage_disabled;
     if (out_bytes) |p| p.* = stats.bytes;
     if (out_blocks) |p| p.* = stats.blocks;
     if (out_limit) |p| p.* = stats.limit orelse 0;
@@ -330,8 +329,7 @@ pub export fn nomadfs_cache_info(node: ?*NodeHandle, out_bytes: ?*u64, out_block
 pub export fn nomadfs_cache_clear(node: ?*NodeHandle, out_freed: ?*u64) c_int {
     const self = acquireHandle(node) orelse return invalid_argument;
     defer releaseHandle(self);
-    const store = self.node.store orelse return storage_disabled;
-    const freed = store.clearCache() catch return internal_error;
+    const freed = self.node.clearCache() catch |err| return if (err == error.StorageDisabled) storage_disabled else internal_error;
     if (out_freed) |p| p.* = freed;
     return nomadfs_ok;
 }
@@ -342,9 +340,11 @@ pub export fn nomadfs_cache_clear(node: ?*NodeHandle, out_freed: ?*u64) c_int {
 pub export fn nomadfs_cache_set_limit(node: ?*NodeHandle, limit_mb: u64) c_int {
     const self = acquireHandle(node) orelse return invalid_argument;
     defer releaseHandle(self);
-    const store = self.node.store orelse return storage_disabled;
-    const bytes = std.math.mul(u64, limit_mb, 1024 * 1024) catch return invalid_argument;
-    store.setCacheLimit(if (limit_mb == 0) null else bytes) catch return internal_error;
+    self.node.setCacheLimit(limit_mb) catch |err| return switch (err) {
+        error.StorageDisabled => storage_disabled,
+        error.InvalidLimit => invalid_argument,
+        else => internal_error,
+    };
     return nomadfs_ok;
 }
 

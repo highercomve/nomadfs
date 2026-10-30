@@ -461,6 +461,46 @@ pub const Node = struct {
         if (self.keeper) |k| k.wake();
     }
 
+    /// Shares a folder (scanned at once), or replaces the folder of a share.
+    pub fn addShare(self: *Node, name: []const u8, path: []const u8) !void {
+        const index = self.shares orelse return error.StorageDisabled;
+        try index.add(name, path);
+        try index.start();
+    }
+
+    /// Stops sharing a folder; false if it wasn't shared.
+    pub fn removeShare(self: *Node, name: []const u8) !bool {
+        const index = self.shares orelse return error.StorageDisabled;
+        return index.remove(name);
+    }
+
+    /// Asks the swarm's backup devices to keep a copy of a share, or stops
+    /// asking (copies already made stay on them).
+    pub fn setShareBackup(self: *Node, name: []const u8, on: bool) !void {
+        const index = self.shares orelse return error.StorageDisabled;
+        try index.setBackup(name, on);
+    }
+
+    /// Which backup devices hold this device's marked shares (fs/backup.zig).
+    /// Allocated in `allocator`: pass an arena.
+    pub fn backupCopies(self: *Node, allocator: std.mem.Allocator) ![]fs.backup.ShareCopies {
+        const index = self.shares orelse return error.StorageDisabled;
+        if (self.store == null) return error.StorageDisabled;
+        return fs.backup.copiesOf(allocator, self.block_manager, index, self.trust_store, self.device_identity.deviceId().bytes);
+    }
+
+    /// The read cache's size and limit.
+    pub fn cacheStats(self: *Node) !storage.engine.StorageEngine.CacheStats {
+        const store = self.store orelse return error.StorageDisabled;
+        return store.cacheStats();
+    }
+
+    /// Empties the read cache; returns the bytes freed. Kept blocks stay.
+    pub fn clearCache(self: *Node) !u64 {
+        const store = self.store orelse return error.StorageDisabled;
+        return store.clearCache();
+    }
+
     /// The read cache's limit in MiB (0: none).
     pub fn setCacheLimit(self: *Node, mb: u64) !void {
         const store = self.store orelse return error.StorageDisabled;

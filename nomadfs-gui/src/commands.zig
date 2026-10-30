@@ -623,27 +623,10 @@ pub const ShareAddArgs = struct { config_path: []const u8, name: []const u8, pat
 /// `invoke("share_add", { config_path, name, path })`: scans the folder,
 /// starts sharing it and records it in the config so it survives restarts.
 pub fn shareAdd(gpa: std.mem.Allocator, args: ShareAddArgs) !void {
-    const name = std.mem.trim(u8, args.name, " \t");
-    const path = std.mem.trim(u8, args.path, " \t");
-    if (!nomadfs.storage.dag.codec.isValidName(name) or std.mem.indexOfScalar(u8, name, ':') != null)
-        return error.InvalidShareName;
-    if (path.len == 0 or std.mem.indexOfAny(u8, path, "\"\n") != null) return error.InvalidPath;
-
     g_mutex.lock();
     defer g_mutex.unlock();
     const handle = g_node orelse return error.NotRunning;
-    const index = try shareIndex(handle);
-    try index.add(name, path);
-    try index.start();
-
-    try config_file.setShare(gpa, args.config_path, name, path);
-    if (args.backup) try setShareBackup(gpa, args.config_path, index, name, true);
-}
-
-/// Marks or unmarks a share for backup, live and in the config.
-fn setShareBackup(gpa: std.mem.Allocator, config_path: []const u8, index: *fs.ShareIndex, name: []const u8, on: bool) !void {
-    try index.setBackup(name, on);
-    try config_file.setShareBackup(gpa, config_path, name, on);
+    try nomadfs.settings.addShare(gpa, args.config_path, &handle.node, args.name, args.path, args.backup);
 }
 
 pub const ShareBackupArgs = struct { config_path: []const u8, name: []const u8, on: bool };
@@ -655,76 +638,33 @@ pub fn shareBackupSet(gpa: std.mem.Allocator, args: ShareBackupArgs) !void {
     g_mutex.lock();
     defer g_mutex.unlock();
     const handle = g_node orelse return error.NotRunning;
-    try setShareBackup(gpa, args.config_path, try shareIndex(handle), args.name, args.on);
+    try nomadfs.settings.shareBackup(gpa, args.config_path, &handle.node, args.name, args.on);
 }
 
-pub const BackupCopy = struct {
-    /// The backup device, as this device names it.
-    device: []const u8,
-    /// Its copy matches this share as it is now.
-    current: bool,
-    synced_at: u64,
-};
 pub const BackupStatus = struct {
     share: []const u8,
-    copies: []BackupCopy,
+    copies: []fs.backup.Copy,
     /// This device is on Wi-Fi (or not a phone): marked shares are offered.
     unmetered: bool,
 };
 
 /// `invoke("backup_status")`: for each share marked for backup, which
-/// backup devices hold a copy and whether it's up to date. Asks every
-/// reachable device, so it takes a moment.
+/// backup devices hold a copy and whether it's up to date (fs/backup.zig).
 pub fn backupStatus(gpa: std.mem.Allocator) ![]BackupStatus {
-    var my_id: [32]u8 = undefined;
-    var bm: *nomadfs.cluster.BlockManager = undefined;
-    var store: *nomadfs.storage.engine.StorageEngine = undefined;
-    var trust: *TrustStore = undefined;
-    var snap: []fs.shares.Share = &.{};
-    var marked: std.ArrayList([]const u8) = .empty;
-    {
+    const node = blk: {
         g_mutex.lock();
         defer g_mutex.unlock();
         const handle = g_node orelse return error.NotRunning;
-        const index = try shareIndex(handle);
-        my_id = handle.node.device_identity.deviceId().bytes;
-        bm = handle.node.block_manager;
-        store = handle.node.store orelse return error.StorageDisabled;
-        trust = handle.node.trust_store;
-        snap = try index.snapshot(gpa);
-        for (snap) |s| if (index.isBackup(s.name)) try marked.append(gpa, s.name);
         // Asking every device takes a while: keep the node alive without
         // holding g_mutex (nodeClose waits for media users).
         _ = g_media_users.fetchAdd(1, .acq_rel);
-    }
+        break :blk &handle.node;
+    };
     defer mediaRelease();
-    const peers = fs.remote.knownPeers(bm, gpa) catch &.{};
-    var copies = try gpa.alloc(std.ArrayList(BackupCopy), marked.items.len);
-    for (copies) |*c| c.* = .empty;
-    for (peers) |peer| {
-        var remote = fs.Remote{ .block_manager = bm, .peer = peer };
-        const listed = remote.shares(gpa) catch continue;
-        var info = fs.backup.decodeInfo(gpa, listed.backup) catch continue;
-        defer info.deinit();
-        const device_name = blk: {
-            if (listed.device_id) |d| if (trust.lookup(d)) |e| break :blk try gpa.dupe(u8, e.labelSlice());
-            break :blk listed.nickname;
-        };
-        for (info.held) |h| {
-            if (!std.mem.eql(u8, &h.owner, &my_id)) continue;
-            for (marked.items, 0..) |name, i| {
-                if (!std.mem.eql(u8, name, h.share)) continue;
-                const root = for (snap) |s| {
-                    if (std.mem.eql(u8, s.name, name)) break s.root;
-                } else null;
-                const current = if (root) |r| std.mem.eql(u8, &r, &h.source_root) else false;
-                try copies[i].append(gpa, .{ .device = device_name, .current = current, .synced_at = h.synced_at });
-            }
-        }
-    }
-    const out = try gpa.alloc(BackupStatus, marked.items.len);
+    const kept = try node.backupCopies(gpa);
+    const out = try gpa.alloc(BackupStatus, kept.len);
     const unmetered = nomadfs.net.local_addrs.onUnmeteredNetwork();
-    for (marked.items, out, copies) |name, *o, *c| o.* = .{ .share = name, .copies = c.items, .unmetered = unmetered };
+    for (kept, out) |k, *o| o.* = .{ .share = k.share, .copies = k.copies, .unmetered = unmetered };
     return out;
 }
 
@@ -735,8 +675,7 @@ pub fn shareRemove(gpa: std.mem.Allocator, args: ShareRemoveArgs) !void {
     g_mutex.lock();
     defer g_mutex.unlock();
     const handle = g_node orelse return error.NotRunning;
-    _ = (try shareIndex(handle)).remove(args.name);
-    try config_file.removeShare(gpa, args.config_path, args.name);
+    try nomadfs.settings.removeShare(gpa, args.config_path, &handle.node, args.name);
 }
 
 pub const RemoteShare = struct { name: []const u8, cid: []const u8, size: u64, mtime: u64 };
