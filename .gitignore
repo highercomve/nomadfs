@@ -1,5 +1,6 @@
 .zig-cache
 zig-out
+zig-pkg
 /dist
 build
 0.15.2
