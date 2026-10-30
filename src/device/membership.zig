@@ -16,6 +16,7 @@ const identity_mod = @import("identity.zig");
 const pairing = @import("pairing.zig");
 const trust_mod = @import("trust.zig");
 const invite = @import("invite.zig");
+const local_addrs = @import("../net/local_addrs.zig");
 const paths_mod = @import("paths.zig");
 const config_mod = @import("../config.zig");
 const ConnectionManager = @import("../net/transport/manager.zig").ConnectionManager;
@@ -103,11 +104,40 @@ pub const Membership = struct {
 
     // ---- Tickets ----
 
+    /// Every address this device is reachable at on `port`, comma separated:
+    /// the LAN one first, then the others (Tailscale and other VPNs), so a
+    /// device that pairs or joins can reach this one away from home too.
+    /// Localhost when there is none. Addresses that don't fit are left out.
+    pub fn advertised(buf: []u8, port: u16) []const u8 {
+        var len: usize = 0;
+        var ip_buf: [16]u8 = undefined;
+        if (invite.lanAddress(&ip_buf)) |ip| len = appendAddr(buf, len, ip, port);
+        var addrs: [8]@import("../net/compat.zig").Address = undefined;
+        const n = local_addrs.list(&addrs, port);
+        for (addrs[0..n]) |a| {
+            var text_buf: [64]u8 = undefined;
+            const text = std.fmt.bufPrint(&text_buf, "{f}", .{a}) catch continue;
+            if (std.mem.indexOf(u8, buf[0..len], text) != null) continue;
+            const sep: usize = if (len > 0) 1 else 0;
+            if (len + sep + text.len > buf.len) break;
+            if (sep == 1) buf[len] = ',';
+            @memcpy(buf[len + sep ..][0..text.len], text);
+            len += sep + text.len;
+        }
+        if (len == 0) len = appendAddr(buf, 0, "127.0.0.1", port);
+        return buf[0..len];
+    }
+
+    fn appendAddr(buf: []u8, len: usize, ip: []const u8, port: u16) usize {
+        const text = std.fmt.bufPrint(buf[len..], "{s}:{d}", .{ ip, port }) catch return len;
+        return len + text.len;
+    }
+
     /// This device's pairing ticket, valid for a day, listing `addresses`
-    /// ("ip:port,ip:port"; empty: localhost on the node port).
+    /// ("ip:port,ip:port"; empty: every address it has, see advertised).
     pub fn ticket(self: *Membership, addresses: []const u8, now: u64) !Ticket {
-        var buf: [64]u8 = undefined;
-        const addrs = if (addresses.len > 0) addresses else try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{self.node_port});
+        var buf: [pairing.max_addresses_len]u8 = undefined;
+        const addrs = if (addresses.len > 0) addresses else advertised(&buf, self.node_port);
         return Ticket.init(self.identity, self.transport_key, self.nickname, addrs, now + ticket_lifetime_s);
     }
 

@@ -1638,14 +1638,14 @@ pub fn inviteCancel() void {
 
 
 /// The page's view of the invite. The service trusted the joiner already;
-/// the app also remembers its addresses as bootstrap peers, once.
+/// its addresses are saved as bootstrap peers once (settings.rememberPeer).
 fn inviteInfo(gpa: std.mem.Allocator, config_path: []const u8, st: Membership.InviteState) !InviteInfo {
     var peer: []const u8 = "";
     if (st.joined) |t| {
         peer = try gpa.dupe(u8, t.nicknameSlice());
         if (!g_invite_adopted) {
             g_invite_adopted = true;
-            rememberAddresses(gpa, config_path, &t) catch |err| std.debug.print("invite: remembering the joiner's addresses failed: {any}\n", .{err});
+            nomadfs.settings.rememberPeer(gpa, config_path, &t) catch |err| std.debug.print("invite: remembering the joiner's addresses failed: {any}\n", .{err});
         }
     }
     var qr_svg: []const u8 = "";
@@ -1662,32 +1662,6 @@ fn inviteInfo(gpa: std.mem.Allocator, config_path: []const u8, st: Membership.In
         .qr_svg = qr_svg,
     };
 }
-
-/// Trusts a device's pairing ticket and remembers its addresses as
-/// bootstrap peers, dialing them now if the node is running.
-/// The joiner's addresses become bootstrap peers (the config and the
-/// running node), so this device reaches it after a restart too.
-fn rememberAddresses(gpa: std.mem.Allocator, config_path: []const u8, ticket: *const Ticket) !void {
-    var urls: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (urls.items) |u| gpa.free(u);
-        urls.deinit(gpa);
-    }
-    var it = std.mem.splitScalar(u8, ticket.addressesSlice(), ',');
-    while (it.next()) |addr| {
-        const a = std.mem.trim(u8, addr, " ");
-        if (a.len == 0 or std.mem.startsWith(u8, a, "127.")) continue;
-        try urls.append(gpa, try std.fmt.allocPrint(gpa, "tcp://{s}", .{a}));
-    }
-    if (urls.items.len == 0) return;
-    try config_file.addBootstrapPeers(gpa, config_path, urls.items);
-    if (g_node) |node| {
-        const csv = try std.mem.joinZ(gpa, ",", urls.items);
-        defer gpa.free(csv);
-        _ = mobile.nomadfs_node_bootstrap(node, csv.ptr);
-    }
-}
-
 
 pub const InviteAcceptArgs = struct { config_path: []const u8, code: []const u8 };
 
@@ -1757,25 +1731,10 @@ fn primaryIp(buf: *[16]u8) ?[]const u8 {
     return nomadfs.device.invite.lanAddress(buf);
 }
 
-/// Every address this device is reachable at, with `port`, comma
-/// separated: the LAN one first, then the others (Tailscale and other
-/// VPNs), so a device that joins can also reach this one away from home.
+/// Every address this device is reachable at (Membership.advertised).
 fn myAddresses(gpa: std.mem.Allocator, port: u16) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    var ip_buf: [16]u8 = undefined;
-    if (primaryIp(&ip_buf)) |ip| try out.print(gpa, "{s}:{d}", .{ ip, port });
-    var addrs: [8]nomadfs.net.compat.Address = undefined;
-    const n = nomadfs.net.local_addrs.list(&addrs, port);
-    for (addrs[0..n]) |a| {
-        var text_buf: [64]u8 = undefined;
-        const text = std.fmt.bufPrint(&text_buf, "{f}", .{a}) catch continue;
-        if (std.mem.indexOf(u8, out.items, text) != null) continue;
-        if (out.items.len > 0) try out.append(gpa, ',');
-        try out.appendSlice(gpa, text);
-    }
-    if (out.items.len == 0) try out.print(gpa, "127.0.0.1:{d}", .{port});
-    return out.toOwnedSlice(gpa);
+    var buf: [nomadfs.device.pairing.max_addresses_len]u8 = undefined;
+    return gpa.dupe(u8, Membership.advertised(&buf, port));
 }
 
 

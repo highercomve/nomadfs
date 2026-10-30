@@ -47,6 +47,28 @@ pub fn joinSwarm(allocator: std.mem.Allocator, config_path: []const u8, membersh
     return joined;
 }
 
+/// Saves a device's addresses (from its ticket: an invite's joiner) as
+/// bootstrap peers, so this device reaches it after a restart too.
+/// Localhost addresses are skipped. A running node needs nothing: the
+/// joiner dials it as soon as it runs on the swarm key.
+pub fn rememberPeer(allocator: std.mem.Allocator, config_path: []const u8, ticket: *const Ticket) !void {
+    var urls: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (urls.items) |u| allocator.free(u);
+        urls.deinit(allocator);
+    }
+    var it = std.mem.splitScalar(u8, ticket.addressesSlice(), ',');
+    while (it.next()) |addr| {
+        const a = std.mem.trim(u8, addr, " ");
+        if (a.len == 0 or std.mem.startsWith(u8, a, "127.")) continue;
+        try urls.append(allocator, try std.fmt.allocPrint(allocator, "tcp://{s}", .{a}));
+    }
+    if (urls.items.len == 0) return;
+    try config_file.addBootstrapPeers(allocator, config_path, urls.items);
+}
+
+const Ticket = @import("device/pairing.zig").Ticket;
+
 // ---- Shared folders ----
 
 /// Shares a folder, saved in the config (`share = "Name:/path"`) and, with a

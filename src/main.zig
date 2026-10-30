@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
         .revoke => try revokeCommand(allocator, config, options.revoke_query.?),
         .run => try runNode(allocator, config, options),
         .mount => try mountCommand(allocator, config, options.mountpoint.?),
-        .invite => try inviteCommand(allocator, config, options.address),
+        .invite => try inviteCommand(allocator, config, options.config_path, options.address),
         .join => try joinCommand(allocator, config, options.config_path, options.join_code.?, options.address),
         .cache => try cacheCommand(allocator, config, false),
         .clear_cache => try cacheCommand(allocator, config, true),
@@ -370,11 +370,13 @@ fn runUntilStopped(node: *nomadfs.Node, running: *std.atomic.Value(bool), config
     };
 }
 
-fn inviteCommand(allocator: std.mem.Allocator, config: config_mod.Config, address: ?[]const u8) !void {
+fn inviteCommand(allocator: std.mem.Allocator, config: config_mod.Config, config_path: ?[]const u8, address: ?[]const u8) !void {
     var ip_buf: [16]u8 = undefined;
     const ip = address orelse device.invite.lanAddress(&ip_buf) orelse "127.0.0.1";
     var addr_buf: [64]u8 = undefined;
-    const node_addr = try std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ ip, config.network.port });
+    // The ticket lists every address this device has (LAN, VPNs) unless
+    // --address picks one.
+    const node_addr = if (address != null) try std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ ip, config.network.port }) else "";
 
     var membership = try device.membership.Membership.open(allocator, config);
     defer membership.close();
@@ -402,6 +404,8 @@ fn inviteCommand(allocator: std.mem.Allocator, config: config_mod.Config, addres
             },
             .joined => {
                 const joiner = st.joined orelse return;
+                if (config_path) |path| nomadfs.settings.rememberPeer(allocator, path, &joiner) catch |err|
+                    std.debug.print("Saving its addresses failed: {any}\n", .{err});
                 var fp_buf: [19]u8 = undefined;
                 std.debug.print("{s} joined ({s}, {s}) and is now trusted.\n", .{
                     joiner.nicknameSlice(),
@@ -422,7 +426,9 @@ fn joinCommand(allocator: std.mem.Allocator, config: config_mod.Config, config_p
     var ip_buf: [16]u8 = undefined;
     const ip = address orelse device.invite.lanAddress(&ip_buf) orelse "127.0.0.1";
     var addr_buf: [64]u8 = undefined;
-    const node_addr = try std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ ip, config.network.port });
+    // The ticket lists every address this device has (LAN, VPNs) unless
+    // --address picks one.
+    const node_addr = if (address != null) try std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ ip, config.network.port }) else "";
 
     var membership = try device.membership.Membership.open(allocator, config);
     defer membership.close();
