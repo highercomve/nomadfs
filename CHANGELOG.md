@@ -3,6 +3,22 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.3.11 - 2026-10-30
+
+Videos play in the desktop app's viewer on NVIDIA graphics, sized to the viewer. Devices on 0.3.10
+and 0.3.11 work together.
+
+### Fixed
+
+- Desktop (Linux) with NVIDIA graphics: playing a video crashed the app (GTK's Vulkan renderer
+  failed in the driver). The app now draws with GTK's GL renderer there.
+- Desktop: a video playing in the viewer grew to its own size and spilled past the viewer; it now
+  fits the space under the viewer's bar.
+
+### Changed
+
+- Uses Oriel 0.20.6.
+
 ## 0.3.10 - 2026-10-30
 
 The file viewer plays videos in place, under its own bar, with a fullscreen button, and has every

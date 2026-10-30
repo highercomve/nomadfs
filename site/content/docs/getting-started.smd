@@ -136,7 +136,7 @@ unmounts. See [Shared folders & mount]($link.page('docs/shared-folders')).
 # [Build the app]($heading.id('app'))
 
 The app in `nomadfs-gui/` is built with [Oriel](https://oriel.foreachdeveloper.com)
-**v0.20.5**, which `zig build` fetches:
+**v0.20.6**, which `zig build` fetches:
 
 ```sh
 cd nomadfs-gui
