@@ -5,13 +5,9 @@ const config_mod = nomadfs.config;
 const device = nomadfs.device;
 const Identity = device.identity.Identity;
 const Ticket = device.pairing.Ticket;
-const TrustStore = device.trust.Store;
-const DevicePaths = device.paths.Paths;
 
 /// Pairing tickets are short-lived on purpose: the transport key inside them
 /// rotates, and an old QR code should not grant access forever.
-const ticket_lifetime_seconds = 24 * 60 * 60;
-
 const Command = enum { run, pair, trust, devices, revoke, mount, invite, cache, clear_cache, bench_read, bench_idle };
 
 const Options = struct {
@@ -325,105 +321,65 @@ fn runUntilStopped(node: *nomadfs.Node, running: *std.atomic.Value(bool), config
 }
 
 fn inviteCommand(allocator: std.mem.Allocator, config: config_mod.Config, address: ?[]const u8) !void {
-    const invite = device.invite;
     var ip_buf: [16]u8 = undefined;
-    const ip = address orelse invite.lanAddress(&ip_buf) orelse "127.0.0.1";
-
-    var paths = try DevicePaths.resolve(allocator, config.node.key_path);
-    defer paths.deinit(allocator);
-    const identity = try Identity.loadOrCreate(paths.identity);
-    const transport = try nomadfs.net.transport.manager.ConnectionManager.loadOrCreateKey(allocator, config.node.key_path);
+    const ip = address orelse device.invite.lanAddress(&ip_buf) orelse "127.0.0.1";
     var addr_buf: [64]u8 = undefined;
     const node_addr = try std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ ip, config.network.port });
-    const now = nowSeconds();
-    const ticket = try Ticket.init(identity, transport.public_key, config.node.nickname, node_addr, now + ticket_lifetime_seconds);
-    var uri_buf: [device.pairing.max_uri_len]u8 = undefined;
-    const uri = try ticket.toUri(&uri_buf);
 
-    const host = try invite.Host.start(allocator, .{
-        .identity = identity,
-        .swarm_key = config.node.swarm_key[0..32].*,
-        .node_port = config.network.port,
-        .ticket_uri = uri,
-    }, try std.math.add(u16, config.network.port, 1), invite.default_lifetime_s, now);
-    defer host.destroy();
+    var membership = try device.membership.Membership.open(allocator, config);
+    defer membership.close();
+    const opened = try membership.startInvite(ip, node_addr, nowSeconds());
 
-    var code_buf: [160]u8 = undefined;
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    const code = try host.code(ip, &code_buf);
-    try out.writer.print("Invite (one use, expires in {d} minutes). Scan it with the NomadFS app\n(Connect devices > Scan QR code) or enter the code:\n\n", .{invite.default_lifetime_s / 60});
-    var matrix = try device.qr.encode(allocator, code, .medium);
+    try out.writer.print("Invite (one use, expires in {d} minutes). Scan it with the NomadFS app\n(Connect devices > Scan QR code) or enter the code:\n\n", .{device.invite.default_lifetime_s / 60});
+    var matrix = try device.qr.encode(allocator, opened.code, .medium);
     defer matrix.deinit();
     try device.qr.renderAscii(matrix, &out.writer, .{});
-    try out.writer.print("\n{s}\n\nWaiting for the other device...\n", .{code});
+    try out.writer.print("\n{s}\n\nWaiting for the other device...\n", .{opened.code});
     try writeStdout(out.written());
 
+    // The service trusts the joiner the first time it sees the join; a node
+    // running on this config picks it up from the trust store.
     while (true) {
         nomadfs.sync.sleep(500 * std.time.ns_per_ms);
-        switch (host.status(nowSeconds())) {
+        const st = membership.inviteStatus(nowSeconds());
+        switch (st.state) {
             .waiting => continue,
-            .expired => {
+            .expired, .none => {
                 std.debug.print("Invite expired.\n", .{});
                 return;
             },
-            .joined => break,
+            .joined => {
+                const joiner = st.joined orelse return;
+                var fp_buf: [19]u8 = undefined;
+                std.debug.print("{s} joined ({s}, {s}) and is now trusted.\n", .{
+                    joiner.nicknameSlice(),
+                    Identity.formatFingerprint(joiner.fingerprint(), &fp_buf),
+                    joiner.addressesSlice(),
+                });
+                return;
+            },
         }
     }
-    const joined_uri = (try host.joinedTicket(allocator)).?;
-    defer allocator.free(joined_uri);
-    const joiner = try Ticket.parseAt(joined_uri, nowSeconds());
-    var store = try TrustStore.load(allocator, paths.trust, identity.seed());
-    defer store.deinit();
-    // The joiner proved it holds this ticket's identity; a newer ticket
-    // already on file still wins over it.
-    if (store.trustTicket(joiner, nowSeconds())) |_| {
-        try store.save();
-    } else |err| switch (err) {
-        error.StaleTicket => std.debug.print("Warning: a newer ticket for this device is already trusted; kept it.\n", .{}),
-        else => return err,
-    }
-    var fp_buf: [19]u8 = undefined;
-    std.debug.print("{s} joined ({s}, {s}) and is now trusted.\n", .{
-        joiner.nicknameSlice(),
-        Identity.formatFingerprint(joiner.fingerprint(), &fp_buf),
-        joiner.addressesSlice(),
-    });
 }
 
 fn pairCommand(allocator: std.mem.Allocator, config: config_mod.Config, address: ?[]const u8) !void {
-    var paths = try DevicePaths.resolve(allocator, config.node.key_path);
-    defer paths.deinit(allocator);
-
-    const identity = try Identity.loadOrCreate(paths.identity);
-    const transport = try nomadfs.net.transport.manager.ConnectionManager.loadOrCreateKey(allocator, config.node.key_path);
-
-    var default_address: [64]u8 = undefined;
-    const addresses = address orelse
-        try std.fmt.bufPrint(&default_address, "127.0.0.1:{d}", .{config.network.port});
-
-    const now = nowSeconds();
-    const ticket = try Ticket.init(
-        identity,
-        transport.public_key,
-        config.node.nickname,
-        addresses,
-        now + ticket_lifetime_seconds,
-    );
+    var membership = try device.membership.Membership.open(allocator, config);
+    defer membership.close();
+    const ticket = try membership.ticket(address orelse "", nowSeconds());
 
     var uri_buf: [device.pairing.max_uri_len]u8 = undefined;
     const uri = try ticket.toUri(&uri_buf);
-
     var fingerprint_buf: [19]u8 = undefined;
-    const fingerprint = Identity.formatFingerprint(identity.fingerprint(), &fingerprint_buf);
+    const fingerprint = Identity.formatFingerprint(ticket.fingerprint(), &fingerprint_buf);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.print(
         "Device: {s}\nFingerprint: {s}\nAddresses: {s}\nExpires: {d}\n\n{s}\n\n",
-        .{ config.node.nickname, fingerprint, ticket.addressesSlice(), ticket.expires_at, uri },
+        .{ ticket.nicknameSlice(), fingerprint, ticket.addressesSlice(), ticket.expires_at, uri },
     );
-
     var matrix = try ticket.qrMatrix(allocator, .medium);
     defer matrix.deinit();
     try device.qr.renderAscii(matrix, &out.writer, .{});
@@ -431,35 +387,21 @@ fn pairCommand(allocator: std.mem.Allocator, config: config_mod.Config, address:
 }
 
 fn trustCommand(allocator: std.mem.Allocator, config: config_mod.Config, uri: []const u8) !void {
-    var paths = try DevicePaths.resolve(allocator, config.node.key_path);
-    defer paths.deinit(allocator);
-
-    const identity = try Identity.loadOrCreate(paths.identity);
-    var store = try TrustStore.load(allocator, paths.trust, identity.seed());
-    defer store.deinit();
-
-    const now = nowSeconds();
-    const ticket = Ticket.parseAt(uri, now) catch |err| {
-        std.debug.print("Error: ticket rejected: {any}\n", .{err});
+    var membership = try device.membership.Membership.open(allocator, config);
+    defer membership.close();
+    const trusted = membership.trustUri(uri, nowSeconds()) catch |err| {
+        switch (err) {
+            error.StaleTicket => std.debug.print("Refused: a newer ticket for this device is already trusted. Ask it for a fresh one.\n", .{}),
+            else => std.debug.print("Error: ticket rejected: {any}\n", .{err}),
+        }
         return err;
     };
-
-    const added = store.trustTicket(ticket, now) catch |err| switch (err) {
-        error.StaleTicket => {
-            std.debug.print("Refused: a newer ticket for this device is already trusted. Ask it for a fresh one.\n", .{});
-            return err;
-        },
-        else => return err,
-    };
-    try store.save();
-
     var fingerprint_buf: [19]u8 = undefined;
-    const fingerprint = Identity.formatFingerprint(ticket.fingerprint(), &fingerprint_buf);
     std.debug.print("{s} device '{s}' ({s}) at {s}\n", .{
-        if (added) "Trusted" else "Refreshed",
-        ticket.nicknameSlice(),
-        fingerprint,
-        paths.trust,
+        if (trusted.added) "Trusted" else "Refreshed",
+        trusted.ticket.nicknameSlice(),
+        Identity.formatFingerprint(trusted.ticket.fingerprint(), &fingerprint_buf),
+        membership.trust.path,
     });
 }
 
@@ -497,25 +439,19 @@ fn formatBytes(buf: []u8, bytes: u64) []const u8 {
 }
 
 fn devicesCommand(allocator: std.mem.Allocator, config: config_mod.Config) !void {
-    var paths = try DevicePaths.resolve(allocator, config.node.key_path);
-    defer paths.deinit(allocator);
-
-    const identity = try Identity.loadOrCreate(paths.identity);
-    var store = try TrustStore.load(allocator, paths.trust, identity.seed());
-    defer store.deinit();
-
-    const entries = store.list();
+    var membership = try device.membership.Membership.open(allocator, config);
+    defer membership.close();
+    const entries = try membership.devices(allocator);
+    defer allocator.free(entries);
     if (entries.len == 0) {
-        std.debug.print("No trusted devices in {s}\n", .{paths.trust});
+        std.debug.print("No trusted devices in {s}\n", .{membership.trust.path});
         return;
     }
-
-    std.debug.print("Trusted devices in {s}:\n", .{paths.trust});
+    std.debug.print("Trusted devices in {s}:\n", .{membership.trust.path});
     for (entries) |*entry| {
         var fingerprint_buf: [19]u8 = undefined;
-        const fingerprint = Identity.formatFingerprint(entry.fingerprint(), &fingerprint_buf);
         std.debug.print("  {s}  {s}  added {d}  [{x}]\n", .{
-            fingerprint,
+            Identity.formatFingerprint(entry.fingerprint(), &fingerprint_buf),
             entry.labelSlice(),
             entry.added_at,
             entry.device_id.bytes[0..4],
@@ -524,38 +460,22 @@ fn devicesCommand(allocator: std.mem.Allocator, config: config_mod.Config) !void
 }
 
 fn revokeCommand(allocator: std.mem.Allocator, config: config_mod.Config, query: []const u8) !void {
-    var paths = try DevicePaths.resolve(allocator, config.node.key_path);
-    defer paths.deinit(allocator);
-
-    // The revocation is signed with this device's identity so peers can
-    // verify it was issued by a trusted operator node, not forged on the
-    // wire.
-    const identity = try Identity.loadOrCreate(paths.identity);
-
-    var store = try TrustStore.load(allocator, paths.trust, identity.seed());
-    defer store.deinit();
-
-    const device_id = store.resolve(query) catch |err| switch (err) {
-        error.InvalidDeviceQuery => {
-            std.debug.print("Error: '{s}' is not a hex device ID or fingerprint\n", .{query});
-            std.process.exit(1);
-        },
-        error.AmbiguousDeviceQuery => {
-            std.debug.print("Error: '{s}' matches more than one device; use the full device ID\n", .{query});
-            std.process.exit(1);
-        },
-        else => return err,
-    } orelse {
-        std.debug.print("No trusted device matches '{s}' in {s}\n", .{ query, paths.trust });
+    var membership = try device.membership.Membership.open(allocator, config);
+    defer membership.close();
+    // Signed with this device's identity, so peers can verify who revoked.
+    const revoked = membership.revoke(query, nowSeconds()) catch |err| {
+        switch (err) {
+            error.InvalidDeviceQuery => std.debug.print("Error: '{s}' is not a hex device ID or fingerprint\n", .{query}),
+            error.AmbiguousDeviceQuery => std.debug.print("Error: '{s}' matches more than one device; use the full device ID\n", .{query}),
+            error.DeviceNotFound => std.debug.print("No trusted device matches '{s}' in {s}\n", .{ query, membership.trust.path }),
+            else => return err,
+        }
         std.process.exit(1);
     };
-
-    const removed = try store.revokeDevice(device_id, identity.deviceId(), nowSeconds());
-    try store.save();
     std.debug.print("Revoked device '{s}' from {s}{s}\n", .{
         query,
-        paths.trust,
-        if (removed) "" else " (tombstone recorded; no local entry)",
+        membership.trust.path,
+        if (revoked.removed) "" else " (tombstone recorded; no local entry)",
     });
 }
 

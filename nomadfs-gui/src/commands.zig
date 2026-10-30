@@ -18,6 +18,7 @@ const Identity = nomadfs.device.identity.Identity;
 const DevicePaths = nomadfs.device.paths.Paths;
 const config_mod = nomadfs.config;
 const NodeID = nomadfs.net.id.NodeID;
+const Membership = nomadfs.device.membership.Membership;
 
 /// Matches HOME's `.nomadfs`, like the CLI's default lookup.
 pub const default_config_subpath = ".nomadfs/nomadfs.conf";
@@ -427,66 +428,60 @@ pub fn getText(gpa: std.mem.Allocator, args: GetTextArgs) ![]const u8 {
 /// the CLI's --pair would print (no QR in a webview; the page can render
 /// it from the URI).
 pub fn pairTicket(gpa: std.mem.Allocator, args: PairTicketArgs) !PairTicketResult {
-    var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
-    defer config.deinit(gpa);
-
-    var paths = try DevicePaths.resolve(gpa, config.node.key_path);
-    defer paths.deinit(gpa);
-
-    const identity = try Identity.loadOrCreate(paths.identity);
-    const transport = try nomadfs.net.transport.manager.ConnectionManager.loadOrCreateKey(gpa, config.node.key_path);
-
-    const addr = if (args.address.len > 0)
-        try gpa.dupe(u8, args.address)
-    else
-        try std.fmt.allocPrint(gpa, "127.0.0.1:{d}", .{config.network.port});
-
-    const seconds = nomadfs.nowSeconds();
-    const ticket = try Ticket.init(identity, transport.public_key, config.node.nickname, addr, seconds + ticketLifetime());
+    var m = try membershipFor(gpa, args.config_path);
+    defer m.done();
+    const ticket = try m.service.ticket(args.address, nomadfs.nowSeconds());
     var uri_buf: [nomadfs.device.pairing.max_uri_len]u8 = undefined;
-    const uri = try ticket.toUri(&uri_buf);
-
     var fingerprint_buf: [19]u8 = undefined;
-    const fingerprint = Identity.formatFingerprint(identity.fingerprint(), &fingerprint_buf);
-
-    const nickname = try gpa.dupe(u8, config.node.nickname);
     return .{
-        .uri = try gpa.dupe(u8, uri),
-        .fingerprint = try gpa.dupe(u8, fingerprint),
-        .nickname = nickname,
+        .uri = try gpa.dupe(u8, try ticket.toUri(&uri_buf)),
+        .fingerprint = try gpa.dupe(u8, Identity.formatFingerprint(ticket.fingerprint(), &fingerprint_buf)),
+        .nickname = try gpa.dupe(u8, ticket.nicknameSlice()),
     };
 }
 
-fn ticketLifetime() u64 {
-    // Same expiry window the CLI is pairs with.
-    return 24 * 60 * 60;
+/// The membership service (device/membership.zig): the running node's, so
+/// a change takes effect in the node at once, else one opened from the
+/// configuration. `done` closes what was opened.
+const MembershipRef = struct {
+    service: *Membership,
+    opened: ?*Membership = null,
+    gpa: std.mem.Allocator,
+    locked: bool,
+
+    fn done(self: *MembershipRef) void {
+        if (self.opened) |o| {
+            o.close();
+            self.gpa.destroy(o);
+        }
+        if (self.locked) g_mutex.unlock();
+    }
+};
+
+fn membershipFor(gpa: std.mem.Allocator, config_path: []const u8) !MembershipRef {
+    g_mutex.lock();
+    if (g_node) |handle| return .{ .service = handle.node.membership, .gpa = gpa, .locked = true };
+    g_mutex.unlock();
+    var config = config_mod.parseConfig(gpa, config_path) catch return error.ConfigInvalid;
+    defer config.deinit(gpa);
+    const opened = try gpa.create(Membership);
+    errdefer gpa.destroy(opened);
+    opened.* = try Membership.open(gpa, config);
+    return .{ .service = opened, .opened = opened, .gpa = gpa, .locked = false };
 }
+
 
 /// `invoke("devices_list", { config_path })`: trusted devices.
 pub fn devicesList(gpa: std.mem.Allocator, args: ListArgs) ![]DeviceEntry {
-    var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
-    defer config.deinit(gpa);
-
-    var paths = try DevicePaths.resolve(gpa, config.node.key_path);
-    defer paths.deinit(gpa);
-
-    const identity = try Identity.loadOrCreate(paths.identity);
-    var store = try TrustStore.load(gpa, paths.trust, identity.seed());
-    defer store.deinit();
-
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    const target: *TrustStore = liveTrustStore(paths.trust) orelse &store;
-
-    // A running node's store changes under revocations from peers: copy it.
-    const list = try target.copyEntries(gpa);
+    var m = try membershipFor(gpa, args.config_path);
+    defer m.done();
+    const list = try m.service.devices(gpa);
     defer gpa.free(list);
     const entries = try gpa.alloc(DeviceEntry, list.len);
     for (entries, list) |*out, entry| {
         var fingerprint_buf: [19]u8 = undefined;
-        const fingerprint = Identity.formatFingerprint(entry.fingerprint(), &fingerprint_buf);
         out.* = .{
-            .fingerprint = try gpa.dupe(u8, fingerprint),
+            .fingerprint = try gpa.dupe(u8, Identity.formatFingerprint(entry.fingerprint(), &fingerprint_buf)),
             .label = try gpa.dupe(u8, entry.labelSlice()),
             .added_at = entry.added_at,
         };
@@ -494,39 +489,16 @@ pub fn devicesList(gpa: std.mem.Allocator, args: ListArgs) ![]DeviceEntry {
     return entries;
 }
 
-/// The running node's trust store, when the node reads the trust file at
-/// `trust_path`; null otherwise. Caller holds g_mutex. The node keeps its
-/// own copy in memory and rewrites the file from that copy on its next
-/// save, so an edit made to the file behind its back would be lost.
-fn liveTrustStore(trust_path: []const u8) ?*TrustStore {
-    const handle = g_node orelse return null;
-    const live = handle.node.trust_store;
-    if (!std.mem.eql(u8, live.path, trust_path)) return null;
-    return live;
-}
 
 /// `invoke("trust_device", { config_path, uri })`.
 pub fn trustDevice(gpa: std.mem.Allocator, args: TrustDeviceArgs) !void {
-    var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
-    defer config.deinit(gpa);
-
-    var paths = try DevicePaths.resolve(gpa, config.node.key_path);
-    defer paths.deinit(gpa);
-
-    const identity = try Identity.loadOrCreate(paths.identity);
-    const now = nomadfs.nowSeconds();
-    const ticket = Ticket.parseAt(args.uri, now) catch return error.TicketRejected;
-
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    if (liveTrustStore(paths.trust)) |live| {
-        _ = live.trustTicket(ticket, now) catch |err| return staleTicket(err);
-        return live.save();
-    }
-    var store = try TrustStore.load(gpa, paths.trust, identity.seed());
-    defer store.deinit();
-    _ = store.trustTicket(ticket, now) catch |err| return staleTicket(err);
-    try store.save();
+    var m = try membershipFor(gpa, args.config_path);
+    defer m.done();
+    _ = m.service.trustUri(args.uri, nomadfs.nowSeconds()) catch |err| return switch (err) {
+        error.StaleTicket => error.TicketStale,
+        error.InvalidTicket, error.ExpiredTicket, error.SignatureVerificationFailed => error.TicketRejected,
+        else => err,
+    };
 }
 
 /// A newer ticket for the device is already pinned: tell the page, which
@@ -544,36 +516,11 @@ fn deviceIdentity(gpa: std.mem.Allocator, key_path: ?[]const u8) !Identity {
 
 /// `invoke("revoke_device", { config_path, query })`.
 pub fn revokeDevice(gpa: std.mem.Allocator, args: RevokeDeviceArgs) !void {
-    var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
-    defer config.deinit(gpa);
-
-    var paths = try DevicePaths.resolve(gpa, config.node.key_path);
-    defer paths.deinit(gpa);
-
-    const identity = try Identity.loadOrCreate(paths.identity);
-    var store = try TrustStore.load(gpa, paths.trust, identity.seed());
-    defer store.deinit();
-
-    // A running node holds its own copy of the store: revoke there, so it
-    // stops trusting the device now (and the file isn't overwritten by an
-    // older copy on its next save).
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    const target: *TrustStore = liveTrustStore(paths.trust) orelse &store;
-
-    const id = try target.resolve(args.query) orelse return error.DeviceNotFound;
-    _ = try target.revokeDevice(id, identity.deviceId(), @intCast(nomadfs.nowSeconds()));
-    try target.save();
-    if (g_node) |handle| {
-        _ = handle.node.connection_manager.closePeer(id);
-        // It stops being a holder too: its copies and its folders leave
-        // the registry (the running node's trust store maps the device ID
-        // to its transport ID).
-        if (target.lookup(id)) |entry| {
-            handle.node.block_manager.forgetPeer(.{ .bytes = entry.transport_key });
-        }
-        handle.node.block_manager.forgetPeer(id);
-    }
+    var m = try membershipFor(gpa, args.config_path);
+    defer m.done();
+    // A running node closes its connections and forgets it as a holder
+    // (the service's hooks, root.zig).
+    _ = try m.service.revoke(args.query, nomadfs.nowSeconds());
 }
 
 // ---- Shared folders ----
@@ -1751,10 +1698,7 @@ pub fn joinInfo(gpa: std.mem.Allocator, args: ListArgs) !JoinInfo {
 
 const invite = nomadfs.device.invite;
 
-var g_invite: ?*invite.Host = null;
-var g_invite_code: ?[]u8 = null;
-var g_invite_handled = false;
-var g_invite_mutex: nomadfs.sync.Mutex = .{};
+var g_invite_adopted = false;
 
 pub const InviteInfo = struct {
     /// "none", "waiting", "joined" or "expired".
@@ -1778,71 +1722,55 @@ pub fn inviteCreate(gpa: std.mem.Allocator, args: ListArgs) !InviteInfo {
     const ip = primaryIp(&ip_buf) orelse return error.NoNetwork;
     const my_addr = try myAddresses(gpa, config.network.port);
     defer gpa.free(my_addr);
-    const ticket = try pairTicket(gpa, .{ .config_path = args.config_path, .address = my_addr });
 
-    g_invite_mutex.lock();
-    defer g_invite_mutex.unlock();
-    cancelInviteLocked();
-    const host = try invite.Host.start(std.heap.page_allocator, .{
-        .identity = try deviceIdentity(gpa, config.node.key_path),
-        .swarm_key = config.node.swarm_key[0..32].*,
-        .node_port = config.network.port,
-        .ticket_uri = ticket.uri,
-    }, try std.math.add(u16, config.network.port, 1), invite.default_lifetime_s, nomadfs.nowSeconds());
-    errdefer host.destroy();
-    var buf: [160]u8 = undefined;
-    g_invite_code = try std.heap.page_allocator.dupe(u8, try host.code(ip, &buf));
-    g_invite = host;
-    g_invite_handled = false;
-    return inviteInfoLocked(gpa, args.config_path);
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const handle = g_node orelse return error.NotRunning;
+    g_invite_adopted = false;
+    const st = try handle.node.membership.startInvite(ip, my_addr, nomadfs.nowSeconds());
+    return inviteInfo(gpa, args.config_path, st);
 }
 
 /// `invite_status { config_path }`. When the invite has been used, the
 /// joiner is trusted and remembered as a peer (once).
 pub fn inviteStatus(gpa: std.mem.Allocator, args: ListArgs) !InviteInfo {
-    g_invite_mutex.lock();
-    defer g_invite_mutex.unlock();
-    return inviteInfoLocked(gpa, args.config_path);
+    const st = blk: {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        const handle = g_node orelse return .{ .state = "none", .code = "", .expires_in = 0, .peer = "", .qr_svg = "" };
+        break :blk handle.node.membership.inviteStatus(nomadfs.nowSeconds());
+    };
+    return inviteInfo(gpa, args.config_path, st);
 }
 
 pub fn inviteCancel() void {
-    g_invite_mutex.lock();
-    defer g_invite_mutex.unlock();
-    cancelInviteLocked();
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    if (g_node) |handle| handle.node.membership.cancelInvite();
 }
 
-fn cancelInviteLocked() void {
-    if (g_invite) |host| host.destroy();
-    g_invite = null;
-    if (g_invite_code) |c| std.heap.page_allocator.free(c);
-    g_invite_code = null;
-}
 
-fn inviteInfoLocked(gpa: std.mem.Allocator, config_path: []const u8) !InviteInfo {
-    const host = g_invite orelse return .{ .state = "none", .code = "", .expires_in = 0, .peer = "", .qr_svg = "" };
-    const now = nomadfs.nowSeconds();
-    const state = host.status(now);
+/// The page's view of the invite. The service trusted the joiner already;
+/// the app also remembers its addresses as bootstrap peers, once.
+fn inviteInfo(gpa: std.mem.Allocator, config_path: []const u8, st: Membership.InviteState) !InviteInfo {
     var peer: []const u8 = "";
-    if (state == .joined) {
-        if (try host.joinedTicket(gpa)) |uri| {
-            const ticket = Ticket.parseAt(uri, now) catch null;
-            if (ticket) |t| peer = try gpa.dupe(u8, t.nicknameSlice());
-            if (!g_invite_handled) {
-                g_invite_handled = true;
-                adoptPeer(gpa, config_path, uri) catch |err| std.debug.print("invite: adopting the joiner failed: {any}\n", .{err});
-            }
+    if (st.joined) |t| {
+        peer = try gpa.dupe(u8, t.nicknameSlice());
+        if (!g_invite_adopted) {
+            g_invite_adopted = true;
+            rememberAddresses(gpa, config_path, &t) catch |err| std.debug.print("invite: remembering the joiner's addresses failed: {any}\n", .{err});
         }
     }
     var qr_svg: []const u8 = "";
-    if (state == .waiting) {
-        var matrix = try nomadfs.device.qr.encode(gpa, g_invite_code orelse "", .medium);
+    if (st.state == .waiting) {
+        var matrix = try nomadfs.device.qr.encode(gpa, st.code, .medium);
         defer matrix.deinit();
         qr_svg = try nomadfs.device.qr.renderSvg(gpa, matrix, 4);
     }
     return .{
-        .state = @tagName(state),
-        .code = if (state == .waiting) try gpa.dupe(u8, g_invite_code orelse "") else "",
-        .expires_in = if (host.expires_at > now) host.expires_at - now else 0,
+        .state = @tagName(st.state),
+        .code = try gpa.dupe(u8, st.code),
+        .expires_in = st.expires_in,
         .peer = peer,
         .qr_svg = qr_svg,
     };
@@ -1850,14 +1778,9 @@ fn inviteInfoLocked(gpa: std.mem.Allocator, config_path: []const u8) !InviteInfo
 
 /// Trusts a device's pairing ticket and remembers its addresses as
 /// bootstrap peers, dialing them now if the node is running.
-fn adoptPeer(gpa: std.mem.Allocator, config_path: []const u8, ticket_uri: []const u8) !void {
-    // The invite peer proved it holds this identity; when a newer ticket of
-    // it is already pinned, keep that pin and still learn its addresses.
-    trustDevice(gpa, .{ .config_path = config_path, .uri = ticket_uri }) catch |err| switch (err) {
-        error.TicketStale => {},
-        else => return err,
-    };
-    const ticket = try Ticket.parseAt(ticket_uri, nomadfs.nowSeconds());
+/// The joiner's addresses become bootstrap peers (the config and the
+/// running node), so this device reaches it after a restart too.
+fn rememberAddresses(gpa: std.mem.Allocator, config_path: []const u8, ticket: *const Ticket) !void {
     var urls: std.ArrayList([]const u8) = .empty;
     defer {
         for (urls.items) |u| gpa.free(u);
@@ -1871,8 +1794,6 @@ fn adoptPeer(gpa: std.mem.Allocator, config_path: []const u8, ticket_uri: []cons
     }
     if (urls.items.len == 0) return;
     try addBootstrapPeers(gpa, config_path, urls.items);
-    g_mutex.lock();
-    defer g_mutex.unlock();
     if (g_node) |node| {
         const csv = try std.mem.joinZ(gpa, ",", urls.items);
         defer gpa.free(csv);

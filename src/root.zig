@@ -50,6 +50,10 @@ pub const Node = struct {
     folder_backup: ?*fs.FolderBackup = null,
     /// The swarm-wide settings every device agrees on (copies, who accepts).
     policy: *device.policy.Policy,
+    /// This device's membership: tickets, invites, trusting and revoking,
+    /// the one service every front end uses (device/membership.zig).
+    membership: *device.membership.Membership,
+    membership_nickname: []u8,
     /// Copies what this device keeps (cluster/keeper.zig); null without a store.
     keeper: ?*cluster.keeper.Keeper = null,
     /// The swarm-wide folder every device reads and writes; null without
@@ -231,6 +235,21 @@ pub const Node = struct {
         };
         errdefer if (keeper) |k| allocator.destroy(k);
         discovery_node.policy = policy;
+
+        const membership_nickname = try allocator.dupe(u8, cfg.node.nickname);
+        errdefer allocator.free(membership_nickname);
+        const membership = try allocator.create(device.membership.Membership);
+        errdefer allocator.destroy(membership);
+        membership.* = .{
+            .allocator = allocator,
+            .identity = device_identity,
+            .transport_key = connection_manager.identity_key.public_key,
+            .nickname = membership_nickname,
+            .node_port = cfg.network.port,
+            .swarm_key = device.membership.Membership.swarmKey(cfg.node.swarm_key),
+            .trust = trust_store,
+            .hooks = .{ .ctx = block_manager, .trustedFn = membershipTrusted, .revokedFn = membershipRevoked },
+        };
         if (keeper) |k| discovery_node.on_policy_change = .{ .ctx = k, .func = wakeKeeper };
 
         // This device's say in the swarm's policy: whether it accepts copies
@@ -297,6 +316,8 @@ pub const Node = struct {
             .read_ahead = read_ahead,
             .folder_backup = folder_backup,
             .policy = policy,
+            .membership = membership,
+            .membership_nickname = membership_nickname,
             .keeper = keeper,
             .bootstrap_running = bootstrap_running,
             .bootstrap_thread = null,
@@ -329,6 +350,9 @@ pub const Node = struct {
         self.known_peers.deinit();
         self.allocator.destroy(self.known_peers);
         self.redial.deinit(self.allocator);
+        self.membership.close();
+        self.allocator.destroy(self.membership);
+        self.allocator.free(self.membership_nickname);
         self.policy.destroy();
         self.trust_store.deinit();
         self.allocator.free(self.info_provider.storage_path);
@@ -758,6 +782,7 @@ test {
         @import("cluster/placement.zig"),
         @import("cluster/keeper.zig"),
         @import("device/policy.zig"),
+        @import("device/membership.zig"),
         @import("cluster/holders.zig"),
         @import("mobile/api.zig"),
         @import("cluster/quorum.zig"),
@@ -809,6 +834,23 @@ test {
         @import("sync.zig"),
     }) |module| {
         std.testing.refAllDecls(module);
+    }
+}
+
+/// A device was trusted through membership: the membership push tells the
+/// swarm on the next ping (its digest changed); nothing else to do here.
+fn membershipTrusted(_: *anyopaque, _: *const device.pairing.Ticket) void {}
+
+/// A device was revoked: its connections close and it stops being a holder
+/// of anything, under its device ID and its transport node ID.
+fn membershipRevoked(ctx: *anyopaque, device_id: net.id.NodeID, transport_key: ?[32]u8) void {
+    const bm: *cluster.BlockManager = @ptrCast(@alignCast(ctx));
+    _ = bm.net.closePeer(device_id);
+    if (bm.holders) |*h| h.forget(device_id);
+    if (transport_key) |tk| {
+        const node_id = net.id.NodeID.fromPublicKey(tk);
+        _ = bm.net.closePeer(node_id);
+        if (bm.holders) |*h| h.forget(node_id);
     }
 }
 
