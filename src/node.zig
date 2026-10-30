@@ -230,6 +230,12 @@ pub const Node = struct {
             }
         };
         errdefer if (keeper) |k| allocator.destroy(k);
+        // Runs first on failure (errdefers unwind in reverse): the threads
+        // started above stop before the keeper and the rest are freed.
+        errdefer {
+            if (swarm) |f| f.stop();
+            if (shares) |index| index.stop();
+        }
         discovery_node.policy = policy;
 
         const membership_nickname = try allocator.dupe(u8, cfg.node.nickname);
@@ -328,14 +334,19 @@ pub const Node = struct {
         self.connection_manager.stop();
         self.discovery_node.drainHandlers();
         self.connection_manager.relay_dialer = null;
-        if (self.keeper) |k| {
-            k.stop();
-            self.allocator.destroy(k);
-        }
+        // Every background thread stops before anything they use is freed:
+        // a sync round wakes the keeper, read-ahead workers read shared
+        // files through the store, backups read the swarm folder.
+        if (self.folder_backup) |b| b.stop();
+        if (self.swarm) |folder| folder.stop();
+        if (self.shares) |index| index.stop();
+        if (self.keeper) |k| k.stop();
+        if (self.read_ahead) |ra| ra.destroy(); // joins its workers
+        // Then freed, users before what they use.
         if (self.folder_backup) |b| b.destroy();
-        if (self.shares) |index| index.destroy();
         if (self.swarm) |folder| folder.destroy();
-        if (self.read_ahead) |ra| ra.destroy();
+        if (self.shares) |index| index.destroy();
+        if (self.keeper) |k| self.allocator.destroy(k);
 
         self.known_peers.deinit();
         self.allocator.destroy(self.known_peers);

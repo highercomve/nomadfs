@@ -282,10 +282,10 @@ fn acceptLoop(allocator: std.mem.Allocator, mut_server: network.Server, cfg: Lis
             continue;
         };
 
-        if (cfg.manager) |m| {
-            m.ref();
-            m.handshake_wg.start();
-        }
+        // The manager outlives the thread: its stop() waits on
+        // handshake_wg. (A reference dropped after finish() could land
+        // after the manager was freed.)
+        if (cfg.manager) |m| m.handshake_wg.start();
 
         const thread = std.Thread.spawn(.{}, handleIncomingConnection, .{
             allocator,
@@ -301,10 +301,7 @@ fn acceptLoop(allocator: std.mem.Allocator, mut_server: network.Server, cfg: Lis
             handshakes.remove(slot);
             handshakes.wg.finish();
             conn.stream.close();
-            if (cfg.manager) |m| {
-                m.handshake_wg.finish();
-                m.deinit();
-            }
+            if (cfg.manager) |m| m.handshake_wg.finish();
             continue;
         };
         thread.detach();
@@ -325,10 +322,7 @@ fn handleIncomingConnection(
 ) void {
     defer {
         handshakes.wg.finish();
-        if (manager) |m| {
-            m.handshake_wg.finish();
-            m.deinit();
-        }
+        if (manager) |m| m.handshake_wg.finish(); // last use of the manager
     }
 
     const traffic = if (manager) |m| &m.traffic else null;
