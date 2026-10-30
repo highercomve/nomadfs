@@ -1,4 +1,5 @@
 const std = @import("std");
+const zigatlas = @import("zigatlas");
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -226,4 +227,26 @@ pub fn build(b: *std.Build) void {
 
     const test_int_step = b.step("test-int", "Run integration tests");
     test_int_step.dependOn(&run_integration_tests.step);
+
+    // zig build atlas: writes zig-out/atlas (ATLAS.md, api.md, atlas.json,
+    // deps.mmd, files.dot). `zig build atlas -- --check` fails on layer breaks.
+    _ = zigatlas.addAtlasStep(b, .{
+        .roots = &.{ "src", "nomadfs-gui/src" },
+        .layers = &.{
+            .{ .name = "frontend", .paths = &.{ "src/main.zig", "src/mobile", "nomadfs-gui/src" }, .thin = true },
+            .{ .name = "node", .paths = &.{ "src/root.zig", "src/node.zig", "src/settings.zig", "src/key_rotation.zig", "src/node_info.zig" } },
+            .{ .name = "fs", .paths = &.{"src/fs"} },
+            .{ .name = "cluster", .paths = &.{"src/cluster"} },
+            // Pairing flows that talk to peers sit above net; identity, trust
+            // and auth (used by the transport handshake) sit below it.
+            .{ .name = "device", .paths = &.{ "src/device/invite.zig", "src/device/membership.zig", "src/device/mod.zig" } },
+            .{ .name = "net", .paths = &.{"src/net"} },
+            .{ .name = "identity", .paths = &.{"src/device"} },
+            .{ .name = "storage", .paths = &.{"src/storage"} },
+            .{ .name = "base", .paths = &.{ "src/config.zig", "src/config_file.zig", "src/env.zig", "src/sync.zig", "src/errors.zig", "src/metrics.zig", "src/net/id.zig" } },
+        },
+        .forbid = &.{
+            .{ .from = "fs", .to = "net", .reason = "fs reaches the network through cluster" },
+        },
+    });
 }

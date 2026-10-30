@@ -11,6 +11,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const sync = @import("sync.zig");
 
+/// This release; scripts/release.sh checks it matches build.zig.zon.
+pub const version = "0.3.0";
+
 pub const format_version: u8 = 1;
 /// Longest encoded info a reader accepts.
 pub const max_len = 1024;

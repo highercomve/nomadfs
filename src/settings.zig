@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const config_file = @import("config_file.zig");
-const Node = @import("root.zig").Node;
+const Node = @import("node.zig").Node;
 const codec = @import("storage/dag/codec.zig");
 
 pub fn swarmBackup(allocator: std.mem.Allocator, config_path: []const u8, node: ?*Node, on: bool) !void {

@@ -39,7 +39,7 @@ if [ -n "${RELEASE:-}" ]; then
   (cd "$work" && grep -E "nomadfs-$RELEASE-(x86_64|aarch64)-linux\$" SHA256SUMS | sha256sum -c --quiet)
   for arch in x86_64 aarch64; do mv "$work/nomadfs-$RELEASE-$arch-linux" "$work/nomadfs-$arch"; done
 else
-  version=$(sed -n 's/^pub const version = "\(.*\)";/\1/p' src/root.zig)
+  version=$(sed -n 's/^pub const version = "\(.*\)";/\1/p' src/node_info.zig)
   step "Building NomadFS $version from this checkout"
   # Same targets as scripts/release.sh: baseline x86_64, static musl.
   zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dcpu=baseline -p "$work/x86_64"

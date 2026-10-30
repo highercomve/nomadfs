@@ -34,6 +34,7 @@ pub const Events = struct {
     @"updater://progress": struct { downloaded: u64, total: ?u64 },
 };
 
+/// @atlas allow: the webview calls these by name
 pub const Commands = struct {
     defaults: void = undefined,
 

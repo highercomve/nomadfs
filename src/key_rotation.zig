@@ -7,7 +7,7 @@ const std = @import("std");
 const sync = @import("sync.zig");
 const config_file = @import("config_file.zig");
 const config_mod = @import("config.zig");
-const Node = @import("root.zig").Node;
+const Node = @import("node.zig").Node;
 
 /// Adopts keys trusted devices send (the node verifies them first). One per
 /// process, outliving the nodes it restarts: its worker thread is detached.

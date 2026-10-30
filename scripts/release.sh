@@ -25,7 +25,7 @@ for zon in build.zig.zon nomadfs-gui/build.zig.zon; do
   grep -q "\.version = \"$version\"" "$zon" || { echo "$zon isn't at $version" >&2; exit 1; }
 done
 # What a device reports about itself (GET_NODE_INFO).
-grep -q "^pub const version = \"$version\";" src/root.zig || { echo "src/root.zig isn't at $version" >&2; exit 1; }
+grep -q "^pub const version = \"$version\";" src/node_info.zig || { echo "src/node_info.zig isn't at $version" >&2; exit 1; }
 # The APK's version: written by `oriel android init` once, so bumped by
 # hand. versionCode = MAJOR*10000 + MINOR*100 + PATCH (Oriel's rule).
 IFS=. read -r major minor patch <<<"${version%%[-+]*}"

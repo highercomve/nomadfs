@@ -16,6 +16,11 @@ the review as one file. Do not modify source files during a review.
   change: a finding about a call needs its callee.
 - A path, a branch or "the whole project" when asked.
 - Note what you did **not** read, so the reader knows the review's reach.
+- Run `zig build atlas` first (it takes a second). It writes `zig-out/atlas/`:
+  `ATLAS.md` (layers, directory dependencies, findings, hotspots), `api.md`
+  (every public function and type) and `atlas.json` (everything, with
+  cross-file calls). The layers it checks are configured in `build.zig`.
+  Treat its findings as leads for the lenses below, not as the review.
 
 ## 2. Lens A: Zig idioms and correctness (Zig 0.16)
 
@@ -108,8 +113,32 @@ Check:
   lower layers (e.g. the fetcher's fake transport); cluster tests for behaviour
   across devices.
 
+### Leads from the atlas
+
+The atlas reads syntax only, so open the code behind every lead. For a diff
+review, keep the leads whose locations are in changed files, plus any new copy
+of changed code elsewhere. `atlas.json` has every finding with `file` and `line`.
+
+| Atlas finding | Check here | Notes from validating it on this tree |
+| :--- | :--- | :--- |
+| `layer_violation`, `forbidden_import` | Dependency direction | Reliable. `device/` is split in `build.zig`: identity, trust, auth and pairing sit below `net` (the handshake uses them); invite and membership sit above it. `net/id.zig` (`NodeID`) is a base type. |
+| `import_cycle` | Dependency direction, cohesion | File loops through a `mod.zig` hub are common Zig style; loops between directories are the real lead. |
+| `thick_frontend` | One service per feature | Reported only when a front-end function both branches heavily and calls the core, so it is usually logic another front end will need. |
+| `duplicate_shape` | One service per feature, domain language | A front-end struct copying a core struct field for field (e.g. the app's `DeviceInfo` and `node_info.Info`) means the front end is re-describing the core's data. |
+| `duplicate_function`, `duplicate_fragment`, `parallel_implementation` | Reuse | Verified accurate: bodies equal apart from local names and literals. Say which layer should own the one copy. Short `info` fragments are often config parsing or test helpers. |
+| `long_function`, `complex_function`, `large_file` | Power of 10 rule 4, cohesion | Generic functions that return a type count as one long function. |
+| `unused_pub` | Cleanups (low) | Counts names only. Reflection (`Commands`) and `export fn` are excluded or muted. |
+
+Before suggesting a new helper, search `zig-out/atlas/api.md` for an existing
+one. An accepted exception is muted in the source with
+`// @atlas allow: <reason>` above the import or declaration. Suggest that
+annotation when a lead is intentional; don't leave the same lead for the next
+review.
+
 ## 6. How to run it
 
+- Run `zig build atlas`, read `zig-out/atlas/ATLAS.md`, and pass its leads for
+  the scope to the lenses (sub-agents get the path, not a copy).
 - Read the scope, then go lens by lens. If the agent can run sub-agents, one per
   lens in parallel is a good split; keep each at medium effort or below and give
   each this file and the scope. Otherwise do the lenses in order.
@@ -136,4 +165,5 @@ with changes / rework), then the findings ranked by severity:
 Severity: **critical** (data loss, crash, security), **high** (wrong behaviour in
 normal use, layer violation that already caused a bug), **medium** (latent bug,
 duplication, missing bound), **low** (clarity, small cleanups). End with what was
-checked and found sound, and what was not covered.
+checked and found sound, and what was not covered. Give the atlas counts
+before and after the change when they moved (e.g. "layer errors 5 → 4").
