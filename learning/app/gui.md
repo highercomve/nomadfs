@@ -1,7 +1,7 @@
 # Chapter 7: The App (`nomadfs-gui/`)
 
 NomadFS ships one app for the Linux desktop and Android phones, built with
-[Oriel](https://oriel.foreachdeveloper.com) (`nomadfs-gui/build.zig.zon` pins Oriel **v0.20.2**;
+[Oriel](https://oriel.foreachdeveloper.com) (`nomadfs-gui/build.zig.zon` pins Oriel **v0.20.3**;
 minimum Zig 0.16.0). Oriel pairs a Zig backend with the system web view (WebKitGTK on Linux, the
 Android WebView on phones). The page is plain HTML and JavaScript with no build step
 (`frontend/index.html`, `frontend/app.js`, `frontend/style.css`).
@@ -74,8 +74,9 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
   own thread through `Node.saveFile`, whose `SaveProgress` hook reports bytes written and checks a
   cancel flag; the page follows `download://progress` events. The list lives in `downloads.json`
   beside the config. A finished download previews from its saved file (`download_read_range`, and the
-  media server's `l` URLs), opens in another app, or opens its folder (`open_path` on the desktop; on
-  Android an `ACTION_VIEW` of the folder's document URI, which Files handles).
+  media server's `l` URLs), opens in another app, or opens its folder: `download_open` and
+  `downloads_open_folder` call Oriel's `App.openPath` with the saved path (GIO's default app on the
+  desktop; on Android the chooser with a read-only `content://` URI, and Files for the folder).
 - **Shared folders**: pick a folder with the system picker (GTK on Linux, the Storage Access
   Framework on Android), name it, share it. Shares are saved in the app's configuration. A new
   share reads "Indexing… N files so far" while its first scan runs; other devices already see what

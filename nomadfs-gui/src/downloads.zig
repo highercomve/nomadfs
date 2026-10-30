@@ -227,6 +227,50 @@ pub fn remove(id: u32, delete_file: bool) !void {
     return error.NotFound;
 }
 
+pub const OpenArgs = struct { id: u32, mime: []const u8 };
+
+/// `invoke("download_open", { id, mime })`: the saved file in another app
+/// (the chooser on Android, the default app for `mime` on the desktop).
+pub fn open(args: OpenArgs) !void {
+    if (!validMime(args.mime)) return error.InvalidArgument;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try savedPathZ(args.id, &path_buf);
+    var mime_buf: [128]u8 = undefined;
+    oriel.App.openPath(path, try std.fmt.bufPrintZ(&mime_buf, "{s}", .{args.mime}));
+}
+
+/// `invoke("downloads_open_folder")`: the downloads folder in the file
+/// manager (Files on Android).
+pub fn openFolder() !void {
+    const dir = try folder(gpa);
+    defer gpa.free(dir);
+    const dir_z = try gpa.dupeZ(u8, dir);
+    defer gpa.free(dir_z);
+    oriel.App.openPath(dir_z, "inode/directory");
+}
+
+/// A finished download's path, NUL-terminated in `buf`.
+fn savedPathZ(id: u32, buf: *[std.fs.max_path_bytes]u8) ![:0]const u8 {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    loadLocked();
+    const d = findLocked(id) orelse return error.NotFound;
+    if (d.state != .done) return error.FileNotFound;
+    return std.fmt.bufPrintZ(buf, "{s}", .{d.path}) catch error.NameTooLong;
+}
+
+/// `type/subtype` from [a-z0-9.+-].
+fn validMime(m: []const u8) bool {
+    if (m.len == 0 or m.len > 100) return false;
+    var slashes: usize = 0;
+    for (m) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '.', '+', '-' => {},
+        '/' => slashes += 1,
+        else => return false,
+    };
+    return slashes == 1 and m[0] != '/' and m[m.len - 1] != '/';
+}
+
 /// Takes every finished download off the list (the files stay).
 pub fn clearFinished() void {
     g_mutex.lock();

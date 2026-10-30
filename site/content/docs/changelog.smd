@@ -7,6 +7,25 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.3.8 - 2026-10-30
+
+Downloaded files open in other apps, and their folder opens, on Android and ChromeOS too. Devices
+on 0.3.7 and 0.3.8 work together.
+
+## Fixed
+
+- **Open folder** in Downloads failed on Android (the page's link to the folder was refused). The
+  folder now opens in Files, or in Downloads where Files can't show it.
+- **Open in another app** on a downloaded file handed other apps a `127.0.0.1` link, which ChromeOS's
+  own apps (Chrome, Gallery) can't reach from outside the Android container. The file itself is
+  now shared with the app picked, read-only, so Photos, Gallery or any other app opens it.
+- On a Chromebook, streaming a file that isn't downloaded offers only Android apps, which can reach
+  the link.
+
+## Changed
+
+- Uses Oriel 0.20.3 (`App.openPath`).
+
 # 0.3.7 - 2026-10-30
 
 Adds a Downloads view: see where each download was saved, follow its progress, and play it or

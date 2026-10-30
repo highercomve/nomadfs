@@ -1456,13 +1456,12 @@ function swarmDownload(it) {
 // ---- Downloads: what was saved, where, and how far a copy has got ----
 
 const downloads = new Map(); // id → a download, as downloads_list gives it
-const onAndroid = /Android/.test(navigator.userAgent);
 
 /** A finished download plays and previews from its saved file. */
 const downloadSource = {
   read: (e, offset, len) => invoke("download_read_range", { id: e.id, offset, len }),
   mediaUrl: (e, external = false) => invoke("media_url", { kind: "download", id: String(e.id), size: e.size, name: e.name, external }),
-  download: (e) => showInFolder(e.folder),
+  download: () => showDownloadsFolder(),
 };
 
 let downloadsFolder = "";
@@ -1494,25 +1493,14 @@ window.oriel.listen?.("download://progress", ({ id, done, size, state, error }) 
   updateDownloadRow(d);
 });
 
-/** The folder in the system's file manager (Files on Android). */
-async function showInFolder(folder) {
-  try {
-    if (onAndroid) {
-      const rel = folder.replace(/^\/storage\/emulated\/0\/?/, "");
-      const uri = `content://com.android.externalstorage.documents/document/primary%3A${encodeURIComponent(rel)}`;
-      await window.oriel.openExternal(uri, { type: "vnd.android.document/directory" });
-    } else {
-      await invoke("open_path", { path: folder });
-    }
-  } catch (err) {
-    snack(`Couldn't open the folder: ${err}`);
-  }
+/** The downloads folder in the system's file manager (Files on Android). */
+function showDownloadsFolder() {
+  invoke("downloads_open_folder", null).catch((err) => snack(`Couldn't open the folder: ${err}`));
 }
 
 /** The saved file in the app the system picks for it. */
 function openDownloadElsewhere(d) {
-  if (onAndroid || !canOpenPaths) return openInApp(downloadSource, d);
-  invoke("open_path", { path: d.path }).catch((err) => snack(`Couldn't open it: ${err}`));
+  invoke("download_open", { id: d.id, mime: mimeFor(d.name) }).catch((err) => snack(`Couldn't open it: ${err}`));
 }
 
 function downloadProgressText(d) {
@@ -1555,7 +1543,7 @@ function downloadRow(d, files) {
     : ok
       ? [
         { icon: "open_in", label: "Open in another app", run: () => openDownloadElsewhere(d) },
-        { icon: "folder", label: "Show in folder", run: () => showInFolder(d.folder) },
+        { icon: "folder", label: "Show in folder", run: showDownloadsFolder },
       ]
       : [
         { icon: "download", label: `Download ${d.name} again`, run: () => retryDownload(d) },
@@ -1564,7 +1552,7 @@ function downloadRow(d, files) {
   const menu = running ? [actions[0]] : [
     ...(ok ? [
       { icon: "open_in", label: "Open in another app", run: () => openDownloadElsewhere(d) },
-      { icon: "folder", label: "Show in folder", run: () => showInFolder(d.folder) },
+      { icon: "folder", label: "Show in folder", run: showDownloadsFolder },
       { icon: "copy", label: "Copy path", run: () => copyText(d.path, "Path copied") },
     ] : [{ icon: "download", label: "Download again", run: () => retryDownload(d) }]),
     "-",
@@ -1620,7 +1608,7 @@ function renderDownloads() {
   $("downloads-clear").hidden = !all.some((d) => d.state !== "running");
 }
 
-$("downloads-folder").addEventListener("click", () => showInFolder(downloadsFolder));
+$("downloads-folder").addEventListener("click", showDownloadsFolder);
 $("downloads-clear").addEventListener("click", async () => {
   await invoke("downloads_clear", null).catch((err) => snack(`${err}`));
   loadDownloads();

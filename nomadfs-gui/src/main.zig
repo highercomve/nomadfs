@@ -45,7 +45,7 @@ pub const Commands = struct {
     /// worker thread: they share one lock, and a command waiting on it on
     /// the UI thread would freeze the window (node_open behind a share scan
     /// did, for 20 s on a phone). Only quick config-file reads stay inline.
-    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_move", "swarm_read_range", "swarm_download", "downloads_list", "download_cancel", "download_remove", "downloads_clear", "downloads_dir", "download_read_range", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set", "swarm_copies_set", "accept_copies_set", "media_url", "about_info", "update_info", "note_store", "cache_info", "cache_clear", "cache_set_limit", "share_backup_set", "backup_status", "file_details", "device_info" } ++ updates.Updater.async_commands;
+    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_move", "swarm_read_range", "swarm_download", "downloads_list", "download_cancel", "download_remove", "downloads_clear", "downloads_dir", "download_open", "downloads_open_folder", "download_read_range", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set", "swarm_copies_set", "accept_copies_set", "media_url", "about_info", "update_info", "note_store", "cache_info", "cache_clear", "cache_set_limit", "share_backup_set", "backup_status", "file_details", "device_info" } ++ updates.Updater.async_commands;
 
     /// `invoke("invite_create", { config_path })`: one-time invite code.
     pub fn invite_create(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.InviteInfo {
@@ -116,7 +116,7 @@ pub const Commands = struct {
         return commands.swarmReadRange(gpa, args);
     }
 
-    /// `invoke("swarm_download", "downloads_list", "download_cancel", "download_remove", "downloads_clear", "downloads_dir", "download_read_range", { cid, author_id, name })`.
+    /// `invoke("swarm_download", "downloads_list", "download_cancel", "download_remove", "downloads_clear", "downloads_dir", "download_open", "downloads_open_folder", "download_read_range", { cid, author_id, name })`.
     pub fn swarm_download(gpa: std.mem.Allocator, args: downloads.SwarmArgs) !downloads.Info {
         return downloads.fromSwarm(gpa, args);
     }
@@ -134,6 +134,16 @@ pub const Commands = struct {
     /// `invoke("download_remove", { id, delete_file })`.
     pub fn download_remove(args: downloads.RemoveArgs) !void {
         return downloads.remove(args.id, args.delete_file);
+    }
+
+    /// `invoke("download_open", { id, mime })`: the saved file in another app.
+    pub fn download_open(args: downloads.OpenArgs) !void {
+        return downloads.open(args);
+    }
+
+    /// `invoke("downloads_open_folder")`: the folder in the file manager.
+    pub fn downloads_open_folder() !void {
+        return downloads.openFolder();
     }
 
     /// `invoke("downloads_dir")`: the folder downloads go to (created).
