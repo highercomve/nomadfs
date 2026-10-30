@@ -570,6 +570,10 @@ pub const Node = struct {
             // What PINGs say about this device: the network may have
             // changed under us (Wi-Fi to mobile data and back).
             discovery_node.setRole(net.discovery.rpc.Roles.metered, !net.local_addrs.onUnmeteredNetwork());
+            // Devices the command line added while this node runs (--invite,
+            // --trust, --revoke): merged in, and vouched for to the swarm by
+            // the membership push like any other member.
+            if (self.trust_store.syncFromDisk() catch false) std.debug.print("trust: picked up changes to {s}\n", .{self.trust_store.path});
             // Back in touch with devices we lost (we changed networks, they
             // woke up), then ask around for new ones, then remember them all.
             self.dialKnownPeers(swarm_key);

@@ -309,6 +309,13 @@ pub const Store = struct {
     save_mutex: sync.Mutex = .{},
     /// When set, saves append a `SIG <hex>` line and loads demand it.
     signing_seed: ?[identity_mod.seed_len]u8 = null,
+    /// The file as this store last read or wrote it. Another process (the
+    /// command line's --invite, --trust, --revoke while the node runs)
+    /// changes it behind the node's back: `syncFromDisk` notices and merges
+    /// instead of the next save overwriting it. Guarded by `save_mutex`.
+    disk_stamp: ?Stamp = null,
+
+    const Stamp = struct { size: u64, mtime: i96 };
 
     /// Loads the store at `path`. A missing file is an empty store; a file
     /// that exists but does not parse is an error. Retired v1 files are
@@ -367,7 +374,51 @@ pub const Store = struct {
         else
             content;
         try store.parse(body);
+        store.disk_stamp = stampOf(io, path);
         return store;
+    }
+
+    fn stampOf(io: std.Io, path: []const u8) ?Stamp {
+        const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+        return .{ .size = st.size, .mtime = st.mtime.nanoseconds };
+    }
+
+    /// Merges what another process wrote to the file since this store last
+    /// read or wrote it: devices it added (unless revoked here later) and
+    /// newer revocations. Returns whether the store changed. Cheap when the
+    /// file didn't change (one stat).
+    pub fn syncFromDisk(self: *Store) !bool {
+        self.save_mutex.lock();
+        defer self.save_mutex.unlock();
+        return self.syncFromDiskLocked();
+    }
+
+    /// Caller holds `save_mutex`.
+    fn syncFromDiskLocked(self: *Store) !bool {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const now = stampOf(io, self.path) orelse return false;
+        if (self.disk_stamp) |known| if (known.size == now.size and known.mtime == now.mtime) return false;
+
+        var disk = try Store.load(self.allocator, self.path, self.signing_seed);
+        defer disk.deinit();
+        var changed = false;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (disk.revocations.items) |r| {
+            if (self.revocationLocked(r.device_id)) |mine| if (mine.at >= r.at) continue;
+            if (self.findLocked(r.device_id)) |e| if (e.added_at >= r.at) continue;
+            _ = try self.revokeDeviceLocked(r.device_id, r.signer_id, r.at);
+            changed = true;
+        }
+        for (disk.entries.items) |e| {
+            if (self.findLocked(e.device_id) != null) continue;
+            if (self.revocationLocked(e.device_id)) |r| if (r.at >= e.added_at) continue;
+            if (self.entries.items.len >= max_entries) break;
+            try self.entries.append(self.allocator, e);
+            changed = true;
+        }
+        self.disk_stamp = disk.disk_stamp;
+        return changed;
     }
 
     pub fn deinit(self: *Store) void {
@@ -628,6 +679,8 @@ pub const Store = struct {
     pub fn save(self: *Store) !void {
         self.save_mutex.lock();
         defer self.save_mutex.unlock();
+        // Keep what another process wrote since: merge it, don't overwrite it.
+        _ = self.syncFromDiskLocked() catch |err| std.debug.print("trust: couldn't merge {s} before saving: {any}\n", .{ self.path, err });
         const io = std.Io.Threaded.global_single_threaded.io();
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.path});
         defer self.allocator.free(tmp_path);
@@ -676,6 +729,7 @@ pub const Store = struct {
             std.Io.Dir.cwd().deleteFile(io, self.path) catch {};
             try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), self.path, io);
         };
+        self.disk_stamp = stampOf(io, self.path);
     }
 
     /// Copies both arrays under one lock, so the saved file is a consistent view.
@@ -1482,4 +1536,47 @@ test "trust: admissions add unknown members, respect tombstones and need a trust
     try testing.expectEqual(@as(u64, 1000), store.lookup(tablet.deviceId()).?.added_at);
     try testing.expectEqual(RevocationOutcome.applied, try applyRevocation(&store, tablet.deviceId(), admin.publicKey(), 1001, try admin.sign(&revocationMessage(tablet.deviceId(), admin.deviceId(), 1001)), 1001));
     try testing.expect(!store.isTrusted(tablet.deviceId()));
+}
+
+test "trust store: a running store merges what another process wrote, never overwrites it" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "test_trust_two_processes.store";
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const seed = [_]u8{0x61} ** identity_mod.seed_len;
+    const a = try identity_mod.Identity.fromSeed([_]u8{0x62} ** identity_mod.seed_len);
+    const b = try identity_mod.Identity.fromSeed([_]u8{0x63} ** identity_mod.seed_len);
+
+    // The node's store, running.
+    var node = try Store.load(testing.allocator, path, seed);
+    defer node.deinit();
+    _ = try node.upsert(a.publicKey(), [_]u8{1} ** 32, "Laptop", 10);
+    try node.save();
+
+    // The command line, another process, adds a device (an invite).
+    {
+        var cli = try Store.load(testing.allocator, path, seed);
+        defer cli.deinit();
+        _ = try cli.upsert(b.publicKey(), [_]u8{2} ** 32, "Phone", 20);
+        try cli.save();
+    }
+
+    // The node notices it, and its next save keeps it.
+    try testing.expect(try node.syncFromDisk());
+    try testing.expect(node.isTrusted(b.deviceId()));
+    try testing.expect(!try node.syncFromDisk()); // unchanged now
+    try node.save();
+    var again = try Store.load(testing.allocator, path, seed);
+    defer again.deinit();
+    try testing.expect(again.isTrusted(a.deviceId()) and again.isTrusted(b.deviceId()));
+
+    // A revocation written by the command line wins over the node's entry.
+    {
+        var cli = try Store.load(testing.allocator, path, seed);
+        defer cli.deinit();
+        _ = try cli.revokeDevice(a.deviceId(), b.deviceId(), 30);
+        try cli.save();
+    }
+    try node.save(); // merges before writing
+    try testing.expect(!node.isTrusted(a.deviceId()));
 }
