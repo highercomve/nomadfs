@@ -158,16 +158,25 @@ pub fn leavesIn(allocator: std.mem.Allocator, loader: Loader, root: Cid, known: 
     } else return error.DagTooDeep;
     // A one-block file has nothing ahead.
     if (depth == 0 or len == 0) return;
-    try collectLeaves(allocator, loader, root, depth, start, start +| len, 0, out, max);
+    // Blocks loaded are bounded too: a peer's tree of empty parents would
+    // otherwise cost a load each without adding a leaf.
+    var budget: usize = max +| max_walk_extra;
+    try collectLeaves(allocator, loader, root, depth, start, start +| len, 0, out, max, &budget);
 }
 
+/// Parent blocks a leaf collection may load beyond one per leaf wanted.
+const max_walk_extra = 4096;
+
 /// `cid` is a parent `levels` above the leaves, its first byte at `base`.
-fn collectLeaves(allocator: std.mem.Allocator, loader: Loader, cid: Cid, levels: usize, start: u64, end: u64, base: u64, out: *std.ArrayList(Cid), max: usize) !void {
+fn collectLeaves(allocator: std.mem.Allocator, loader: Loader, cid: Cid, levels: usize, start: u64, end: u64, base: u64, out: *std.ArrayList(Cid), max: usize, budget: *usize) !void {
+    if (budget.* == 0) return error.DagTooLarge;
+    budget.* -= 1;
     const bytes = try loader.load(&cid, allocator);
     defer allocator.free(bytes);
     var links = switch (try codec.decode(bytes)) {
         .parent => |l| l,
-        else => return,
+        // A leaf where a parent belongs: the tree's levels don't agree.
+        else => return error.InvalidTree,
     };
     var pos = base;
     while (links.next()) |link| {
@@ -178,7 +187,7 @@ fn collectLeaves(allocator: std.mem.Allocator, loader: Loader, cid: Cid, levels:
         if (levels == 1) {
             try out.append(allocator, link.cid.*);
         } else {
-            try collectLeaves(allocator, loader, link.cid.*, levels - 1, start, end, lo, out, max);
+            try collectLeaves(allocator, loader, link.cid.*, levels - 1, start, end, lo, out, max, budget);
         }
     }
 }

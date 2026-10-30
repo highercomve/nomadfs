@@ -76,6 +76,9 @@ fn walk(allocator: std.mem.Allocator, loader: tree.Loader, cid: Cid, level: u32,
         .parent => |l| l,
         else => return error.UnbalancedDag,
     };
+    // Every parent links at least one chunk in a real file: more parents
+    // than chunks allowed is a peer's tree of empty parents.
+    if (parents.* >= max_chunks) return error.DagTooLarge;
     parents.* += 1;
     while (links.next()) |link| {
         if (level == 1) {
