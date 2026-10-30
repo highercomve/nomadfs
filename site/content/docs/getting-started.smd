@@ -22,7 +22,11 @@ curl -fsSL https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/in
 
 `VERSION=0.2.3` installs a given release; `NO_CLI=1`, `NO_DESKTOP=1` and
 `NO_RESTART=1` skip the command line, the launcher entry, or starting the app.
-The app then updates itself ([Updates]($link.ref('updates'))).
+The app then updates itself ([Updates]($link.ref('updates'))), and the
+command line with `nomadfs --upgrade`: it checks the release's signature
+before it replaces the binary (`--check` only says whether there is a new
+one, `--yes` doesn't ask). Restart a running node afterwards.
+`nomadfs --version` prints the version.
 
 To build from source you need [Zig 0.16.0](https://ziglang.org/download/).
 For the Linux mount you also need `fusermount3` (the `fuse3` package on most
@@ -132,7 +136,7 @@ unmounts. See [Shared folders & mount]($link.page('docs/shared-folders')).
 # [Build the app]($heading.id('app'))
 
 The app in `nomadfs-gui/` is built with [Oriel](https://oriel.foreachdeveloper.com)
-**v0.20.3**, which `zig build` fetches:
+**v0.20.4**, which `zig build` fetches:
 
 ```sh
 cd nomadfs-gui

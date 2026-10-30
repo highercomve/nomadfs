@@ -104,6 +104,9 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .windows) {
         exe.root_module.link_libc = true;
     }
+    // `nomadfs --upgrade`: Oriel's self-updater engine (std only, no GUI).
+    const oriel = b.dependency("oriel", .{ .target = target, .optimize = optimize });
+    exe.root_module.addImport("oriel_updater", oriel.module("oriel_updater"));
 
     // Dynamic C ABI library for mobile bindings (JNI via Android NDK, or any
     // FFI host). Exports live in `src/mobile/api.zig`, referenced from root.

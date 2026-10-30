@@ -3,6 +3,29 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.3.9 - 2026-10-30
+
+The command line updates itself: `nomadfs --upgrade`. Devices on 0.3.8 and 0.3.9 work together.
+
+### Added
+
+- `nomadfs --upgrade` replaces the command line binary with the latest release's, after checking
+  the release's signature and the download's checksum. It asks first (`--yes` doesn't); `--check`
+  only says whether there is a newer one. A running node uses the new binary once restarted.
+  Releases now carry `latest-cli.json`, a signed manifest for the command line binaries, so the
+  first upgrade available is to the release after this one.
+- `nomadfs --version` (`-V`).
+
+### Fixed
+
+- Swarm folder: in a window around 1000 px wide, the type filters were squeezed between the search
+  and the buttons and cut off. The search and the buttons share a line, and the filters get the
+  next one.
+
+### Changed
+
+- Uses Oriel 0.20.4 (its `oriel_updater` module, for `--upgrade`).
+
 ## 0.3.8 - 2026-10-30
 
 Downloaded files open in other apps, and their folder opens, on Android and ChromeOS too. Devices

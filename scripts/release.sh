@@ -5,7 +5,8 @@
 #   nomadfs-<v>-x86_64-linux, nomadfs-<v>-aarch64-linux   command line node
 #   nomadfs-gui-<v>-x86_64.AppImage, .deb, .rpm            desktop app
 #   nomadfs-<v>.apk                                        Android
-#   latest.json                                            signed update manifest
+#   latest.json                                            signed update manifest (the apps)
+#   latest-cli.json                                        signed update manifest (nomadfs --upgrade)
 #   SHA256SUMS
 #
 # Usage: scripts/release.sh [out-dir]     (default /tmp/nfs-release-<v>)
@@ -81,10 +82,10 @@ run android-x86_64 zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-androi
 cp android/app/build/outputs/apk/debug/app-debug.apk "$assets/nomadfs-$version.apk"
 
 step "Update manifest (latest.json)"
-sign() { # <asset> <target> <format>
-  run "sign-$2" zig build sign-update -- "$assets/$1" --app-id com.foreachdeveloper.nomadfs \
+sign() { # <asset> <target> <format> [<app id suffix> <manifest dir>]
+  run "sign-$2${4:-}" zig build sign-update -- "$assets/$1" --app-id "com.foreachdeveloper.nomadfs${4:-}" \
     --version "$version" --target "$2" --format "$3" --url "$base/$1" \
-    --key "$key" --out "$out/manifests/update-$2.json"
+    --key "$key" --out "$out/${5:-manifests}/update-$2.json"
 }
 sign "nomadfs-gui-$version-x86_64.AppImage" x86_64-linux appimage
 # One APK for both ABIs. The app opens its download; Android installs it.
@@ -92,6 +93,13 @@ sign "nomadfs-$version.apk" aarch64-android raw
 sign "nomadfs-$version.apk" x86_64-android raw
 run combine zig build combine-manifests -- "$out"/manifests/update-*.json \
   --pub-date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --out "$assets/latest.json"
+# The command line node: its own app id, so the app's manifest can't
+# replace it with an AppImage (both are x86_64-linux).
+mkdir -p "$out/manifests-cli"
+sign "nomadfs-$version-x86_64-linux" x86_64-linux raw .cli manifests-cli
+sign "nomadfs-$version-aarch64-linux" aarch64-linux raw .cli manifests-cli
+run combine-cli zig build combine-manifests -- "$out"/manifests-cli/update-*.json \
+  --pub-date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --out "$assets/latest-cli.json"
 
 cd "$assets"
 sha256sum -- * > SHA256SUMS

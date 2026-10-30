@@ -6,7 +6,9 @@ const device = nomadfs.device;
 const Identity = device.identity.Identity;
 const Ticket = device.pairing.Ticket;
 
-const Command = enum { run, pair, trust, devices, revoke, mount, invite, join, cache, clear_cache, bench_read, bench_idle };
+const upgrade = @import("upgrade.zig");
+
+const Command = enum { run, pair, trust, devices, revoke, mount, invite, join, cache, clear_cache, bench_read, bench_idle, upgrade };
 
 const Options = struct {
     command: Command = .run,
@@ -26,6 +28,7 @@ const Options = struct {
     bench_wait_seconds: u32 = 30,
     bench_cold: bool = false,
     bench_idle_seconds: u32 = 0,
+    upgrade: upgrade.Options = .{},
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -37,6 +40,8 @@ pub fn main(init: std.process.Init) !void {
 
     var options: Options = .{};
     if (!try parseArgs(init.arena.allocator(), args, &options)) return;
+    // Needs no config: it replaces the binary.
+    if (options.command == .upgrade) std.process.exit(try upgrade.run(init.io, allocator, options.upgrade));
 
     // The file found when none is given: commands that save to it (--join,
     // --invite, a rotated key) need to know which.
@@ -61,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
         .clear_cache => try cacheCommand(allocator, config, true),
         .bench_read => try benchReadCommand(allocator, config, options.bench_read_path.?, options.bench_wait_seconds, options.bench_cold),
         .bench_idle => try benchIdleCommand(allocator, config, options.bench_idle_seconds),
+        .upgrade => unreachable, // handled before the config loads
     }
 }
 
@@ -82,30 +88,25 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Optio
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--config")) {
+        if (commandFlag(arg)) |command| {
+            try selectCommand(options, command);
+        } else if (std.mem.eql(u8, arg, "--config")) {
             options.config_path = try nextValue(args, &i, "--config");
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return false;
-        } else if (std.mem.eql(u8, arg, "--pair")) {
-            try selectCommand(options, .pair);
-        } else if (std.mem.eql(u8, arg, "--trust")) {
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
+            std.debug.print("nomadfs {s}\n", .{nomadfs.node_info.version});
+            return false;
+        } else if (switchFlag(arg, options)) {} else if (std.mem.eql(u8, arg, "--trust")) {
             try selectCommand(options, .trust);
             options.trust_uri = try nextValue(args, &i, "--trust");
-        } else if (std.mem.eql(u8, arg, "--devices")) {
-            try selectCommand(options, .devices);
         } else if (std.mem.eql(u8, arg, "--revoke")) {
             try selectCommand(options, .revoke);
             options.revoke_query = try nextValue(args, &i, "--revoke");
-        } else if (std.mem.eql(u8, arg, "--invite")) {
-            try selectCommand(options, .invite);
         } else if (std.mem.eql(u8, arg, "--join")) {
             try selectCommand(options, .join);
             options.join_code = try nextValue(args, &i, "--join");
-        } else if (std.mem.eql(u8, arg, "--cache")) {
-            try selectCommand(options, .cache);
-        } else if (std.mem.eql(u8, arg, "--clear-cache")) {
-            try selectCommand(options, .clear_cache);
         } else if (std.mem.eql(u8, arg, "--bench-read")) {
             try selectCommand(options, .bench_read);
             options.bench_read_path = try nextValue(args, &i, "--bench-read");
@@ -115,8 +116,6 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Optio
                 std.debug.print("Error: --bench-wait expects an integer number of seconds\n", .{});
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, arg, "--bench-cold")) {
-            options.bench_cold = true;
         } else if (std.mem.eql(u8, arg, "--bench-idle")) {
             try selectCommand(options, .bench_idle);
             const val_str = try nextValue(args, &i, "--bench-idle");
@@ -129,8 +128,6 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Optio
             options.mountpoint = try nextValue(args, &i, "--mount");
         } else if (std.mem.eql(u8, arg, "--share")) {
             try options.shares.append(arena, try nextValue(args, &i, "--share"));
-        } else if (std.mem.eql(u8, arg, "--swarm-backup")) {
-            options.swarm_backup = true;
         } else if (std.mem.eql(u8, arg, "--copies")) {
             const val_str = try nextValue(args, &i, "--copies");
             const n = std.fmt.parseInt(u8, val_str, 10) catch 0;
@@ -153,10 +150,39 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Optio
         }
     }
 
+    if ((options.upgrade.check or options.upgrade.yes) and options.command != .upgrade) {
+        std.debug.print("Error: --check and --yes go with --upgrade\n", .{});
+        std.process.exit(1);
+    }
     if (options.address != null and options.command != .pair and options.command != .invite and options.command != .join) {
         std.debug.print("Error: --address is only valid with --pair, --invite or --join\n", .{});
         std.process.exit(1);
     }
+    return true;
+}
+
+/// The flags that only pick a command.
+fn commandFlag(arg: []const u8) ?Command {
+    const flags = [_]struct { []const u8, Command }{
+        .{ "--pair", .pair },   .{ "--devices", .devices },         .{ "--invite", .invite },
+        .{ "--cache", .cache }, .{ "--clear-cache", .clear_cache }, .{ "--upgrade", .upgrade },
+    };
+    for (flags) |f| if (std.mem.eql(u8, arg, f[0])) return f[1];
+    return null;
+}
+
+/// The on/off flags; false when `arg` isn't one.
+fn switchFlag(arg: []const u8, options: *Options) bool {
+    const eql = std.mem.eql;
+    if (eql(u8, arg, "--check")) {
+        options.upgrade.check = true;
+    } else if (eql(u8, arg, "--yes") or eql(u8, arg, "-y")) {
+        options.upgrade.yes = true;
+    } else if (eql(u8, arg, "--bench-cold")) {
+        options.bench_cold = true;
+    } else if (eql(u8, arg, "--swarm-backup")) {
+        options.swarm_backup = true;
+    } else return false;
     return true;
 }
 
@@ -171,7 +197,7 @@ fn nextValue(args: []const []const u8, index: *usize, flag: []const u8) ![]const
 
 fn selectCommand(options: *Options, command: Command) !void {
     if (options.command != .run) {
-        std.debug.print("Error: only one of --pair, --trust, --devices, --revoke, --mount, --invite, --cache, --clear-cache, --bench-read or --bench-idle may be used\n", .{});
+        std.debug.print("Error: only one of --pair, --trust, --devices, --revoke, --mount, --invite, --cache, --clear-cache, --bench-read, --bench-idle or --upgrade may be used\n", .{});
         std.process.exit(1);
     }
     options.command = command;
@@ -192,6 +218,8 @@ fn printHelp() void {
         \\  nomadfs --cache | --clear-cache [config_path]
         \\  nomadfs --bench-read <swarm path> [--bench-wait SECONDS] [--bench-cold] [config_path]
         \\  nomadfs --bench-idle SECONDS [config_path]
+        \\  nomadfs --upgrade [--check] [--yes]
+        \\  nomadfs --version
         \\
         \\Options:
         \\  --config <path>    Path to the configuration file
@@ -231,6 +259,11 @@ fn printHelp() void {
         \\  --bench-wait <sec>  Seconds to wait for swarm peer sync before bench read (default 30)
         \\  --bench-cold        Clear the read cache before benchmarking a read
         \\  --bench-idle <sec>  Run the node for SECONDS and print wire chatter totals
+        \\  --upgrade          Replace this binary with the latest release, after
+        \\                     checking its signature (asks first; --yes doesn't,
+        \\                     --check only says whether there is one). A running
+        \\                     node uses it once restarted
+        \\  --version, -V      Print the version
         \\  --help, -h         Show this help message
         \\
     , .{});

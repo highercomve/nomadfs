@@ -1175,11 +1175,14 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 /* Phones: the buttons get a row of their own, above the search. */
 .swarm-toolbar .actions { order: -1; display: flex; gap: 8px; }
 .swarm-toolbar .actions .btn { flex: 1; }
+/* Wide: the search and the buttons on one line, the filter chips on the next. */
 @media (min-width: 840px) {
-  .swarm-toolbar { flex-direction: row; align-items: center; }
-  .swarm-toolbar .browse-tools { flex: 1; min-width: 0; }
-  .swarm-toolbar .actions { order: 0; }
+  .swarm-toolbar { flex-direction: row; flex-wrap: wrap; align-items: center; }
+  .swarm-toolbar .browse-tools:not([hidden]) { display: contents; }
+  .swarm-toolbar .tools-search-row { order: 0; flex: 0 1 320px; }
+  .swarm-toolbar .actions { order: 1; margin-left: auto; }
   .swarm-toolbar .actions .btn { flex: none; }
+  .swarm-toolbar .type-chips { order: 2; flex: 1 0 100%; }
 }
 .row-actions { display: flex; gap: 2px; flex: none; }
 .list.rows li .col-by { display: none; }
@@ -1412,7 +1415,8 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
   .tools-search-row { width: auto; flex: 0 1 320px; }
   .sort-select, .sort-dir { display: none; }
   .search-field { flex: 1; }
-  .type-chips { flex: 1; min-width: 0; }
+  /* The chips keep their width: short of room, they take a line of their own under the search. */
+  .type-chips { flex: 1 0 auto; max-width: 100%; }
 }
 
 /* ---- About ---- */
