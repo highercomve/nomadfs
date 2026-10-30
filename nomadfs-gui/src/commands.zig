@@ -1021,6 +1021,19 @@ pub fn swarmRename(args: SwarmRenameArgs) !void {
     try (try swarmFolder()).rename(args.path, std.mem.trim(u8, args.name, " \t"));
 }
 
+pub const SwarmMoveArgs = struct { path: []const u8, to_dir: []const u8 };
+
+/// `swarm_move { path, to_dir }`: a file or folder into another folder of
+/// the swarm folder ("" = the top), keeping its name.
+pub fn swarmMove(gpa: std.mem.Allocator, args: SwarmMoveArgs) !void {
+    const dir = std.mem.trim(u8, args.to_dir, " \t/");
+    const name = std.fs.path.basename(args.path);
+    const dest = if (dir.len == 0) try gpa.dupe(u8, name) else try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, name });
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    try (try swarmFolder()).move(args.path, dest, .{});
+}
+
 // ---- File details (how NomadFS stores a file) ----
 
 pub const FileDetailsArgs = struct {

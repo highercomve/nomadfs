@@ -25,7 +25,12 @@ var g_started = false;
 var g_token: [32]u8 = undefined;
 var g_base_buf: [64]u8 = undefined;
 var g_base: []const u8 = "";
-var g_server: if (is_android) void else oriel.media_server.Server = undefined;
+var g_server: oriel.media_server.Server = undefined;
+/// The HTTP server's base (`http://127.0.0.1:<port>/`), once it runs: on
+/// the desktop from the start; on Android when another app needs a URL
+/// (the scheme serves only this app's WebView).
+var g_http_base_buf: [64]u8 = undefined;
+var g_http_base: []const u8 = "";
 
 // One type, re-exported by both (media_server doesn't exist on Android).
 const Source = if (is_android) oriel.media_scheme.Source else oriel.media_server.Source;
@@ -39,6 +44,9 @@ pub const UrlArgs = struct {
     cid: []const u8,
     size: u64,
     name: []const u8,
+    /// For another app (VLC, ...): an http://127.0.0.1 URL on every
+    /// platform, not the WebView-only scheme Android previews use.
+    external: bool = false,
 };
 
 /// `invoke("media_url", { kind, id, cid, size, name })`: a URL the page's
@@ -59,7 +67,8 @@ pub fn url(alloc: std.mem.Allocator, args: UrlArgs) ![]const u8 {
         ext_len += 1;
     };
     const ext = if (ext_len > 0) ext_buf[0..ext_len] else "bin";
-    return std.fmt.allocPrint(alloc, "{s}{s}/{c}/{s}/{s}/{d}/f.{s}", .{ g_base, &g_token, k, args.id, args.cid, args.size, ext });
+    const base = if (args.external) try httpBase() else g_base;
+    return std.fmt.allocPrint(alloc, "{s}{s}/{c}/{s}/{s}/{d}/f.{s}", .{ base, &g_token, k, args.id, args.cid, args.size, ext });
 }
 
 fn ensureStarted() !void {
@@ -74,21 +83,35 @@ fn ensureStarted() !void {
         try oriel.media_scheme.setSource(source);
         g_base = oriel.media_scheme.base_url;
     } else {
-        // A free port: try a few random ones above the registered range.
-        var attempt: usize = 0;
-        while (true) : (attempt += 1) {
-            var r: [2]u8 = undefined;
-            io.random(&r);
-            const port: u16 = 40000 + std.mem.readInt(u16, &r, .little) % 20000;
-            g_server.start(io, gpa, .{ .root_dir = "", .port = port, .source = source }) catch |err| {
-                if (attempt < 20) continue;
-                return err;
-            };
-            g_base = try std.fmt.bufPrint(&g_base_buf, "http://127.0.0.1:{d}/", .{port});
-            break;
-        }
+        try startHttpLocked(io);
+        g_base = g_http_base;
     }
     g_started = true;
+}
+
+/// The HTTP server's base, starting it if it isn't running (Android).
+fn httpBase() ![]const u8 {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    if (g_http_base.len == 0) try startHttpLocked(std.Io.Threaded.global_single_threaded.io());
+    return g_http_base;
+}
+
+/// Starts the HTTP server on 127.0.0.1, on a free port: a few random ones
+/// above the registered range. Caller holds g_mutex.
+fn startHttpLocked(io: std.Io) !void {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        var r: [2]u8 = undefined;
+        io.random(&r);
+        const port: u16 = 40000 + std.mem.readInt(u16, &r, .little) % 20000;
+        g_server.start(io, gpa, .{ .root_dir = "", .port = port, .source = source }) catch |err| {
+            if (attempt < 20) continue;
+            return err;
+        };
+        g_http_base = try std.fmt.bufPrint(&g_http_base_buf, "http://127.0.0.1:{d}/", .{port});
+        return;
+    }
 }
 
 const Target = struct { kind: u8, id: [32]u8, cid: [32]u8, size: u64 };

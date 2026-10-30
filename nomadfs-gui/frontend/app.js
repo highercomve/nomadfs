@@ -55,6 +55,9 @@ const ICONS = {
   backup: "M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z",
   backup_off: "M19.35 10.04C18.67 6.59 15.64 4 12 4c-1.48 0-2.85.43-4.01 1.17l1.46 1.46C10.21 6.23 11.08 6 12 6c3.04 0 5.5 2.46 5.5 5.5v.5H19c1.66 0 3 1.34 3 3 0 1.13-.64 2.11-1.56 2.62l1.45 1.45C23.16 18.16 24 16.68 24 15c0-2.64-2.05-4.78-4.65-4.96zM3 5.27l2.75 2.74C2.56 8.15 0 10.77 0 14c0 3.31 2.69 6 6 6h11.73l2 2L21 20.73 4.27 4 3 5.27zM7.73 10l8 8H6c-2.21 0-4-1.79-4-4s1.79-4 4-4h1.73z",
   info: "M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z",
+  open_in: "M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0-2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z",
+  link: "M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z",
+  move: "M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2zm4 13v-3h-4v-2h4V9l4 4-4 4z",
   remove: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z",
 };
 
@@ -99,7 +102,7 @@ function iconFor(name, dir) {
 }
 
 /** A Material list row: leading icon, headline + meta, optional trailing button. */
-function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = false, onClick, action, actions, cols }) {
+function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = false, onClick, action, actions, cols, menu }) {
   if (action && !actions) actions = [action];
   const li = document.createElement("li");
   const lead = document.createElement("span");
@@ -159,9 +162,120 @@ function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = false, on
   }
   if (onClick) {
     li.classList.add("clickable");
-    li.addEventListener("click", onClick);
+    li.addEventListener("click", (e) => { if (!li.dataset.menuOpened) onClick(e); delete li.dataset.menuOpened; });
   }
+  if (menu?.length) attachMenu(li, menu);
   return li;
+}
+
+// ---- The row menu (right-click; a long press on touch screens) ----
+
+let menuEl = null;
+
+/** `items`: { icon, label, run, danger } or "-" (a separator). */
+function attachMenu(li, items) {
+  li.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    showMenu(e.clientX, e.clientY, items);
+  });
+  // Touch: a long press opens it, and the click that ends it doesn't open the row.
+  let timer = 0;
+  let start = null;
+  li.addEventListener("pointerdown", (e) => {
+    if (e.pointerType !== "touch") return;
+    start = { x: e.clientX, y: e.clientY };
+    timer = setTimeout(() => {
+      li.dataset.menuOpened = "1";
+      showMenu(start.x, start.y, items);
+    }, 550);
+  });
+  const cancel = () => clearTimeout(timer);
+  li.addEventListener("pointerup", cancel);
+  li.addEventListener("pointercancel", cancel);
+  li.addEventListener("pointermove", (e) => {
+    if (start && Math.hypot(e.clientX - start.x, e.clientY - start.y) > 10) cancel();
+  });
+}
+
+function showMenu(x, y, items) {
+  closeMenu();
+  menuEl = document.createElement("div");
+  menuEl.className = "row-menu";
+  menuEl.setAttribute("role", "menu");
+  for (const it of items) {
+    if (it === "-") {
+      menuEl.appendChild(Object.assign(document.createElement("hr"), { className: "row-menu-sep" }));
+      continue;
+    }
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `row-menu-item${it.danger ? " danger" : ""}`;
+    b.setAttribute("role", "menuitem");
+    b.appendChild(svg(ICONS[it.icon]));
+    b.appendChild(document.createTextNode(it.label));
+    b.addEventListener("click", (e) => { e.stopPropagation(); closeMenu(); it.run(); });
+    menuEl.appendChild(b);
+  }
+  document.body.appendChild(menuEl);
+  // Inside the window, near the pointer.
+  const r = menuEl.getBoundingClientRect();
+  menuEl.style.left = `${Math.max(8, Math.min(x, innerWidth - r.width - 8))}px`;
+  menuEl.style.top = `${Math.max(8, Math.min(y, innerHeight - r.height - 8))}px`;
+  menuEl.querySelector("button")?.focus();
+}
+
+function closeMenu() {
+  menuEl?.remove();
+  menuEl = null;
+}
+
+document.addEventListener("pointerdown", (e) => { if (menuEl && !menuEl.contains(e.target)) closeMenu(); }, true);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && menuEl) { closeMenu(); e.stopPropagation(); } }, true);
+addEventListener("scroll", closeMenu, true);
+addEventListener("resize", closeMenu);
+// The WebView's own menu (Back, Reload...) means nothing here; text fields keep theirs.
+document.addEventListener("contextmenu", (e) => {
+  if (!e.target.closest("input, textarea, [contenteditable]") && !getSelection()?.toString()) e.preventDefault();
+});
+
+/** A file's MIME type, from its extension: what another app opens it as. */
+function mimeFor(name) {
+  const ext = (name.split(".").pop() || "").toLowerCase();
+  return ({
+    mkv: "video/x-matroska", mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime", avi: "video/x-msvideo", webm: "video/webm", ts: "video/mp2t", wmv: "video/x-ms-wmv",
+    mp3: "audio/mpeg", m4a: "audio/mp4", flac: "audio/flac", ogg: "audio/ogg", opus: "audio/opus", wav: "audio/wav", aac: "audio/aac",
+    jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", heic: "image/heic",
+    pdf: "application/pdf", txt: "text/plain", md: "text/markdown", zip: "application/zip",
+  })[ext] || "application/octet-stream";
+}
+
+/** The menu items every file has: open elsewhere, download, details, link. */
+function fileMenu(source, e, details) {
+  return [
+    { icon: "open_in", label: "Open in another app", run: () => openInApp(source, e) },
+    { icon: "download", label: "Download", run: () => source.download(e) },
+    { icon: "info", label: "Details", run: () => openDetails(e.name, details) },
+    { icon: "link", label: "Copy link", run: () => copyLink(source, e) },
+  ];
+}
+
+/** Streams it to the app the system picks for its type (VLC for a video). */
+async function openInApp(source, e) {
+  try {
+    const url = await source.mediaUrl(e, true);
+    await window.oriel.openExternal(url, { type: mimeFor(e.name) });
+  } catch (err) {
+    snack(`Couldn't open it: ${err}`);
+  }
+}
+
+async function copyLink(source, e) {
+  try {
+    copyText(await source.mediaUrl(e, true), "Link copied: it plays while NomadFS runs on this device");
+  } catch (err) {
+    snack(`No link: ${err}`);
+  }
 }
 
 // ---- Back (Android's back button and gesture, a mouse's back button) ----
@@ -781,6 +895,7 @@ function browseRow(e, files) {
       date: formatDate(e.mtime),
     },
     onClick: () => openPreview(deviceSource(device), files, files.indexOf(e)),
+    menu: fileMenu(deviceSource(device), e, { cid: e.cid, peer: device.peer }),
     actions: [
       { icon: "info", label: `Details of ${e.name}`, run: () => openDetails(e.name, { cid: e.cid, peer: device.peer }) },
       { icon: "download", label: "Download", run: fetchIt },
@@ -887,14 +1002,14 @@ let pv = null; // { source, files, index, token, url }
 function deviceSource(device) {
   return {
     read: (e, offset, len) => invoke("read_range", { peer: device.peer, cid: e.cid, offset, len }),
-    mediaUrl: (e) => invoke("media_url", { kind: "device", id: device.peer, cid: e.cid, size: e.size, name: e.name }),
+    mediaUrl: (e, external = false) => invoke("media_url", { kind: "device", id: device.peer, cid: e.cid, size: e.size, name: e.name, external }),
     download: (e, btn) => downloadFile(device, e, btn),
   };
 }
 /** ...or the swarm folder (the device that added it, then anyone). */
 const swarmSource = {
   read: (e, offset, len) => invoke("swarm_read_range", { cid: e.cid, author_id: e.author_id, offset, len }),
-  mediaUrl: (e) => invoke("media_url", { kind: "swarm", id: e.author_id, cid: e.cid, size: e.size, name: e.name }),
+  mediaUrl: (e, external = false) => invoke("media_url", { kind: "swarm", id: e.author_id, cid: e.cid, size: e.size, name: e.name, external }),
   download: (e, btn) => swarmDownload(e, btn),
 };
 
@@ -952,7 +1067,9 @@ const nativeVideo = window.oriel.video?.available ? window.oriel.video : null;
 async function streamPreview(entry, kind, token) {
   let url;
   try {
-    url = await pv.source.mediaUrl(entry);
+    // The native player gets an address other apps can open too, so its
+    // "Open in another app" works (Android's in-app scheme is WebView-only).
+    url = await pv.source.mediaUrl(entry, kind === "video" && !!nativeVideo);
   } catch (err) {
     if (pv && token === pv.token) previewMessage("file", `Preview failed: ${err}`);
     return;
@@ -1308,7 +1425,14 @@ function swarmRow(it, files) {
   ];
   if (!it.dir) actions.unshift({ icon: "download", label: "Download", run: (btn) => swarmDownload(it, btn) });
   if (!it.dir && it.cid) actions.unshift({ icon: "info", label: `Details of ${it.name}`, run: () => openDetails(it.name, { cid: it.cid, author_id: it.author_id }) });
+  const edits = [
+    { icon: "edit", label: "Rename", run: () => swarmRenamePrompt(it) },
+    { icon: "move", label: "Move to…", run: () => swarmMovePrompt(it) },
+    { icon: "trash", label: "Delete", run: () => swarmDeleteConfirm(it), danger: true },
+  ];
+  const menu = it.dir || !it.cid ? edits : [...fileMenu(swarmSource, it, { cid: it.cid, author_id: it.author_id }), "-", ...edits];
   return row({
+    menu,
     icon: it.dir ? "folder" : iconFor(it.name, false),
     iconClass: it.dir ? "folder" : "",
     headline: it.name,
@@ -1382,6 +1506,26 @@ async function swarmRenamePrompt(it) {
     snack(`Renamed to ${name}`);
   } catch (err) {
     snack(`${err}`.includes("PathAlreadyExists") ? `"${name}" already exists here.` : `Rename failed: ${err}`);
+  }
+  loadSwarm();
+}
+
+async function swarmMovePrompt(it) {
+  const here = it.path.includes("/") ? it.path.slice(0, it.path.lastIndexOf("/")) : "";
+  const to = await askDialog({
+    title: `Move ${it.name}`,
+    text: "To which folder of the swarm folder? Like Photos/2024; empty for the top.",
+    value: here,
+    confirm: "Move",
+  });
+  if (to === null || to === undefined) return;
+  const dir = to.trim().replace(/^\/+|\/+$/g, "");
+  if (dir === here) return;
+  try {
+    await invoke("swarm_move", { path: it.path, to_dir: dir });
+    snack(`Moved to ${dir || "the top"}`);
+  } catch (err) {
+    snack(`${err}`.includes("PathAlreadyExists") ? `"${it.name}" already exists there.` : `Move failed: ${err}`);
   }
   loadSwarm();
 }

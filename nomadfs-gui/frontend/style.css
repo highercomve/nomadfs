@@ -1559,3 +1559,34 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 .list.rows li.skeleton:nth-child(3) .sk-bar:not(.short) { width: 63%; }
 @keyframes sk-shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
 @media (prefers-reduced-motion: reduce) { .sk-bar { animation: none; } }
+
+/* The row menu (right-click, long press). */
+.row-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 200px;
+  padding: 6px 0;
+  border-radius: 8px;
+  background: var(--md-surface-container-high, #222a36);
+  color: var(--md-on-surface);
+  box-shadow: 0 6px 18px rgb(0 0 0 / .45);
+  border: 1px solid var(--md-outline-variant, rgb(255 255 255 / .08));
+}
+.row-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 16px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+.row-menu-item svg { width: 18px; height: 18px; fill: currentColor; opacity: .8; }
+.row-menu-item:hover, .row-menu-item:focus-visible { background: rgb(255 255 255 / .07); outline: none; }
+.row-menu-item.danger { color: var(--md-error, #ffb4ab); }
+.row-menu-sep { border: 0; border-top: 1px solid rgb(255 255 255 / .08); margin: 6px 0; }
