@@ -23,7 +23,7 @@ each new connection to whoever serves it.
     ([Chapter 1.6](./nat.md)), and the TCP accept thread.
 *   `setConnectionHandler(ctx, handler)` sets the function that runs, on its
     own thread, for every connection added to the pool. In a node it is
-    `discovery.Node.serve` (`src/root.zig`), which accepts that connection's
+    `discovery.Node.serve` (`src/node.zig`), which accepts that connection's
     Yamux streams. `setDiscoveryHandler` receives peers found on the LAN.
 
 ## 2. Reference Counting

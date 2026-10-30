@@ -62,7 +62,7 @@ graph TD
 - Every block fetched is verified against its CID by `StorageEngine.put` before it is kept, so the
   local store doubles as the cache.
 
-## 3. Wiring in `src/root.zig`
+## 3. Wiring in `src/node.zig`
 
 `Node.init` builds the folder layer only when storage is enabled (`[storage] enabled = true`):
 

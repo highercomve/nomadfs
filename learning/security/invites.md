@@ -145,7 +145,7 @@ connection. The reply is `STORE_ACK { stored }`.\
 ### 2.2 Sending: `Node.rotateSwarmKey`
 
 `Node.rotateSwarmKey(allocator, new_key, epoch) ![]Delivery` in
-`src/root.zig`:
+`src/node.zig`:
 
 1. For every peer in the routing table, connect and read the verified
    device ID of the connection (`getRemoteDeviceID`).
@@ -207,7 +207,7 @@ The full mechanism is in [Chapter 6.2, "Revocation Propagation"](./pairing.md#re
 | RPC | `REVOKE` (type 15) → `STORE_ACK` | `{ device_id, signer_key, at, signature }`; `at` is signed and verified |
 | Accept rule | `trust.applyRevocation` | Signature valid, signer ≠ revoked, signer trusted locally, `at <= now + max_revocation_skew`, device not re-paired after `at` (`added_at < at`) |
 | Push on dial | `DiscoveryNode.ping` → `pushRevocations` | After a verified PONG on a connection this node opened; forwards original `at` |
-| Sweep | `src/root.zig`, every 60 s | `sweepRevocations(4)`: the 4 peers closest to this node's ID; forwards original `at` |
+| Sweep | `src/node.zig`, every 60 s | `sweepRevocations(4)`: the 4 peers closest to this node's ID; forwards original `at` |
 | Undo | `--trust` a fresh ticket | Re-pairing clears the tombstone (`clearRevocation`) |
 
 A node that accepts a revocation saves the store at once if the outcome was `.applied` (duplicates are not re-saved), immediately closes any live sessions with the revoked device via `closePeer`, and later pushes it preserving the original timestamp `at` under its own signature.

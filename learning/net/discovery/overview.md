@@ -47,7 +47,7 @@ graph LR
     In["incoming PING"] --> RT
 ```
 
-*   **Bootstrap** (`Node.bootstrap` in `src/root.zig`): connects to each
+*   **Bootstrap** (`Node.bootstrap` in `src/node.zig`): connects to each
     `bootstrap_peers` entry (up to 5 attempts, 1 s apart), sends `PING` and
     `DIAL_BACK` ([Chapter 1.6](../transport/nat.md)).
 *   **LAN** (`discovery.Node.onDiscovery`): an announced, unknown node ID is
@@ -73,7 +73,7 @@ device's node ID when it isn't in the routing table
 
 ## 6. Maintenance
 
-After bootstrap, `runBootstrap` (`src/root.zig`):
+After bootstrap, `runBootstrap` (`src/node.zig`):
 
 | Task | When |
 | :--- | :--- |

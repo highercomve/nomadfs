@@ -51,7 +51,7 @@ no TLS or crypto libraries. The app adds Oriel.
 | **Cluster** | `src/cluster/` | Distribution: where each block comes from (the fetcher), who holds what, who keeps each swarm file (placement), copying (the keeper). |
 | **Folders** | `src/fs/` | Shared folders and the filestore, the swarm folder CRDT, the FUSE mount. |
 | **Devices** | `src/device/` | Ed25519 identity, the trust store, pairing tickets, invites, key rotation. |
-| **Node** | `src/root.zig`, `src/main.zig` | Wires everything together; the command line. |
+| **Node** | `src/node.zig`, `src/main.zig` | Wires everything together; the command line. |
 | **Mobile** | `src/mobile/` | A C ABI (`libnomadfs`) and Swift bindings. |
 | **App** | `nomadfs-gui/` | The desktop and Android app, built with Oriel. |
 
@@ -144,7 +144,7 @@ the code today.
 ## 5. Getting Started with the Code
 
 If you are reading the source alongside this book, start here:
-*   `src/root.zig`: the `Node`, which creates and connects every part.
+*   `src/node.zig`: the `Node`, which creates and connects every part.
 *   `src/main.zig`: the command line (`--share`, `--invite`, `--mount`, …).
 *   `src/config.zig`: the `nomadfs.conf` parser. The file is read from the
     current folder, `~/.nomadfs/` or `/etc/nomadfs/`.

@@ -107,7 +107,7 @@ someone else's reply are not.
 
 Every bucket records `last_updated`, set whenever `add` runs on it.
 `discovery.Node.refreshBuckets()` (called every 60 s by `runBootstrap` in
-`src/root.zig`) looks up `randomIdInBucket(i)` for every bucket not updated
+`src/node.zig`) looks up `randomIdInBucket(i)` for every bucket not updated
 for an hour (3600 s). That repopulates quiet regions of the ID space.
 
 ## 6. Other Operations

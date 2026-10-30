@@ -126,8 +126,8 @@ of changed code elsewhere. `atlas.json` has every finding with `file` and `line`
 | `thick_frontend` | One service per feature | Reported only when a front-end function both branches heavily and calls the core, so it is usually logic another front end will need. |
 | `duplicate_shape` | One service per feature, domain language | A front-end struct copying a core struct field for field (e.g. the app's `DeviceInfo` and `node_info.Info`) means the front end is re-describing the core's data. |
 | `duplicate_function`, `duplicate_fragment`, `parallel_implementation` | Reuse | Verified accurate: bodies equal apart from local names and literals. Say which layer should own the one copy. Short `info` fragments are often config parsing or test helpers. |
-| `long_function`, `complex_function`, `large_file` | Power of 10 rule 4, cohesion | Generic functions that return a type count as one long function. |
-| `unused_pub` | Cleanups (low) | Counts names only. Reflection (`Commands`) and `export fn` are excluded or muted. |
+| `long_function`, `complex_function`, `large_file` | Power of 10 rule 4, cohesion | Generic types (`fn Table(T) type`) are measured method by method. |
+| `unused_pub` | Cleanups (low) | Counts names across the whole repo, tests included. Reflection (`Commands`) is muted; `export fn` and std hooks are skipped. |
 
 Before suggesting a new helper, search `zig-out/atlas/api.md` for an existing
 one. An accepted exception is muted in the source with

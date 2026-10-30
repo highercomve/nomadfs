@@ -120,7 +120,7 @@ same rounds with `FIND_VALUE` (`lookupValueWorker`). A reply is either:
 
 | Caller | Purpose |
 | :--- | :--- |
-| `runBootstrap` (`src/root.zig`) | one self-lookup after the bootstrap peers, to fill the buckets near our ID |
+| `runBootstrap` (`src/node.zig`) | one self-lookup after the bootstrap peers, to fill the buckets near our ID |
 | `refreshBuckets` | a random ID in each bucket idle for an hour |
 | `BlockManager.findPeer` (`src/cluster/block_manager.zig`) | the node ID of a device to reach (a share's owner, a swarm file's author) when it isn't in the table |
 | `addProvider`, `findProviders`, `closestFor` | run `lookup(key)` on a CID first, then send `ADD_PROVIDER` / `GET_PROVIDERS` to (or return) the K closest peers now in the table. These serve the `BlockManager` put/get path |

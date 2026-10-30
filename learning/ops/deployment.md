@@ -81,7 +81,7 @@ same `swarm_key` and each other's address in `bootstrap_peers`.
 
 ## 3. What Starts When the Node Runs
 
-`Node.init` (`src/root.zig`) in order:
+`Node.init` (`src/node.zig`) in order:
 
 1. `ConnectionManager` with the transport key (`node.key`, created on first
    run, mode `0600`), and its reaper thread.

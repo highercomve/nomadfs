@@ -21,7 +21,7 @@ Top-level namespaces exported by `src/root.zig`:
 | `metrics` | an unwired metrics collector ([Chapter 8.3](../ops/observability.md)) |
 | `Node` | the orchestrator below |
 
-## 1. `Node` (`src/root.zig`)
+## 1. `Node` (`src/node.zig`)
 
 ```zig
 pub const Node = struct {

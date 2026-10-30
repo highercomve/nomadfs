@@ -22,7 +22,7 @@ There is no preference list, no removal of nodes and no hand-over on churn.
 
 ## 2. How the Node Uses It
 
-`src/root.zig` creates a `HashRing` and, when storage is enabled, adds **only the local node**, with **10** tokens. No other node is ever added, and `getNode` has no caller. The ring has no effect on where data goes.
+`src/node.zig` creates a `HashRing` and, when storage is enabled, adds **only the local node**, with **10** tokens. No other node is ever added, and `getNode` has no caller. The ring has no effect on where data goes.
 
 ## 3. Where Placement Actually Happens
 

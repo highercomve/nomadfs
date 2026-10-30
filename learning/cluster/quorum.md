@@ -15,7 +15,7 @@ pub fn isWriteSatisfied(config: QuorumConfig, successful_writes: u8) bool;
 pub fn isReadSatisfied(config: QuorumConfig, successful_reads: u8) bool; // never called
 ```
 
-`src/root.zig` builds the `BlockManager` with `.quorum = .{ .W = cfg.storage.write_quorum }`. `N` and `R` keep their defaults and nothing reads them.
+`src/node.zig` builds the `BlockManager` with `.quorum = .{ .W = cfg.storage.write_quorum }`. `N` and `R` keep their defaults and nothing reads them.
 
 ## 2. What `W` Counts
 

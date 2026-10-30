@@ -2,7 +2,7 @@
 
 Every way of running NomadFS, whether the command line, the desktop app, the
 Android app or the C library, runs the same core: the `Node` in
-`src/root.zig`. This chapter shows what a `Node` contains, how it starts,
+`src/node.zig`. This chapter shows what a `Node` contains, how it starts,
 and who drives it.
 
 ## 1. The `Node`

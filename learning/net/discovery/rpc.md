@@ -19,7 +19,7 @@ stream.close()              ──FIN──▶     stream.close()
 
 *   One request and at most one reply per [Yamux stream](../transport/yamux.md),
     each bounded by `rpc_timeout_ms = 10_000`. `DIAL_BACK` has no reply.
-*   `Node.serve(conn)` is the connection handler set in `src/root.zig`. It
+*   `Node.serve(conn)` is the connection handler set in `src/node.zig`. It
     loops on `acceptStream()` and runs each request on its own thread, which
     holds its own reference to the connection.
 *   **Handler concurrency cap & draining**: concurrent handlers are capped at

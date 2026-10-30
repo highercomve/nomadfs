@@ -123,7 +123,7 @@ shows both under **About → Read cache**, with the limit as a setting. The C AB
 ### Blocks stored before the cache existed
 
 Before 0.2.0 every fetched block went into the kept area. On its first start a 0.2.0 node sorts them
-once (`Node.sortLegacyCache`, `src/root.zig`): after every share's first scan has finished, however
+once (`Node.sortLegacyCache`, `src/node.zig`): after every share's first scan has finished, however
 long that takes (a share whose folder is gone and so never gets a root is given up on after 30 minutes),
 it collects the blocks reachable from its shares' roots and from the swarm folder files it wrote or
 backed up (`walk.addStoredReachable`, which reads stored block files only, never a shared file), and

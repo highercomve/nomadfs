@@ -29,7 +29,7 @@ A router that accepted a mapping may still not be reachable (carrier-grade
 NAT, ISP firewalls, double NAT). `DIAL_BACK` is a request to check.
 
 ### The flow
-1.  `Node.connectBootstrapPeer` (`src/root.zig`) connects to each configured
+1.  `Node.connectBootstrapPeer` (`src/node.zig`) connects to each configured
     bootstrap peer and sends a `PING` coherence check.
 2.  It then calls `discovery.Node.checkReachability(conn)`, which opens a
     stream and sends **`DIAL_BACK { port }`** with this node's listening port.

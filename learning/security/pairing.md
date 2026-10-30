@@ -295,7 +295,7 @@ clears the tombstone. Propagation happens on two paths
 - **On dial**: after a verified `PING`/`PONG` on a connection this node
   opened, `pushRevocations` sends every tombstone it holds, preserving each
   tombstone's original `at` timestamp.
-- **Sweep**: the maintenance loop in `src/root.zig` calls
+- **Sweep**: the maintenance loop in `src/node.zig` calls
   `sweepRevocations(4)` every 60 seconds, which dials the 4 peers closest to
   this node's ID in the routing table and replays every tombstone.
 
