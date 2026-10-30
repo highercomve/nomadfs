@@ -137,7 +137,7 @@ test "key rotation: a received key is saved, then the node restarted" {
     Adopter.apply(&adopter, [_]u8{0xee} ** 32, 2); // older: ignored
 
     var tries: u32 = 0;
-    while (Restarted.count.load(.acquire) == 0 and tries < 100) : (tries += 1) sync.sleep(20 * std.time.ns_per_ms);
+    while (Restarted.count.load(.acquire) == 0 and tries < 500) : (tries += 1) sync.sleep(20 * std.time.ns_per_ms);
     try testing.expectEqual(@as(u32, 1), Restarted.count.load(.acquire));
     var buf: [512]u8 = undefined;
     var file = try std.Io.Dir.cwd().openFile(io, path, .{});

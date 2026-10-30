@@ -35,10 +35,13 @@ pub const SwarmFolder = struct {
     self_name: []u8,
     /// Where the manifest is kept between runs.
     file_path: []u8,
-    /// Guards `manifest`, `pending_save` and the sync counters.
+    /// Guards `manifest`, `dirty` and the sync counters.
     mutex: sync.Mutex = .{},
-    /// The manifest encoded by the last edit, not written yet (flushSave).
-    pending_save: ?[]u8 = null,
+    /// Edited since the last write (flushSave).
+    dirty: bool = false,
+    /// When the manifest was last written (monotonic ms); writes are at
+    /// most one a second, so copying many files doesn't rewrite it each.
+    written_ms: i64 = 0,
     /// Serialises manifest writes; taken before `mutex`, never inside it.
     save_mutex: sync.Mutex = .{},
     manifest: Manifest,
@@ -100,7 +103,7 @@ pub const SwarmFolder = struct {
 
     pub fn destroy(self: *SwarmFolder) void {
         self.stop();
-        self.flushSave(); // an edit still unwritten
+        self.writeIfDirty(true); // an edit still unwritten
         self.backup_enabled.store(false, .release);
         self.backed_up.deinit(self.allocator);
         self.manifest.deinit();
@@ -138,34 +141,52 @@ pub const SwarmFolder = struct {
         std.Io.Dir.cwd().rename(self.file_path, std.Io.Dir.cwd(), corrupt_path, self.io) catch {};
     }
 
-    /// Caller holds `mutex`. Encodes the manifest for flushSave, which the
-    /// caller runs after unlocking (`defer self.flushSave()` before the
-    /// lock): the disk write doesn't hold up readdir and lookups.
+    /// Caller holds `mutex`. Marks the manifest for writing; flushSave,
+    /// which the caller runs after unlocking (`defer self.flushSave()`
+    /// before the lock), writes it.
     fn saveLocked(self: *SwarmFolder) !void {
-        self.manifest.pruneTombstones(self.now());
-        const bytes = try self.manifest.encode(self.allocator);
-        errdefer self.allocator.free(bytes);
-        if (bytes.len > manifest_mod.max_bytes) return error.ManifestTooLarge;
-        if (self.pending_save) |old| self.allocator.free(old); // superseded
-        self.pending_save = bytes;
+        self.dirty = true;
     }
 
-    /// Writes the latest encoded manifest, if any: temp file, then renamed
-    /// into place. `save_mutex` keeps writes in encode order (whoever
-    /// writes takes the newest). A failed write is logged; the next save
-    /// writes everything again.
+    /// Writes the manifest if it changed and the last write was a second
+    /// ago or more; else the folder's thread writes it shortly (flushDue).
     fn flushSave(self: *SwarmFolder) void {
+        self.writeIfDirty(false);
+    }
+
+    /// Writes an edited manifest now (shutdown), or when a second has
+    /// passed since the last write. Encoded under `mutex`, written outside
+    /// it, in order (`save_mutex`). A failed write is logged and retried
+    /// on the next one.
+    fn writeIfDirty(self: *SwarmFolder, now_or_never: bool) void {
         self.save_mutex.lock();
         defer self.save_mutex.unlock();
+        const at = sync.monotonicMillis();
         const bytes = blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
-            const b = self.pending_save orelse return;
-            self.pending_save = null;
+            if (!self.dirty) return;
+            if (!now_or_never and at - self.written_ms < 1000) return;
+            self.manifest.pruneTombstones(self.now());
+            const b = self.manifest.encode(self.allocator) catch |err| {
+                std.debug.print("swarm: encoding the manifest failed: {any}\n", .{err});
+                return;
+            };
+            self.dirty = false;
             break :blk b;
         };
         defer self.allocator.free(bytes);
-        self.writeManifest(bytes) catch |err| std.debug.print("swarm: saving the manifest failed: {any}\n", .{err});
+        self.written_ms = at;
+        if (bytes.len > manifest_mod.max_bytes) {
+            std.debug.print("swarm: the manifest is over {d} bytes; not saved\n", .{manifest_mod.max_bytes});
+            return;
+        }
+        self.writeManifest(bytes) catch |err| {
+            std.debug.print("swarm: saving the manifest failed: {any}\n", .{err});
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.dirty = true; // try again with the next write
+        };
     }
 
     fn writeManifest(self: *SwarmFolder, bytes: []const u8) !void {
@@ -548,13 +569,16 @@ pub const SwarmFolder = struct {
             defer self.allocator.free(bytes);
             reached += 1;
             if (bytes.len == 0) continue;
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            changed += self.manifest.mergeEncoded(bytes) catch |err| {
+            // Parsed outside the lock: reads through the mount don't wait on it.
+            var parsed = Manifest.parse(self.allocator, bytes) catch |err| {
                 std.debug.print("swarm: {x}'s manifest can't be merged: {any}\n", .{ peer.bytes[0..4], err });
                 failed += 1;
                 continue;
             };
+            defer parsed.deinit();
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            changed += self.manifest.mergeParsed(&parsed);
         }
         defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
@@ -591,6 +615,7 @@ pub const SwarmFolder = struct {
         while (self.running.load(.acquire)) {
             sync.sleep(step);
             waited += step;
+            self.flushSave(); // edits batched in the last second
             if (waited < self.sync_interval_ns) continue;
             waited = 0;
             _ = self.syncNow() catch {};

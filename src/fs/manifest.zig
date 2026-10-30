@@ -374,15 +374,36 @@ pub const Manifest = struct {
     /// Merges every entry of an encoded manifest. Returns how many changed
     /// something. Entries that fail validation are skipped.
     pub fn mergeEncoded(self: *Manifest, bytes: []const u8) !usize {
+        var parsed = try parse(self.allocator, bytes);
+        defer parsed.deinit();
+        return self.mergeParsed(&parsed);
+    }
+
+    /// A peer's manifest, decoded but not merged yet: parsing needs no
+    /// lock on the manifest it goes into (mergeParsed does).
+    pub const Parsed = struct {
+        arena: std.heap.ArenaAllocator,
+        wire: []WireEntry,
+
+        pub fn deinit(self: *Parsed) void {
+            self.arena.deinit();
+        }
+    };
+
+    pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Parsed {
         if (bytes.len > max_bytes) return error.ManifestTooLarge;
-        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        const wire = std.json.parseFromSliceLeaky([]WireEntry, arena, bytes, .{ .ignore_unknown_fields = true }) catch
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena_state.deinit();
+        const wire = std.json.parseFromSliceLeaky([]WireEntry, arena_state.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch
             return error.InvalidManifest;
         if (wire.len > max_entries) return error.InvalidManifest;
+        return .{ .arena = arena_state, .wire = wire };
+    }
+
+    /// Merges a parsed manifest; returns how many entries changed.
+    pub fn mergeParsed(self: *Manifest, parsed: *const Parsed) usize {
         var changed: usize = 0;
-        for (wire) |w| {
+        for (parsed.wire) |w| {
             const entry = fromWire(w) catch continue;
             if (self.merge(entry) catch false) changed += 1;
         }
