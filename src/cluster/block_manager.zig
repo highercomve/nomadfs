@@ -192,6 +192,11 @@ pub const BlockManager = struct {
         return allocator.dupe(u8, bytes);
     }
 
+    /// The swarm manifest digest `peer` last announced in a ping, or null.
+    pub fn peerSwarmDigest(self: *BlockManager, peer: NodeID) ?[32]u8 {
+        return self.dht_node.peerSwarmDigest(peer);
+    }
+
     /// The trust store the handshakes check, if any.
     pub fn trustStore(self: *BlockManager) ?*@import("../device/trust.zig").Store {
         return self.dht_node.trust_store;

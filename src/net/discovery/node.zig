@@ -13,6 +13,8 @@ const device_trust = @import("../../device/trust.zig");
 const device_rotation = @import("../../device/rotation.zig");
 const identity_mod = @import("../../device/identity.zig");
 const policy_mod = @import("../../device/policy.zig");
+const gossip = @import("gossip.zig");
+const relay_service = @import("relay_service.zig");
 
 /// Bounds on values peers can STORE here. Without them any peer could fill
 /// our memory with arbitrary values.
@@ -98,7 +100,7 @@ pub const Node = struct {
     discovery_dials: std.AutoHashMapUnmanaged(id.NodeID, i64) = .empty,
 
     pub const max_handlers = 256;
-    const max_recent_peers = 1024;
+    pub const max_recent_peers = 1024;
 
     /// Produces this node's share listing (an encoded dir block, owned by
     /// the caller) on demand. Type-erased so the DHT does not depend on the
@@ -139,7 +141,7 @@ pub const Node = struct {
         count: usize = 0,
 
         pub const max_peer_roles = 256;
-        const RoleEntry = struct { id: id.NodeID, roles: u8, heard_ms: i64 };
+        const RoleEntry = struct { id: id.NodeID, roles: u8, swarm: [32]u8, heard_ms: i64 };
     };
 
     /// Turns one announced role bit (rpc.Roles) on or off. The next PING
@@ -154,22 +156,25 @@ pub const Node = struct {
     }
 
     /// Records `roles` for an authenticated peer (PING or PONG heard).
-    fn recordPeerRoles(self: *Node, peer: id.NodeID, roles: u8) void {
+    /// Records what an authenticated peer said about itself (PING or PONG
+    /// heard): its roles and its swarm manifest digest.
+    fn recordPeerRoles(self: *Node, peer: id.NodeID, roles: u8, swarm: [32]u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.recordPeerRolesLocked(peer, roles, sync.monotonicMillis());
+        self.recordPeerRolesLocked(peer, roles, swarm, sync.monotonicMillis());
     }
 
-    fn recordPeerRolesLocked(self: *Node, peer: id.NodeID, roles: u8, now: i64) void {
+    fn recordPeerRolesLocked(self: *Node, peer: id.NodeID, roles: u8, swarm: [32]u8, now: i64) void {
         for (self.peer_roles.entries[0..self.peer_roles.count]) |*e| {
             if (e.id.eql(peer)) {
                 e.roles = roles;
+                e.swarm = swarm;
                 e.heard_ms = now;
                 return;
             }
         }
         if (self.peer_roles.count < PeerRoles.max_peer_roles) {
-            self.peer_roles.entries[self.peer_roles.count] = .{ .id = peer, .roles = roles, .heard_ms = now };
+            self.peer_roles.entries[self.peer_roles.count] = .{ .id = peer, .roles = roles, .swarm = swarm, .heard_ms = now };
             self.peer_roles.count += 1;
             return;
         }
@@ -178,7 +183,7 @@ pub const Node = struct {
         for (self.peer_roles.entries, 0..) |e, i| {
             if (e.heard_ms < self.peer_roles.entries[victim].heard_ms) victim = i;
         }
-        self.peer_roles.entries[victim] = .{ .id = peer, .roles = roles, .heard_ms = now };
+        self.peer_roles.entries[victim] = .{ .id = peer, .roles = roles, .swarm = swarm, .heard_ms = now };
     }
 
     /// A peer's announced roles, or null when it hasn't been heard since
@@ -190,6 +195,24 @@ pub const Node = struct {
             if (e.id.eql(peer)) return e.roles;
         }
         return null;
+    }
+
+    /// The swarm manifest digest a peer last announced, or null when it
+    /// hasn't been heard (or has no swarm folder).
+    pub fn peerSwarmDigest(self: *Node, peer: id.NodeID) ?[32]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.peer_roles.entries[0..self.peer_roles.count]) |e| {
+            if (e.id.eql(peer)) return if (std.mem.eql(u8, &e.swarm, &rpc.no_swarm)) null else e.swarm;
+        }
+        return null;
+    }
+
+    /// This node's swarm manifest digest, for its PINGs and PONGs.
+    fn announcedSwarm(self: *Node) [32]u8 {
+        const source = self.swarm_source orelse return rpc.no_swarm;
+        const f = source.digestFn orelse return rpc.no_swarm;
+        return f(source.ctx);
     }
 
     /// Copies up to `out.len` known peer IDs (the routing table).
@@ -331,7 +354,7 @@ pub const Node = struct {
 
         const msg = rpc.Message{
             .sender_id = self.manager.node_id,
-            .payload = .{ .PING = .{ .port = self.manager.bound_port, .announced = self.announced(), .roles = self.announcedRoles() } },
+            .payload = .{ .PING = .{ .port = self.manager.bound_port, .announced = self.announced(), .roles = self.announcedRoles(), .swarm = self.announcedSwarm() } },
         };
 
         try msg.send(self.allocator, stream);
@@ -344,7 +367,7 @@ pub const Node = struct {
         // Record the ID the handshake authenticated, not the claimed one.
         const peer_id = conn.getRemoteNodeID();
         if (!response.sender_id.eql(peer_id)) return error.PeerIdMismatch;
-        self.recordPeerRoles(peer_id, response.payload.PONG.roles);
+        self.recordPeerRoles(peer_id, response.payload.PONG.roles, response.payload.PONG.swarm);
 
         var info = kbucket.PeerInfo{
             .id = peer_id,
@@ -371,13 +394,13 @@ pub const Node = struct {
         // which devices we stopped trusting.
         if (self.trust_store) |trust| {
             if (trust.revocationCount() > 0) {
-                _ = self.pushRevocations(conn) catch {};
+                _ = gossip.pushRevocations(self, conn) catch {};
             }
             // And which devices belong to the swarm: pairing with one member
             // makes a device a member everywhere.
-            if (trust.count() > 0) _ = self.pushAdmissions(conn) catch {};
+            if (trust.count() > 0) _ = gossip.pushAdmissions(self, conn) catch {};
             // And the swarm's settings, only when this peer lacks some.
-            _ = self.pushPolicy(conn) catch {};
+            _ = gossip.pushPolicy(self, conn) catch {};
         }
     }
 
@@ -731,29 +754,6 @@ pub const Node = struct {
         }
     }
 
-    /// Hands `new_key` (epoch) to `conn`'s peer, signed with this device's
-    /// identity. Returns whether the peer adopted it. Only call this for a
-    /// connection whose device is trusted: the key travels to whoever it is.
-    pub fn sendRotation(self: *Node, conn: network.Connection, new_key: [32]u8, epoch: u64) !bool {
-        const identity = self.device_identity orelse return error.NoDeviceIdentity;
-        const signature = try identity.sign(&device_rotation.message(epoch, new_key));
-        const stream = try conn.openStream();
-        defer stream.close();
-        stream.setTimeout(self.rpc_timeout_ms);
-        const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .ROTATE_KEY = .{
-            .epoch = epoch,
-            .new_key = new_key,
-            .signer_key = identity.publicKey(),
-            .signature = signature,
-        } } };
-        try msg.send(self.allocator, stream);
-        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
-        defer response.deinit(self.allocator);
-        return switch (response.payload) {
-            .STORE_ACK => |ack| ack.stored,
-            else => error.InvalidResponse,
-        };
-    }
 
     /// Asks `conn`'s peer for its swarm folder manifest (caller-owned,
     /// allocated with the node's allocator; validate by merging it).
@@ -775,122 +775,10 @@ pub const Node = struct {
         }
     }
 
-    /// Signs and pushes `device`'s revocation to `conn`'s peer. Fails when
-    /// this node has no device identity to sign with.
-    pub fn sendRevoke(self: *Node, conn: network.Connection, device_id: id.NodeID) !bool {
-        if (self.trust_store) |trust| {
-            const tombstones = try trust.copyRevocations(self.allocator);
-            defer self.allocator.free(tombstones);
-            for (tombstones) |r| {
-                if (r.device_id.eql(device_id)) return self.sendRevokeAt(conn, device_id, r.at);
-            }
-        }
-        const now = std.math.cast(u64, sync.timestamp()) orelse return error.InvalidTimestamp;
-        return self.sendRevokeAt(conn, device_id, now);
-    }
 
-    fn sendRevokeAt(self: *Node, conn: network.Connection, device_id: id.NodeID, at: u64) !bool {
-        const identity = self.device_identity orelse return error.NoDeviceIdentity;
-        const signed = device_trust.revocationMessage(device_id, identity.deviceId(), at);
-        const stream = try conn.openStream();
-        defer stream.close();
-        stream.setTimeout(self.rpc_timeout_ms);
 
-        const signature = try identity.sign(&signed);
 
-        const msg = rpc.Message{
-            .sender_id = self.manager.node_id,
-            .payload = .{ .REVOKE = .{ .device_id = device_id, .signer_key = identity.publicKey(), .at = at, .signature = signature } },
-        };
-        try msg.send(self.allocator, stream);
 
-        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
-        defer response.deinit(self.allocator);
-        switch (response.payload) {
-            .STORE_ACK => |ack| return ack.stored,
-            else => return error.InvalidResponse,
-        }
-    }
-
-    /// Sends every tombstone this node holds to `conn`'s peer, so a newly
-    /// connected peer learns which devices were removed elsewhere. Returns
-    /// how many peers honored them. No-op without tombstones or an identity.
-    pub fn pushRevocations(self: *Node, conn: network.Connection) !usize {
-        const trust = self.trust_store orelse return 0;
-        if (self.device_identity == null) return 0;
-        const tombstones = try trust.copyRevocations(self.allocator);
-        defer self.allocator.free(tombstones);
-
-        var honored: usize = 0;
-        for (tombstones) |r| {
-            const ok = self.sendRevokeAt(conn, r.device_id, r.at) catch |err| {
-                std.debug.print("Failed to push revocation of {x}: {any}\n", .{ r.device_id.bytes[0..4], err });
-                continue;
-            };
-            if (ok) honored += 1;
-        }
-        return honored;
-    }
-
-    /// Sends every policy record to `conn`'s peer, unless it acknowledged
-    /// this exact set before: a change costs one message per record per
-    /// peer, an unchanged policy nothing. Returns how many it took.
-    pub fn pushPolicy(self: *Node, conn: network.Connection) !usize {
-        const policy = self.policy orelse return 0;
-        const peer = conn.getRemoteDeviceID() orelse return 0;
-        const digest = policy.digest();
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (self.policy_sent.get(peer)) |d| if (d == digest) return 0;
-        }
-        const records = try policy.records(self.allocator);
-        defer self.allocator.free(records);
-        if (records.len == 0) return 0;
-        var taken: usize = 0;
-        for (records) |r| {
-            const stream = conn.openStream() catch break;
-            defer stream.close();
-            stream.setTimeout(self.rpc_timeout_ms);
-            const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .POLICY = .{ .record = r.encode() } } };
-            msg.send(self.allocator, stream) catch break;
-            const response = rpc.Message.deserialize(self.allocator, stream.reader()) catch break;
-            defer response.deinit(self.allocator);
-            switch (response.payload) {
-                .STORE_ACK => |ack| if (ack.stored) {
-                    taken += 1;
-                },
-                else => break,
-            }
-        }
-        // Remembered only when every record was acknowledged.
-        if (taken == records.len) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (self.policy_sent.count() >= 256) self.policy_sent.clearRetainingCapacity();
-            self.policy_sent.put(self.allocator, peer, digest) catch {};
-        }
-        return taken;
-    }
-
-    /// POLICY: a signed swarm setting; applied when newer, acknowledged
-    /// when not older-and-invalid (device/policy.zig).
-    fn handlePolicy(self: *Node, stream: network.Stream, bytes: [policy_mod.Record.encoded_len]u8) !void {
-        var stored = false;
-        if (self.policy) |policy| if (self.trust_store) |trust| if (self.device_identity) |identity| {
-            if (policy_mod.Record.decode(&bytes)) |r| {
-                const now = std.math.cast(u64, sync.timestamp()) orelse 0;
-                const outcome = policy.apply(r, trust, identity.deviceId(), now) catch .rejected;
-                stored = outcome != .rejected;
-                if (outcome == .applied) {
-                    policy.save() catch |err| std.debug.print("policy: not saved: {any}\n", .{err});
-                    if (self.on_policy_change) |cb| cb.func(cb.ctx);
-                }
-            } else |_| {}
-        };
-        const response = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .STORE_ACK = .{ .stored = stored } } };
-        try response.send(self.allocator, stream);
-    }
 
     pub const AdmitSent = struct {
         digest: u64,
@@ -900,155 +788,14 @@ pub const Node = struct {
 
         /// Seconds before the same list is sent again: rarely once taken (a
         /// peer may have lost its store), sooner when some were refused.
-        fn retryAfter(self: AdmitSent) i64 {
+        pub fn retryAfter(self: AdmitSent) i64 {
             return if (self.complete) 6 * 60 * 60 else 10 * 60;
         }
     };
 
-    /// Signs and sends this node's vouch for `entry` (ADMIT): `entry` is a
-    /// member here, admitted at `entry.added_at`.
-    fn sendAdmit(self: *Node, conn: network.Connection, entry: device_trust.Entry) !bool {
-        const identity = self.device_identity orelse return error.NoDeviceIdentity;
-        const label = entry.labelSlice();
-        const signed = device_trust.admissionMessage(entry.public_key, entry.transport_key, label, entry.added_at, identity.deviceId());
-        var admit: rpc.Admit = .{
-            .public_key = entry.public_key,
-            .transport_key = entry.transport_key,
-            .at = entry.added_at,
-            .signer_key = identity.publicKey(),
-            .signature = try identity.sign(&signed),
-        };
-        @memcpy(admit.label[0..label.len], label);
-        admit.label_len = @intCast(label.len);
 
-        const stream = try conn.openStream();
-        defer stream.close();
-        stream.setTimeout(self.rpc_timeout_ms);
-        const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .ADMIT = admit } };
-        try msg.send(self.allocator, stream);
-        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
-        defer response.deinit(self.allocator);
-        switch (response.payload) {
-            .STORE_ACK => |ack| return ack.stored,
-            else => return error.InvalidResponse,
-        }
-    }
 
-    /// Vouches for every member this node trusts to `conn`'s peer. A peer
-    /// that trusts this node adds the ones it doesn't know. Returns how many
-    /// it took. Entries without a pinned transport key are not sent.
-    pub fn pushAdmissions(self: *Node, conn: network.Connection) !usize {
-        const trust = self.trust_store orelse return 0;
-        if (self.device_identity == null) return 0;
-        const entries = try trust.copyEntries(self.allocator);
-        defer self.allocator.free(entries);
-        const peer = conn.getRemoteDeviceID();
-        var hasher = std.hash.Wyhash.init(0);
-        for (entries) |e| {
-            hasher.update(&e.device_id.bytes);
-            hasher.update(std.mem.asBytes(&e.added_at));
-        }
-        const digest = hasher.final();
-        const now = sync.timestamp();
-        if (peer) |p| {
-            self.mutex.lock();
-            const fresh = if (self.admit_sent.get(p)) |last| last.digest == digest and now -| last.at < last.retryAfter() else false;
-            self.mutex.unlock();
-            if (fresh) return 0;
-        }
 
-        var taken: usize = 0;
-        var sent: usize = 0;
-        for (entries) |e| {
-            if (std.mem.eql(u8, &e.transport_key, &device_trust.no_transport_key)) continue;
-            // The peer itself needs no vouch for itself.
-            if (peer) |p| if (p.eql(e.device_id)) continue;
-            sent += 1;
-            const ok = self.sendAdmit(conn, e) catch |err| {
-                std.debug.print("Failed to vouch for {x}: {any}\n", .{ e.device_id.bytes[0..4], err });
-                continue;
-            };
-            if (ok) taken += 1;
-        }
-        // Remembered either way: a peer that refused some vouches (it
-        // doesn't trust this node yet, or its store is full) hears the list
-        // again after a while, not on every ping.
-        if (peer) |p| {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (self.admit_sent.count() >= 256) self.admit_sent.clearRetainingCapacity();
-            self.admit_sent.put(self.allocator, p, .{ .digest = digest, .at = now, .complete = taken == sent }) catch {};
-        }
-        return taken;
-    }
-
-    /// Anti-entropy for membership: vouches for every member to a sample of
-    /// known peers, so a device that joined through another member learns
-    /// the rest of the swarm even when nobody dials it.
-    pub fn sweepAdmissions(self: *Node, sample: usize) !usize {
-        const trust = self.trust_store orelse return 0;
-        if (trust.count() == 0 or self.device_identity == null) return 0;
-        self.mutex.lock();
-        const maybe_peers = self.routing_table.getClosestPeers(self.manager.node_id, sample) catch |err| {
-            self.mutex.unlock();
-            return err;
-        };
-        self.mutex.unlock();
-        const peers = maybe_peers;
-        defer self.allocator.free(peers);
-        var reached: usize = 0;
-        for (peers) |peer| {
-            const conn = self.manager.connectToPeerMulti(peer.addresses[0..peer.addrs_count], self.swarm_key, peer.id) catch continue;
-            defer conn.deinit();
-            if ((self.pushAdmissions(conn) catch 0) > 0) reached += 1;
-            _ = self.pushPolicy(conn) catch {};
-        }
-        return reached;
-    }
-
-    /// Anti-entropy for revocations: connects to a sample of known peers
-    /// and replays every tombstone we hold, so peers that never dialed us
-    /// still learn which devices were removed. Returns how many peers
-    /// accepted at least one revocation.
-    pub fn sweepRevocations(self: *Node, sample: usize) !usize {
-        const trust = self.trust_store orelse return 0;
-        const tombstones = try trust.copyRevocations(self.allocator);
-        defer self.allocator.free(tombstones);
-        if (tombstones.len == 0 or self.device_identity == null) return 0;
-
-        self.mutex.lock();
-        const maybe_peers = self.routing_table.getClosestPeers(self.manager.node_id, sample) catch |err| {
-            self.mutex.unlock();
-            return err;
-        };
-        self.mutex.unlock();
-        const peers = maybe_peers;
-        defer self.allocator.free(peers);
-
-        var accepted: usize = 0;
-        for (peers) |peer| {
-            const conn = self.manager.connectToPeerMulti(
-                peer.addresses[0..peer.addrs_count],
-                self.swarm_key,
-                peer.id,
-            ) catch |err| {
-                std.debug.print("Revocation sweep: {x} unreachable: {any}\n", .{ peer.id.bytes[0..4], err });
-                continue;
-            };
-            defer conn.deinit();
-
-            var any_honored = false;
-            for (tombstones) |r| {
-                const ok = self.sendRevokeAt(conn, r.device_id, r.at) catch |err| {
-                    std.debug.print("Revocation sweep: push to {x} failed: {any}\n", .{ peer.id.bytes[0..4], err });
-                    continue;
-                };
-                if (ok) any_honored = true;
-            }
-            if (any_honored) accepted += 1;
-        }
-        return accepted;
-    }
 
     // Returns either the value (allocated) or closer peers (allocated)
     pub const FindValueResult = union(enum) {
@@ -1238,6 +985,60 @@ pub const Node = struct {
         }
     }
 
+
+    // ---- Relaying (relay_service.zig) ----
+
+    /// Streams one node pipes at once.
+    pub const max_relays = 32;
+    /// After no relay reached a device (usually: it's off), dials to it
+    /// don't ask relays again for this long.
+    pub const relay_retry_ms: i64 = 60_000;
+    /// Bound on a relay setting a connection up (it may dial the target).
+    pub const relay_setup_timeout_ms: u32 = 15_000;
+
+
+    // ---- Membership news (gossip.zig) and relaying (relay_service.zig) ----
+
+    pub fn sweepRevocations(self: *Node, sample: usize) !usize {
+        return gossip.sweepRevocations(self, sample);
+    }
+
+    pub fn sendRevoke(self: *Node, conn: network.Connection, device_id: id.NodeID) !bool {
+        return gossip.sendRevoke(self, conn, device_id);
+    }
+
+    pub fn pushPolicy(self: *Node, conn: network.Connection) !usize {
+        return gossip.pushPolicy(self, conn);
+    }
+
+    pub fn pushAdmissions(self: *Node, conn: network.Connection) !usize {
+        return gossip.pushAdmissions(self, conn);
+    }
+
+    pub fn dialThroughRelay(self: *Node, target: id.NodeID) !network.Connection {
+        return relay_service.dialThroughRelay(self, target);
+    }
+
+    pub fn enableRelay(self: *Node) void {
+        return relay_service.enableRelay(self);
+    }
+
+    pub fn setSwarmEpoch(self: *Node, epoch: u64) void {
+        return gossip.setSwarmEpoch(self, epoch);
+    }
+
+    pub fn sweepAdmissions(self: *Node, sample: usize) !usize {
+        return gossip.sweepAdmissions(self, sample);
+    }
+
+    pub fn pushRevocations(self: *Node, conn: network.Connection) !usize {
+        return gossip.pushRevocations(self, conn);
+    }
+
+    pub fn sendRotation(self: *Node, conn: network.Connection, new_key: [32]u8, epoch: u64) !bool {
+        return gossip.sendRotation(self, conn, new_key, epoch);
+    }
+
     pub fn serve(self: *Node, conn: network.Connection) !void {
         _ = conn.getRemoteNodeID();
 
@@ -1290,7 +1091,7 @@ pub const Node = struct {
         // NOTE: We do NOT add the peer here anymore. We wait for PING to get the correct port.
 
         switch (msg.payload) {
-            .PING => |p| try self.handlePing(stream, conn, msg.sender_id, p.port, p.roles, p.announced.slice()),
+            .PING => |p| try self.handlePing(stream, conn, msg.sender_id, p.port, p.roles, p.swarm, p.announced.slice()),
             .FIND_NODE => |p| try self.respondCloserPeers(stream, p.target, .find_node),
             .FIND_VALUE => |p| try self.handleFindValue(stream, p.key),
             .STORE => |p| try self.handleStore(stream, p.key, p.value),
@@ -1298,18 +1099,18 @@ pub const Node = struct {
             .GET_SHARES => try self.handleGetShares(stream),
             .GET_SWARM => |p| try self.handleGetSwarm(stream, p.have),
             .GET_NODE_INFO => try self.handleGetNodeInfo(stream, conn),
-            .ROTATE_KEY => |p| try self.handleRotateKey(stream, conn, p.epoch, p.new_key, p.signer_key, p.signature),
-            .REVOKE => |p| try self.handleRevoke(stream, p.device_id, p.signer_key, p.at, p.signature),
-            .ADMIT => |p| try self.handleAdmit(stream, p),
-            .POLICY => |p| try self.handlePolicy(stream, p.record),
+            .ROTATE_KEY => |p| try gossip.handleRotateKey(self, stream, conn, p.epoch, p.new_key, p.signer_key, p.signature),
+            .REVOKE => |p| try gossip.handleRevoke(self, stream, p.device_id, p.signer_key, p.at, p.signature),
+            .ADMIT => |p| try gossip.handleAdmit(self, stream, p),
+            .POLICY => |p| try gossip.handlePolicy(self, stream, p.record),
             .ADD_PROVIDER => |p| try self.handleAddProvider(stream, conn, p.key),
             .GET_PROVIDERS => |p| try self.handleGetProviders(stream, p.key),
             .DIAL_BACK => |p| try self.handleDialBack(conn, p.port),
             .RELAY_CONNECT => |p| {
-                self.handleRelayConnect(stream, conn, p.target);
+                relay_service.handleRelayConnect(self, stream, conn, p.target);
                 return true;
             },
-            .RELAY_INCOMING => |p| return self.handleRelayIncoming(stream, conn, p.from),
+            .RELAY_INCOMING => |p| return relay_service.handleRelayIncoming(self, stream, conn, p.from),
             else => {
                 std.debug.print("Received unhandled DHT message type: {any}\n", .{msg.payload});
             },
@@ -1317,198 +1118,22 @@ pub const Node = struct {
         return false;
     }
 
-    // ---- Relaying (transport/relay.zig) ----
 
-    /// Streams one node pipes at once.
-    pub const max_relays = 32;
-    /// After no relay reached a device (usually: it's off), dials to it
-    /// don't ask relays again for this long.
-    const relay_retry_ms: i64 = 60_000;
-    /// Bound on a relay setting a connection up (it may dial the target).
-    const relay_setup_timeout_ms: u32 = 15_000;
 
-    /// Lets the connection manager reach devices through others when none
-    /// of their addresses answers. Call once the node has its final address.
-    pub fn enableRelay(self: *Node) void {
-        self.manager.relay_dialer = .{ .ctx = self, .dialFn = dialThroughRelayErased };
-    }
 
-    fn dialThroughRelayErased(ctx: *anyopaque, target: id.NodeID) anyerror!network.Connection {
-        const self: *Node = @ptrCast(@alignCast(ctx));
-        return self.dialThroughRelay(target);
-    }
 
-    /// Asks each device this one is connected to to pipe a stream to
-    /// `target`, and runs the connection over the first that does.
-    /// Returns a reference the caller must deinit().
-    pub fn dialThroughRelay(self: *Node, target: id.NodeID) !network.Connection {
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            pruneRecent(&self.relay_misses, sync.monotonicMillis());
-            if (self.relay_misses.get(target)) |until| {
-                if (sync.monotonicMillis() < until) return error.NoRelay;
-            }
-        }
-        const conn = self.dialThroughRelayOnce(target) catch |err| {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            const now = sync.monotonicMillis();
-            pruneRecent(&self.relay_misses, now);
-            if (self.relay_misses.count() < max_recent_peers) {
-                self.relay_misses.put(self.allocator, target, now + relay_retry_ms) catch {};
-            }
-            return err;
-        };
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        _ = self.relay_misses.remove(target);
-        return conn;
-    }
 
-    fn dialThroughRelayOnce(self: *Node, target: id.NodeID) !network.Connection {
-        const conns = try self.manager.liveConnections(self.allocator);
-        defer {
-            for (conns) |c| c.deinit();
-            self.allocator.free(conns);
-        }
-        for (conns) |via| {
-            if (via.getRemoteNodeID().eql(target)) continue;
-            if (via.getPeerAddress().isUnspecified()) continue; // relays don't chain
-            const stream = via.openStream() catch continue;
-            if (!self.requestRelay(stream, target)) {
-                stream.close();
-                continue;
-            }
-            via.retain();
-            const conn = relay.establish(self.allocator, stream, via, self.swarm_key, self.manager.identity_key, true, self.manager.handshake_timeout_ms, self.manager.deviceAuthPtr()) catch |err| {
-                std.debug.print("relay: handshake with {x} through {x} failed: {any}\n", .{ target.bytes[0..4], via.getRemoteNodeID().bytes[0..4], err });
-                continue;
-            };
-            if (!conn.getRemoteNodeID().eql(target)) {
-                conn.deinit();
-                continue;
-            }
-            std.debug.print("relay: reached {x} through {x}\n", .{ target.bytes[0..4], via.getRemoteNodeID().bytes[0..4] });
-            // One reference for the manager, one for the caller.
-            conn.retain();
-            self.manager.addConnection(conn) catch conn.deinit();
-            return conn;
-        }
-        return error.NoRelay;
-    }
 
-    /// RELAY_CONNECT on `stream`; true when the relay answered ok.
-    fn requestRelay(self: *Node, stream: network.Stream, target: id.NodeID) bool {
-        stream.setTimeout(relay_setup_timeout_ms);
-        const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .RELAY_CONNECT = .{ .target = target } } };
-        msg.send(self.allocator, stream) catch return false;
-        // Older nodes don't know RELAY_CONNECT: they close the stream.
-        const reply = rpc.Message.deserialize(self.allocator, stream.reader()) catch return false;
-        defer reply.deinit(self.allocator);
-        return reply.payload == .RELAY_ACK and reply.payload.RELAY_ACK.ok;
-    }
 
-    fn sendRelayAck(self: *Node, stream: network.Stream, ok: bool) !void {
-        const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .RELAY_ACK = .{ .ok = ok } } };
-        try msg.send(self.allocator, stream);
-    }
 
-    /// RELAY_CONNECT from `conn`'s device: pipes `stream` to `target` until
-    /// either end closes. Takes ownership of `stream`. Only devices of the
-    /// swarm can ask (the connection is authenticated), and the target is
-    /// reached directly, never through another relay.
-    fn handleRelayConnect(self: *Node, stream: network.Stream, conn: network.Connection, target: id.NodeID) void {
-        const from = conn.getRemoteNodeID();
-        const out = self.openRelayStream(from, target) orelse {
-            self.sendRelayAck(stream, false) catch {};
-            stream.close();
-            return;
-        };
-        defer _ = self.active_relays.fetchSub(1, .acq_rel);
-        defer out.via.deinit();
-        self.sendRelayAck(stream, true) catch {
-            stream.close();
-            out.stream.close();
-            return;
-        };
-        std.debug.print("relay: piping {x} to {x}\n", .{ from.bytes[0..4], target.bytes[0..4] });
-        relay.splice(stream, out.stream);
-        std.debug.print("relay: {x} to {x} closed\n", .{ from.bytes[0..4], target.bytes[0..4] });
-    }
 
-    const RelayOut = struct { stream: network.Stream, via: network.Connection };
 
-    /// A stream to `target` that it accepted for `from` (RELAY_INCOMING),
-    /// counted in active_relays; null if it can't be had.
-    fn openRelayStream(self: *Node, from: id.NodeID, target: id.NodeID) ?RelayOut {
-        if (target.eql(self.manager.node_id) or target.eql(from)) return null;
-        if (self.active_relays.fetchAdd(1, .acq_rel) >= max_relays) {
-            _ = self.active_relays.fetchSub(1, .acq_rel);
-            return null;
-        }
-        var counted = true;
-        defer if (counted) {
-            _ = self.active_relays.fetchSub(1, .acq_rel);
-        };
-
-        const via = self.manager.existingConnection(target) orelse blk: {
-            const peer = peer: {
-                self.mutex.lock();
-                defer self.mutex.unlock();
-                break :peer self.routing_table.getPeer(target);
-            } orelse return null;
-            break :blk self.manager.connectDirect(peer.addresses[0..peer.addrs_count], self.swarm_key, target) catch return null;
-        };
-        if (via.getPeerAddress().isUnspecified()) {
-            via.deinit(); // relayed itself: relays don't chain
-            return null;
-        }
-        const stream = via.openStream() catch {
-            via.deinit();
-            return null;
-        };
-        stream.setTimeout(relay_setup_timeout_ms);
-        const ok = blk: {
-            const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .RELAY_INCOMING = .{ .from = from } } };
-            msg.send(self.allocator, stream) catch break :blk false;
-            const reply = rpc.Message.deserialize(self.allocator, stream.reader()) catch break :blk false;
-            defer reply.deinit(self.allocator);
-            break :blk reply.payload == .RELAY_ACK and reply.payload.RELAY_ACK.ok;
-        };
-        if (!ok) {
-            stream.close();
-            via.deinit();
-            return null;
-        }
-        counted = false;
-        return .{ .stream = stream, .via = via };
-    }
-
-    /// RELAY_INCOMING: `from` connects to this node through `conn`'s
-    /// device over `stream`. Returns whether the stream was taken.
-    fn handleRelayIncoming(self: *Node, stream: network.Stream, conn: network.Connection, from: id.NodeID) bool {
-        self.sendRelayAck(stream, true) catch return false;
-        conn.retain();
-        const relayed = relay.establish(self.allocator, stream, conn, self.swarm_key, self.manager.identity_key, false, self.manager.handshake_timeout_ms, self.manager.deviceAuthPtr()) catch |err| {
-            std.debug.print("relay: handshake with {x} failed: {any}\n", .{ from.bytes[0..4], err });
-            return true;
-        };
-        if (!relayed.getRemoteNodeID().eql(from)) {
-            relayed.deinit();
-            return true;
-        }
-        std.debug.print("relay: {x} connected through {x}\n", .{ from.bytes[0..4], conn.getRemoteNodeID().bytes[0..4] });
-        self.manager.addConnection(relayed) catch relayed.deinit();
-        return true;
-    }
-
-    fn handlePing(self: *Node, stream: network.Stream, conn: network.Connection, claimed_id: id.NodeID, port: u16, roles: u8, announced_addrs: []const network.Address) !void {
+    fn handlePing(self: *Node, stream: network.Stream, conn: network.Connection, claimed_id: id.NodeID, port: u16, roles: u8, swarm: [32]u8, announced_addrs: []const network.Address) !void {
         // The handshake authenticated the connection; a PING may not claim
         // another node's identity (or ours) to plant it in the routing table.
         const sender_id = conn.getRemoteNodeID();
         if (!claimed_id.eql(sender_id)) return error.PeerIdMismatch;
-        self.recordPeerRoles(sender_id, roles);
+        self.recordPeerRoles(sender_id, roles, swarm);
 
         // If we receive an INCOMING ping, it means we are reachable!
         self.is_public.store(true, .release);
@@ -1535,7 +1160,7 @@ pub const Node = struct {
 
         const response = rpc.Message{
             .sender_id = self.manager.node_id,
-            .payload = .{ .PONG = .{ .port = self.manager.bound_port, .announced = self.announced(), .roles = self.announcedRoles() } },
+            .payload = .{ .PONG = .{ .port = self.manager.bound_port, .announced = self.announced(), .roles = self.announcedRoles(), .swarm = self.announcedSwarm() } },
         };
         try response.send(self.allocator, stream);
     }
@@ -1667,32 +1292,8 @@ pub const Node = struct {
         try response.send(self.allocator, stream);
     }
 
-    pub fn setSwarmEpoch(self: *Node, epoch: u64) void {
-        self.rotation_mutex.lock();
-        defer self.rotation_mutex.unlock();
-        self.swarm_epoch = epoch;
-    }
 
-    fn handleRotateKey(self: *Node, stream: network.Stream, conn: network.Connection, epoch: u64, new_key: [32]u8, signer_key: [32]u8, signature: [64]u8) !void {
-        const accepted = self.applyRotation(conn.getRemoteDeviceID(), epoch, new_key, signer_key, signature);
-        const response = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .STORE_ACK = .{ .stored = accepted } } };
-        try response.send(self.allocator, stream);
-    }
 
-    fn applyRotation(self: *Node, peer_device: ?id.NodeID, epoch: u64, new_key: [32]u8, signer_key: [32]u8, signature: [64]u8) bool {
-        self.rotation_mutex.lock();
-        defer self.rotation_mutex.unlock();
-        if (epoch == std.math.maxInt(u64)) return false;
-        const trust = self.trust_store orelse return false;
-        const sink = self.rotation_sink orelse return false;
-        device_rotation.verify(trust, peer_device, signer_key, signature, epoch, new_key, self.swarm_epoch) catch |err| {
-            std.debug.print("Refused a swarm key rotation: {any}\n", .{err});
-            return false;
-        };
-        self.swarm_epoch = epoch;
-        sink.applyFn(sink.ctx, new_key, epoch);
-        return true;
-    }
 
     fn handleGetSwarm(self: *Node, stream: network.Stream, have: [32]u8) !void {
         const same = if (self.swarm_source) |source| (if (source.digestFn) |f| std.mem.eql(u8, &f(source.ctx), &have) else false) else false;
@@ -1708,58 +1309,7 @@ pub const Node = struct {
     }
 
 
-    /// REVOKE: only honored when the signature verifies, the signer is not
-    /// the revoked device, and the signer's Ed25519 identity is in this
-    /// node's own trust store. Everything else is refused, never applied.
-    fn handleRevoke(
-        self: *Node,
-        stream: network.Stream,
-        device_id: id.NodeID,
-        signer_key: [32]u8,
-        at: u64,
-        signature: [64]u8,
-    ) !void {
-        var honored = false;
-        if (self.trust_store) |trust| {
-            const now = std.math.cast(u64, sync.timestamp()) orelse return error.InvalidTimestamp;
-            // The entry goes with the revocation: read its transport key first.
-            const transport_key: ?[32]u8 = if (trust.lookup(device_id)) |e| e.transport_key else null;
-            const outcome = device_trust.applyRevocation(trust, device_id, signer_key, at, signature, now) catch .rejected;
-            honored = outcome != .rejected;
-            if (outcome == .applied) {
-                _ = self.manager.closePeer(device_id);
-                // It stops being a holder too (cluster/holders.zig).
-                if (self.revocation_sink) |sink| sink.revokedFn(sink.ctx, device_id, transport_key);
-            }
-            // Accepted tombstones must survive a restart, or every re-dial
-            // replays the whole revocation.
-            if (outcome == .applied) trust.save() catch |err| {
-                std.debug.print("Failed to persist accepted revocation: {any}\n", .{err});
-            };
-        }
-        const response = rpc.Message{
-            .sender_id = self.manager.node_id,
-            .payload = .{ .STORE_ACK = .{ .stored = honored } },
-        };
-        try response.send(self.allocator, stream);
-    }
 
-    /// ADMIT: a member vouches for a device. Added when this node trusts
-    /// the signer and doesn't know the device (device_trust.applyAdmission).
-    fn handleAdmit(self: *Node, stream: network.Stream, admit: rpc.Admit) !void {
-        var taken = false;
-        if (self.trust_store) |trust| {
-            const self_id = if (self.device_identity) |identity| identity.deviceId() else id.NodeID{ .bytes = [_]u8{0} ** 32 };
-            const now = std.math.cast(u64, sync.timestamp()) orelse return error.InvalidTimestamp;
-            const outcome = device_trust.applyAdmission(trust, admit.public_key, admit.transport_key, admit.labelSlice(), admit.at, admit.signer_key, admit.signature, self_id, now) catch .rejected;
-            taken = outcome != .rejected;
-            if (outcome == .applied) trust.save() catch |err| {
-                std.debug.print("Failed to persist a new swarm member: {any}\n", .{err});
-            };
-        }
-        const response = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .STORE_ACK = .{ .stored = taken } } };
-        try response.send(self.allocator, stream);
-    }
 
     fn handleFindValue(self: *Node, stream: network.Stream, key: id.NodeID) !void {
         // Copy under the lock: the stored slice may be replaced concurrently.
@@ -1802,7 +1352,7 @@ pub const Node = struct {
 };
 
 // Remove expired entries without allocating or invalidating a live iterator.
-fn pruneRecent(map: *std.AutoHashMapUnmanaged(id.NodeID, i64), now: i64) void {
+pub fn pruneRecent(map: *std.AutoHashMapUnmanaged(id.NodeID, i64), now: i64) void {
     var stale: [Node.max_recent_peers]id.NodeID = undefined;
     var count: usize = 0;
     var it = map.iterator();
@@ -1916,7 +1466,7 @@ test "concurrent rotations apply an epoch once and reject the maximum epoch" {
             self.count += 1;
         }
         fn run(n: *Node, signer: identity_mod.Identity, sig: [64]u8) void {
-            _ = n.applyRotation(signer.deviceId(), 5, [_]u8{7} ** 32, signer.publicKey(), sig);
+            _ = gossip.applyRotation(n, signer.deviceId(), 5, [_]u8{7} ** 32, signer.publicKey(), sig);
         }
     };
     var sink = Sink{};
@@ -1933,7 +1483,7 @@ test "concurrent rotations apply an epoch once and reject the maximum epoch" {
     const count = sink.count;
     try std.testing.expectEqual(@as(usize, 1), count);
     const max_sig = try peer.sign(&device_rotation.message(std.math.maxInt(u64), key));
-    try std.testing.expect(!node.applyRotation(peer.deviceId(), std.math.maxInt(u64), key, peer.publicKey(), max_sig));
+    try std.testing.expect(!gossip.applyRotation(&node, peer.deviceId(), std.math.maxInt(u64), key, peer.publicKey(), max_sig));
 }
 
 /// Only a socket equal to a dial candidate proves that candidate was used.

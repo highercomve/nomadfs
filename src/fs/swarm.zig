@@ -526,15 +526,20 @@ pub const SwarmFolder = struct {
         var reached: u32 = 0;
         var failed: u32 = 0;
         for (peers) |peer| {
-            const conn = bm.connectTo(peer) catch continue; // offline: not a failure
-            defer conn.deinit();
-            // A peer with the same content answers with nothing: a quiet
-            // swarm costs a digest per peer per round, not the manifest.
             const have = blk: {
                 self.mutex.lock();
                 defer self.mutex.unlock();
                 break :blk self.manifest.digest();
             };
+            // Its pings say it has the same content: nothing to ask, so a
+            // quiet swarm costs no traffic at all here.
+            if (bm.peerSwarmDigest(peer)) |theirs| if (std.mem.eql(u8, &theirs, &have)) {
+                reached += 1;
+                continue;
+            };
+            const conn = bm.connectTo(peer) catch continue; // offline: not a failure
+            defer conn.deinit();
+            // Asked anyway, a peer with the same content answers with nothing.
             const bytes = bm.swarmManifest(self.allocator, conn, have) catch |err| {
                 std.debug.print("swarm: no manifest from {x}: {any}\n", .{ peer.bytes[0..4], err });
                 failed += 1;
@@ -717,6 +722,7 @@ pub const SwarmFolder = struct {
         defer self.mutex.unlock();
         self.backup_mutex.lock();
         defer self.backup_mutex.unlock();
+        self.pruneBackedUpLocked(allocator);
         for (self.manifest.entries.values()) |e| {
             if (out.items.len >= max) break;
             if (e.deleted or e.kind != .file or self.backed_up.contains(e.cid)) continue;
@@ -839,6 +845,25 @@ pub const SwarmFolder = struct {
         defer self.backup_mutex.unlock();
         var i: usize = 0;
         while (i < bytes.len) : (i += 32) try self.backed_up.put(self.allocator, bytes[i..][0..32].*, {});
+    }
+
+    /// Forgets copies of content no live file has any more, so the list
+    /// stays within the manifest's size. Caller holds `mutex` and
+    /// `backup_mutex`. Best effort: without memory it keeps the list.
+    fn pruneBackedUpLocked(self: *SwarmFolder, allocator: std.mem.Allocator) void {
+        var live: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+        defer live.deinit(allocator);
+        for (self.manifest.entries.values()) |e| {
+            if (e.deleted or e.kind != .file) continue;
+            live.put(allocator, e.cid, {}) catch return;
+        }
+        var gone: std.ArrayList([32]u8) = .empty;
+        defer gone.deinit(allocator);
+        var it = self.backed_up.keyIterator();
+        while (it.next()) |cid| if (!live.contains(cid.*)) gone.append(allocator, cid.*) catch return;
+        if (gone.items.len == 0) return;
+        for (gone.items) |cid| _ = self.backed_up.remove(cid);
+        self.unsaved += 1; // written with the next progress save
     }
 
     /// Caller holds `backup_mutex`. Temp file, then rename.

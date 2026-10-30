@@ -115,12 +115,14 @@ pub const Roles = struct {
 };
 
 pub const MessagePayload = union(MessageType) {
-    PING: struct { port: u16, announced: Announced = .{}, roles: u8 = 0 },
+    /// `swarm`: the sender's swarm folder manifest digest (zeros: none), so
+    /// peers fetch its manifest only when it differs from theirs.
+    PING: struct { port: u16, announced: Announced = .{}, roles: u8 = 0, swarm: [32]u8 = no_swarm },
     /// `port`: where the responder listens. A PING can travel over a
     /// connection the responder opened, whose source port is not that.
     /// Sent last, so 0.3.2 and older read the rest and ignore it; null
     /// from them.
-    PONG: struct { announced: Announced = .{}, port: ?u16 = null, roles: u8 = 0 },
+    PONG: struct { announced: Announced = .{}, port: ?u16 = null, roles: u8 = 0, swarm: [32]u8 = no_swarm },
     FIND_NODE: struct { target: id.NodeID },
     FIND_NODE_RESPONSE: struct { closer_peers: []kbucket.PeerInfo },
     FIND_VALUE: struct { key: id.NodeID },
@@ -206,11 +208,13 @@ pub const Message = struct {
                 try writer.writeInt(u16, p.port, .big);
                 try writeAnnounced(p.announced, writer);
                 try writer.writeByte(p.roles);
+                try writer.writeAll(&p.swarm);
             },
             .PONG => |p| {
                 try writeAnnounced(p.announced, writer);
                 if (p.port) |port| try writer.writeInt(u16, port, .big);
                 try writer.writeByte(p.roles);
+                try writer.writeAll(&p.swarm);
             },
             .FIND_NODE => |p| {
                 try writer.writeAll(&p.target.bytes);
@@ -313,14 +317,22 @@ pub const Message = struct {
                 const announced = try readAnnounced(reader);
                 // Before 0.3.3 the message ends here; roles arrive last.
                 const roles: u8 = reader.readByte() catch 0;
-                break :blk MessagePayload{ .PING = .{ .port = port, .announced = announced, .roles = roles } };
+                var swarm: [32]u8 = no_swarm;
+                reader.readNoEof(&swarm) catch {
+                    swarm = no_swarm;
+                };
+                break :blk MessagePayload{ .PING = .{ .port = port, .announced = announced, .roles = roles, .swarm = swarm } };
             },
             .PONG => blk: {
                 const announced = try readAnnounced(reader);
                 // Older nodes end the reply here and close the stream.
                 const port: ?u16 = reader.readInt(u16, .big) catch null;
                 const roles: u8 = reader.readByte() catch 0;
-                break :blk MessagePayload{ .PONG = .{ .announced = announced, .port = port, .roles = roles } };
+                var swarm: [32]u8 = no_swarm;
+                reader.readNoEof(&swarm) catch {
+                    swarm = no_swarm;
+                };
+                break :blk MessagePayload{ .PONG = .{ .announced = announced, .port = port, .roles = roles, .swarm = swarm } };
             },
             .FIND_NODE => blk: {
                 var target: id.NodeID = undefined;
@@ -575,6 +587,9 @@ fn valueLenMax(len: usize, max: usize) !u32 {
 /// caps its manifest below this (checked in node.zig).
 pub const max_swarm_len = 64 * 1024 * 1024;
 
+/// PING/PONG `swarm` when the sender has no swarm folder.
+pub const no_swarm = [_]u8{0} ** 32;
+
 /// The largest NODE_INFO (node_info.zig encodes within it).
 pub const max_node_info_len = 1024;
 
@@ -757,19 +772,20 @@ test "rpc: PONG carries the listening port, and reads without it from older node
 
     var buf = TestBuffer{ .allocator = allocator };
     defer buf.list.deinit(allocator);
-    try (Message{ .sender_id = sender, .payload = .{ .PONG = .{ .announced = announced, .port = 7865, .roles = Roles.swarm_backup | Roles.metered } } }).serialize(buf.writer());
+    try (Message{ .sender_id = sender, .payload = .{ .PONG = .{ .announced = announced, .port = 7865, .roles = Roles.swarm_backup | Roles.metered, .swarm = [_]u8{9} ** 32 } } }).serialize(buf.writer());
     const pong = try Message.deserialize(allocator, buf.reader());
     defer pong.deinit(allocator);
     try std.testing.expectEqual(@as(?u16, 7865), pong.payload.PONG.port);
     try std.testing.expectEqual(@as(u8, 1), pong.payload.PONG.announced.count);
     try std.testing.expectEqual(Roles.swarm_backup | Roles.metered, pong.payload.PONG.roles);
+    try std.testing.expectEqual([_]u8{9} ** 32, pong.payload.PONG.swarm);
 
     // 0.3.2 and older: the addresses, then the stream ends.
     var old = TestBuffer{ .allocator = allocator };
     defer old.list.deinit(allocator);
     try (Message{ .sender_id = sender, .payload = .{ .PONG = .{ .announced = announced } } }).serialize(old.writer());
-    // The roles byte is trailing: an old peer's message ends before it.
-    old.list.items.len -= 1;
+    // The roles byte and the swarm digest trail: an old peer's message ends before them.
+    old.list.items.len -= 1 + 32; // roles and swarm digest
     const old_pong = try Message.deserialize(allocator, old.reader());
     defer old_pong.deinit(allocator);
     try std.testing.expectEqual(@as(?u16, null), old_pong.payload.PONG.port);
@@ -786,7 +802,7 @@ test "rpc: PONG carries the listening port, and reads without it from older node
     try std.testing.expectEqual(Roles.metered, ping.payload.PING.roles);
 
     try (Message{ .sender_id = sender, .payload = .{ .PING = .{ .port = 7865, .announced = announced } } }).serialize(old.writer());
-    old.list.items.len -= 1;
+    old.list.items.len -= 1 + 32; // roles and swarm digest
     const old_ping = try Message.deserialize(allocator, old.reader());
     defer old_ping.deinit(allocator);
     try std.testing.expectEqual(@as(u16, 7865), old_ping.payload.PING.port);
