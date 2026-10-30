@@ -177,6 +177,17 @@ pub const Policy = struct {
         return outcome;
     }
 
+    /// Signs whether this device accepts copies, when that changed (or was
+    /// never said), applies it and saves it; the caller spreads it.
+    pub fn setAccepts(self: *Policy, identity: identity_mod.Identity, trust: *trust_mod.Store, on: bool, now: u64) !Outcome {
+        const me = identity.deviceId();
+        if (self.hasAccepts(me) and self.acceptsCopies(me) == on) return .duplicate;
+        const r = try sign(identity, .accepts, me, @intFromBool(on), now);
+        const outcome = try self.apply(r, trust, me, now);
+        if (outcome == .applied) try self.save();
+        return outcome;
+    }
+
     /// Verifies and applies `r` (from a peer or this device). `trust` says
     /// who may sign; `self_device` is this device, always allowed.
     pub fn apply(self: *Policy, r: Record, trust: *trust_mod.Store, self_device: NodeID, now: u64) !Outcome {

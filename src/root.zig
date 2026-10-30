@@ -3,6 +3,7 @@ const std = @import("std");
 
 pub const config = @import("config.zig");
 pub const config_file = @import("config_file.zig");
+pub const settings = @import("settings.zig");
 pub const net = @import("net/mod.zig");
 pub const storage = @import("storage/mod.zig");
 pub const device = @import("device/mod.zig");
@@ -255,15 +256,8 @@ pub const Node = struct {
 
         // This device's say in the swarm's policy: whether it accepts copies
         // (signed again only when it changed), and --copies.
-        const now = nowSeconds();
-        if (policy.acceptsCopies(device_identity.deviceId()) != cfg.storage.accept_copies or !policy.hasAccepts(device_identity.deviceId())) {
-            const r = try device.policy.sign(device_identity, .accepts, device_identity.deviceId(), @intFromBool(cfg.storage.accept_copies), now);
-            if (try policy.apply(r, trust_store, device_identity.deviceId(), now) == .applied) policy.save() catch |err| std.debug.print("policy: not saved: {any}\n", .{err});
-        }
-        if (cfg.storage.set_copies) |n| {
-            const r = try device.policy.sign(device_identity, .copies, .{ .bytes = [_]u8{0} ** 32 }, n, now);
-            if (try policy.apply(r, trust_store, device_identity.deviceId(), now) == .applied) policy.save() catch |err| std.debug.print("policy: not saved: {any}\n", .{err});
-        }
+        _ = policy.setAccepts(device_identity, trust_store, cfg.storage.accept_copies, nowSeconds()) catch |err| std.debug.print("policy: accept_copies not signed: {any}\n", .{err});
+        if (cfg.storage.set_copies) |n| _ = policy.setCopies(device_identity, trust_store, n, nowSeconds()) catch |err| std.debug.print("policy: copies not set: {any}\n", .{err});
 
         const info_provider = try allocator.create(InfoProvider);
         errdefer allocator.destroy(info_provider);
@@ -441,6 +435,37 @@ pub const Node = struct {
         }
         // Signal bootstrap thread to stop if main loop stops
         self.bootstrap_running.store(false, .release);
+    }
+
+    // ---- Settings applied to the running node (settings.zig saves them) ----
+
+    /// Keep a copy of every swarm folder file here, or not; peers learn it
+    /// from the roles in pings.
+    pub fn setSwarmBackup(self: *Node, on: bool) !void {
+        if (self.swarm) |folder| try folder.setBackup(on);
+        self.discovery_node.setRole(net.discovery.rpc.Roles.swarm_backup, on);
+    }
+
+    /// Whether this device keeps copies of other devices' swarm files:
+    /// signed into the swarm's policy (spread on the next pings) and
+    /// announced in the roles.
+    pub fn setAcceptCopies(self: *Node, on: bool) !void {
+        _ = try self.policy.setAccepts(self.device_identity, self.trust_store, on, nowSeconds());
+        self.discovery_node.setRole(net.discovery.rpc.Roles.accepts_copies, on);
+        if (self.keeper) |k| k.wake();
+    }
+
+    /// The swarm's `copies`, signed by this device; the keeper re-plans.
+    pub fn setCopies(self: *Node, n: u8) !void {
+        _ = try self.policy.setCopies(self.device_identity, self.trust_store, n, nowSeconds());
+        if (self.keeper) |k| k.wake();
+    }
+
+    /// The read cache's limit in MiB (0: none).
+    pub fn setCacheLimit(self: *Node, mb: u64) !void {
+        const store = self.store orelse return error.StorageDisabled;
+        const bytes = std.math.mul(u64, mb, 1024 * 1024) catch return error.InvalidLimit;
+        try store.setCacheLimit(if (mb == 0) null else bytes);
     }
 
     /// Binds the listener and returns. The accept and
@@ -791,6 +816,7 @@ test {
         @import("cluster/vectors.zig"),
         @import("config.zig"),
         @import("config_file.zig"),
+        @import("settings.zig"),
         @import("node_info.zig"),
         @import("device/auth.zig"),
         @import("device/identity.zig"),

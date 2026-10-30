@@ -412,19 +412,17 @@ fn cacheCommand(allocator: std.mem.Allocator, config: config_mod.Config, clear: 
         std.debug.print("Storage is disabled in this configuration.\n", .{});
         return;
     }
-    var store = try nomadfs.storage.engine.StorageEngine.init(allocator, config.storage.storage_path);
-    defer store.deinit();
     if (clear) {
-        const freed = try store.clearCache();
+        const freed = try nomadfs.settings.cacheClear(allocator, config, null);
         var buf: [32]u8 = undefined;
         std.debug.print("Cleared the read cache: freed {s}.\n", .{formatBytes(&buf, freed)});
         return;
     }
-    const stats = store.cacheStats();
+    const info = try nomadfs.settings.cacheInfo(allocator, config, null);
     var used_buf: [32]u8 = undefined;
     var limit_buf: [32]u8 = undefined;
-    const limit = if (config.storage.cache_mb == 0) "no limit" else formatBytes(&limit_buf, config.storage.cache_mb * 1024 * 1024);
-    std.debug.print("Read cache: {s} in {d} blocks (limit {s})\n", .{ formatBytes(&used_buf, stats.bytes), stats.blocks, limit });
+    const limit = if (info.limit_mb == 0) "no limit" else formatBytes(&limit_buf, info.limit_mb * 1024 * 1024);
+    std.debug.print("Read cache: {s} in {d} blocks (limit {s})\n", .{ formatBytes(&used_buf, info.bytes), info.blocks, limit });
 }
 
 fn formatBytes(buf: []u8, bytes: u64) []const u8 {

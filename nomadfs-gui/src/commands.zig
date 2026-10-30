@@ -426,6 +426,13 @@ pub fn pairTicket(gpa: std.mem.Allocator, args: PairTicketArgs) !PairTicketResul
 /// The membership service (device/membership.zig): the running node's, so
 /// a change takes effect in the node at once, else one opened from the
 /// configuration. `done` closes what was opened.
+/// The running node, for services that act on it when there is one.
+/// Caller holds g_mutex.
+fn runningNode() ?*nomadfs.Node {
+    const handle = g_node orelse return null;
+    return &handle.node;
+}
+
 const MembershipRef = struct {
     service: *Membership,
     opened: ?*Membership = null,
@@ -1108,13 +1115,10 @@ pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
 /// (`swarm_backup`), and applied to the running node at once.
 pub fn swarmBackupSet(gpa: std.mem.Allocator, args: BackupArgs) !BackupInfo {
     if (!backup_supported) return error.Unsupported;
-    try config_file.setBool(gpa, args.config_path, "swarm_backup", args.on);
     {
         g_mutex.lock();
         defer g_mutex.unlock();
-        if (swarmFolder()) |folder| try folder.setBackup(args.on) else |_| {}
-        // Peers learn the switch through PING and PONG roles.
-        if (g_node) |handle| handle.node.discovery_node.setRole(nomadfs.net.discovery.rpc.Roles.swarm_backup, args.on);
+        try nomadfs.settings.swarmBackup(gpa, args.config_path, runningNode(), args.on);
     }
     return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
 }
@@ -1125,10 +1129,7 @@ pub fn swarmReplicasSet(gpa: std.mem.Allocator, args: SwarmReplicasArgs) !Backup
     {
         g_mutex.lock();
         defer g_mutex.unlock();
-        const handle = g_node orelse return error.NotRunning;
-        const node = &handle.node;
-        _ = try node.policy.setCopies(node.device_identity, node.trust_store, args.replicas, nomadfs.nowSeconds());
-        if (node.keeper) |k| k.wake();
+        try nomadfs.settings.copies(runningNode() orelse return error.NotRunning, args.replicas);
     }
     return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
 }
@@ -1137,17 +1138,10 @@ pub fn swarmReplicasSet(gpa: std.mem.Allocator, args: SwarmReplicasArgs) !Backup
 /// copies of other devices' swarm files. Saved in the config
 /// (`accept_copies`) and signed into the swarm's policy at once.
 pub fn acceptCopiesSet(gpa: std.mem.Allocator, args: AcceptCopiesArgs) !BackupInfo {
-    try config_file.setBool(gpa, args.config_path, "accept_copies", args.on);
     {
         g_mutex.lock();
         defer g_mutex.unlock();
-        if (g_node) |handle| {
-            const node = &handle.node;
-            const now = nomadfs.nowSeconds();
-            const r = try nomadfs.device.policy.sign(node.device_identity, .accepts, node.device_identity.deviceId(), @intFromBool(args.on), now);
-            if (try node.policy.apply(r, node.trust_store, node.device_identity.deviceId(), now) == .applied) try node.policy.save();
-            node.discovery_node.setRole(nomadfs.net.discovery.rpc.Roles.accepts_copies, args.on);
-        }
+        try nomadfs.settings.acceptCopies(gpa, args.config_path, runningNode(), args.on);
     }
     return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
 }
@@ -2086,14 +2080,6 @@ pub const CacheInfo = struct {
 
 pub const CacheLimitArgs = struct { config_path: []const u8, limit_mb: u64 };
 
-/// The running node's store, or the one the config names (closed by the
-/// caller) when no node runs.
-fn withStore(gpa: std.mem.Allocator, config: config_mod.Config, owned: *?nomadfs.storage.engine.StorageEngine) !*nomadfs.storage.engine.StorageEngine {
-    if (g_node) |handle| if (handle.node.store) |s| return s;
-    if (!config.storage.enabled) return error.StorageDisabled;
-    owned.* = try nomadfs.storage.engine.StorageEngine.init(gpa, config.storage.storage_path);
-    return &owned.*.?;
-}
 
 /// `invoke("cache_info", { config_path })`: the read cache's size and limit.
 pub fn cacheInfo(gpa: std.mem.Allocator, args: ListArgs) !CacheInfo {
@@ -2101,10 +2087,8 @@ pub fn cacheInfo(gpa: std.mem.Allocator, args: ListArgs) !CacheInfo {
     defer config.deinit(gpa);
     g_mutex.lock();
     defer g_mutex.unlock();
-    var owned: ?nomadfs.storage.engine.StorageEngine = null;
-    defer if (owned) |*o| o.deinit();
-    const stats = (try withStore(gpa, config, &owned)).cacheStats();
-    return .{ .bytes = stats.bytes, .blocks = stats.blocks, .limit_mb = config.storage.cache_mb };
+    const info = try nomadfs.settings.cacheInfo(gpa, config, runningNode());
+    return .{ .bytes = info.bytes, .blocks = info.blocks, .limit_mb = info.limit_mb };
 }
 
 /// `invoke("cache_clear", { config_path })`: empties the read cache and
@@ -2114,21 +2098,15 @@ pub fn cacheClear(gpa: std.mem.Allocator, args: ListArgs) !u64 {
     defer config.deinit(gpa);
     g_mutex.lock();
     defer g_mutex.unlock();
-    var owned: ?nomadfs.storage.engine.StorageEngine = null;
-    defer if (owned) |*o| o.deinit();
-    return (try withStore(gpa, config, &owned)).clearCache();
+    return nomadfs.settings.cacheClear(gpa, config, runningNode());
 }
 
 /// `invoke("cache_set_limit", { config_path, limit_mb })`: saves `cache_mb`
 /// and applies it to the running node at once (0 = no limit).
 pub fn cacheSetLimit(gpa: std.mem.Allocator, args: CacheLimitArgs) !void {
-    _ = std.math.mul(u64, args.limit_mb, 1024 * 1024) catch return error.InvalidLimit;
-    try config_file.setInt(gpa, args.config_path, "cache_mb", args.limit_mb);
     g_mutex.lock();
     defer g_mutex.unlock();
-    if (g_node) |handle| if (handle.node.store) |s| {
-        try s.setCacheLimit(if (args.limit_mb == 0) null else args.limit_mb * 1024 * 1024);
-    };
+    try nomadfs.settings.cacheLimit(gpa, args.config_path, runningNode(), args.limit_mb);
 }
 
 pub const AboutInfo = struct {
