@@ -366,7 +366,7 @@ pub const ShareIndex = struct {
     }
 
     /// Adapter for discovery Node.share_source.
-    pub fn source(self: *ShareIndex) @import("../net/discovery/node.zig").Node.ShareSource {
+    pub fn source(self: *ShareIndex) @import("../cluster/mod.zig").ShareSource {
         return .{ .ctx = self, .listFn = listingErased };
     }
 

@@ -12,7 +12,7 @@ const cluster = @import("../cluster/mod.zig");
 const device = @import("../device/mod.zig");
 const storage = @import("../storage/mod.zig");
 const NodeID = @import("../net/id.zig").NodeID;
-const ShareSource = @import("../net/discovery/node.zig").Node.ShareSource;
+const ShareSource = cluster.ShareSource;
 const manifest_mod = @import("manifest.zig");
 const remote_mod = @import("remote.zig");
 const tree = @import("tree.zig");
@@ -526,7 +526,7 @@ pub const SwarmFolder = struct {
         var reached: u32 = 0;
         var failed: u32 = 0;
         for (peers) |peer| {
-            const conn = bm.connectTo(peer) catch continue;
+            const conn = bm.connectTo(peer) catch continue; // offline: not a failure
             defer conn.deinit();
             // A peer with the same content answers with nothing: a quiet
             // swarm costs a digest per peer per round, not the manifest.
@@ -535,12 +535,12 @@ pub const SwarmFolder = struct {
                 defer self.mutex.unlock();
                 break :blk self.manifest.digest();
             };
-            const bytes = bm.dht_node.fetchSwarm(conn, have) catch |err| {
+            const bytes = bm.swarmManifest(self.allocator, conn, have) catch |err| {
                 std.debug.print("swarm: no manifest from {x}: {any}\n", .{ peer.bytes[0..4], err });
                 failed += 1;
                 continue;
             };
-            defer bm.dht_node.allocator.free(bytes);
+            defer self.allocator.free(bytes);
             reached += 1;
             if (bytes.len == 0) continue;
             self.mutex.lock();

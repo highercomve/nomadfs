@@ -7,7 +7,6 @@ const kbucket = @import("kbucket.zig");
 const providers_mod = @import("providers.zig");
 const pairing = @import("../../device/pairing.zig");
 const policy_mod = @import("../../device/policy.zig");
-const node_info = @import("../../node_info.zig");
 const codec = @import("../../storage/dag/codec.zig");
 
 /// In-memory target for Message.serialize (Message.send).
@@ -407,7 +406,7 @@ pub const Message = struct {
                 try reader.readNoEof(&record);
                 break :blk MessagePayload{ .POLICY = .{ .record = record } };
             },
-            .NODE_INFO => MessagePayload{ .NODE_INFO = .{ .info = try readValueMax(allocator, reader, node_info.max_len) } },
+            .NODE_INFO => MessagePayload{ .NODE_INFO = .{ .info = try readValueMax(allocator, reader, max_node_info_len) } },
             .ROTATE_KEY => blk: {
                 const epoch = try reader.readInt(u64, .big);
                 var new_key: [32]u8 = undefined;
@@ -575,6 +574,9 @@ fn valueLenMax(len: usize, max: usize) !u32 {
 /// library's manifest is tens of MiB, more than other values. The folder
 /// caps its manifest below this (checked in node.zig).
 pub const max_swarm_len = 64 * 1024 * 1024;
+
+/// The largest NODE_INFO (node_info.zig encodes within it).
+pub const max_node_info_len = 1024;
 
 /// Each message's values are bounded before they're read, so a peer can't
 /// make a handler buffer more than its type allows (256 handlers at the

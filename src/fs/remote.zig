@@ -7,7 +7,6 @@ const std = @import("std");
 const cluster = @import("../cluster/mod.zig");
 const fetcher_mod = @import("../cluster/fetcher.zig");
 const NodeID = @import("../net/id.zig").NodeID;
-const DhtNode = @import("../net/discovery/mod.zig").Node;
 const storage = @import("../storage/mod.zig");
 const sync = @import("../sync.zig");
 const tree = @import("tree.zig");
@@ -76,23 +75,14 @@ pub const Remote = struct {
     /// share's root dir).
     pub fn shares(self: *Remote, allocator: std.mem.Allocator) !Shares {
         const bm = self.block_manager orelse return error.PeerDown;
-        const dht_node = bm.dht_node;
-        const conn = try bm.connectTo(self.peer);
-        defer conn.deinit();
-        const reply = try dht_node.fetchShares(conn);
-        defer dht_node.allocator.free(reply.listing);
-        defer dht_node.allocator.free(reply.nickname);
-
-        const nickname = try allocator.dupe(u8, reply.nickname);
-        errdefer allocator.free(nickname);
-        const device_id = conn.getRemoteDeviceID();
-        const res = Shares{
-            .nickname = nickname,
+        const reply = try bm.shares(allocator, self.peer);
+        defer allocator.free(reply.listing);
+        errdefer allocator.free(reply.nickname);
+        return .{
+            .nickname = reply.nickname,
             .listing = try tree.decodeListing(allocator, reply.listing),
-            .device_id = device_id,
+            .device_id = reply.device_id,
         };
-        if (bm.fetcher) |*f| f.markUp(self.peer);
-        return res;
     }
 };
 
@@ -176,14 +166,7 @@ pub fn sharesOfAll(allocator: std.mem.Allocator, block_manager: *cluster.BlockMa
 
 /// Every peer the routing table knows (caller frees).
 pub fn knownPeers(block_manager: *cluster.BlockManager, allocator: std.mem.Allocator) ![]NodeID {
-    const dht_node = block_manager.dht_node;
-    dht_node.mutex.lock();
-    defer dht_node.mutex.unlock();
-    const peers = try dht_node.routing_table.getAllPeers();
-    defer dht_node.routing_table.allocator.free(peers);
-    const ids = try allocator.alloc(NodeID, peers.len);
-    for (peers, ids) |p, *out| out.* = p.id;
-    return ids;
+    return block_manager.knownPeers(allocator);
 }
 
 

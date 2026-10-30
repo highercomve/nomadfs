@@ -147,6 +147,56 @@ pub const BlockManager = struct {
         return self.net.connectToPeerMulti(peer.addresses[0..peer.addrs_count], self.dht_node.swarm_key, peer_id);
     }
 
+    // ---- What the folder layer (fs) asks of the network ----
+
+    /// Every peer the routing table knows (caller frees).
+    pub fn knownPeers(self: *BlockManager, allocator: std.mem.Allocator) ![]NodeID {
+        const node = self.dht_node;
+        node.mutex.lock();
+        defer node.mutex.unlock();
+        const peers = try node.routing_table.getAllPeers();
+        defer node.routing_table.allocator.free(peers);
+        const ids = try allocator.alloc(NodeID, peers.len);
+        for (peers, ids) |p, *out| out.* = p.id;
+        return ids;
+    }
+
+    pub const SharesReply = struct {
+        nickname: []u8,
+        /// Encoded dir block.
+        listing: []u8,
+        /// The device's authenticated identity, when it presented one.
+        device_id: ?NodeID,
+    };
+
+    /// Asks `peer` which folders it shares (GET_SHARES). Slices allocated
+    /// in `allocator`.
+    pub fn shares(self: *BlockManager, allocator: std.mem.Allocator, peer: NodeID) !SharesReply {
+        const conn = try self.connectTo(peer);
+        defer conn.deinit();
+        const reply = try self.dht_node.fetchShares(conn);
+        defer self.dht_node.allocator.free(reply.listing);
+        defer self.dht_node.allocator.free(reply.nickname);
+        const nickname = try allocator.dupe(u8, reply.nickname);
+        errdefer allocator.free(nickname);
+        const listing = try allocator.dupe(u8, reply.listing);
+        if (self.fetcher) |*f| f.markUp(peer);
+        return .{ .nickname = nickname, .listing = listing, .device_id = conn.getRemoteDeviceID() };
+    }
+
+    /// `conn`'s device's swarm folder manifest unless it matches the digest `have`
+    /// (GET_SWARM; empty then). Allocated in `allocator`.
+    pub fn swarmManifest(self: *BlockManager, allocator: std.mem.Allocator, conn: network.Connection, have: [32]u8) ![]u8 {
+        const bytes = try self.dht_node.fetchSwarm(conn, have);
+        defer self.dht_node.allocator.free(bytes);
+        return allocator.dupe(u8, bytes);
+    }
+
+    /// The trust store the handshakes check, if any.
+    pub fn trustStore(self: *BlockManager) ?*@import("../device/trust.zig").Store {
+        return self.dht_node.trust_store;
+    }
+
     /// A connection to a device already in the routing table, without a DHT
     /// lookup: reads must not wait on the network to find a holder.
     pub fn connectKnown(self: *BlockManager, peer_id: NodeID) !network.Connection {

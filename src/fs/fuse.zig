@@ -718,7 +718,7 @@ pub const Mount = struct {
         const out = self.allocator.alloc([]u8, online_count) catch return;
         defer self.allocator.free(out);
 
-        const trust_store = if (self.block_manager) |bm| bm.dht_node.trust_store else null;
+        const trust_store = if (self.block_manager) |bm| bm.trustStore() else null;
         var trust_entries: std.ArrayList(device_trust.Entry) = .empty;
         defer trust_entries.deinit(self.allocator);
         trust_entries.ensureTotalCapacity(self.allocator, online_count) catch return;

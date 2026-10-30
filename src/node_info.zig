@@ -16,7 +16,7 @@ pub const version = "0.3.3";
 
 pub const format_version: u8 = 1;
 /// Longest encoded info a reader accepts.
-pub const max_len = 1024;
+pub const max_len = @import("net/discovery/rpc.zig").max_node_info_len;
 const max_text = 48;
 
 pub const Info = struct {
