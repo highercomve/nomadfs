@@ -35,8 +35,12 @@ pub const SwarmFolder = struct {
     self_name: []u8,
     /// Where the manifest is kept between runs.
     file_path: []u8,
-    /// Guards `manifest` and the sync counters.
+    /// Guards `manifest`, `pending_save` and the sync counters.
     mutex: sync.Mutex = .{},
+    /// The manifest encoded by the last edit, not written yet (flushSave).
+    pending_save: ?[]u8 = null,
+    /// Serialises manifest writes; taken before `mutex`, never inside it.
+    save_mutex: sync.Mutex = .{},
     manifest: Manifest,
     last_sync: u64 = 0,
     peers_synced: u32 = 0,
@@ -93,6 +97,7 @@ pub const SwarmFolder = struct {
 
     pub fn destroy(self: *SwarmFolder) void {
         self.stop();
+        self.flushSave(); // an edit still unwritten
         self.backup_enabled.store(false, .release);
         self.backed_up.deinit(self.allocator);
         self.manifest.deinit();
@@ -130,12 +135,37 @@ pub const SwarmFolder = struct {
         std.Io.Dir.cwd().rename(self.file_path, std.Io.Dir.cwd(), corrupt_path, self.io) catch {};
     }
 
-    /// Caller holds `mutex`. Written to a temp file and renamed into place.
+    /// Caller holds `mutex`. Encodes the manifest for flushSave, which the
+    /// caller runs after unlocking (`defer self.flushSave()` before the
+    /// lock): the disk write doesn't hold up readdir and lookups.
     fn saveLocked(self: *SwarmFolder) !void {
         self.manifest.pruneTombstones(self.now());
         const bytes = try self.manifest.encode(self.allocator);
-        defer self.allocator.free(bytes);
+        errdefer self.allocator.free(bytes);
         if (bytes.len > manifest_mod.max_bytes) return error.ManifestTooLarge;
+        if (self.pending_save) |old| self.allocator.free(old); // superseded
+        self.pending_save = bytes;
+    }
+
+    /// Writes the latest encoded manifest, if any: temp file, then renamed
+    /// into place. `save_mutex` keeps writes in encode order (whoever
+    /// writes takes the newest). A failed write is logged; the next save
+    /// writes everything again.
+    fn flushSave(self: *SwarmFolder) void {
+        self.save_mutex.lock();
+        defer self.save_mutex.unlock();
+        const bytes = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const b = self.pending_save orelse return;
+            self.pending_save = null;
+            break :blk b;
+        };
+        defer self.allocator.free(bytes);
+        self.writeManifest(bytes) catch |err| std.debug.print("swarm: saving the manifest failed: {any}\n", .{err});
+    }
+
+    fn writeManifest(self: *SwarmFolder, bytes: []const u8) !void {
         const tmp = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.file_path});
         defer self.allocator.free(tmp);
         {
@@ -172,6 +202,7 @@ pub const SwarmFolder = struct {
         const root = try builder.build(&reader);
         defer self.allocator.free(root);
 
+        defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
         _ = try self.manifest.edit(path, .{ .cid = root[0..32].*, .size = reader.offset, .mtime = self.now() }, self.self_id.bytes, self.self_name);
@@ -202,6 +233,7 @@ pub const SwarmFolder = struct {
     pub fn makeDir(self: *SwarmFolder, dir: []const u8, name: []const u8) !void {
         const path = try join(self.allocator, dir, name);
         defer self.allocator.free(path);
+        defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
         _ = try self.manifest.edit(path, .{ .kind = .dir, .mtime = self.now() }, self.self_id.bytes, self.self_name);
@@ -210,6 +242,7 @@ pub const SwarmFolder = struct {
 
     /// Deletes a file, or a folder with everything in it.
     pub fn remove(self: *SwarmFolder, path: []const u8) !void {
+        defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
         const doomed = try self.liveUnderLocked(path);
@@ -241,6 +274,7 @@ pub const SwarmFolder = struct {
         // A folder can't move inside itself.
         if (std.mem.startsWith(u8, new_path, path) and new_path.len > path.len and new_path[path.len] == '/') return error.InvalidPath;
 
+        defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
         const moving = try self.liveUnderLocked(path);
@@ -490,6 +524,7 @@ pub const SwarmFolder = struct {
                 continue;
             };
         }
+        defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
         self.peers_synced = reached;
