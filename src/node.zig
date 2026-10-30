@@ -190,7 +190,10 @@ pub const Node = struct {
         // the same trust store the handshake policy reads.
         discovery_node.trust_store = trust_store;
         // A revoked device stops being a holder too (cluster/holders.zig).
-        discovery_node.revocation_sink = .{ .ctx = block_manager, .revokedFn = cluster.BlockManager.revokedErased };
+        // Every revocation, from a peer, this device or another process on
+        // this config (the disk merge), has the same effect: membershipRevoked.
+        discovery_node.revocation_sink = .{ .ctx = block_manager, .revokedFn = membershipRevoked };
+        trust_store.revoked_hook = .{ .ctx = block_manager, .revokedFn = membershipRevoked };
 
         // A swarm backup device keeps the members' folders marked for
         // backup too (fs/backup.zig); the thread starts with the listener.

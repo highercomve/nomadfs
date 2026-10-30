@@ -185,24 +185,6 @@ pub const BlockManager = struct {
         return node.copyPeerIDs(out);
     }
 
-    /// A device stops holding: drop its records, as holder or as origin.
-    /// `device_id` is a device's identity ID; the trust store (which knows
-    /// the device) maps it to its transport ID, the keys holders are
-    /// recorded under.
-    pub fn forgetPeer(self: *BlockManager, device_id: NodeID) void {
-        var stands = &(self.holders orelse return);
-        stands.forget(device_id);
-        const trust = self.dht_node.trust_store orelse return;
-        const entry = trust.lookup(device_id) orelse return;
-        stands.forget(NodeID.fromPublicKey(entry.transport_key));
-    }
-
-    /// The discovery node's revocation sink: type erased for it.
-    pub fn revokedErased(ctx: *anyopaque, device_id: NodeID) void {
-        const self: *BlockManager = @ptrCast(@alignCast(ctx));
-        self.forgetPeer(device_id);
-    }
-
     fn findPeer(self: *BlockManager, peer_id: NodeID) !dht.kbucket.PeerInfo {
         if (self.knownPeer(peer_id)) |peer| return peer;
         try self.dht_node.lookup(peer_id);

@@ -131,7 +131,8 @@ pub const Node = struct {
     /// Told about an honored revocation (its device ID).
     pub const RevocationSink = struct {
         ctx: *anyopaque,
-        revokedFn: *const fn (ctx: *anyopaque, device_id: id.NodeID) void,
+        /// `transport_key`: the device's pinned one, read before removal.
+        revokedFn: *const fn (ctx: *anyopaque, device_id: id.NodeID, transport_key: ?[32]u8) void,
     };
 
     /// Peers' announced roles, bounded: at most max_peer_roles devices,
@@ -1732,12 +1733,14 @@ pub const Node = struct {
         var honored = false;
         if (self.trust_store) |trust| {
             const now = std.math.cast(u64, sync.timestamp()) orelse return error.InvalidTimestamp;
+            // The entry goes with the revocation: read its transport key first.
+            const transport_key: ?[32]u8 = if (trust.lookup(device_id)) |e| e.transport_key else null;
             const outcome = device_trust.applyRevocation(trust, device_id, signer_key, at, signature, now) catch .rejected;
             honored = outcome != .rejected;
             if (outcome == .applied) {
                 _ = self.manager.closePeer(device_id);
                 // It stops being a holder too (cluster/holders.zig).
-                if (self.revocation_sink) |sink| sink.revokedFn(sink.ctx, device_id);
+                if (self.revocation_sink) |sink| sink.revokedFn(sink.ctx, device_id, transport_key);
             }
             // Accepted tombstones must survive a restart, or every re-dial
             // replays the whole revocation.

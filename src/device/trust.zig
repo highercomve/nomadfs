@@ -314,8 +314,19 @@ pub const Store = struct {
     /// changes it behind the node's back: `syncFromDisk` notices and merges
     /// instead of the next save overwriting it. Guarded by `save_mutex`.
     disk_stamp: ?Stamp = null,
+    /// Told about each device a disk merge revoked, so the node acts on it
+    /// as on any other revocation (closes its connections, forgets it as a
+    /// holder). Called after `mutex` is released. Set before other threads
+    /// use the store.
+    revoked_hook: ?RevokedHook = null,
 
     const Stamp = struct { size: u64, mtime: i96 };
+
+    /// `transport_key`: the device's pinned one, read before it was removed.
+    pub const RevokedHook = struct {
+        ctx: *anyopaque,
+        revokedFn: *const fn (ctx: *anyopaque, device_id: NodeID, transport_key: ?[32]u8) void,
+    };
 
     /// Loads the store at `path`. A missing file is an empty store; a file
     /// that exists but does not parse is an error. Retired v1 files are
@@ -401,23 +412,45 @@ pub const Store = struct {
 
         var disk = try Store.load(self.allocator, self.path, self.signing_seed);
         defer disk.deinit();
+        // Revoked here by the merge, told to the hook once unlocked.
+        var gone: std.ArrayList(Gone) = .empty;
+        defer gone.deinit(self.allocator);
+        const changed = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :blk try self.mergeLocked(&disk, &gone);
+        };
+        self.disk_stamp = disk.disk_stamp;
+        if (self.revoked_hook) |h| for (gone.items) |g| h.revokedFn(h.ctx, g.device_id, g.transport_key);
+        return changed;
+    }
+
+    const Gone = struct { device_id: NodeID, transport_key: ?[32]u8 };
+
+    /// Takes newer revocations and entries from `disk`. Caller holds `mutex`.
+    fn mergeLocked(self: *Store, disk: *Store, gone: *std.ArrayList(Gone)) !bool {
         var changed = false;
-        self.mutex.lock();
-        defer self.mutex.unlock();
         for (disk.revocations.items) |r| {
             if (self.revocationLocked(r.device_id)) |mine| if (mine.at >= r.at) continue;
-            if (self.findLocked(r.device_id)) |e| if (e.added_at >= r.at) continue;
-            _ = try self.revokeDeviceLocked(r.device_id, r.signer_id, r.at);
+            const known = self.findLocked(r.device_id);
+            if (known) |e| if (e.added_at >= r.at) continue;
+            const transport_key: ?[32]u8 = if (known) |e| e.transport_key else null;
+            if (try self.revokeDeviceLocked(r.device_id, r.signer_id, r.at)) try gone.append(self.allocator, .{ .device_id = r.device_id, .transport_key = transport_key });
             changed = true;
         }
         for (disk.entries.items) |e| {
-            if (self.findLocked(e.device_id) != null) continue;
             if (self.revocationLocked(e.device_id)) |r| if (r.at >= e.added_at) continue;
+            if (self.findLocked(e.device_id)) |mine| {
+                // Re-paired from the other process (a fresh ticket): newer wins.
+                if (e.added_at <= mine.added_at and e.ticket_expiry <= mine.ticket_expiry) continue;
+                mine.* = e;
+                changed = true;
+                continue;
+            }
             if (self.entries.items.len >= max_entries) break;
             try self.entries.append(self.allocator, e);
             changed = true;
         }
-        self.disk_stamp = disk.disk_stamp;
         return changed;
     }
 
@@ -1577,6 +1610,30 @@ test "trust store: a running store merges what another process wrote, never over
         _ = try cli.revokeDevice(a.deviceId(), b.deviceId(), 30);
         try cli.save();
     }
+    const Told = struct {
+        var device: ?NodeID = null;
+        var transport: ?[32]u8 = null;
+        fn revoked(_: *anyopaque, device_id: NodeID, transport_key: ?[32]u8) void {
+            device = device_id;
+            transport = transport_key;
+        }
+    };
+    var ctx: u8 = 0;
+    node.revoked_hook = .{ .ctx = &ctx, .revokedFn = Told.revoked };
     try node.save(); // merges before writing
     try testing.expect(!node.isTrusted(a.deviceId()));
+    // The node acts on it as on any revocation, with the key it had pinned.
+    try testing.expect(Told.device.?.eql(a.deviceId()));
+    try testing.expectEqual([_]u8{1} ** 32, Told.transport.?);
+
+    // A --trust refresh written by the command line (a new ticket and transport key) wins
+    // over the node's older entry.
+    {
+        var cli = try Store.load(testing.allocator, path, seed);
+        defer cli.deinit();
+        _ = try cli.upsertInner(b.publicKey(), [_]u8{3} ** 32, "Phone", 40, 1000); // a fresh ticket
+        try cli.save();
+    }
+    try testing.expect(try node.syncFromDisk());
+    try testing.expectEqual([_]u8{3} ** 32, node.lookup(b.deviceId()).?.transport_key);
 }
