@@ -7,7 +7,8 @@
 set -euo pipefail
 bin=${1:-zig-out/bin/nomadfs}
 mode=${2:-serve}
-dir=$(mktemp -d)
+# The real path: macOS lists mounts under /private/var, not /var.
+dir=$(cd "$(mktemp -d)" && pwd -P)
 export HOME="$dir" USERPROFILE="$dir"
 cat > "$dir/smoke.conf" <<CONF
 nickname = "davsmoke"
