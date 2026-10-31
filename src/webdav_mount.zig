@@ -24,9 +24,8 @@ pub const Mount = struct {
     /// Unmounts (if mounted), stops the server and frees everything,
     /// `self` included.
     pub fn stop(self: *Mount) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
         if (self.at) |at| {
-            unmount(self.allocator, io, at) catch {};
+            unmount(self.allocator, at) catch {};
             self.allocator.free(at);
         }
         self.server.deinit();
@@ -60,11 +59,11 @@ pub fn mount(gpa: std.mem.Allocator, io: std.Io, url: []const u8, target: []cons
         .macos => {
             try std.Io.Dir.cwd().createDirPath(io, target);
             // -S: no dialogs (no credentials are asked); -v: the volume's name.
-            try runOk(gpa, io, &.{ "/sbin/mount_webdav", "-S", "-v", "NomadFS", url, target });
+            try runOk(gpa, &.{ "/sbin/mount_webdav", "-S", "-v", "NomadFS", url, target });
             return gpa.dupe(u8, target);
         },
         .windows => {
-            const out = try runOut(gpa, io, &.{ "net", "use", target, url, "/persistent:no" });
+            const out = try runOut(gpa, &.{ "net", "use", target, url, "/persistent:no" });
             defer gpa.free(out);
             if (!std.mem.eql(u8, target, "*")) return gpa.dupe(u8, target);
             // "Drive Z: is now connected to ..." (the letter, in any language).
@@ -79,22 +78,26 @@ pub fn mount(gpa: std.mem.Allocator, io: std.Io, url: []const u8, target: []cons
 }
 
 /// Undoes `mount`. Errors only when the system refused.
-pub fn unmount(gpa: std.mem.Allocator, io: std.Io, target: []const u8) !void {
+pub fn unmount(gpa: std.mem.Allocator, target: []const u8) !void {
     switch (builtin.os.tag) {
-        .macos => try runOk(gpa, io, &.{ "/sbin/umount", target }),
-        .windows => try runOk(gpa, io, &.{ "net", "use", target, "/delete", "/y" }),
+        .macos => try runOk(gpa, &.{ "/sbin/umount", target }),
+        .windows => try runOk(gpa, &.{ "net", "use", target, "/delete", "/y" }),
         else => return error.Unsupported,
     }
 }
 
-fn runOk(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
-    gpa.free(try runOut(gpa, io, argv));
+fn runOk(gpa: std.mem.Allocator, argv: []const []const u8) !void {
+    gpa.free(try runOut(gpa, argv));
 }
 
 /// Runs `argv`; its output on success, error.MountFailed (its message
 /// logged) otherwise.
-fn runOut(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
-    const res = std.process.run(gpa, io, .{ .argv = argv, .stdout_limit = .limited(64 * 1024), .stderr_limit = .limited(64 * 1024) }) catch |err| {
+fn runOut(gpa: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    // Spawning allocates through the Io's own allocator, and the child
+    // gets its environment: the global single-threaded Io has neither.
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = processEnviron() });
+    defer threaded.deinit();
+    const res = std.process.run(gpa, threaded.io(), .{ .argv = argv, .stdout_limit = .limited(64 * 1024), .stderr_limit = .limited(64 * 1024) }) catch |err| {
         std.debug.print("{s}: {s}\n", .{ argv[0], @errorName(err) });
         return error.MountFailed;
     };
@@ -109,4 +112,12 @@ fn runOut(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
         return error.MountFailed;
     }
     return res.stdout;
+}
+
+fn processEnviron() std.process.Environ {
+    return switch (builtin.os.tag) {
+        .windows => .{ .block = .global },
+        .macos => .{ .block = .{ .slice = std.mem.span(std.c.environ) } },
+        else => .empty,
+    };
 }
