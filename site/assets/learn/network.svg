@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 470" role="img" aria-labelledby="t">
+<title id="t">Three devices on two networks: a home server on the home network only, a phone on Tailscale only, and a desktop on both. The desktop connects directly to each. The phone and the server have no direct route, so the desktop relays their connection, which stays encrypted end to end.</title>
+<defs>
+<style>
+text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; fill: #f2e8d8; }
+.h { font-size: 19px; font-weight: 600; fill: #f5efe6; }
+.b { font-size: 16.5px; }
+.s { font-size: 14px; fill: #a99f8f; }
+.k { font-size: 13px; letter-spacing: 1.6px; fill: #f6b042; }
+.ko { font-size: 13px; letter-spacing: 1.6px; fill: #5ce1e6; }
+.kd { font-size: 13px; letter-spacing: 1.6px; fill: #6f6a63; }
+.box { fill: #1a2131; stroke: #f2e8d8; stroke-opacity: .22; stroke-width: 1.5; }
+.boxa { fill: #f6b042; fill-opacity: .1; stroke: #f6b042; stroke-width: 1.6; }
+.zone { fill: #10141f; fill-opacity: .55; stroke: #f2e8d8; stroke-opacity: .2; stroke-width: 1.3; stroke-dasharray: 6 6; }
+.zoneo { fill: #2ec4b6; fill-opacity: .05; stroke: #5ce1e6; stroke-opacity: .45; stroke-width: 1.3; stroke-dasharray: 6 6; }
+.lno { stroke: #5ce1e6; stroke-width: 2; fill: none; }
+.lna { stroke: #f6b042; stroke-width: 2; fill: none; stroke-dasharray: 7 6; }
+.lnx { stroke: #6f6a63; stroke-width: 1.5; fill: none; stroke-dasharray: 2 6; stroke-linecap: round; }
+.x { stroke: #e8833a; stroke-width: 2.4; stroke-linecap: round; }
+</style>
+<marker id="aro" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5ce1e6"/></marker>
+<marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#f6b042"/></marker>
+</defs>
+
+<!-- no direct route -->
+<path class="lnx" d="M140 170 C140 40, 630 40, 630 170"/>
+<line class="x" x1="375" y1="62" x2="393" y2="80"/>
+<line class="x" x1="393" y1="62" x2="375" y2="80"/>
+<text class="kd" x="384" y="40" text-anchor="middle">NO DIRECT ROUTE</text>
+
+<!-- the two networks -->
+<rect class="zone" x="20" y="100" width="450" height="230" rx="10"/>
+<text class="k" x="38" y="126">HOME NETWORK</text>
+<text class="s" x="38" y="146">192.168.1.0/24</text>
+<rect class="zoneo" x="300" y="150" width="440" height="230" rx="10"/>
+<text class="ko" x="722" y="350" text-anchor="end">TAILSCALE</text>
+<text class="s" x="722" y="368" text-anchor="end">100.64.0.0/10</text>
+
+<!-- devices -->
+<rect class="box" x="44" y="170" width="192" height="92" rx="6"/>
+<text class="h" x="140" y="206" text-anchor="middle">Home server</text>
+<text class="s" x="140" y="232" text-anchor="middle">home network</text>
+<text class="s" x="140" y="250" text-anchor="middle">only</text>
+
+<rect class="boxa" x="306" y="170" width="158" height="92" rx="6"/>
+<text class="h" x="385" y="206" text-anchor="middle">Desktop</text>
+<text class="s" x="385" y="232" text-anchor="middle">on both</text>
+<text class="s" x="385" y="250" text-anchor="middle">networks</text>
+
+<rect class="box" x="534" y="170" width="192" height="92" rx="6"/>
+<text class="h" x="630" y="206" text-anchor="middle">Phone</text>
+<text class="s" x="630" y="232" text-anchor="middle">mobile data,</text>
+<text class="s" x="630" y="250" text-anchor="middle">Tailscale</text>
+
+<!-- direct connections -->
+<path class="lno" d="M238 216 L304 216" marker-start="url(#aro)" marker-end="url(#aro)"/>
+<path class="lno" d="M466 216 L532 216" marker-start="url(#aro)" marker-end="url(#aro)"/>
+
+<!-- the relayed connection -->
+<path class="lna" d="M140 264 C140 330, 330 330, 372 266"/>
+<path class="lna" d="M398 266 C440 330, 630 330, 630 264" marker-end="url(#ara)"/>
+
+<!-- legend -->
+<line class="lno" x1="40" y1="414" x2="84" y2="414"/>
+<text class="s" x="96" y="419">direct: TCP, Noise, Yamux</text>
+<line class="lna" x1="40" y1="446" x2="84" y2="446"/>
+<text class="s" x="96" y="451">relayed by the desktop, encrypted end to end between phone and server</text>
+</svg>

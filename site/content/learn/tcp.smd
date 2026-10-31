@@ -43,9 +43,9 @@ own announcement, on its own port. Set `enable_mdns = false` to turn it off.
 [Kademlia](https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf)
 distributed hash table described below.
 
-**Getting through a router.** With `upnp_enabled = true` (the default) the
-node asks the local router over UPnP to forward its TCP port, and removes the
-mapping when it stops. After it connects to a bootstrap peer, it sends a
+**Getting through a router.** With `upnp_enabled = true` (off by default:
+it opens the port to the internet) the node asks the local router over UPnP
+to forward its TCP port, and removes the mapping when it stops. After it connects to a bootstrap peer, it sends a
 `DIAL_BACK` request asking that peer to connect back to it, which shows
 whether the port can be reached from outside.
 
@@ -95,6 +95,9 @@ share it is browsing:
 1. If the routing table has the device's node ID, it dials the addresses
    stored there (up to 8 per peer), or reuses the open connection.
 2. If not, it runs a `FIND_NODE` lookup for that ID and then dials.
+3. If no address answers, it asks the devices it is connected to whether one
+   of them can carry the connection: see
+   [Relays]($link.page('learn/relay')).
 
 Every request after that is a message on a Yamux stream: one byte for the
 message type, the sender's 32-byte node ID, then the payload. Requests

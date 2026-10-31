@@ -12,15 +12,26 @@
 
 NomadFS is a private, distributed filesystem and device mesh written in [Zig 0.16](https://ziglang.org/). It connects laptops, desktops, phones, and servers into a secure peer-to-peer storage mesh. Share folders across devices with instant metadata and on-demand streaming, collaborate via a CRDT-replicated swarm folder, and mount your mesh directly into your operating system with FUSE.
 
-All core features are verified on real hardware across Linux desktop and Android (tested on an Android phone and Linux workstation).
+All core features are verified on real hardware: Linux desktops, Android phones and a Chromebook, with Windows and macOS built and tested in CI.
 
 **Download:** the [latest release](https://github.com/highercomve/nomadfs/releases/latest) has the app for Android (APK, or [Google Play](https://play.google.com/apps/internaltest/4701140950897222942) testing), Linux (AppImage, deb, rpm), Windows (installer) and macOS (Apple silicon, .dmg), and the `nomadfs` CLI for Linux, Windows and macOS. Docs: [nomadfs.foreachdeveloper.com](https://nomadfs.foreachdeveloper.com).
 
-**Install on Linux** (the app and the CLI in `~/.local/bin`, with a launcher entry; the app then updates itself):
+**Install from a terminal** (the app and the CLI for your user, every file checked against the release's checksums; the app then updates itself, and the CLI with `nomadfs --upgrade`):
 
 ```sh
+# Linux and macOS (Apple silicon): Linux puts the AppImage and the CLI in
+# ~/.local/bin with a launcher entry; macOS puts NomadFS.app in /Applications
+# and the CLI in ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/install.sh | bash
 ```
+
+```powershell
+# Windows (PowerShell): runs the app's installer silently and puts nomadfs.exe
+# on your PATH
+irm https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/install.ps1 | iex
+```
+
+`VERSION=0.3.17` (`$env:VERSION = '0.3.17'` on Windows) installs a given release; `NO_CLI=1` and `NO_RESTART=1` skip the CLI or starting the app; `NO_DESKTOP=1` skips the Linux launcher entry.
 
 ---
 

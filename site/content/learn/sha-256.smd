@@ -4,7 +4,7 @@
 .date = .date("2026-10-27T00:00:00"),
 .authors = ["NomadFS"],
 .layout = "learn.shtml",
-.custom = { "label": "learn · storage · 04", "prev": "learn/yamux", "next": "learn/fastcdc" },
+.custom = { "label": "learn · storage · 04", "prev": "learn/relay", "next": "learn/fastcdc" },
 ---
 
 # [What SHA-256 is]($heading.id('what'))

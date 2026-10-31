@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 540" role="img" aria-labelledby="t">
+<title id="t">Two private networks joined by a node with a public address: a laptop at home and a server at the office are each behind a router that blocks incoming connections. Each dials out to a NomadFS node on a cloud server, which is in the same swarm. When the laptop opens the office server's files, the cloud node relays the connection, encrypted end to end.</title>
+<defs>
+<style>
+text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; fill: #f2e8d8; }
+.h { font-size: 19px; font-weight: 600; fill: #f5efe6; }
+.b { font-size: 15.5px; }
+.s { font-size: 14px; fill: #a99f8f; }
+.k { font-size: 13px; letter-spacing: 1.6px; fill: #f6b042; }
+.ko { font-size: 13px; letter-spacing: 1.6px; fill: #5ce1e6; }
+.box { fill: #1a2131; stroke: #f2e8d8; stroke-opacity: .22; stroke-width: 1.5; }
+.boxa { fill: #f6b042; fill-opacity: .1; stroke: #f6b042; stroke-width: 1.6; }
+.router { fill: #10141f; stroke: #e8833a; stroke-opacity: .8; stroke-width: 1.5; }
+.zone { fill: #10141f; fill-opacity: .55; stroke: #f2e8d8; stroke-opacity: .2; stroke-width: 1.3; stroke-dasharray: 6 6; }
+.net { fill: #2ec4b6; fill-opacity: .04; stroke: #5ce1e6; stroke-opacity: .35; stroke-width: 1.3; stroke-dasharray: 2 6; stroke-linecap: round; }
+.lno { stroke: #5ce1e6; stroke-width: 2; fill: none; }
+.lna { stroke: #f6b042; stroke-width: 2; fill: none; stroke-dasharray: 7 6; }
+</style>
+<marker id="aro" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5ce1e6"/></marker>
+<marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#f6b042"/></marker>
+</defs>
+
+<!-- the internet and the public node -->
+<rect class="net" x="150" y="14" width="460" height="196" rx="14"/>
+<text class="ko" x="380" y="40" text-anchor="middle">THE INTERNET</text>
+<rect class="boxa" x="265" y="60" width="230" height="96" rx="6"/>
+<text class="h" x="380" y="94" text-anchor="middle">Cloud node</text>
+<text class="s" x="380" y="118" text-anchor="middle">nomadfs on a VPS,</text>
+<text class="s" x="380" y="138" text-anchor="middle">public address</text>
+
+<!-- the two private networks -->
+<rect class="zone" x="20" y="250" width="300" height="230" rx="10"/>
+<text class="k" x="38" y="306">HOME</text>
+<text class="s" x="38" y="326">192.168.1.0/24</text>
+<rect class="zone" x="440" y="250" width="300" height="230" rx="10"/>
+<text class="k" x="722" y="306" text-anchor="end">OFFICE</text>
+<text class="s" x="722" y="326" text-anchor="end">10.0.0.0/24</text>
+<!-- both dial out -->
+<path class="lno" d="M224 368 L224 300 C224 240, 262 196, 296 160" marker-end="url(#aro)"/>
+<text class="s" x="214" y="352" text-anchor="end">dials out</text>
+<path class="lno" d="M536 368 L536 300 C536 240, 498 196, 464 160" marker-end="url(#aro)"/>
+<text class="s" x="546" y="352">dials out</text>
+
+
+<!-- routers and devices -->
+<rect class="router" x="90" y="222" width="160" height="60" rx="6"/>
+<text class="b" x="170" y="246" text-anchor="middle">router</text>
+<text class="s" x="170" y="268" text-anchor="middle">blocks incoming</text>
+<rect class="box" x="74" y="370" width="192" height="80" rx="6"/>
+<text class="h" x="170" y="404" text-anchor="middle">Laptop</text>
+<text class="s" x="170" y="428" text-anchor="middle">behind NAT</text>
+<rect class="router" x="510" y="222" width="160" height="60" rx="6"/>
+<text class="b" x="590" y="246" text-anchor="middle">router</text>
+<text class="s" x="590" y="268" text-anchor="middle">blocks incoming</text>
+<rect class="box" x="494" y="370" width="192" height="80" rx="6"/>
+<text class="h" x="590" y="404" text-anchor="middle">Office server</text>
+<text class="s" x="590" y="428" text-anchor="middle">behind NAT</text>
+
+<!-- the relayed connection -->
+<path class="lna" d="M266 410 C340 410, 345 200, 362 158"/>
+<path class="lna" d="M398 158 C415 200, 420 410, 492 410" marker-end="url(#ara)"/>
+<text class="s" x="380" y="512" text-anchor="middle">laptop ⇄ office server, relayed by the cloud node,</text>
+<text class="s" x="380" y="532" text-anchor="middle">encrypted end to end</text>
+</svg>

@@ -28,6 +28,10 @@ trees.
 - [Yamux]($link.page('learn/yamux')). Many independent streams over one
   encrypted connection, so a slow file transfer doesn't block a directory
   listing.
+- [Relays: across networks]($link.page('learn/relay')). How devices on
+  different networks reach each other: every address a device has, and a
+  third device carrying the connection when none answers, including a cloud
+  node joining two private networks.
 
 # [Storage: how files become blocks]($heading.id('storage'))
 

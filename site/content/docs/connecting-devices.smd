@@ -109,4 +109,16 @@ end between the phone and the server; the device in the middle only passes
 bytes along. All the traffic then goes through that device, so a direct path
 (both on Tailscale) is still faster.
 
+Two networks that share no device, such as home and an office, each behind a
+router that lets nothing in, can be joined by a NomadFS node on a cloud
+server: both sides dial out to it, and it relays between them.
+
+[A laptop at home and a server at the office both dial out to a cloud node, which relays between them.](<$image.siteAsset('learn/rendezvous.svg').alt('Two private networks joined by a node with a public address: a laptop at home and a server at the office are each behind a router that blocks incoming connections. Each dials out to a NomadFS node on a cloud server, which is in the same swarm. When the laptop opens the office server files, the cloud node relays the connection, encrypted end to end.')>)
+
+Install the command line on the server, open its port (9000 by default), run
+`nomadfs --invite` there and join each device with it, or list its public
+address in each device's `bootstrap_peers`.
+[Relays: across networks]($link.page('learn/relay').ref('cloud')) has the
+details.
+
 Every device involved needs NomadFS 0.3.4 or later.

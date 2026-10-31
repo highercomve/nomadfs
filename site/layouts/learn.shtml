@@ -12,6 +12,7 @@
 				<a href="$site.page('learn/tcp').link()">TCP: finding devices</a>
 				<a href="$site.page('learn/noise').link()">Noise XXpsk3</a>
 				<a href="$site.page('learn/yamux').link()">Yamux</a>
+				<a href="$site.page('learn/relay').link()">Relays: across networks</a>
 				<h4>Storage</h4>
 				<a href="$site.page('learn/sha-256').link()">SHA-256 &amp; CIDs</a>
 				<a href="$site.page('learn/fastcdc').link()">FastCDC</a>

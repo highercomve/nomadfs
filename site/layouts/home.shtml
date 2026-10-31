@@ -147,7 +147,19 @@
 					</div>
 				</li>
 			</ol>
-			<p class="how-more">Each step uses a technology you may want to look into: content-defined chunking, Merkle DAGs, the Noise handshake, a CRDT. <a href="$site.page('learn').link()">Learn how NomadFS works</a>, one diagram-led page each.</p>
+			<div class="net-block">
+				<div class="net-copy">
+					<p class="plate-label">the network</p>
+					<h3>How your devices reach each other</h3>
+					<p>There is no server in the middle. Each device keeps one encrypted connection to each device it talks to, and tells the others every address it has: the home network, Tailscale or another VPN, a public address. A keepalive notices a dropped connection within 45 seconds, and it comes back in seconds.</p>
+					<p>When none of a device's addresses answers, another device that reaches both carries the connection, still encrypted end to end. A small node on a cloud server joins two private networks the same way.</p>
+					<p><a href="$site.page('learn/relay').link()">Relays: across networks →</a></p>
+				</div>
+				<figure class="plate net-figure">
+					<img src="$site.asset('learn/network.svg').link()" alt="Three devices on two networks: a home server on the home network only, a phone on Tailscale only, and a desktop on both. The desktop connects directly to each; the phone and the server have no direct route, so the desktop relays their connection, encrypted end to end." width="760" height="470" loading="lazy">
+				</figure>
+			</div>
+			<p class="how-more">Each step uses a technology you may want to look into: content-defined chunking, Merkle DAGs, the Noise handshake, relays, a CRDT. <a href="$site.page('learn').link()">Learn how NomadFS works</a>, one diagram-led page each.</p>
 		</section>
 
 		<section class="section" id="download" data-release-json="$site.asset('release.json').link()">

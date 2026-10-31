@@ -4,7 +4,7 @@
 .date = .date("2026-10-27T00:00:00"),
 .authors = ["NomadFS"],
 .layout = "learn.shtml",
-.custom = { "label": "learn · transport · 03", "prev": "learn/noise", "next": "learn/sha-256" },
+.custom = { "label": "learn · transport · 03", "prev": "learn/noise", "next": "learn/relay" },
 ---
 
 # [What Yamux is]($heading.id('what'))

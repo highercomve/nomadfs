@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 560" role="img" aria-labelledby="t">
+<title id="t">Setting up a relayed connection: the phone tries the server's addresses and none answers. It sends RELAY_CONNECT to the desktop, which sends RELAY_INCOMING to the server over its own connection. The server answers RELAY_ACK, the desktop answers the phone, and from then on the desktop copies bytes both ways while the phone and the server run the Noise handshake and Yamux through it.</title>
+<defs>
+<style>
+text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; fill: #f2e8d8; }
+.h { font-size: 19px; font-weight: 600; fill: #f5efe6; }
+.b { font-size: 15.5px; }
+.s { font-size: 14px; fill: #a99f8f; }
+.n { font-size: 13px; letter-spacing: 1.4px; fill: #f6b042; }
+.box { fill: #1a2131; stroke: #f2e8d8; stroke-opacity: .22; stroke-width: 1.5; }
+.boxa { fill: #f6b042; fill-opacity: .1; stroke: #f6b042; stroke-width: 1.6; }
+.life { stroke: #f2e8d8; stroke-opacity: .16; stroke-width: 1.3; stroke-dasharray: 4 6; }
+.ln { stroke: #a99f8f; stroke-width: 1.7; fill: none; }
+.lno { stroke: #5ce1e6; stroke-width: 2.2; fill: none; }
+.lnx { stroke: #6f6a63; stroke-width: 1.5; fill: none; stroke-dasharray: 2 6; stroke-linecap: round; }
+.x { stroke: #e8833a; stroke-width: 2.4; stroke-linecap: round; }
+.pipe { fill: #1d1a14; fill-opacity: 1; stroke: #f6b042; stroke-opacity: .5; stroke-width: 1.3; stroke-dasharray: 5 5; }
+</style>
+<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#a99f8f"/></marker>
+<marker id="aro" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5ce1e6"/></marker>
+</defs>
+
+<!-- participants -->
+<rect class="box" x="30" y="20" width="170" height="64" rx="6"/>
+<text class="h" x="115" y="48" text-anchor="middle">Phone</text>
+<text class="s" x="115" y="70" text-anchor="middle">dialing</text>
+<rect class="boxa" x="295" y="20" width="170" height="64" rx="6"/>
+<text class="h" x="380" y="48" text-anchor="middle">Desktop</text>
+<text class="s" x="380" y="70" text-anchor="middle">the relay</text>
+<rect class="box" x="560" y="20" width="170" height="64" rx="6"/>
+<text class="h" x="645" y="48" text-anchor="middle">Home server</text>
+<text class="s" x="645" y="70" text-anchor="middle">the target</text>
+<line class="life" x1="115" y1="84" x2="115" y2="468"/>
+<line class="life" x1="380" y1="84" x2="380" y2="468"/>
+<line class="life" x1="645" y1="84" x2="645" y2="468"/>
+
+<!-- 1: direct attempt fails -->
+<text class="n" x="20" y="124">1</text>
+<path class="lnx" d="M118 132 C300 110, 470 110, 642 132"/>
+<line class="x" x1="372" y1="108" x2="388" y2="124"/>
+<line class="x" x1="388" y1="108" x2="372" y2="124"/>
+<text class="s" x="380" y="152" text-anchor="middle">none of the server's addresses answers</text>
+
+<!-- 2: RELAY_CONNECT -->
+<text class="n" x="20" y="196">2</text>
+<path class="ln" d="M118 200 L376 200" marker-end="url(#ar)"/>
+<text class="b" x="247" y="190" text-anchor="middle">RELAY_CONNECT</text>
+<text class="s" x="247" y="220" text-anchor="middle">to: server</text>
+
+<!-- 3: RELAY_INCOMING -->
+<text class="n" x="20" y="262">3</text>
+<path class="ln" d="M384 266 L641 266" marker-end="url(#ar)"/>
+<text class="b" x="512" y="256" text-anchor="middle">RELAY_INCOMING</text>
+<text class="s" x="512" y="286" text-anchor="middle">from: phone</text>
+
+<!-- 4: acks -->
+<text class="n" x="20" y="328">4</text>
+<path class="ln" d="M641 332 L384 332" marker-end="url(#ar)"/>
+<text class="b" x="512" y="322" text-anchor="middle">RELAY_ACK ok</text>
+<path class="ln" d="M376 352 L119 352" marker-end="url(#ar)"/>
+<text class="b" x="247" y="342" text-anchor="middle">RELAY_ACK ok</text>
+
+<!-- 5: end to end -->
+<text class="n" x="20" y="410">5</text>
+<rect class="pipe" x="300" y="390" width="160" height="72" rx="6"/>
+<text class="s" x="380" y="418" text-anchor="middle">copies bytes</text>
+<text class="s" x="380" y="438" text-anchor="middle">both ways,</text>
+<text class="s" x="380" y="456" text-anchor="middle">reads none</text>
+<path class="lno" d="M119 410 L298 410" marker-start="url(#aro)"/>
+<path class="lno" d="M462 410 L641 410" marker-end="url(#aro)"/>
+<text class="b" x="380" y="496" text-anchor="middle">Noise XXpsk3, then Yamux: phone ⇄ server</text>
+<text class="s" x="380" y="520" text-anchor="middle">the same handshake as a direct connection, with the swarm key</text>
+</svg>

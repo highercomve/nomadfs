@@ -1,0 +1,139 @@
+---
+.title = "Relays: across networks",
+.description = "Your devices sit on different networks: home Wi-Fi, a VPN, mobile data, an office behind its own router. When two of them can't reach each other, a third one both can reach carries the connection, still encrypted end to end.",
+.date = .date("2026-10-31T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "learn.shtml",
+.custom = { "label": "learn · transport · 04", "prev": "learn/yamux", "next": "learn/sha-256" },
+---
+
+# [One connection per pair]($heading.id('pairs'))
+
+There is no server in the middle of a swarm. Each device keeps one
+connection to each device it talks to: [TCP]($link.page('learn/tcp')),
+encrypted with [Noise]($link.page('learn/noise')), and split into streams with
+[Yamux]($link.page('learn/yamux')). A request for a block, a share listing or
+the swarm folder's manifest is one stream on that connection.
+
+A connection works both ways once it's open. A phone on mobile data can't be
+dialed, but once it dials the home server, the server can ask the phone for
+blocks over that same connection.
+
+# [Every address a device has]($heading.id('addresses'))
+
+A device tells the devices it connects to every address it has: the home
+network, Tailscale or another VPN, a public address. They remember them on
+disk, along with the devices they reached only through a relay. Every 30
+seconds each device goes through the devices it remembers and reconnects to
+the ones it lost, trying the home network first, then the VPN, then public
+addresses. A device that doesn't answer is tried again later and later,
+from 30 seconds up to 5 minutes.
+
+So a phone that met the desktop at home reaches it over Tailscale when it's
+away, without changing anything.
+
+# [When no address answers]($heading.id('relay'))
+
+[A home server on the home network only, a phone on Tailscale only, and a desktop on both. The desktop connects to each; the phone and the server have no route, so the desktop relays their connection.](<$image.siteAsset('learn/network.svg').alt('Three devices on two networks: a home server on the home network only, a phone on Tailscale only, and a desktop on both. The desktop connects directly to each. The phone and the server have no direct route, so the desktop relays their connection, which stays encrypted end to end.')>)
+
+Some pairs have no route at all. A home server that is only on the home
+network can't be reached from a phone on mobile data. The desktop is on both
+networks, though, so it can carry the connection. Nothing needs setting up:
+every device can relay for the others.
+
+[The phone asks the desktop to relay; the desktop tells the server; both acknowledge; then the phone and the server handshake through the desktop.](<$image.siteAsset('learn/relay.svg').alt('Setting up a relayed connection: the phone tries the server addresses and none answers. It sends RELAY_CONNECT to the desktop, which sends RELAY_INCOMING to the server over its own connection. The server answers RELAY_ACK, the desktop answers the phone, and from then on the desktop copies bytes both ways while the phone and the server run the Noise handshake and Yamux through it.')>)
+
+1. The phone tries every address it knows for the server. None answers.
+2. It asks each device it is connected to in turn: `RELAY_CONNECT`, naming
+   the server.
+3. The desktop reaches the server, over the connection it already has or by
+   dialing one of the server's addresses, and sends `RELAY_INCOMING`, naming
+   the phone.
+4. The server answers `RELAY_ACK`, and the desktop answers the phone.
+5. From then on the desktop copies bytes both ways. The phone and the server
+   run the same Noise handshake as on a direct connection, with the swarm key
+   and their device identities, then Yamux, all through those copied bytes.
+
+The desktop sees only ciphertext. The phone and the server check each other
+exactly as they would directly: a relay can't read the traffic or pretend to
+be the server.
+
+# [Joining two private networks]($heading.id('cloud'))
+
+[A laptop at home and a server at the office, each behind a router, both dial out to a NomadFS node on a cloud server, which relays between them.](<$image.siteAsset('learn/rendezvous.svg').alt('Two private networks joined by a node with a public address: a laptop at home and a server at the office are each behind a router that blocks incoming connections. Each dials out to a NomadFS node on a cloud server, which is in the same swarm. When the laptop opens the office server files, the cloud node relays the connection, encrypted end to end.')>)
+
+Two networks that share no device, such as home and the office, each behind
+a router that lets nothing in, can still be joined. Run a NomadFS node
+somewhere both can reach: a small cloud server with a public address.
+
+- Both sides dial out to it, which their routers allow, and keep those
+  connections up by reconnecting every 30 seconds.
+- When the laptop needs the office server, no address of the server answers
+  from home, so the laptop asks the cloud node. The cloud node already has a
+  connection from the office server and relays over it.
+
+To set one up:
+
+1. Install the command line node on the server (the
+   [download section](https://nomadfs.foreachdeveloper.com/#download) has it for Linux on
+   x86_64 and ARM) and open its TCP port, 9000 by default, in the server's
+   firewall.
+2. On the server, run `nomadfs --invite` and join each device with that
+   invite. A device that joins keeps the inviter's address and reconnects to
+   it at start-up. Devices already in the swarm can instead list it in
+   `bootstrap_peers` in `nomadfs.conf`:
+   `bootstrap_peers = ["tcp://203.0.113.7:9000"]`. Use that too when the
+   server's own network interface has only a private address (some clouds
+   put the public one in front of it): an invite carries the addresses the
+   server sees on itself.
+
+The cloud node is a member of the swarm like any other device, so it can
+also keep copies: with `swarm_backup = true` it holds every swarm file, and
+the swarm folder stays readable while the device that added a file is off.
+
+# [Keeping it up]($heading.id('keepalive'))
+
+Mobile networks and home routers forget a connection that stays quiet, and
+a phone switching between Wi-Fi and mobile data drops its connections
+without telling anyone. So:
+
+- **Keepalive.** A connection that has been silent for 15 seconds sends a
+  ping; one that hears nothing for 45 seconds is closed as dead. Without
+  this, a connection the network had dropped looked open forever.
+- **Back at once.** A closed connection starts the next reconnect round
+  within seconds instead of waiting for the 30-second one.
+- **Relays first.** The devices a device depends on, its bootstrap peers and
+  the relays it went through, are tried again at least every 10 seconds,
+  and every 5 seconds while none answers. When one comes back, every other
+  device is tried again at once: their failures came from being cut off.
+- **Relayed devices stay.** A device reached through a relay is checked
+  every round like any other, so its relayed connection isn't closed as
+  idle, and a device that misses one answer stays listed for 45 seconds.
+
+Measured with a node that can reach only the public relay and a path that
+goes silent for 75 seconds: the relay is reconnected 7 seconds after the
+path comes back, and every home device is listed again after 27.
+
+# [What a relay costs]($heading.id('limits'))
+
+- **All the traffic crosses the relay.** A video streamed from the office
+  through a cloud node uses the cloud node's bandwidth twice, in and out.
+- **Direct is tried again.** Every 30 seconds a device that reaches another
+  only through a relay tries a direct connection again, and uses it once it
+  works (a laptop that comes home, say).
+- **Relays don't chain.** The relay must reach the target itself, directly or
+  over a connection the target opened. A relayed connection is never used
+  to relay another.
+- **Bounded.** A device pipes at most 32 relayed connections at once. When no
+  relay reaches a device (it is usually just off), devices don't ask again
+  for that one for 60 seconds, unless they were cut off from their relays.
+- **No hole punching.** Two devices behind routers always go through a relay,
+  even where a direct path could be opened.
+- **Swarm members only.** Asking for a relay takes a connection authenticated
+  with the swarm key, and a relay only connects to devices it already knows.
+
+Source: `src/net/transport/relay.zig` (the copying and the connection over a
+stream), `src/net/discovery/relay_service.zig` (`RELAY_CONNECT`,
+`RELAY_INCOMING`, `RELAY_ACK`), `keepAlive` in `src/net/transport/yamux.zig`,
+and `dialKnownPeers` in `src/node.zig`. The investigation behind this:
+[relay-routing.md](https://github.com/highercomve/nomadfs/blob/main/learning/net/transport/relay-routing.md).

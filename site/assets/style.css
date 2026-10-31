@@ -594,3 +594,12 @@ code {
 .install-pair { margin-top: 14px; }
 .install-card .copy-btn { position: static; margin-left: auto; opacity: 1; }
 .install-card pre { white-space: pre; }
+
+/* "How your devices reach each other", under the route on the home page. */
+.net-block { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 36px; align-items: center; margin-top: 56px; }
+.net-copy h3 { margin: 0 0 12px; font-size: 24px; font-weight: 650; letter-spacing: -.015em; }
+.net-copy p:not(.plate-label) { margin: 0 0 14px; color: var(--sand-dim); font-size: 16px; }
+.net-copy .plate-label { color: var(--amber); }
+.net-figure { margin: 0; padding: 18px; }
+.net-figure img { display: block; width: 100%; height: auto; }
+@media (max-width: 960px) { .net-block { grid-template-columns: 1fr; } }
