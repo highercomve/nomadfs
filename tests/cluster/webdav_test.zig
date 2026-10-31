@@ -155,6 +155,22 @@ test "webdav: the swarm folder is read-write over HTTP, the rest read-only" {
     try std.testing.expect(std.mem.indexOf(u8, listing.body, "/Swarm/docs/</D:href>") != null);
     try std.testing.expect(std.mem.indexOf(u8, listing.body, "._hello") == null);
     try std.testing.expectEqualStrings("apple double", (try request(a, port, "GET", "/Swarm/._hello%20world.txt", "", "")).body);
+    // Metadata and files don't turn into each other.
+    try std.testing.expectEqual(@as(u16, 403), (try request(a, port, "MOVE", "/Swarm/._hello%20world.txt", try std.fmt.allocPrint(a, "Destination: {s}/Swarm/meta.txt\r\n", .{root}), "")).status);
+    try std.testing.expectEqual(@as(u16, 403), (try request(a, port, "MOVE", "/Swarm/hello%20world.txt", try std.fmt.allocPrint(a, "Destination: {s}/Swarm/desktop.ini\r\n", .{root}), "")).status);
+    try std.testing.expect(folder.fileInfo("hello world.txt") != null);
+    // A client waiting for 100 Continue gets it before sending the body.
+    {
+        const stream = try compat.tcpConnectToAddress(compat.Address.initIp4(.{ 127, 0, 0, 1 }, port));
+        defer stream.close();
+        try stream.writeAll(try std.fmt.allocPrint(a, "PUT {s}/Swarm/waited.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n", .{root}));
+        var interim: [25]u8 = undefined;
+        var filled: usize = 0;
+        while (filled < interim.len) filled += try stream.read(interim[filled..]);
+        try std.testing.expectEqualStrings("HTTP/1.1 100 Continue\r\n\r\n", &interim);
+        try stream.writeAll("wait");
+        try std.testing.expectEqual(@as(u16, 201), (try readResponse(a, stream)).status);
+    }
 
     // Move, copy, delete.
     try std.testing.expectEqual(@as(u16, 201), (try request(a, port, "MOVE", "/Swarm/hello%20world.txt", try std.fmt.allocPrint(a, "Destination: http://127.0.0.1{s}/Swarm/docs/moved.txt\r\n", .{root}), "")).status);

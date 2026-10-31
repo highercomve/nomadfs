@@ -378,8 +378,20 @@ fn onWebDavStop(_: std.posix.SIG) callconv(.c) void {
     webdav_stop.store(true, .release);
 }
 
-fn onWebDavConsole(_: u32) callconv(.winapi) c_int {
+/// Set once the WebDAV mount is unmounted and stopped.
+var webdav_done = std.atomic.Value(bool).init(false);
+
+fn onWebDavConsole(event: u32) callconv(.winapi) c_int {
     webdav_stop.store(true, .release);
+    // Closing the window, logoff, shutdown: the process ends when this
+    // returns, so wait (Windows allows 5 seconds) for `net use /delete`.
+    const close_event = 2;
+    const logoff_event = 5;
+    const shutdown_event = 6;
+    if (event == close_event or event == logoff_event or event == shutdown_event) {
+        var waited: u32 = 0;
+        while (!webdav_done.load(.acquire) and waited < 4500) : (waited += 50) nomadfs.sync.sleep(50 * std.time.ns_per_ms);
+    }
     return 1;
 }
 
@@ -404,7 +416,10 @@ fn webdavCommand(allocator: std.mem.Allocator, config: config_mod.Config, port: 
         if (builtin.os.tag == .windows and mountpoint != null) std.debug.print("Windows mounts WebDAV with its WebClient service: start it (services.msc), or use --webdav <port> and connect from Explorer.\n", .{});
         return err;
     };
-    defer mount.stop();
+    defer {
+        mount.stop();
+        webdav_done.store(true, .release);
+    }
     if (mount.at) |at| {
         std.debug.print("Mounted at {s}, served at {s} (Ctrl-C to unmount)\n", .{ at, mount.url() });
     } else {

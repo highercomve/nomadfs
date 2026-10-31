@@ -21,13 +21,26 @@ pub const Mount = struct {
         return self.url_buf[0..self.url_len];
     }
 
+    /// Mounts the server at `target` (see `mount`); `at` says where.
+    pub fn attach(self: *Mount, target: []const u8) !void {
+        std.debug.assert(self.at == null);
+        self.at = try mount(self.allocator, std.Io.Threaded.global_single_threaded.io(), self.url(), target);
+    }
+
+    /// Unmounts, if mounted; the server goes on. Forced when the server
+    /// has already stopped: the system would wait on it otherwise.
+    pub fn detach(self: *Mount) void {
+        const at = self.at orelse return;
+        self.at = null;
+        defer self.allocator.free(at);
+        if (!self.server.running.load(.acquire)) return forceUnmountPath(self.allocator, at);
+        unmount(self.allocator, at) catch {};
+    }
+
     /// Unmounts (if mounted), stops the server and frees everything,
     /// `self` included.
     pub fn stop(self: *Mount) void {
-        if (self.at) |at| {
-            unmount(self.allocator, at) catch {};
-            self.allocator.free(at);
-        }
+        self.detach();
         self.server.deinit();
         self.allocator.destroy(self.server);
         self.allocator.destroy(self);
@@ -45,7 +58,7 @@ pub fn start(allocator: std.mem.Allocator, server: *webdav.Server, target: ?[]co
     errdefer allocator.destroy(self);
     self.* = .{ .allocator = allocator, .server = server };
     self.url_len = (try server.url(&self.url_buf)).len;
-    if (target) |t| self.at = try mount(allocator, std.Io.Threaded.global_single_threaded.io(), self.url(), t);
+    if (target) |t| try self.attach(t);
     return self;
 }
 
@@ -94,6 +107,14 @@ pub fn forceUnmount(target: [*:0]const u8) void {
     if (builtin.os.tag != .macos) return;
     const mnt_force = 0x00080000;
     _ = darwin.unmount(target, mnt_force);
+}
+
+fn forceUnmountPath(gpa: std.mem.Allocator, target: []const u8) void {
+    switch (builtin.os.tag) {
+        .macos => runOk(gpa, &.{ "/sbin/umount", "-f", target }) catch {},
+        .windows => unmount(gpa, target) catch {},
+        else => {},
+    }
 }
 
 const darwin = struct {

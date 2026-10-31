@@ -139,9 +139,12 @@ pub fn mediaRelease() void {
 pub fn nodeClose() void {
     // Before the lock: a copy waiting to pin the node needs it to stop.
     if (before_node_close) |stop| stop();
+    // After the unlock below (defers run last first): unmounting can take seconds.
+    var webdav: ?*nomadfs.webdav_mount.Mount = null;
+    defer if (webdav) |m| m.stop();
     g_mutex.lock();
     defer g_mutex.unlock();
-    stopMountLocked(); // the mount reads through this node
+    webdav = stopMountLocked(); // the mount reads through this node
     // No new media reads can start (they need g_mutex); let current ones end.
     while (g_media_users.load(.acquire) > 0) nomadfs.sync.sleep(10 * std.time.ns_per_ms);
     if (g_node) |node| {
@@ -1162,11 +1165,12 @@ const can_webdav = nomadfs.webdav_mount.supported;
 /// The WebDAV mount (macOS, Windows), from its server's start; `at` is set
 /// once the system has mounted it.
 var g_webdav: ?*nomadfs.webdav_mount.Mount = null;
-/// mount_webdav or `net use` is running, outside g_mutex (they can take
-/// seconds). Guarded by g_mutex.
-var g_webdav_mounting = false;
-/// Stopped while mounting: mountWebDav frees it when the command returns.
-/// Guarded by g_mutex.
+/// Mounting or unmounting g_webdav, outside g_mutex (mount_webdav, umount
+/// and `net use` can take seconds). Guarded by g_mutex.
+var g_webdav_busy = false;
+/// Its server was stopped meanwhile (the node is going, or Stop during a
+/// mount): the busy call frees it when its command returns. Guarded by
+/// g_mutex.
 var g_webdav_abandoned = false;
 
 /// Opens a folder in the system's file manager where xdg-open isn't the
@@ -1274,34 +1278,36 @@ fn mountWebDav(path: []const u8) !void {
     const m = blk: {
         g_mutex.lock();
         defer g_mutex.unlock();
-        if (g_webdav != null or g_webdav_mounting) return error.AlreadyMounted;
+        if (g_webdav != null or g_webdav_busy) return error.AlreadyMounted;
         const handle = g_node orelse return error.NotRunning;
         const m = try handle.node.startWebDav(std.heap.page_allocator, 0, null);
         g_webdav = m;
-        g_webdav_mounting = true;
+        g_webdav_busy = true;
         g_webdav_abandoned = false;
         break :blk m;
     };
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const mounted = nomadfs.webdav_mount.mount(std.heap.page_allocator, io, m.url(), path);
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    g_webdav_mounting = false;
-    if (mounted) |at| m.at = at else |_| {}
-    if (g_webdav_abandoned) {
-        // Stopped meanwhile (g_webdav is already cleared): unmount and free.
-        g_webdav_abandoned = false;
-        m.stop();
-        return error.NotRunning;
-    }
-    const at = mounted catch |err| {
-        g_webdav = null;
-        m.stop();
-        return err;
+    const attached = m.attach(path);
+    const keep = blk: {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        g_webdav_busy = false;
+        if (g_webdav_abandoned) {
+            // Stopped meanwhile: g_webdav is already cleared.
+            g_webdav_abandoned = false;
+            break :blk false;
+        }
+        attached catch {
+            g_webdav = null;
+            break :blk false;
+        };
+        // For emergencyUnmount; a path too long for it is still mounted.
+        if (setMountPath(m.at.?)) |_| g_mount_active.store(true, .release) else |_| {}
+        break :blk true;
     };
-    // For emergencyUnmount; a path too long for it is still mounted.
-    _ = setMountPath(at) catch return;
-    g_mount_active.store(true, .release);
+    if (keep) return;
+    m.stop(); // outside the lock: it may unmount
+    try attached;
+    return error.NotRunning;
 }
 
 /// Sets up the mount job and starts its serve thread; every step unwinds
@@ -1342,33 +1348,56 @@ pub fn emergencyUnmount() void {
     if (can_mount) fs.fuse.unmount(path) else nomadfs.webdav_mount.forceUnmount(path.ptr);
 }
 
-/// `invoke("mount_stop")`.
+/// `invoke("mount_stop")`. The WebDAV volume is unmounted outside g_mutex,
+/// with its server still serving so the system can finish writing.
 pub fn mountStop() void {
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    stopMountLocked();
+    const m = blk: {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        // No WebDAV volume (FUSE, if any), or one still being mounted (the
+        // mount call frees it): nothing comes back to unmount here.
+        if (g_webdav == null or g_webdav_busy) {
+            const left = stopMountLocked();
+            std.debug.assert(left == null);
+            return;
+        }
+        const m = g_webdav.?;
+        g_mount_active.store(false, .release);
+        g_webdav_busy = true;
+        break :blk m;
+    };
+    m.detach();
+    {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        g_webdav_busy = false;
+        // Abandoned meanwhile (the node closing): g_webdav is cleared already.
+        if (!g_webdav_abandoned) g_webdav = null;
+        g_webdav_abandoned = false;
+    }
+    m.stop();
 }
 
-/// Caller holds g_mutex.
-fn stopMountLocked() void {
+/// Stops the mount. The WebDAV server stops here, before the node it reads
+/// can go; its volume is returned for the caller to unmount and free once
+/// g_mutex is released (Mount.stop), or null. Caller holds g_mutex.
+fn stopMountLocked() ?*nomadfs.webdav_mount.Mount {
     if (g_webdav) |m| {
         g_webdav = null;
-        if (g_webdav_mounting) {
-            // mountWebDav frees it once the command returns; it stops
-            // serving now, since the node it reads may be going.
-            m.server.stop();
-            g_webdav_abandoned = true;
-        } else {
-            g_mount_active.store(false, .release);
-            m.stop();
-        }
+        g_mount_active.store(false, .release);
+        m.server.stop();
+        if (!g_webdav_busy) return m;
+        // The call running the command frees it when that returns.
+        g_webdav_abandoned = true;
+        return null;
     }
-    const job = g_mount orelse return;
+    const job = g_mount orelse return null;
     if (can_mount and !job.done.load(.acquire)) fs.fuse.unmount(job.path);
     // Unmounting makes the serve loop return.
     job.thread.join();
     freeMountJob(job);
     g_mount = null;
+    return null;
 }
 
 /// Frees a job whose thread has ended on its own (unmounted from outside,

@@ -197,7 +197,15 @@ pub const Stream = struct {
     /// Bounds each blocking read and write to `timeout_ms`; 0 removes the
     /// bound. Expiry surfaces as error.WouldBlock. Not wired up on Windows yet.
     pub fn setTimeout(self: Stream, timeout_ms: u32) !void {
-        if (builtin.os.tag == .windows) return;
+        if (builtin.os.tag == .windows) {
+            // Winsock takes a DWORD of milliseconds (0: none, as elsewhere).
+            const ws = std.os.windows.ws2_32;
+            const ms: u32 = timeout_ms;
+            const handle = self.inner.socket.handle;
+            if (winsock.setsockopt(handle, ws.SOL.SOCKET, ws.SO.RCVTIMEO, std.mem.asBytes(&ms), @sizeOf(u32)) != 0) return error.Unexpected;
+            if (winsock.setsockopt(handle, ws.SOL.SOCKET, ws.SO.SNDTIMEO, std.mem.asBytes(&ms), @sizeOf(u32)) != 0) return error.Unexpected;
+            return;
+        }
         const tv = std.posix.timeval{
             .sec = @intCast(timeout_ms / std.time.ms_per_s),
             .usec = @intCast((timeout_ms % std.time.ms_per_s) * std.time.us_per_ms),
@@ -412,3 +420,7 @@ test "bad socket descriptor is an error rather than EOF" {
     var byte: [1]u8 = undefined;
     try std.testing.expectError(error.FileDescriptorClosed, stream.read(&byte));
 }
+
+const winsock = struct {
+    extern "ws2_32" fn setsockopt(s: @TypeOf(@as(std.Io.net.Socket, undefined).handle), level: i32, optname: i32, optval: [*]const u8, optlen: i32) callconv(.winapi) i32;
+};

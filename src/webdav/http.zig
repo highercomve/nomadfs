@@ -122,6 +122,8 @@ pub const Conn = struct {
     /// Bytes left in the current chunk (chunked bodies).
     chunk_left: u64 = 0,
     body_left: u64 = 0,
+    /// A response head went out for the current request.
+    head_sent: bool = false,
 
     fn fill(self: *Conn) !bool {
         if (self.start > 0) {
@@ -233,7 +235,17 @@ pub const Conn = struct {
         return out.items;
     }
 
+    /// `Expect: 100-continue`: tells the client to send the body now
+    /// rather than after its own wait (a second, for curl).
+    pub fn continueIfExpected(self: *Conn, req: *const Request) !void {
+        if (req.body_done) return;
+        const expect = req.header("expect") orelse return;
+        if (!std.ascii.eqlIgnoreCase(expect, "100-continue")) return;
+        try self.stream.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
+    }
+
     pub fn writeHead(self: *Conn, code: u16, text: []const u8, headers: []const [2][]const u8) !void {
+        self.head_sent = true;
         var buf: [2048]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         try w.print("HTTP/1.1 {d} {s}\r\n", .{ code, text });

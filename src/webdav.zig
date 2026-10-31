@@ -86,19 +86,13 @@ pub const Server = struct {
 
     pub fn init(allocator: std.mem.Allocator, block_manager: ?*cluster.BlockManager) Server {
         const io = std.Io.Threaded.global_single_threaded.io();
-        var self: Server = .{
+        return .{
             .allocator = allocator,
             .io = io,
             .block_manager = block_manager,
             .directory = devices_mod.Directory.init(allocator, block_manager),
             .log_requests = logRequested(),
         };
-        var secret: [16]u8 = undefined;
-        io.random(&secret);
-        self.token = std.fmt.bytesToHex(secret, .lower);
-        self.root[0] = '/';
-        @memcpy(self.root[1..], &self.token);
-        return self;
     }
 
     pub fn deinit(self: *Server) void {
@@ -113,13 +107,20 @@ pub const Server = struct {
         self.conns.list.deinit(self.allocator);
     }
 
-    /// Listens on 127.0.0.1:`port` (0: any free port; see `port`).
+    /// Listens on 127.0.0.1:`port` (0: any free port; see `port`), under
+    /// a new random token.
     pub fn start(self: *Server, port: u16) !void {
         if (self.listener != null) return;
+        var secret: [16]u8 = undefined;
+        try self.io.randomSecure(&secret);
+        self.token = std.fmt.bytesToHex(secret, .lower);
+        self.root[0] = '/';
+        @memcpy(self.root[1..], &self.token);
         var listener = try compat.listenLoopback(port);
         errdefer listener.deinit();
         self.port = listener.inner.socket.address.getPort();
         self.listener = listener;
+        errdefer self.listener = null;
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
         if (self.swarm) |s| s.cleanStaging();
@@ -135,11 +136,14 @@ pub const Server = struct {
         if (self.accept_thread) |t| t.join();
         self.accept_thread = null;
         self.listener = null;
+        {
+            self.conns.mutex.lock();
+            defer self.conns.mutex.unlock();
+            for (self.conns.list.items) |c| c.shutdown();
+            while (self.conns.active > 0) self.conns.done.wait(&self.conns.mutex);
+        }
+        // Last: a request still running may list the devices.
         self.directory.stop();
-        self.conns.mutex.lock();
-        defer self.conns.mutex.unlock();
-        for (self.conns.list.items) |c| c.shutdown();
-        while (self.conns.active > 0) self.conns.done.wait(&self.conns.mutex);
     }
 
     /// `http://127.0.0.1:<port>/<token>/`, into `buf`.
@@ -228,11 +232,14 @@ pub const Server = struct {
             return keep;
         };
         if (self.log_requests) std.debug.print("webdav: {s} /{s} depth={s}\n", .{ req.method, try std.mem.join(arena, "/", req.segments), req.header("depth") orelse "-" });
+        conn.head_sent = false;
         self.dispatch(arena, conn, &req) catch |err| {
             // The body may be unread: the connection can't be reused.
             const status = statusOf(err);
             if (self.log_requests) std.debug.print("webdav: -> {d} ({s})\n", .{ status.code, @errorName(err) });
-            conn.respond(status.code, status.text, &.{}, "") catch {};
+            // Once a response has begun, closing is the only way to say it
+            // failed: a status line now would land inside the body.
+            if (!conn.head_sent) conn.respond(status.code, status.text, &.{}, "") catch {};
             return false;
         };
         return keep;
@@ -289,6 +296,16 @@ pub const Server = struct {
         swarm_dir: struct { path: []const u8, mtime: u64 },
         swarm_file: struct { path: []const u8, info: swarm_mod.SwarmFolder.Info },
         scratch: struct { path: []const u8, size: u64 },
+
+        /// A file's size (0 for anything else).
+        fn size(n: Node) u64 {
+            return switch (n) {
+                .share_file => |f| f.size,
+                .swarm_file => |f| f.info.size,
+                .scratch => |f| f.size,
+                else => 0,
+            };
+        }
 
         fn isDir(n: Node) bool {
             return switch (n) {
@@ -410,11 +427,7 @@ pub const Server = struct {
             const bytes = try self.scratchCopy(arena, node.scratch.path) orelse return conn.respond(404, "Not Found", &.{}, "");
             return conn.respond(200, "OK", &.{.{ "Content-Type", "application/octet-stream" }}, if (head_only) "" else bytes);
         }
-        const size: u64 = switch (node) {
-            .share_file => |f| f.size,
-            .swarm_file => |f| f.info.size,
-            else => unreachable,
-        };
+        const size = node.size();
         const mtime: u64 = switch (node) {
             .share_file => |f| f.mtime,
             .swarm_file => |f| f.info.mtime,
@@ -484,6 +497,7 @@ pub const Server = struct {
         const folder = self.swarm orelse return error.FileNotFound;
         const name = req.segments[req.segments.len - 1];
         if (isScratchName(name)) {
+            try conn.continueIfExpected(req);
             const bytes = try conn.readSmallBody(arena, req, max_scratch);
             try self.scratchPut(path, bytes);
             return conn.respond(201, "Created", &.{}, "");
@@ -494,6 +508,7 @@ pub const Server = struct {
             try conn.discardBody(req);
             return conn.respond(405, "Method Not Allowed", &.{}, "");
         }
+        try conn.continueIfExpected(req);
         var body = conn.bodyReader(req);
         const staging = try self.stage(arena, folder, .{ .body = &body });
         defer self.unstage(staging);
@@ -538,6 +553,10 @@ pub const Server = struct {
         const dest = try self.resolve(arena, dest_segments);
         const existed = dest != null;
         if (existed and !overwrite) return conn.respond(412, "Precondition Failed", &.{}, "");
+        // Metadata stays metadata and files stay files: a file renamed to
+        // `._x` would leave the swarm, and `._x` renamed to a file would
+        // vanish from both.
+        if ((source == .scratch) != isScratchName(dest_segments[dest_segments.len - 1])) return conn.respond(403, "Forbidden", &.{}, "");
         if (source == .scratch) {
             const bytes = try self.scratchCopy(arena, source.scratch.path) orelse return conn.respond(404, "Not Found", &.{}, "");
             try self.scratchPut(to, bytes);
@@ -589,6 +608,8 @@ pub const Server = struct {
             try file.writePositionalAll(self.io, buf[0..got], at);
             at += got;
         }
+        // A file that ends early (its device gone) is no copy.
+        if (source == .node and at != source.node.size()) return error.EndOfStream;
         return staging;
     }
 
@@ -664,12 +685,15 @@ pub const Server = struct {
         errdefer self.allocator.free(copy);
         self.scratch.mutex.lock();
         defer self.scratch.mutex.unlock();
-        if (self.scratch.files.get(path) == null) self.scratchMakeRoomLocked(bytes.len);
+        // A replaced file counts anew: out first, then room for the new one.
+        if (self.scratch.files.getPtr(path)) |old| {
+            self.scratch.bytes -= old.len;
+            self.allocator.free(old.*);
+            old.* = &.{};
+        }
+        self.scratchMakeRoomLocked(path, bytes.len);
         const gop = try self.scratch.files.getOrPut(self.allocator, path);
-        if (gop.found_existing) {
-            self.scratch.bytes -= gop.value_ptr.len;
-            self.allocator.free(gop.value_ptr.*);
-        } else {
+        if (!gop.found_existing) {
             gop.key_ptr.* = self.allocator.dupe(u8, path) catch |err| {
                 _ = self.scratch.files.remove(path);
                 return err;
@@ -681,10 +705,16 @@ pub const Server = struct {
 
     /// Drops entries until one more of `len` bytes fits the caps. Which
     /// ones go doesn't matter much: a lost one is only metadata.
-    fn scratchMakeRoomLocked(self: *Server, len: usize) void {
-        while (self.scratch.files.count() > 0 and (self.scratch.files.count() >= max_scratch_files or self.scratch.bytes + len > max_scratch_bytes)) {
+    fn scratchMakeRoomLocked(self: *Server, keep: []const u8, len: usize) void {
+        while (true) {
+            // `keep` (being replaced) stays: it holds no bytes now.
+            const others = self.scratch.files.count() - @intFromBool(self.scratch.files.contains(keep));
+            if (others == 0) return;
+            if (others < max_scratch_files and self.scratch.bytes + len <= max_scratch_bytes) return;
             var it = self.scratch.files.iterator();
-            const victim = it.next().?;
+            const victim = while (it.next()) |e| {
+                if (!eql(e.key_ptr.*, keep)) break e;
+            } else return;
             const key = victim.key_ptr.*;
             const value = victim.value_ptr.*;
             self.scratch.files.removeByPtr(victim.key_ptr);
@@ -799,6 +829,11 @@ test "webdav: desktop metadata files are bounded" {
     defer std.testing.allocator.free(big);
     for (0..20) |i| try server.scratchPut(try std.fmt.bufPrint(&name_buf, "big/._{d}", .{i}), big);
     try std.testing.expect(server.scratch.bytes <= max_scratch_bytes);
+    // Replacing small files with big ones counts too.
+    server.scratchDeleteUnder("big");
+    for (0..20) |i| try server.scratchPut(try std.fmt.bufPrint(&name_buf, "d/._{d}", .{i}), big);
+    try std.testing.expect(server.scratch.bytes <= max_scratch_bytes);
+    try std.testing.expect(server.scratch.files.count() <= max_scratch_files);
     server.scratchDeleteUnder("big");
     server.scratchDeleteUnder("d");
     try std.testing.expectEqual(@as(usize, 0), server.scratch.files.count());

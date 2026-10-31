@@ -101,7 +101,13 @@ pub const Directory = struct {
     /// stale and, the first time, waits briefly for the answers. Without
     /// the refresher (tests), refreshes in place.
     pub fn ensureFresh(self: *Directory) void {
-        if (self.refresh.thread == null) return self.refreshAll();
+        if (self.stopping.load(.acquire)) return;
+        const has_refresher = blk: {
+            self.refresh.mutex.lock();
+            defer self.refresh.mutex.unlock();
+            break :blk self.refresh.thread != null;
+        };
+        if (!has_refresher) return self.refreshAll();
         self.requestRefresh();
         self.refresh.mutex.lock();
         defer self.refresh.mutex.unlock();

@@ -247,6 +247,13 @@ pub const SwarmFolder = struct {
         const path = try join(self.allocator, dir, name);
         defer self.allocator.free(path);
         if (!manifest_mod.validPath(path)) return error.InvalidPath;
+        // Checked before the bytes are stored too, so a refusal leaves no
+        // blocks behind (and again below, under the lock that edits).
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.folderAtLocked(path)) return error.IsDirectory;
+        }
 
         var file = try std.Io.Dir.cwd().openFile(self.io, local_path, .{});
         defer file.close(self.io);
