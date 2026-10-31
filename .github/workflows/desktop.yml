@@ -106,7 +106,17 @@ jobs:
         run: zig build -Doptimize=ReleaseSafe
       - name: Smoke test
         run: bash scripts/smoke.sh zig-out/bin/nomadfs.exe
+      - name: WebView2 runtime
+        shell: pwsh
+        run: |
+          # Windows 10 and 11 have it; the runner's Windows Server may not.
+          $key = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          if (Test-Path $key) { "WebView2 $((Get-ItemProperty $key).pv)"; exit 0 }
+          $setup = Join-Path $env:RUNNER_TEMP 'webview2.exe'
+          Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $setup
+          Start-Process $setup -ArgumentList '/silent','/install' -Wait
       - name: Install the release's app and start it
+        timeout-minutes: 10
         run: |
           tag="${TAG:-$(gh release view --json tagName -q .tagName)}"
           if ! gh release download "$tag" -p '*-setup.exe' -D "$RUNNER_TEMP/rel"; then
@@ -124,5 +134,6 @@ jobs:
           pid=$!
           sleep 20
           tail -30 "$RUNNER_TEMP/app.log" || true
-          kill -0 "$pid"
-          kill "$pid" || true
+          # Still running (Git Bash's kill can't end a native GUI process).
+          tasklist //FI "IMAGENAME eq nomadfs-gui.exe" | grep -i nomadfs-gui
+          taskkill //F //IM nomadfs-gui.exe

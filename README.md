@@ -127,7 +127,7 @@ ORIEL_FORK=../oriel scripts/install-local.sh  # build against a local Oriel
 ```
 
 ### Desktop App (`nomadfs-gui`)
-The app uses [Oriel](https://oriel.foreachdeveloper.com) v0.20.6, which `zig build` fetches.
+The app uses [Oriel](https://oriel.foreachdeveloper.com) v0.20.7, which `zig build` fetches.
 
 ```bash
 cd nomadfs-gui

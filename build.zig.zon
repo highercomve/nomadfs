@@ -41,8 +41,8 @@
         // `oriel_updater` module only). zig build --fork=../oriel builds
         // against a local checkout.
         .oriel = .{
-            .url = "https://github.com/highercomve/Oriel/archive/refs/tags/v0.20.6.tar.gz",
-            .hash = "oriel-0.20.6-K1NO5VxV_gC7AW_NToFoIwfZYgQ4l9MNansMIqLkQIhX",
+            .url = "https://github.com/highercomve/Oriel/archive/refs/tags/v0.20.7.tar.gz",
+            .hash = "oriel-0.20.7-K1NO5YNX_gBr_P5Xid7OOiDCufRVyZLvDXOcAk3YwO4b",
         },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{
