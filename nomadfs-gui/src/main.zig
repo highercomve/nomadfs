@@ -423,7 +423,19 @@ fn onTerminate(sig: std.os.linux.SIG) callconv(.c) void {
     std.os.linux.exit_group(128 + @as(i32, @intCast(@intFromEnum(sig))));
 }
 
+/// macOS: the same for the WebDAV volume, which would otherwise stay
+/// mounted with no server.
+fn onTerminateDarwin(sig: std.posix.SIG) callconv(.c) void {
+    commands.emergencyUnmount();
+    std.c._exit(128 + @as(c_int, @intCast(@intFromEnum(sig))));
+}
+
 fn installExitHandlers() void {
+    if (builtin.os.tag == .macos) {
+        const action = std.posix.Sigaction{ .handler = .{ .handler = onTerminateDarwin }, .mask = std.posix.sigemptyset(), .flags = 0 };
+        for ([_]std.posix.SIG{ .TERM, .INT, .HUP }) |sig| std.posix.sigaction(sig, &action, null);
+        return;
+    }
     if (builtin.os.tag != .linux or builtin.abi.isAndroid()) return;
     const action = std.os.linux.Sigaction{
         .handler = .{ .handler = onTerminate },

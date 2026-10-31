@@ -47,8 +47,14 @@ if [ "$mode" = mount ]; then
 else
   "$bin" --webdav "$port" "$dir/smoke.conf" > "$log" 2>&1 &
   pid=$!
-  url="http://127.0.0.1:$port"
-  for _ in $(seq 1 30); do curl -sf -X OPTIONS "$url/" > /dev/null && break; sleep 1; done
+  # The URL has a random token in it: read it from what the node prints.
+  url=
+  for _ in $(seq 1 30); do
+    url=$(grep -o "http://127.0.0.1:$port/[0-9a-f]*" "$log" | head -1) && [ -n "$url" ] && break
+    sleep 1
+  done
+  [ -n "$url" ] || { cat "$log"; exit 1; }
+  test "$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND "http://127.0.0.1:$port/")" = 404
   test "$(curl -s -o /dev/null -w '%{http_code}' -T "$dir/hello.txt" "$url/Swarm/hello.txt")" = 201
   test "$(curl -s -o /dev/null -w '%{http_code}' -X MKCOL "$url/Swarm/notes")" = 201
   test "$(curl -s -o /dev/null -w '%{http_code}' -X MOVE -H "Destination: $url/Swarm/notes/moved.txt" "$url/Swarm/hello.txt")" = 201

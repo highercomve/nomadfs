@@ -62,6 +62,8 @@ test {
         @import("key_rotation.zig"),
         @import("node_info.zig"),
         @import("webdav.zig"),
+        @import("webdav/http.zig"),
+        @import("webdav/xml.zig"),
         @import("node.zig"),
         @import("device/auth.zig"),
         @import("device/identity.zig"),

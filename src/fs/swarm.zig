@@ -222,6 +222,12 @@ pub const SwarmFolder = struct {
         return @intCast(@max(0, @divFloor(t, std.time.ns_per_s)));
     }
 
+    /// `a/b/c` as `a/b` and `c`; a top-level name has the parent "".
+    pub fn splitParent(path: []const u8) struct { dir: []const u8, name: []const u8 } {
+        const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return .{ .dir = "", .name = path };
+        return .{ .dir = path[0..slash], .name = path[slash + 1 ..] };
+    }
+
     fn join(allocator: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
         if (dir.len == 0) return allocator.dupe(u8, name);
         return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name });
@@ -253,6 +259,8 @@ pub const SwarmFolder = struct {
         defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
+        // A file never replaces a folder: its contents would be left under a file.
+        if (self.folderAtLocked(path)) return error.IsDirectory;
         _ = try self.manifest.edit(path, .{ .cid = root[0..32].*, .size = reader.offset, .mtime = modified }, self.self_id.bytes, self.self_name);
         try self.saveLocked();
         // The devices that keep copies pull it (their keepers), once their
@@ -302,9 +310,7 @@ pub const SwarmFolder = struct {
 
     /// Renames a file or folder in place (same parent folder).
     pub fn rename(self: *SwarmFolder, path: []const u8, new_name: []const u8) !void {
-        const slash = std.mem.lastIndexOfScalar(u8, path, '/');
-        const parent = if (slash) |s| path[0..s] else "";
-        const new_path = try join(self.allocator, parent, new_name);
+        const new_path = try join(self.allocator, splitParent(path).dir, new_name);
         defer self.allocator.free(new_path);
         return self.move(path, new_path, .{});
     }
@@ -352,6 +358,15 @@ pub const SwarmFolder = struct {
             _ = try self.manifest.edit(old, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
         }
         try self.saveLocked();
+    }
+
+    /// Whether a folder is at `path`: its own entry, or things inside it.
+    fn folderAtLocked(self: *SwarmFolder, path: []const u8) bool {
+        if (self.manifest.get(path)) |e| if (!e.deleted) return e.kind == .dir;
+        for (self.manifest.entries.values()) |e| {
+            if (!e.deleted and e.path.len > path.len and e.path[path.len] == '/' and std.mem.startsWith(u8, e.path, path)) return true;
+        }
+        return false;
     }
 
     /// Whether `path` is a folder, given what is live under it (itself
@@ -973,6 +988,11 @@ test "swarm: a move replaces only an empty folder, and a file only a file" {
     try folder.addFile("", "f", file_path);
     try testing.expectError(error.NotADirectory, folder.move("E", "f", .{ .replace = true }));
     try testing.expectError(error.IsDirectory, folder.move("f", "E", .{ .replace = true }));
+    // Nor does adding a file over a folder, empty or implied by its contents.
+    try testing.expectError(error.IsDirectory, folder.addFile("", "E", file_path));
+    try folder.addFile("deep/er", "g", file_path);
+    try testing.expectError(error.IsDirectory, folder.addFile("", "deep", file_path));
+    try testing.expect(folder.fileInfo("deep/er/g") != null);
 }
 
 test "swarm: files keep their own modified time" {

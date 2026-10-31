@@ -22,12 +22,20 @@ const Response = struct {
     }
 };
 
-/// One request on its own connection (`Connection: close`): the whole
-/// response, read to the end.
+/// The server's path prefix (`/<token>`), set once it starts.
+var root: []const u8 = "";
+
+/// One request on its own connection (`Connection: close`), to `path`
+/// under the server's root: the whole response, read to the end.
 fn request(arena: std.mem.Allocator, port: u16, method: []const u8, path: []const u8, extra: []const u8, body: []const u8) !Response {
+    return requestAt(arena, port, method, try std.fmt.allocPrint(arena, "{s}{s}", .{ root, path }), extra, body);
+}
+
+/// Like `request`, with `target` as given (no root in front).
+fn requestAt(arena: std.mem.Allocator, port: u16, method: []const u8, target: []const u8, extra: []const u8, body: []const u8) !Response {
     const stream = try compat.tcpConnectToAddress(compat.Address.initIp4(.{ 127, 0, 0, 1 }, port));
     defer stream.close();
-    const head = try std.fmt.allocPrint(arena, "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n{s}Content-Length: {d}\r\n\r\n", .{ method, path, port, extra, body.len });
+    const head = try std.fmt.allocPrint(arena, "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n{s}Content-Length: {d}\r\n\r\n", .{ method, target, port, extra, body.len });
     try stream.writeAll(head);
     try stream.writeAll(body);
     return readResponse(arena, stream);
@@ -77,10 +85,19 @@ test "webdav: the swarm folder is read-write over HTTP, the rest read-only" {
     server.swarm = folder;
     try server.start(0);
     const port = server.port;
+    root = &server.root;
+    defer root = "";
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
+
+    // Without the token nothing is served; OPTIONS still answers.
+    try std.testing.expectEqual(@as(u16, 404), (try requestAt(a, port, "PROPFIND", "/", "Depth: 1\r\n", "")).status);
+    try std.testing.expectEqual(@as(u16, 404), (try requestAt(a, port, "PUT", "/Swarm/x.txt", "", "x")).status);
+    try std.testing.expectEqual(@as(u16, 200), (try requestAt(a, port, "OPTIONS", "/", "", "")).status);
+    const wrong = try std.fmt.allocPrint(a, "/{s}/Swarm/", .{"0" ** 32});
+    try std.testing.expectEqual(@as(u16, 404), (try requestAt(a, port, "PROPFIND", wrong, "Depth: 0\r\n", "")).status);
 
     // Discovery: it's a class 2 WebDAV server (lockable, so writable).
     const options = try request(a, port, "OPTIONS", "/", "", "");
@@ -88,9 +105,10 @@ test "webdav: the swarm folder is read-write over HTTP, the rest read-only" {
     try std.testing.expect(std.mem.indexOf(u8, options.header("DAV").?, "2") != null);
 
     // The root lists the swarm folder.
-    const root = try request(a, port, "PROPFIND", "/", "Depth: 1\r\n", "");
-    try std.testing.expectEqual(@as(u16, 207), root.status);
-    try std.testing.expect(std.mem.indexOf(u8, root.body, "<D:href>/Swarm/</D:href>") != null);
+    const listed_root = try request(a, port, "PROPFIND", "/", "Depth: 1\r\n", "");
+    try std.testing.expectEqual(@as(u16, 207), listed_root.status);
+    try std.testing.expect(std.mem.indexOf(u8, listed_root.body, try std.fmt.allocPrint(a, "<D:href>{s}/Swarm/</D:href>", .{root})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed_root.body, try std.fmt.allocPrint(a, "<D:href>{s}/</D:href>", .{root})) != null);
 
     // Write a file, a folder, and a chunked upload into it.
     try std.testing.expectEqual(@as(u16, 201), (try request(a, port, "PUT", "/Swarm/hello%20world.txt", "", "hello webdav")).status);
@@ -98,11 +116,28 @@ test "webdav: the swarm folder is read-write over HTTP, the rest read-only" {
     {
         const stream = try compat.tcpConnectToAddress(compat.Address.initIp4(.{ 127, 0, 0, 1 }, port));
         defer stream.close();
-        try stream.writeAll("PUT /Swarm/docs/notes.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n" ++
-            "5\r\nfirst\r\n7\r\n second\r\n0\r\n\r\n");
+        try stream.writeAll(try std.fmt.allocPrint(a, "PUT {s}/Swarm/docs/notes.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "5\r\nfirst\r\n7\r\n second\r\n0\r\n\r\n", .{root}));
         try std.testing.expectEqual(@as(u16, 201), (try readResponse(a, stream)).status);
     }
     try std.testing.expectEqual(@as(u64, 12), folder.fileInfo("docs/notes.txt").?.size);
+    // Headers read after a chunked body that arrives later than the head
+    // (the connection's buffer is reused for it): Depth 0 is still seen.
+    {
+        const stream = try compat.tcpConnectToAddress(compat.Address.initIp4(.{ 127, 0, 0, 1 }, port));
+        defer stream.close();
+        try stream.writeAll(try std.fmt.allocPrint(a, "PROPFIND {s}/Swarm/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nDepth: 0\r\nTransfer-Encoding: chunked\r\n\r\n", .{root}));
+        nomadfs.sync.sleep(100 * std.time.ns_per_ms);
+        // Longer than the head, so it would cover the Depth line.
+        try stream.writeAll("400\r\n" ++ ("<!-- -->" ** 128) ++ "\r\n0\r\n\r\n");
+        const listed = try readResponse(a, stream);
+        try std.testing.expectEqual(@as(u16, 207), listed.status);
+        try std.testing.expect(std.mem.indexOf(u8, listed.body, "notes") == null and std.mem.indexOf(u8, listed.body, "docs") == null);
+    }
+    // A file never replaces a folder.
+    try std.testing.expectEqual(@as(u16, 405), (try request(a, port, "PUT", "/Swarm/docs", "", "not a folder")).status);
+    try std.testing.expect(folder.fileInfo("docs") == null);
+    try std.testing.expect(folder.fileInfo("docs/notes.txt") != null);
 
     // Read back, whole and a range.
     const got = try request(a, port, "GET", "/Swarm/hello%20world.txt", "", "");
@@ -122,12 +157,23 @@ test "webdav: the swarm folder is read-write over HTTP, the rest read-only" {
     try std.testing.expectEqualStrings("apple double", (try request(a, port, "GET", "/Swarm/._hello%20world.txt", "", "")).body);
 
     // Move, copy, delete.
-    try std.testing.expectEqual(@as(u16, 201), (try request(a, port, "MOVE", "/Swarm/hello%20world.txt", "Destination: http://127.0.0.1/Swarm/docs/moved.txt\r\n", "")).status);
+    try std.testing.expectEqual(@as(u16, 201), (try request(a, port, "MOVE", "/Swarm/hello%20world.txt", try std.fmt.allocPrint(a, "Destination: http://127.0.0.1{s}/Swarm/docs/moved.txt\r\n", .{root}), "")).status);
     try std.testing.expectEqual(@as(u16, 404), (try request(a, port, "GET", "/Swarm/hello%20world.txt", "", "")).status);
-    try std.testing.expectEqual(@as(u16, 201), (try request(a, port, "COPY", "/Swarm/docs/moved.txt", "Destination: /Swarm/copy.txt\r\n", "")).status);
+    const to_copy = try std.fmt.allocPrint(a, "Destination: {s}/Swarm/copy.txt\r\n", .{root});
+    try std.testing.expectEqual(@as(u16, 201), (try request(a, port, "COPY", "/Swarm/docs/moved.txt", to_copy, "")).status);
     try std.testing.expectEqualStrings("hello webdav", (try request(a, port, "GET", "/Swarm/copy.txt", "", "")).body);
-    try std.testing.expectEqual(@as(u16, 412), (try request(a, port, "MOVE", "/Swarm/copy.txt", "Destination: /Swarm/docs/moved.txt\r\nOverwrite: F\r\n", "")).status);
+    // Over an existing file: replaced in place.
+    try std.testing.expectEqual(@as(u16, 201), (try request(a, port, "PUT", "/Swarm/other.txt", "", "other")).status);
+    try std.testing.expectEqual(@as(u16, 204), (try request(a, port, "COPY", "/Swarm/other.txt", to_copy, "")).status);
+    try std.testing.expectEqualStrings("other", (try request(a, port, "GET", "/Swarm/copy.txt", "", "")).body);
+    try std.testing.expectEqual(@as(u16, 403), (try request(a, port, "COPY", "/Swarm/copy.txt", to_copy, "")).status);
+    // A destination outside the server's root is refused.
+    try std.testing.expectEqual(@as(u16, 403), (try request(a, port, "COPY", "/Swarm/copy.txt", "Destination: /Swarm/stray.txt\r\n", "")).status);
+    try std.testing.expectEqual(@as(u16, 412), (try request(a, port, "MOVE", "/Swarm/copy.txt", try std.fmt.allocPrint(a, "Destination: {s}/Swarm/docs/moved.txt\r\nOverwrite: F\r\n", .{root}), "")).status);
+    try std.testing.expectEqual(@as(u16, 201), (try request(a, port, "PUT", "/Swarm/docs/._moved.txt", "", "meta")).status);
     try std.testing.expectEqual(@as(u16, 204), (try request(a, port, "DELETE", "/Swarm/docs", "", "")).status);
+    // The folder's desktop metadata goes with it.
+    try std.testing.expectEqual(@as(u16, 404), (try request(a, port, "GET", "/Swarm/docs/._moved.txt", "", "")).status);
     try std.testing.expectEqual(@as(u16, 404), (try request(a, port, "PROPFIND", "/Swarm/docs", "Depth: 0\r\n", "")).status);
     try std.testing.expect(folder.fileInfo("docs/notes.txt") == null);
 
@@ -141,6 +187,6 @@ test "webdav: the swarm folder is read-write over HTTP, the rest read-only" {
     // A web page reaching it through another host name is refused.
     const stream = try compat.tcpConnectToAddress(compat.Address.initIp4(.{ 127, 0, 0, 1 }, port));
     defer stream.close();
-    try stream.writeAll("GET /Swarm/copy.txt HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n");
+    try stream.writeAll(try std.fmt.allocPrint(a, "GET {s}/Swarm/copy.txt HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n", .{root}));
     try std.testing.expectEqual(@as(u16, 403), (try readResponse(a, stream)).status);
 }

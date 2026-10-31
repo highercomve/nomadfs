@@ -1159,8 +1159,15 @@ pub fn swarmReadRange(gpa: std.mem.Allocator, args: SwarmRangeArgs) ![]const u8 
 const can_mount = builtin.os.tag == .linux and !builtin.abi.isAndroid();
 const can_webdav = nomadfs.webdav_mount.supported;
 
-/// The WebDAV mount (macOS, Windows), while mounted.
+/// The WebDAV mount (macOS, Windows), from its server's start; `at` is set
+/// once the system has mounted it.
 var g_webdav: ?*nomadfs.webdav_mount.Mount = null;
+/// mount_webdav or `net use` is running, outside g_mutex (they can take
+/// seconds). Guarded by g_mutex.
+var g_webdav_mounting = false;
+/// Stopped while mounting: mountWebDav frees it when the command returns.
+/// Guarded by g_mutex.
+var g_webdav_abandoned = false;
 
 /// Opens a folder in the system's file manager where xdg-open isn't the
 /// way (macOS, Windows): set by main.zig to Oriel's App.openPath.
@@ -1242,16 +1249,12 @@ pub const MountArgs = struct { path: []const u8 };
 /// an app reads them. Returns once the kernel shows the mount.
 pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
     if (!can_mount and !can_webdav) return error.MountUnsupported;
+    if (!can_mount) return mountWebDav(args.path);
     g_mutex.lock();
     defer g_mutex.unlock();
     reapMountLocked();
-    if (g_mount != null or g_webdav != null) return error.AlreadyMounted;
+    if (g_mount != null) return error.AlreadyMounted;
     const handle = g_node orelse return error.NotRunning;
-    if (!can_mount) {
-        // The swarm folder writable, devices read only, over WebDAV.
-        g_webdav = try handle.node.startWebDav(std.heap.page_allocator, 0, args.path);
-        return;
-    }
     try fs.fuse.prepareMountpoint(gpa, args.path);
     const job = try startMountJob(handle, args.path);
     // From here the job is g_mount's: a failed mount is reaped, once.
@@ -1262,6 +1265,43 @@ pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
         reapMountLocked(); // frees `job`
         return err;
     };
+}
+
+/// The swarm folder writable, devices read only, over WebDAV. The server
+/// starts under g_mutex; the system mounts it outside the lock, so other
+/// commands go on meanwhile.
+fn mountWebDav(path: []const u8) !void {
+    const m = blk: {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        if (g_webdav != null or g_webdav_mounting) return error.AlreadyMounted;
+        const handle = g_node orelse return error.NotRunning;
+        const m = try handle.node.startWebDav(std.heap.page_allocator, 0, null);
+        g_webdav = m;
+        g_webdav_mounting = true;
+        g_webdav_abandoned = false;
+        break :blk m;
+    };
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const mounted = nomadfs.webdav_mount.mount(std.heap.page_allocator, io, m.url(), path);
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    g_webdav_mounting = false;
+    if (mounted) |at| m.at = at else |_| {}
+    if (g_webdav_abandoned) {
+        // Stopped meanwhile (g_webdav is already cleared): unmount and free.
+        g_webdav_abandoned = false;
+        m.stop();
+        return error.NotRunning;
+    }
+    const at = mounted catch |err| {
+        g_webdav = null;
+        m.stop();
+        return err;
+    };
+    // For emergencyUnmount; a path too long for it is still mounted.
+    _ = setMountPath(at) catch return;
+    g_mount_active.store(true, .release);
 }
 
 /// Sets up the mount job and starts its serve thread; every step unwinds
@@ -1296,10 +1336,10 @@ fn serveMount(job: *MountJob) void {
 /// Unmounts without taking any lock, for a signal handler about to end
 /// the process: the kernel would otherwise keep a dead mount behind.
 pub fn emergencyUnmount() void {
-    if (!can_mount) return;
     if (!g_mount_active.load(.acquire)) return;
     // Unmounting a mount that already ended just fails; harmless here.
-    fs.fuse.unmount(std.mem.sliceTo(&g_mount_path, 0));
+    const path = std.mem.sliceTo(&g_mount_path, 0);
+    if (can_mount) fs.fuse.unmount(path) else nomadfs.webdav_mount.forceUnmount(path.ptr);
 }
 
 /// `invoke("mount_stop")`.
@@ -1312,8 +1352,16 @@ pub fn mountStop() void {
 /// Caller holds g_mutex.
 fn stopMountLocked() void {
     if (g_webdav) |m| {
-        m.stop();
         g_webdav = null;
+        if (g_webdav_mounting) {
+            // mountWebDav frees it once the command returns; it stops
+            // serving now, since the node it reads may be going.
+            m.server.stop();
+            g_webdav_abandoned = true;
+        } else {
+            g_mount_active.store(false, .release);
+            m.stop();
+        }
     }
     const job = g_mount orelse return;
     if (can_mount and !job.done.load(.acquire)) fs.fuse.unmount(job.path);

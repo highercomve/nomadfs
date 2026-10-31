@@ -239,7 +239,7 @@ pub fn build(b: *std.Build) void {
         .roots = &.{ "src", "nomadfs-gui/src" },
         .layers = &.{
             .{ .name = "frontend", .paths = &.{ "src/main.zig", "src/mobile", "nomadfs-gui/src" }, .thin = true },
-            .{ .name = "node", .paths = &.{ "src/root.zig", "src/node.zig", "src/settings.zig", "src/key_rotation.zig", "src/node_info.zig", "src/webdav.zig", "src/webdav_mount.zig" } },
+            .{ .name = "node", .paths = &.{ "src/root.zig", "src/node.zig", "src/settings.zig", "src/key_rotation.zig", "src/node_info.zig", "src/webdav.zig", "src/webdav", "src/webdav_mount.zig" } },
             .{ .name = "fs", .paths = &.{"src/fs"} },
             .{ .name = "cluster", .paths = &.{"src/cluster"} },
             // Pairing flows that talk to peers sit above net; identity, trust

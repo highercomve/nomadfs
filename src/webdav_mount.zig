@@ -14,7 +14,7 @@ pub const Mount = struct {
     server: *webdav.Server,
     /// Where it is mounted (owned), or null when only served.
     at: ?[]u8 = null,
-    url_buf: [64]u8 = undefined,
+    url_buf: [96]u8 = undefined,
     url_len: usize = 0,
 
     pub fn url(self: *const Mount) []const u8 {
@@ -80,11 +80,25 @@ pub fn mount(gpa: std.mem.Allocator, io: std.Io, url: []const u8, target: []cons
 /// Undoes `mount`. Errors only when the system refused.
 pub fn unmount(gpa: std.mem.Allocator, target: []const u8) !void {
     switch (builtin.os.tag) {
-        .macos => try runOk(gpa, &.{ "/sbin/umount", target }),
+        // A volume Finder still has open needs forcing.
+        .macos => runOk(gpa, &.{ "/sbin/umount", target }) catch try runOk(gpa, &.{ "/sbin/umount", "-f", target }),
         .windows => try runOk(gpa, &.{ "net", "use", target, "/delete", "/y" }),
         else => return error.Unsupported,
     }
 }
+
+/// Unmounts `target` (macOS) with the unmount system call alone, forced:
+/// safe in a signal handler, for a process about to end that would
+/// otherwise leave a volume with no server behind.
+pub fn forceUnmount(target: [*:0]const u8) void {
+    if (builtin.os.tag != .macos) return;
+    const mnt_force = 0x00080000;
+    _ = darwin.unmount(target, mnt_force);
+}
+
+const darwin = struct {
+    extern "c" fn unmount(dir: [*:0]const u8, flags: c_int) c_int;
+};
 
 fn runOk(gpa: std.mem.Allocator, argv: []const []const u8) !void {
     gpa.free(try runOut(gpa, argv));
