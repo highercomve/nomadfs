@@ -34,4 +34,5 @@ test {
     _ = @import("cluster/fuse_mt_test.zig");
     _ = @import("cluster/device_names_test.zig");
     _ = @import("cluster/traffic_test.zig");
+    _ = @import("cluster/webdav_test.zig");
 }

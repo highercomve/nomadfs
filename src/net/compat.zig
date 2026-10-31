@@ -291,6 +291,15 @@ pub fn listen(port: u16) !Server {
     return .{ .inner = s };
 }
 
+/// Like listen, on 127.0.0.1 only (this device's own programs). Port 0
+/// picks a free one: `server.inner.socket.address.getPort()`.
+pub fn listenLoopback(port: u16) !Server {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    const s = try addr.listen(io, .{ .reuse_address = true });
+    return .{ .inner = s };
+}
+
 pub fn tcpConnectToAddress(address: Address) !Stream {
     const io = std.Io.Threaded.global_single_threaded.io();
     const s = try address.ip.connect(io, .{ .mode = .stream });

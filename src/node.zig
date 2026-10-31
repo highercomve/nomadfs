@@ -493,6 +493,21 @@ pub const Node = struct {
         return mount;
     }
 
+    /// Starts a WebDAV server on 127.0.0.1:`port` (0: any free port) with
+    /// this node's devices and swarm folder (fs/webdav.zig). Caller stops
+    /// it with `deinit` and `allocator.destroy`.
+    pub fn newWebDav(self: *Node, allocator: std.mem.Allocator, port: u16) !*fs.webdav.Server {
+        if (self.store == null) return error.StorageDisabled;
+        const server = try allocator.create(fs.webdav.Server);
+        errdefer allocator.destroy(server);
+        server.* = fs.webdav.Server.init(allocator, self.block_manager);
+        errdefer server.deinit();
+        server.swarm = self.swarm;
+        server.read_ahead = self.read_ahead;
+        try server.start(port);
+        return server;
+    }
+
     pub fn inspectFile(self: *Node, allocator: std.mem.Allocator, source: FileSource) !fs.inspect.Inspection {
         if (self.store == null) return error.StorageDisabled;
         var buffer = fs.remote.holdersBuffer();

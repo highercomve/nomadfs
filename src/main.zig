@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const nomadfs = @import("nomadfs");
 const config_mod = nomadfs.config;
 
@@ -8,7 +9,7 @@ const Ticket = device.pairing.Ticket;
 
 const upgrade = @import("upgrade.zig");
 
-const Command = enum { run, pair, trust, devices, revoke, mount, invite, join, cache, clear_cache, bench_read, bench_idle, upgrade };
+const Command = enum { run, pair, trust, devices, revoke, mount, webdav, invite, join, cache, clear_cache, bench_read, bench_idle, upgrade };
 
 const Options = struct {
     command: Command = .run,
@@ -18,6 +19,8 @@ const Options = struct {
     revoke_query: ?[]const u8 = null,
     join_code: ?[]const u8 = null,
     mountpoint: ?[]const u8 = null,
+    /// --webdav <port>: serve WebDAV on 127.0.0.1 without mounting it.
+    webdav_port: u16 = 0,
     /// --share Name:/path, added to the configured shares.
     shares: std.ArrayList([]const u8) = .empty,
     /// --copies <N>: the swarm's copies setting, signed into its policy.
@@ -60,6 +63,7 @@ pub fn main(init: std.process.Init) !void {
         .revoke => try revokeCommand(allocator, config, options.revoke_query.?),
         .run => try runNode(allocator, config, options),
         .mount => try mountCommand(allocator, config, options.mountpoint.?),
+        .webdav => try webdavCommand(allocator, config, options.webdav_port, null),
         .invite => try inviteCommand(allocator, config, options.config_path, options.address),
         .join => try joinCommand(allocator, config, options.config_path, options.join_code.?, options.address),
         .cache => try cacheCommand(allocator, config, false),
@@ -126,6 +130,13 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, options: *Optio
         } else if (std.mem.eql(u8, arg, "--mount")) {
             try selectCommand(options, .mount);
             options.mountpoint = try nextValue(args, &i, "--mount");
+        } else if (std.mem.eql(u8, arg, "--webdav")) {
+            try selectCommand(options, .webdav);
+            const val_str = try nextValue(args, &i, "--webdav");
+            options.webdav_port = std.fmt.parseInt(u16, val_str, 10) catch {
+                std.debug.print("Error: --webdav expects a port (0 for any)\n", .{});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, arg, "--share")) {
             try options.shares.append(arena, try nextValue(args, &i, "--share"));
         } else if (std.mem.eql(u8, arg, "--copies")) {
@@ -346,12 +357,81 @@ fn onStopSignal(_: std.os.linux.SIG) callconv(.c) void {
 }
 
 fn mountCommand(allocator: std.mem.Allocator, config: config_mod.Config, mountpoint: []const u8) !void {
-    if (comptime !@hasDecl(nomadfs.fs.fuse, "Mount")) {
-        std.debug.print("Error: --mount is only supported on Linux\n", .{});
+    if (comptime @hasDecl(nomadfs.fs.fuse, "Mount")) return mountLinux(allocator, config, mountpoint);
+    if (comptime !nomadfs.fs.webdav_mount.supported) {
+        std.debug.print("Error: --mount isn't supported here; --webdav <port> serves the same over WebDAV\n", .{});
         std.process.exit(1);
-    } else {
-        return mountLinux(allocator, config, mountpoint);
     }
+    return webdavCommand(allocator, config, 0, mountpoint);
+}
+
+/// Set by Ctrl-C (or the console closing): the WebDAV command ends.
+var webdav_stop = std.atomic.Value(bool).init(false);
+
+fn onWebDavStop(_: std.posix.SIG) callconv(.c) void {
+    webdav_stop.store(true, .release);
+}
+
+fn onWebDavConsole(_: u32) callconv(.winapi) c_int {
+    webdav_stop.store(true, .release);
+    return 1;
+}
+
+extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (u32) callconv(.winapi) c_int, add: c_int) callconv(.winapi) c_int;
+
+/// macOS, Windows (and anywhere with --webdav): the node and a WebDAV
+/// server on 127.0.0.1, mounted at `mountpoint` when given (a folder on
+/// macOS, a drive letter like Z: on Windows), until Ctrl-C.
+fn webdavCommand(allocator: std.mem.Allocator, config: config_mod.Config, port: u16, mountpoint: ?[]const u8) !void {
+    if (!config.storage.enabled) {
+        std.debug.print("Error: --mount and --webdav need storage enabled (fetched blocks are cached there)\n", .{});
+        std.process.exit(1);
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var node = try startNode(allocator, config);
+    defer node.deinit();
+    std.debug.print("NomadFS {s}: device {x}\n", .{ config.node.nickname, node.device_identity.deviceId().bytes[0..6] });
+    node.bootstrap(config.network.bootstrap_peers, config.node.swarm_key) catch |err| {
+        std.debug.print("Bootstrap error: {any}\n", .{err});
+    };
+    var running = std.atomic.Value(bool).init(true);
+    const run_thread = try std.Thread.spawn(.{}, runUntilStopped, .{ &node, &running, config });
+    defer {
+        running.store(false, .release);
+        run_thread.join();
+    }
+
+    if (builtin.os.tag == .windows) {
+        _ = SetConsoleCtrlHandler(onWebDavConsole, 1);
+    } else {
+        const action = std.posix.Sigaction{ .handler = .{ .handler = onWebDavStop }, .mask = std.posix.sigemptyset(), .flags = 0 };
+        std.posix.sigaction(.INT, &action, null);
+        std.posix.sigaction(.TERM, &action, null);
+    }
+
+    const server = try node.newWebDav(allocator, port);
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    var url_buf: [64]u8 = undefined;
+    const url = try server.url(&url_buf);
+    const mounted = if (mountpoint) |target| nomadfs.fs.webdav_mount.mount(allocator, io, url, target) catch |err| {
+        std.debug.print("Error: couldn't mount {s} at {s}: {s}\n", .{ url, target, @errorName(err) });
+        if (builtin.os.tag == .windows) std.debug.print("Windows mounts WebDAV with its WebClient service: start it (services.msc), or connect to {s} from Explorer.\n", .{url});
+        return err;
+    } else null;
+    defer if (mounted) |m| {
+        nomadfs.fs.webdav_mount.unmount(allocator, io, m) catch {};
+        allocator.free(m);
+        std.debug.print("Unmounted.\n", .{});
+    };
+    if (mounted) |m| {
+        std.debug.print("Mounted at {s}, served at {s} (Ctrl-C to unmount)\n", .{ m, url });
+    } else {
+        std.debug.print("WebDAV at {s}: the swarm folder (read and write) and every device's shares (Ctrl-C to stop)\n", .{url});
+    }
+    while (!webdav_stop.load(.acquire)) nomadfs.sync.sleep(200 * std.time.ns_per_ms);
 }
 
 fn mountLinux(allocator: std.mem.Allocator, config: config_mod.Config, mountpoint: []const u8) !void {

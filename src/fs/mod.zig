@@ -17,6 +17,12 @@ pub const readahead = @import("readahead.zig");
 pub const device_names = @import("device_names.zig");
 pub const backup_import = @import("backup_import.zig");
 pub const inspect = @import("inspect.zig");
+/// The devices a mount shows (FUSE and WebDAV).
+pub const devices = @import("devices.zig");
+/// The same view over WebDAV on 127.0.0.1 (macOS, Windows; anywhere).
+pub const webdav = @import("webdav.zig");
+/// Mounting it with the system's tools (macOS, Windows).
+pub const webdav_mount = @import("webdav_mount.zig");
 /// Read-only FUSE mount of every device's shares (desktop Linux only).
 pub const fuse = if (builtin.os.tag == .linux and !builtin.abi.isAndroid()) @import("fuse.zig") else struct {};
 
@@ -38,5 +44,7 @@ test {
     _ = swarm;
     _ = backup_import;
     _ = device_names;
+    _ = devices;
+    std.testing.refAllDecls(webdav);
     std.testing.refAllDecls(fuse);
 }
