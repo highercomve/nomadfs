@@ -54,3 +54,12 @@ The GitHub APK is debug-signed: a device must uninstall it before installing the
 
 New personal developer accounts need a closed test with at least 12 testers opted in for 14 days
 before production access. Upload to internal testing first, then closed testing.
+
+## Status
+
+- 2026-10-30: app created in Play Console (Sergio A Marin, personal account); store listing,
+  privacy policy, app access, ads, content rating (ESRB Teen / 12+: users interact), target
+  audience 18+, data safety (no data collected or shared), category Tools.
+- Internal testing: 311 (0.3.11) released 2026-10-30, testers "Amigos" and "GhostPantry owner".
+  Opt-in: https://play.google.com/apps/internaltest/4701140950897222942
+- Next: closed testing with at least 12 testers for 14 days, then apply for production.

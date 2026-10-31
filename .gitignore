@@ -20,3 +20,4 @@ nomadfs-gui/zig-pkg/
 
 # Local screenshots and logs from driving the app
 .playwright-mcp/
+store/*.aab
