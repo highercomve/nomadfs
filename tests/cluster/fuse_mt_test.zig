@@ -75,7 +75,7 @@ test "fuse mt: stalled network op does not block other ops" {
         .block_manager = null,
         .peer = NodeID{ .bytes = [_]u8{0x22} ** 32 },
     };
-    try mount.devices.append(allocator, .{
+    try mount.directory.devices.append(allocator, .{
         .name = try allocator.dupe(u8, "RemoteDev"),
         .remote = remote_peer,
         .online = true,
@@ -218,7 +218,7 @@ test "fuse mt: out-of-order replies match by unique" {
         .block_manager = null,
         .peer = NodeID{ .bytes = [_]u8{0x44} ** 32 },
     };
-    try mount.devices.append(allocator, .{
+    try mount.directory.devices.append(allocator, .{
         .name = try allocator.dupe(u8, "RemoteDev"),
         .remote = remote_peer,
         .online = true,
@@ -342,7 +342,7 @@ test "fuse mt: pool growth up to worker_max" {
         .block_manager = null,
         .peer = NodeID{ .bytes = [_]u8{0x66} ** 32 },
     };
-    try mount.devices.append(allocator, .{
+    try mount.directory.devices.append(allocator, .{
         .name = try allocator.dupe(u8, "RemoteDev"),
         .remote = remote_peer,
         .online = true,

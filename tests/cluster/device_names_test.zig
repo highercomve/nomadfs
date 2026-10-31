@@ -210,7 +210,7 @@ test "device names: mount readdir lists Swarm and avoids reserved name collision
     // Add three fake devices directly
     const dev_a = try allocator.create(fuse.Remote);
     dev_a.* = .{ .block_manager = null, .peer = NodeID{ .bytes = [_]u8{0xaa} ** 32 } };
-    try mount.devices.append(allocator, .{
+    try mount.directory.devices.append(allocator, .{
         .name = try allocator.dupe(u8, "Alpha"),
         .remote = dev_a,
         .online = true,
@@ -219,7 +219,7 @@ test "device names: mount readdir lists Swarm and avoids reserved name collision
 
     const dev_c = try allocator.create(fuse.Remote);
     dev_c.* = .{ .block_manager = null, .peer = NodeID{ .bytes = [_]u8{0xcc} ** 32 } };
-    try mount.devices.append(allocator, .{
+    try mount.directory.devices.append(allocator, .{
         .name = try allocator.dupe(u8, "Alpha-cccccccc"),
         .remote = dev_c,
         .online = true,
@@ -229,7 +229,7 @@ test "device names: mount readdir lists Swarm and avoids reserved name collision
     // Device D claims "Swarm" but gets suffixed
     const dev_d = try allocator.create(fuse.Remote);
     dev_d.* = .{ .block_manager = null, .peer = NodeID{ .bytes = [_]u8{0xdd} ** 32 } };
-    try mount.devices.append(allocator, .{
+    try mount.directory.devices.append(allocator, .{
         .name = try allocator.dupe(u8, "Swarm-dddddddd"),
         .remote = dev_d,
         .online = true,
@@ -241,19 +241,19 @@ test "device names: mount readdir lists Swarm and avoids reserved name collision
 
     const root_inode = mount.table.map.get(fuse.root_id).?.data;
     // Inspect childrenOf(.root)
-    mount.lock.lock();
+    mount.directory.lock.lock();
     const children = blk: {
         var out: std.ArrayList(struct { name: []const u8 }) = .empty;
         if (mount.swarm != null) {
             try out.append(arena.allocator(), .{ .name = "Swarm" });
         }
-        for (mount.devices.items) |d| {
+        for (mount.directory.devices.items) |d| {
             if (!d.online) continue;
             try out.append(arena.allocator(), .{ .name = try arena.allocator().dupe(u8, d.name) });
         }
         break :blk out.items;
     };
-    mount.lock.unlock();
+    mount.directory.lock.unlock();
 
     // Verify: exactly 4 items, Swarm appears exactly once, no duplicates
     try std.testing.expectEqual(@as(usize, 4), children.len);

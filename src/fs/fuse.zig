@@ -23,8 +23,7 @@ const swarm_mod = @import("swarm.zig");
 const manifest_mod = @import("manifest.zig");
 pub const Remote = remote_mod.Remote;
 const InodeTable = @import("inode_table.zig").Table(Inode);
-const device_names = @import("device_names.zig");
-const device_trust = @import("../device/trust.zig");
+const devices_mod = @import("devices.zig");
 
 // ---- Kernel protocol (include/uapi/linux/fuse.h) ----
 
@@ -267,13 +266,9 @@ const Errno = enum(i32) {
 /// Seconds the kernel may cache names and attributes. Short, because a
 /// share's content changes whenever its folder does.
 const cache_seconds = 1;
-/// How long a device list stays fresh before peers are asked again.
-const device_refresh_ns = 5 * std.time.ns_per_s;
 /// Large enough for any request a read-only mount receives.
 const request_buffer_len = 1024 * 1024 + 4096;
 const worker_max = 16;
-const refresh_parallel = 8;
-const first_refresh_wait_ms = 3000;
 
 threadlocal var tl_reply: std.ArrayList(u8) = .empty;
 
@@ -317,15 +312,7 @@ pub const Handle = struct {
     mtime: ?u64 = null,
 };
 
-pub const Device = struct {
-    name: []u8,
-    remote: *Remote,
-    shares: ?tree.Listing = null,
-    online: bool = false,
-    last_seen_ms: i64 = 0,
-    device_id: ?[32]u8 = null,
-    claimed: []u8 = &[_]u8{},
-};
+pub const Device = devices_mod.Device;
 
 pub const Mount = struct {
     allocator: std.mem.Allocator,
@@ -336,7 +323,8 @@ pub const Mount = struct {
     gid: u32,
     lock: sync.Mutex = .{},
     table: InodeTable,
-    devices: std.ArrayList(Device) = .empty,
+    /// The devices shown under the root (shared with the WebDAV server's kind).
+    directory: devices_mod.Directory,
     /// Shown as the mtime of the root and device folders.
     mounted_at: u64 = 0,
     /// The swarm folder, shown as <mount>/Swarm when set.
@@ -360,20 +348,13 @@ pub const Mount = struct {
         threads: std.ArrayList(std.Thread) = .empty,
         count: u32 = 0,
     } = .{},
-    refresh: struct {
-        mutex: sync.Mutex = .{},
-        cond: sync.Condition = .{},
-        wanted: bool = false,
-        first_done: bool = false,
-        last_start_ms: i64 = 0,
-        thread: ?std.Thread = null,
-    } = .{},
 
     pub fn init(allocator: std.mem.Allocator, block_manager: ?*cluster.BlockManager, store: *storage.engine.StorageEngine) !Mount {
         var self = Mount{
             .table = try InodeTable.init(allocator, .{ .kind = .root }),
             .allocator = allocator,
             .block_manager = block_manager,
+            .directory = devices_mod.Directory.init(allocator, block_manager),
             .store = store,
             .uid = linux.getuid(),
             .gid = linux.getgid(),
@@ -387,7 +368,7 @@ pub const Mount = struct {
 
     pub fn deinit(self: *Mount) void {
         self.stopping.store(true, .release);
-        self.stopRefresher();
+        self.directory.stop();
         while (true) {
             const thread = blk: {
                 self.pool.mutex.lock();
@@ -410,13 +391,7 @@ pub const Mount = struct {
         self.handles.deinit(self.allocator);
         self.writing.deinit(self.allocator);
         self.table.deinit();
-        for (self.devices.items) |d| {
-            self.allocator.free(d.name);
-            if (d.claimed.len > 0) self.allocator.free(d.claimed);
-            if (d.shares) |s| s.deinit();
-            self.allocator.destroy(d.remote);
-        }
-        self.devices.deinit(self.allocator);
+        self.directory.deinit();
         tl_reply.deinit(self.allocator);
         tl_reply = .empty;
     }
@@ -431,7 +406,7 @@ pub const Mount = struct {
 
     /// Split out so tests can drive it with a socketpair instead of /dev/fuse.
     pub fn run(self: *Mount) !void {
-        try self.startRefresher();
+        try self.directory.start();
         {
             self.pool.mutex.lock();
             self.pool.count = 1;
@@ -439,7 +414,7 @@ pub const Mount = struct {
         }
         self.workerMain();
         self.stopping.store(true, .release);
-        self.stopRefresher();
+        self.directory.stop();
         while (true) {
             const thread = blk: {
                 self.pool.mutex.lock();
@@ -537,233 +512,6 @@ pub const Mount = struct {
         };
         self.pool.threads.appendAssumeCapacity(thread);
         self.pool.count += 1;
-    }
-
-    fn startRefresher(self: *Mount) !void {
-        self.refresh.mutex.lock();
-        defer self.refresh.mutex.unlock();
-        if (self.refresh.thread != null) return;
-        self.refresh.thread = try std.Thread.spawn(.{}, refresherMain, .{self});
-    }
-
-    fn stopRefresher(self: *Mount) void {
-        const thread = blk: {
-            self.refresh.mutex.lock();
-            defer self.refresh.mutex.unlock();
-            self.refresh.wanted = true;
-            self.refresh.cond.broadcast();
-            const t = self.refresh.thread;
-            self.refresh.thread = null;
-            break :blk t;
-        };
-        if (thread) |t| t.join();
-    }
-
-    fn refresherMain(self: *Mount) void {
-        while (!self.stopping.load(.acquire)) {
-            self.refresh.mutex.lock();
-            while (!self.refresh.wanted and !self.stopping.load(.acquire)) {
-                self.refresh.cond.wait(&self.refresh.mutex);
-            }
-            if (self.stopping.load(.acquire)) {
-                self.refresh.mutex.unlock();
-                return;
-            }
-            self.refresh.wanted = false;
-            self.refresh.last_start_ms = sync.monotonicMillis();
-            self.refresh.mutex.unlock();
-
-            self.refreshAll();
-
-            self.refresh.mutex.lock();
-            self.refresh.first_done = true;
-            self.refresh.cond.broadcast();
-            self.refresh.mutex.unlock();
-        }
-    }
-
-    fn requestRefresh(self: *Mount) void {
-        self.refresh.mutex.lock();
-        defer self.refresh.mutex.unlock();
-        const now = sync.monotonicMillis();
-        if (now - self.refresh.last_start_ms >= @divFloor(device_refresh_ns, std.time.ns_per_ms)) {
-            self.refresh.wanted = true;
-            self.refresh.cond.signal();
-        }
-    }
-
-    fn refreshAll(self: *Mount) void {
-        const bm = self.block_manager orelse return;
-        const peers = remote_mod.knownPeers(bm, self.allocator) catch return;
-        defer self.allocator.free(peers);
-
-        {
-            self.lock.lock();
-            defer self.lock.unlock();
-            const now = sync.monotonicMillis();
-            for (self.devices.items) |*d| {
-                if (now - d.last_seen_ms > 10 * 60 * 1000) {
-                    if (d.shares) |listing| listing.deinit();
-                    d.shares = null;
-                    d.online = false;
-                }
-            }
-        }
-
-        var i: usize = 0;
-        while (i < peers.len and !self.stopping.load(.acquire)) {
-            const batch_end = @min(i + refresh_parallel, peers.len);
-            const batch = peers[i..batch_end];
-            i = batch_end;
-
-            const ProbeContext = struct {
-                mount: *Mount,
-                peer: NodeID,
-                shares_res: ?Remote.Shares = null,
-
-                fn run(ctx: *@This()) void {
-                    var probe = Remote{
-                        .block_manager = ctx.mount.block_manager.?,
-                        .peer = ctx.peer,
-                    };
-                    ctx.shares_res = probe.shares(ctx.mount.allocator) catch null;
-                }
-            };
-
-            var contexts: [refresh_parallel]ProbeContext = undefined;
-            var threads: [refresh_parallel]?std.Thread = [_]?std.Thread{null} ** refresh_parallel;
-
-            for (batch, 0..) |peer, b_idx| {
-                contexts[b_idx] = .{ .mount = self, .peer = peer };
-                threads[b_idx] = std.Thread.spawn(.{}, ProbeContext.run, .{&contexts[b_idx]}) catch null;
-                if (threads[b_idx] == null) {
-                    contexts[b_idx].run();
-                }
-            }
-
-            for (batch, 0..) |peer, b_idx| {
-                if (threads[b_idx]) |t| t.join();
-                if (contexts[b_idx].shares_res) |shares| {
-                    self.applyShares(peer, shares);
-                } else {
-                    self.lock.lock();
-                    for (self.devices.items) |*d| {
-                        if (d.remote.peer.eql(peer)) {
-                            d.online = false;
-                            break;
-                        }
-                    }
-                    self.lock.unlock();
-                    // Reads of its files fail fast until it answers again.
-                    if (bm.fetcher) |*f| f.markDown(peer);
-                }
-            }
-        }
-    }
-
-    fn applyShares(self: *Mount, peer: NodeID, shares: Remote.Shares) void {
-        defer self.allocator.free(shares.nickname);
-        self.lock.lock();
-        defer self.lock.unlock();
-
-        const bm = self.block_manager orelse {
-            shares.listing.deinit();
-            return;
-        };
-        const index = for (self.devices.items, 0..) |d, i| {
-            if (d.remote.peer.eql(peer)) break i;
-        } else blk: {
-            const remote = self.allocator.create(Remote) catch {
-                shares.listing.deinit();
-                return;
-            };
-            errdefer self.allocator.destroy(remote);
-            remote.* = .{ .block_manager = bm, .peer = peer };
-            const name = self.allocator.dupe(u8, "") catch {
-                self.allocator.destroy(remote);
-                shares.listing.deinit();
-                return;
-            };
-            self.devices.append(self.allocator, .{ .name = name, .remote = remote }) catch {
-                self.allocator.free(name);
-                self.allocator.destroy(remote);
-                shares.listing.deinit();
-                return;
-            };
-            break :blk self.devices.items.len - 1;
-        };
-        const device = &self.devices.items[index];
-
-        if (device.shares) |old| old.deinit();
-        device.online = true;
-        device.last_seen_ms = sync.monotonicMillis();
-        device.device_id = if (shares.device_id) |id| id.bytes else peer.bytes;
-        if (device.claimed.len > 0) self.allocator.free(device.claimed);
-        device.claimed = self.allocator.dupe(u8, shares.nickname) catch &[_]u8{};
-        device.shares = shares.listing;
-
-        self.recomputeNames();
-    }
-
-    /// Recomputes mount folder names for all online devices.
-    /// Caller holds self.lock.
-    fn recomputeNames(self: *Mount) void {
-        var online_count: usize = 0;
-        for (self.devices.items) |d| {
-            if (d.online) online_count += 1;
-        }
-        if (online_count == 0) return;
-
-        const online_indices = self.allocator.alloc(usize, online_count) catch return;
-        defer self.allocator.free(online_indices);
-        const entries = self.allocator.alloc(device_names.Entry, online_count) catch return;
-        defer self.allocator.free(entries);
-        const out = self.allocator.alloc([]u8, online_count) catch return;
-        defer self.allocator.free(out);
-
-        const trust_store = if (self.block_manager) |bm| bm.trustStore() else null;
-        var trust_entries: std.ArrayList(device_trust.Entry) = .empty;
-        defer trust_entries.deinit(self.allocator);
-        trust_entries.ensureTotalCapacity(self.allocator, online_count) catch return;
-
-        var j: usize = 0;
-        for (self.devices.items, 0..) |d, i| {
-            if (!d.online) continue;
-            online_indices[j] = i;
-            const dev_id = d.device_id orelse d.remote.peer.bytes;
-            var trusted_info: ?device_names.TrustedInfo = null;
-            if (trust_store) |ts| {
-                if (ts.lookup(NodeID{ .bytes = dev_id })) |te| {
-                    trust_entries.appendAssumeCapacity(te);
-                    const last_te = &trust_entries.items[trust_entries.items.len - 1];
-                    trusted_info = .{
-                        .label = last_te.labelSlice(),
-                        .added_at = last_te.added_at,
-                    };
-                }
-            }
-            entries[j] = .{
-                .device_id = dev_id,
-                .trusted = trusted_info,
-                .nickname = d.claimed,
-            };
-            j += 1;
-        }
-
-        device_names.assign(self.allocator, entries, out) catch |err| {
-            std.debug.print("recomputeNames: assign failed: {any}\n", .{err});
-            return;
-        };
-
-        for (online_indices, out) |dev_idx, new_name| {
-            const old_name = self.devices.items[dev_idx].name;
-            if (std.mem.eql(u8, old_name, new_name)) {
-                self.allocator.free(new_name);
-                continue;
-            }
-            self.devices.items[dev_idx].name = new_name;
-            self.allocator.free(old_name);
-        }
     }
 
     /// Handles one request; true once the kernel tears the session down.
@@ -906,12 +654,7 @@ pub const Mount = struct {
             const folder = self.swarm orelse return error.FileNotFound;
             return folder.readAt(self.allocator, node.cid, node.author, offset, dest);
         }
-        const remote = blk: {
-            self.lock.lock();
-            defer self.lock.unlock();
-            if (node.device >= self.devices.items.len) return error.FileNotFound;
-            break :blk self.devices.items[node.device].remote;
-        };
+        const remote = self.directory.remote(node.device) orelse return error.FileNotFound;
         if (self.hooks.before_network) |hook| hook(self.hooks.ctx);
         const bm = remote.block_manager orelse return error.PeerDown;
         return remote_mod.readShareAt(self.allocator, bm, self.read_ahead, remote.peer, node.cid, offset, dest);
@@ -1430,35 +1173,18 @@ pub const Mount = struct {
                 if (self.swarm != null) {
                     try out.append(arena, .{ .name = "Swarm", .node = .{ .kind = .swarm_dir, .mtime = self.mounted_at } });
                 }
-                if (self.refresh.thread != null) {
-                    self.requestRefresh();
-                    self.refresh.mutex.lock();
-                    if (!self.refresh.first_done and !self.stopping.load(.acquire)) {
-                        self.refresh.cond.timedWait(&self.refresh.mutex, first_refresh_wait_ms * std.time.ns_per_ms);
-                    }
-                    self.refresh.mutex.unlock();
-                } else {
-                    self.refreshAll();
-                }
-                self.lock.lock();
-                defer self.lock.unlock();
-                for (self.devices.items, 0..) |d, i| {
-                    // A device without a name yet (naming failed) is not listed.
-                    if (!d.online or d.name.len == 0) continue;
-                    try out.append(arena, .{ .name = try arena.dupe(u8, d.name), .node = .{
+                self.directory.ensureFresh();
+                for (try self.directory.online(arena)) |d| {
+                    try out.append(arena, .{ .name = d.name, .node = .{
                         .kind = .device,
-                        .device = @intCast(i),
+                        .device = d.index,
                         .mtime = self.mounted_at,
                     } });
                 }
             },
             .device => {
-                self.lock.lock();
-                defer self.lock.unlock();
-                if (parent.device >= self.devices.items.len) return out.items;
-                const listing = self.devices.items[parent.device].shares orelse return out.items;
-                for (listing.entries) |e| {
-                    try out.append(arena, .{ .name = try arena.dupe(u8, e.name), .node = .{
+                for (try self.directory.shares(arena, parent.device)) |e| {
+                    try out.append(arena, .{ .name = e.name, .node = .{
                         .kind = .dir,
                         .device = parent.device,
                         .cid = e.cid,
@@ -1502,12 +1228,7 @@ pub const Mount = struct {
                 }
             },
             .dir => {
-                const remote = blk: {
-                    self.lock.lock();
-                    defer self.lock.unlock();
-                    if (parent.device >= self.devices.items.len) return error.FileNotFound;
-                    break :blk self.devices.items[parent.device].remote;
-                };
+                const remote = self.directory.remote(parent.device) orelse return error.FileNotFound;
                 const listing = try tree.listDir(arena, remote.loader(), &parent.cid);
                 for (listing.entries) |e| {
                     try out.append(arena, .{ .name = try arena.dupe(u8, e.name), .node = .{
@@ -1845,6 +1566,7 @@ test "fuse: attr size does not overflow on 2^64-1" {
         .table = try InodeTable.init(std.testing.allocator, .{ .kind = .root }),
         .allocator = std.testing.allocator,
         .block_manager = undefined,
+        .directory = devices_mod.Directory.init(std.testing.allocator, null),
         .store = undefined,
         .uid = 1000,
         .gid = 1000,
@@ -1861,6 +1583,7 @@ test "fuse: dispatch skips header shorter than InHeader" {
         .table = try InodeTable.init(std.testing.allocator, .{ .kind = .root }),
         .allocator = std.testing.allocator,
         .block_manager = undefined,
+        .directory = devices_mod.Directory.init(std.testing.allocator, null),
         .store = undefined,
         .uid = 1000,
         .gid = 1000,
@@ -1881,6 +1604,7 @@ test "fuse: dropHandle clears writing entry when fh matches" {
         .table = try InodeTable.init(std.testing.allocator, .{ .kind = .root }),
         .allocator = std.testing.allocator,
         .block_manager = undefined,
+        .directory = devices_mod.Directory.init(std.testing.allocator, null),
         .store = undefined,
         .uid = 1000,
         .gid = 1000,

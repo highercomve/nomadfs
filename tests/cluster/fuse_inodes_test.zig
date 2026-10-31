@@ -499,7 +499,7 @@ test "fuse inodes: 3-node loopback share walk with FORGET bounds inode table" {
     // 1. LOOKUP device (unpaired devices have fingerprint suffix)
     try sendReaddir(&mount, fuse.root_id);
     // A copy: a refresh may rename the device and free its name.
-    const dev_name = try allocator.dupe(u8, mount.devices.items[0].name);
+    const dev_name = try allocator.dupe(u8, mount.directory.devices.items[0].name);
     defer allocator.free(dev_name);
     try sendLookup(&mount, fuse.root_id, dev_name);
     const dev_ino = mount.table.find(fuse.root_id, dev_name).?;
