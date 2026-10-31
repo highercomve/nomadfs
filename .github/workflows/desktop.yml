@@ -46,6 +46,17 @@ jobs:
       - name: WebDAV server (curl; another user refused)
         timeout-minutes: 5
         run: bash scripts/webdav-smoke.sh zig-out/bin/nomadfs serve
+      # The install scripts, against the latest release (a release run is
+      # skipped: its macOS files are attached later in this workflow).
+      - name: install.sh (latest release)
+        if: github.event_name != 'release'
+        timeout-minutes: 5
+        run: |
+          export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
+          NO_RESTART=1 bash scripts/install.sh
+          test -x "$HOME/.local/bin/nomadfs-gui"
+          test -f "$HOME/.local/share/applications/com.foreachdeveloper.nomadfs.desktop"
+          "$HOME/.local/bin/nomadfs" --version
   macos:
     runs-on: macos-latest
     steps:
@@ -64,6 +75,14 @@ jobs:
       - name: WebDAV mount (mount_webdav, then cp, mv, rm through it)
         timeout-minutes: 5
         run: bash scripts/webdav-smoke.sh zig-out/bin/nomadfs mount
+      - name: install.sh (latest release)
+        if: github.event_name != 'release'
+        timeout-minutes: 5
+        run: |
+          export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
+          NO_RESTART=1 APP_DIR="$RUNNER_TEMP/Applications" bash scripts/install.sh
+          codesign --verify --deep "$RUNNER_TEMP/Applications/NomadFS.app"
+          "$HOME/.local/bin/nomadfs" --version
       - name: Import signing identity
         env:
           CERT: ${{ secrets.NOMADFS_MACOS_CERT_P12_BASE64 }}
@@ -204,3 +223,18 @@ jobs:
           if ($app.HasExited) { "the app exited with $($app.ExitCode)"; exit 1 }
           "the app is running"
           Stop-Process -Id $app.Id -Force
+      - name: install.ps1 (latest release; PowerShell 5.1, then 7 through iex)
+        if: github.event_name != 'release'
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $env:NO_RESTART = '1'
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$env:LOCALAPPDATA\NomadFS\bin\nomadfs.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # The way the site says to run it.
+          Get-Content scripts\install.ps1 -Raw | Invoke-Expression
+          $exe = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Recurse -Filter 'nomadfs-gui.exe' | Select-Object -First 1
+          if (-not $exe) { "the app isn't installed"; exit 1 }
+          [Environment]::GetEnvironmentVariable('Path', 'User')

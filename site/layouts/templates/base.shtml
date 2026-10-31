@@ -3,16 +3,16 @@
 	<head id="head">
 		<meta charset="utf-8">
 		<meta name="viewport" content="width=device-width, initial-scale=1">
-		<meta name="description" content="NomadFS: share folders across your own devices with files downloaded on demand, one swarm folder every device writes, and a Linux mount. An app for the Linux desktop and Android.">
+		<meta name="description" content="NomadFS: share folders across your own devices with files downloaded on demand, one swarm folder every device writes, and a mount on every desktop. An app for Linux, Windows, macOS and Android.">
 		<meta property="og:title" content="NomadFS: your devices, one filesystem">
-		<meta property="og:description" content="Share folders across your laptop, phone and home server. Files travel only when you open them; a swarm folder every device reads and writes; a FUSE mount on Linux.">
+		<meta property="og:description" content="Share folders across your laptop, phone and home server. Files travel only when you open them; a swarm folder every device reads and writes; a mount on Linux, Windows and macOS.">
 		<meta property="og:image" content="$site.asset('brand/nomadfs-banner.png').link()">
 		<meta name="theme-color" content="#0b0e16">
 		<link rel="icon" type="image/png" href="$site.asset('brand/nomadfs-icon-32.png').link()">
 		<link rel="icon" type="image/svg+xml" href="$site.asset('brand/nomadfs-icon.svg').link()">
 		<link rel="preload" as="font" type="font/woff2" href="$site.asset('fonts/bricolage-grotesque.woff2').link()" crossorigin>
 		<link rel="preload" as="font" type="font/woff2" href="$site.asset('fonts/figtree.woff2').link()" crossorigin>
-		<link type="text/css" rel="stylesheet" href="$site.asset('style.css').link().suffix('?v=20261027d')">
+		<link type="text/css" rel="stylesheet" href="$site.asset('style.css').link().suffix('?v=20261031g')">
 		<link type="text/css" rel="stylesheet" href="$site.asset('highlight.css').link().suffix('?v=20261027d')">
 		<style>[hidden] { display: none !important; }</style>
 		<super>
@@ -28,6 +28,7 @@
 					<span></span><span></span><span></span>
 				</button>
 				<nav class="topnav">
+					<a href="$site.page('').link().suffix('#download')">Download</a>
 					<a href="$site.page('docs').link()">Docs</a>
 					<a href="$site.page('learn').link()">Learn</a>
 					<a href="$site.page('docs/getting-started').link()">Get started</a>
@@ -64,6 +65,6 @@
 			</div>
 			<p class="footer-legal">Built with <a href="https://ziglang.org/" target="_blank" rel="noopener">Zig</a> &amp; <a href="https://oriel.foreachdeveloper.com" target="_blank" rel="noopener">Oriel</a> by <a href="https://www.foreachdeveloper.com/" target="_blank" rel="noopener">foreachdeveloper</a> · Site made with <a href="https://zine-ssg.io" target="_blank" rel="noopener">Zine</a> · Fonts under the SIL Open Font License</p>
 		</footer>
-		<script src="$site.asset('site.js').link().suffix('?v=20261027d')" defer></script>
+		<script src="$site.asset('site.js').link().suffix('?v=20261031g')" defer></script>
 	</body>
 </html>

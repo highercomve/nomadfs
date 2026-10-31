@@ -30,16 +30,25 @@ On Windows and macOS the app then updates itself, like the AppImage on Linux
 (run the macOS app from Applications, not from the disk image). Its **Mount**
 tab shows everything as a folder in Finder, or a drive in Explorer.
 
-On Linux, this installs the latest release for your user (the app's AppImage
-and the command line in `~/.local/bin`, and a launcher entry), checking every
-file against the release's checksums:
+Or install from a terminal: the latest release for your user, every file
+checked against the release's checksums. On Linux and macOS:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/install.sh | bash
 ```
 
-`VERSION=0.2.3` installs a given release; `NO_CLI=1`, `NO_DESKTOP=1` and
-`NO_RESTART=1` skip the command line, the launcher entry, or starting the app.
+On Linux that puts the app's AppImage and the command line in `~/.local/bin`,
+with a launcher entry; on macOS (Apple silicon), the app in `/Applications`
+and the command line in `~/.local/bin`. On Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/install.ps1 | iex
+```
+
+That runs the app's installer silently and puts `nomadfs.exe` on your PATH.
+`VERSION=0.3.14` (`$env:VERSION = '0.3.14'` on Windows) installs a given
+release; `NO_CLI=1`, `NO_RESTART=1` and, on Linux, `NO_DESKTOP=1` skip the
+command line, starting the app, or the launcher entry.
 The app then updates itself ([Updates]($link.ref('updates'))), and the
 command line with `nomadfs --upgrade`: it checks the release's signature
 before it replaces the binary (`--check` only says whether there is a new
