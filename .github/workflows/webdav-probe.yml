@@ -4,24 +4,43 @@ jobs:
   probe:
     runs-on: macos-latest
     steps:
-      - name: man page and usage
+      - name: try -i and URL credentials
         run: |
-          man mount_webdav | col -b | sed -n '1,200p' || true
-          /sbin/mount_webdav 2>&1 | head -20 || true
-          strings /sbin/mount_webdav | grep -i -E 'auth|user|pass|fd' | head -40 || true
-      - name: try login formats
-        run: |
-          try() {
-            name=$1; data=$2
-            mkdir -p /tmp/m_$name
-            rm -f /tmp/req_$name
-            (nc -l 127.0.0.1 47999 > /tmp/req_$name) & ncpid=$!
-            sleep 1
-            printf "$data" | /sbin/mount_webdav -S -a 0 -v Probe http://127.0.0.1:47999/ /tmp/m_$name; echo "$name: exit $?"
-            sleep 1; kill $ncpid 2>/dev/null || true
-            echo "$name request:"; head -c 300 /tmp/req_$name; echo
-          }
-          try le '\x07\x00\x00\x00nomadfs\x04\x00\x00\x00pass'
-          try be '\x00\x00\x00\x07nomadfs\x00\x00\x00\x04pass'
-          try nl 'nomadfs\npass\n'
-          try nul 'nomadfs\x00pass\x00'
+          cat > /tmp/dav.py <<'PY'
+          import base64, sys
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          OK = "Basic " + base64.b64encode(b"nomadfs:pass").decode()
+          class H(BaseHTTPRequestHandler):
+              def handle_one_request(self):
+                  super().handle_one_request()
+              def do_any(self):
+                  n = int(self.headers.get("Content-Length") or 0)
+                  if n: self.rfile.read(n)
+                  auth = self.headers.get("Authorization")
+                  print("REQ", self.command, self.path, "auth=", auth, flush=True)
+                  if self.command == "OPTIONS":
+                      self.send_response(200); self.send_header("DAV", "1, 2"); self.send_header("Content-Length", "0"); self.end_headers(); return
+                  if auth != OK:
+                      self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="NomadFS"'); self.send_header("Content-Length", "0"); self.end_headers(); return
+                  body = b'<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:"><D:response><D:href>/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>'
+                  self.send_response(207); self.send_header("Content-Type", "application/xml"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+              do_GET = do_PROPFIND = do_LOCK = do_UNLOCK = do_PUT = do_HEAD = do_any
+              def log_message(self, *a): pass
+          HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+          PY
+          python3 /tmp/dav.py 47998 > /tmp/dav.log 2>&1 &
+          sleep 2
+          mkdir -p /tmp/mi /tmp/mu
+          echo "== -i with stdin"
+          printf 'nomadfs\npass\n' | /sbin/mount_webdav -S -i -v Probe http://127.0.0.1:47998/ /tmp/mi < /dev/stdin; echo "exit $?"
+          mount | grep /tmp/mi || true
+          /sbin/umount /tmp/mi 2>/dev/null || true
+          echo "== -i, script with a tty"
+          printf 'nomadfs\npass\n' | script -q /dev/null /sbin/mount_webdav -S -i -v Probe http://127.0.0.1:47998/ /tmp/mi; echo "exit $?"
+          mount | grep /tmp/mi || true
+          /sbin/umount /tmp/mi 2>/dev/null || true
+          echo "== credentials in the URL"
+          /sbin/mount_webdav -S -v Probe http://nomadfs:pass@127.0.0.1:47998/ /tmp/mu; echo "exit $?"
+          mount | grep /tmp/mu || true
+          /sbin/umount /tmp/mu 2>/dev/null || true
+          echo "== server log"; cat /tmp/dav.log
