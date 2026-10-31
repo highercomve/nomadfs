@@ -5,11 +5,11 @@
 //!   /<token>/Swarm/<path...>             the swarm folder: read and write
 //!   /<token>/<device>/<share>/<path...>  every reachable device's shares: read only
 //!
-//! The token is random for each start and is in the URL the mount uses,
-//! so other accounts on the machine, which can reach 127.0.0.1 too, can't
-//! read or write the swarm. Where the URL is public (macOS lists every
-//! mount's URL to every account), the mount uses the plain URL with Basic
-//! auth instead: `user` and a random password, also new each start.
+//! The token is random for each start and is in the URL the mount uses.
+//! Other accounts on the machine can reach 127.0.0.1 too, and on macOS
+//! they can read the URL (the mount table shows it): where the system can
+//! tell (Linux, macOS), a connection from another user's process is closed
+//! unanswered (webdav/peer.zig).
 //!
 //! Devices come from devices.Directory, the same list and names as the FUSE
 //! mount. Writes go through the swarm folder's own edits (addFileAt,
@@ -35,6 +35,7 @@ const ReadAhead = @import("fs/readahead.zig").ReadAhead;
 const env = @import("env.zig");
 const http = @import("webdav/http.zig");
 const xml = @import("webdav/xml.zig");
+const peer = @import("webdav/peer.zig");
 const Conn = http.Conn;
 const Request = http.Request;
 
@@ -52,9 +53,6 @@ const max_connections = 64;
 const chunk_len = 256 * 1024;
 const idle_timeout_ms = 60_000;
 
-/// The Basic auth user name.
-pub const user = "nomadfs";
-
 pub const Server = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -67,12 +65,8 @@ pub const Server = struct {
     port: u16 = 0,
     /// The URL's first path segment (hex of 16 random bytes).
     token: [32]u8 = undefined,
-    /// `/<token>`, the root of every href reached through the token.
+    /// `/<token>`, the root of every href.
     root: [33]u8 = undefined,
-    /// The Basic auth password (hex of 16 random bytes).
-    password: [32]u8 = undefined,
-    /// The Authorization value it makes: `base64(user:password)`.
-    basic: [std.base64.standard.Encoder.calcSize(user.len + 1 + 32)]u8 = undefined,
     accept_thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = .init(false),
     /// Open connections, so stop() can end them.
@@ -120,16 +114,11 @@ pub const Server = struct {
     /// a new random token.
     pub fn start(self: *Server, port: u16) !void {
         if (self.listener != null) return;
-        var secret: [32]u8 = undefined;
+        var secret: [16]u8 = undefined;
         try self.io.randomSecure(&secret);
-        self.token = std.fmt.bytesToHex(secret[0..16].*, .lower);
+        self.token = std.fmt.bytesToHex(secret, .lower);
         self.root[0] = '/';
         @memcpy(self.root[1..], &self.token);
-        self.password = std.fmt.bytesToHex(secret[16..32].*, .lower);
-        const pair = user ++ ":" ++ [_]u8{0} ** 32;
-        var plain: [pair.len]u8 = pair.*;
-        @memcpy(plain[user.len + 1 ..], &self.password);
-        _ = std.base64.standard.Encoder.encode(&self.basic, &plain);
         var listener = try compat.listenLoopback(port);
         errdefer listener.deinit();
         self.port = listener.inner.socket.address.getPort();
@@ -165,12 +154,6 @@ pub const Server = struct {
         return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}/{s}/", .{ self.port, &self.token });
     }
 
-    /// `http://127.0.0.1:<port>/`, into `buf`: for clients that log in
-    /// with `user` and `password`.
-    pub fn plainUrl(self: *const Server, buf: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}/", .{self.port});
-    }
-
     fn acceptLoop(self: *Server) void {
         while (self.running.load(.acquire)) {
             var listener = self.listener orelse return;
@@ -193,7 +176,7 @@ pub const Server = struct {
                 conn.stream.close();
                 continue;
             }
-            const t = std.Thread.spawn(.{}, serveConnection, .{ self, conn.stream }) catch {
+            const t = std.Thread.spawn(.{}, serveConnection, .{ self, conn.stream, conn.address.getPort() }) catch {
                 self.forget(conn.stream);
                 conn.stream.close();
                 continue;
@@ -215,10 +198,15 @@ pub const Server = struct {
         self.conns.done.broadcast();
     }
 
-    fn serveConnection(self: *Server, stream: compat.Stream) void {
+    fn serveConnection(self: *Server, stream: compat.Stream, client_port: u16) void {
         defer {
             self.forget(stream);
             stream.close();
+        }
+        // Another account's process: closed unanswered (see peer.zig).
+        if (peer.supported and !peer.sameUser(self.allocator, self.port, client_port)) {
+            if (self.log_requests) std.debug.print("webdav: refused a connection from another user (port {d})\n", .{client_port});
+            return;
         }
         stream.setTimeout(idle_timeout_ms) catch {};
         var conn = Conn{ .stream = stream };
@@ -243,19 +231,14 @@ pub const Server = struct {
             return false;
         }
         const keep = !std.ascii.eqlIgnoreCase(req.header("connection") orelse "", "close");
-        // Logged in, or under the token; otherwise only OPTIONS is
-        // answered (it says nothing of what is served).
-        if (self.authorized(&req)) {
-            req.root = "";
-        } else if (self.underRoot(req.segments)) |rest| {
-            req.segments = rest;
-            req.root = &self.root;
-        } else {
+        // Without the token only OPTIONS is answered: it says nothing of
+        // what is served.
+        req.segments = self.underRoot(req.segments) orelse {
             try conn.discardBody(&req);
             if (eql(req.method, "OPTIONS")) return self.options(conn, keep);
-            try conn.respond(401, "Unauthorized", &.{.{ "WWW-Authenticate", "Basic realm=\"NomadFS\"" }}, "");
+            try conn.respond(404, "Not Found", &.{}, "");
             return keep;
-        }
+        };
         if (self.log_requests) std.debug.print("webdav: {s} /{s} depth={s}\n", .{ req.method, try std.mem.join(arena, "/", req.segments), req.header("depth") orelse "-" });
         conn.head_sent = false;
         self.dispatch(arena, conn, &req) catch |err| {
@@ -300,14 +283,6 @@ pub const Server = struct {
             .{ "Allow", "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, MOVE, COPY, PROPFIND, PROPPATCH, LOCK, UNLOCK" },
         }, "");
         return keep;
-    }
-
-    /// The request carries `Authorization: Basic` with this start's password.
-    fn authorized(self: *const Server, req: *const Request) bool {
-        const value = req.header("authorization") orelse return false;
-        const scheme = "Basic ";
-        if (value.len != scheme.len + self.basic.len or !std.ascii.eqlIgnoreCase(value[0..scheme.len], scheme)) return false;
-        return std.crypto.timing_safe.eql(@TypeOf(self.basic), value[scheme.len..][0..self.basic.len].*, self.basic);
     }
 
     /// `segments` without the token in front, or null when it isn't there.
@@ -444,9 +419,9 @@ pub const Server = struct {
         const w = &body.writer;
         try w.writeAll("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n");
         const name = if (req.segments.len > 0) req.segments[req.segments.len - 1] else "NomadFS";
-        try writeResponse(w, req.root, req.segments, null, name, node);
+        try writeResponse(w, &self.root, req.segments, null, name, node);
         if (!eql(depth, "0") and node.isDir()) {
-            for (try self.children(arena, node)) |c| try writeResponse(w, req.root, req.segments, c.name, c.name, c.node);
+            for (try self.children(arena, node)) |c| try writeResponse(w, &self.root, req.segments, c.name, c.name, c.node);
         }
         try w.writeAll("</D:multistatus>\n");
         try conn.respond(207, "Multi-Status", &.{.{ "Content-Type", "application/xml; charset=utf-8" }}, body.written());
@@ -577,8 +552,7 @@ pub const Server = struct {
         try conn.discardBody(req);
         const dest_header = req.header("destination") orelse return conn.respond(400, "Bad Request", &.{}, "");
         const dest_all = try http.splitPath(arena, http.targetPath(dest_header)) orelse return conn.respond(400, "Bad Request", &.{}, "");
-        // The destination is under the same root the request came in by.
-        const dest_segments = (if (req.root.len == 0) dest_all else self.underRoot(dest_all)) orelse return conn.respond(403, "Forbidden", &.{}, "");
+        const dest_segments = self.underRoot(dest_all) orelse return conn.respond(403, "Forbidden", &.{}, "");
         const to = try swarmPath(arena, dest_segments) orelse return conn.respond(403, "Forbidden", &.{}, "");
         const folder = self.swarm orelse return error.FileNotFound;
         const overwrite = !eql(req.header("overwrite") orelse "T", "F");
@@ -663,7 +637,7 @@ pub const Server = struct {
             "<D:timeout>Second-3600</D:timeout><D:locktoken><D:href>");
         try w.writeAll(token);
         try w.writeAll("</D:href></D:locktoken><D:lockroot><D:href>");
-        try xml.writeHref(w, req.root, req.segments, null);
+        try xml.writeHref(w, &self.root, req.segments, null);
         try w.writeAll("</D:href></D:lockroot></D:activelock></D:lockdiscovery></D:prop>\n");
         const header = try std.fmt.allocPrint(arena, "<{s}>", .{token});
         try conn.respond(200, "OK", &.{ .{ "Content-Type", "application/xml; charset=utf-8" }, .{ "Lock-Token", header } }, body.written());
@@ -671,12 +645,12 @@ pub const Server = struct {
 
     /// Clients set times and Windows attributes after a copy; each property
     /// is reported as set.
-    fn proppatch(_: *Server, arena: std.mem.Allocator, conn: *Conn, req: *Request) !void {
+    fn proppatch(self: *Server, arena: std.mem.Allocator, conn: *Conn, req: *Request) !void {
         const body_in = try conn.readSmallBody(arena, req, max_small_body);
         var body: std.Io.Writer.Allocating = .init(arena);
         const w = &body.writer;
         try w.writeAll("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>");
-        try xml.writeHref(w, req.root, req.segments, null);
+        try xml.writeHref(w, &self.root, req.segments, null);
         try w.writeAll("</D:href><D:propstat><D:prop>");
         // Echo each property element named inside <prop> as an empty one.
         var it = std.mem.splitSequence(u8, body_in, "<");

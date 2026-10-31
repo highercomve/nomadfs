@@ -27,6 +27,22 @@ env:
   TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 jobs:
+  # The WebDAV server's check that a connection comes from this user,
+  # with another user (sudo -u nobody) refused.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG || github.ref }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Command line
+        run: zig build -Doptimize=ReleaseSafe
+      - name: WebDAV server (curl; another user refused)
+        timeout-minutes: 5
+        run: bash scripts/webdav-smoke.sh zig-out/bin/nomadfs serve
   macos:
     runs-on: macos-latest
     steps:

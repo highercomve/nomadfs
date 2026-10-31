@@ -64,6 +64,7 @@ test {
         @import("webdav.zig"),
         @import("webdav/http.zig"),
         @import("webdav/xml.zig"),
+        @import("webdav/peer.zig"),
         @import("node.zig"),
         @import("device/auth.zig"),
         @import("device/identity.zig"),
