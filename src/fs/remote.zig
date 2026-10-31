@@ -169,7 +169,6 @@ pub fn knownPeers(block_manager: *cluster.BlockManager, allocator: std.mem.Alloc
     return block_manager.knownPeers(allocator);
 }
 
-
 pub const DeviceShare = struct {
     name: []const u8,
     cid: [32]u8,

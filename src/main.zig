@@ -358,7 +358,7 @@ fn onStopSignal(_: std.os.linux.SIG) callconv(.c) void {
 
 fn mountCommand(allocator: std.mem.Allocator, config: config_mod.Config, mountpoint: []const u8) !void {
     if (comptime @hasDecl(nomadfs.fs.fuse, "Mount")) return mountLinux(allocator, config, mountpoint);
-    if (comptime !nomadfs.fs.webdav_mount.supported) {
+    if (comptime !nomadfs.webdav_mount.supported) {
         std.debug.print("Error: --mount isn't supported here; --webdav <port> serves the same over WebDAV\n", .{});
         std.process.exit(1);
     }
@@ -383,24 +383,9 @@ extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (u32) callconv(.w
 /// server on 127.0.0.1, mounted at `mountpoint` when given (a folder on
 /// macOS, a drive letter like Z: on Windows), until Ctrl-C.
 fn webdavCommand(allocator: std.mem.Allocator, config: config_mod.Config, port: u16, mountpoint: ?[]const u8) !void {
-    if (!config.storage.enabled) {
-        std.debug.print("Error: --mount and --webdav need storage enabled (fetched blocks are cached there)\n", .{});
-        std.process.exit(1);
-    }
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var node = try startNode(allocator, config);
-    defer node.deinit();
-    std.debug.print("NomadFS {s}: device {x}\n", .{ config.node.nickname, node.device_identity.deviceId().bytes[0..6] });
-    node.bootstrap(config.network.bootstrap_peers, config.node.swarm_key) catch |err| {
-        std.debug.print("Bootstrap error: {any}\n", .{err});
-    };
-    var running = std.atomic.Value(bool).init(true);
-    const run_thread = try std.Thread.spawn(.{}, runUntilStopped, .{ &node, &running, config });
-    defer {
-        running.store(false, .release);
-        run_thread.join();
-    }
-
+    var live: LiveNode = undefined;
+    try live.start(allocator, config, "--mount and --webdav");
+    defer live.stop();
     if (builtin.os.tag == .windows) {
         _ = SetConsoleCtrlHandler(onWebDavConsole, 1);
     } else {
@@ -408,51 +393,53 @@ fn webdavCommand(allocator: std.mem.Allocator, config: config_mod.Config, port: 
         std.posix.sigaction(.INT, &action, null);
         std.posix.sigaction(.TERM, &action, null);
     }
-
-    const server = try node.newWebDav(allocator, port);
-    defer {
-        server.deinit();
-        allocator.destroy(server);
-    }
-    var url_buf: [64]u8 = undefined;
-    const url = try server.url(&url_buf);
-    const mounted = if (mountpoint) |target| nomadfs.fs.webdav_mount.mount(allocator, io, url, target) catch |err| {
-        std.debug.print("Error: couldn't mount {s} at {s}: {s}\n", .{ url, target, @errorName(err) });
-        if (builtin.os.tag == .windows) std.debug.print("Windows mounts WebDAV with its WebClient service: start it (services.msc), or connect to {s} from Explorer.\n", .{url});
+    const mount = live.node.startWebDav(allocator, port, mountpoint) catch |err| {
+        std.debug.print("Error: couldn't start the mount: {s}\n", .{@errorName(err)});
+        if (builtin.os.tag == .windows and mountpoint != null) std.debug.print("Windows mounts WebDAV with its WebClient service: start it (services.msc), or use --webdav <port> and connect from Explorer.\n", .{});
         return err;
-    } else null;
-    defer if (mounted) |m| {
-        nomadfs.fs.webdav_mount.unmount(allocator, io, m) catch {};
-        allocator.free(m);
-        std.debug.print("Unmounted.\n", .{});
     };
-    if (mounted) |m| {
-        std.debug.print("Mounted at {s}, served at {s} (Ctrl-C to unmount)\n", .{ m, url });
+    defer mount.stop();
+    if (mount.at) |at| {
+        std.debug.print("Mounted at {s}, served at {s} (Ctrl-C to unmount)\n", .{ at, mount.url() });
     } else {
-        std.debug.print("WebDAV at {s}: the swarm folder (read and write) and every device's shares (Ctrl-C to stop)\n", .{url});
+        std.debug.print("WebDAV at {s}: the swarm folder (read and write) and every device's shares (Ctrl-C to stop)\n", .{mount.url()});
     }
     while (!webdav_stop.load(.acquire)) nomadfs.sync.sleep(200 * std.time.ns_per_ms);
 }
 
+/// A node started, bootstrapped and running on its own thread, for the
+/// commands that serve it (--mount, --webdav).
+const LiveNode = struct {
+    node: nomadfs.Node,
+    running: std.atomic.Value(bool),
+    thread: std.Thread,
+
+    fn start(self: *LiveNode, allocator: std.mem.Allocator, config: config_mod.Config, what: []const u8) !void {
+        if (!config.storage.enabled) {
+            std.debug.print("Error: {s} needs storage enabled (fetched blocks are cached there)\n", .{what});
+            std.process.exit(1);
+        }
+        self.node = try startNode(allocator, config);
+        errdefer self.node.deinit();
+        std.debug.print("NomadFS {s}: device {x}\n", .{ config.node.nickname, self.node.device_identity.deviceId().bytes[0..6] });
+        self.node.bootstrap(config.network.bootstrap_peers, config.node.swarm_key) catch |err| {
+            std.debug.print("Bootstrap error: {any}\n", .{err});
+        };
+        self.running = .init(true);
+        self.thread = try std.Thread.spawn(.{}, runUntilStopped, .{ &self.node, &self.running, config });
+    }
+
+    fn stop(self: *LiveNode) void {
+        self.running.store(false, .release);
+        self.thread.join();
+        self.node.deinit();
+    }
+};
+
 fn mountLinux(allocator: std.mem.Allocator, config: config_mod.Config, mountpoint: []const u8) !void {
-    if (!config.storage.enabled) {
-        std.debug.print("Error: --mount needs storage enabled (fetched blocks are cached there)\n", .{});
-        std.process.exit(1);
-    }
-
-    var node = try startNode(allocator, config);
-    defer node.deinit();
-    std.debug.print("NomadFS {s}: device {x}\n", .{ config.node.nickname, node.device_identity.deviceId().bytes[0..6] });
-    node.bootstrap(config.network.bootstrap_peers, config.node.swarm_key) catch |err| {
-        std.debug.print("Bootstrap error: {any}\n", .{err});
-    };
-
-    var running = std.atomic.Value(bool).init(true);
-    const run_thread = try std.Thread.spawn(.{}, runUntilStopped, .{ &node, &running, config });
-    defer {
-        running.store(false, .release);
-        run_thread.join();
-    }
+    var live: LiveNode = undefined;
+    try live.start(allocator, config, "--mount");
+    defer live.stop();
 
     if (mountpoint.len >= mounted_at.len) return error.NameTooLong;
     @memcpy(mounted_at[0..mountpoint.len], mountpoint);
@@ -467,7 +454,7 @@ fn mountLinux(allocator: std.mem.Allocator, config: config_mod.Config, mountpoin
     _ = std.os.linux.sigaction(.TERM, &handler, null);
 
     try nomadfs.fs.fuse.prepareMountpoint(allocator, mountpoint);
-    var mount = try node.newMount(allocator);
+    var mount = try live.node.newMount(allocator);
     defer mount.deinit();
     std.debug.print("Mounted at {s} (Ctrl-C to unmount)\n", .{mountpoint});
     mount.serve(mountpoint) catch |err| {

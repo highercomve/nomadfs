@@ -755,7 +755,6 @@ pub const Node = struct {
         }
     }
 
-
     /// Asks `conn`'s peer for its swarm folder manifest (caller-owned,
     /// allocated with the node's allocator; validate by merging it).
     /// The peer's swarm manifest, or empty when it is the same as `have`
@@ -776,11 +775,6 @@ pub const Node = struct {
         }
     }
 
-
-
-
-
-
     pub const AdmitSent = struct {
         digest: u64,
         at: i64,
@@ -793,10 +787,6 @@ pub const Node = struct {
             return if (self.complete) 6 * 60 * 60 else 10 * 60;
         }
     };
-
-
-
-
 
     // Returns either the value (allocated) or closer peers (allocated)
     pub const FindValueResult = union(enum) {
@@ -986,7 +976,6 @@ pub const Node = struct {
         }
     }
 
-
     // ---- Relaying (relay_service.zig) ----
 
     /// Streams one node pipes at once.
@@ -996,7 +985,6 @@ pub const Node = struct {
     pub const relay_retry_ms: i64 = 60_000;
     /// Bound on a relay setting a connection up (it may dial the target).
     pub const relay_setup_timeout_ms: u32 = 15_000;
-
 
     // ---- Membership news (gossip.zig) and relaying (relay_service.zig) ----
 
@@ -1118,16 +1106,6 @@ pub const Node = struct {
         }
         return false;
     }
-
-
-
-
-
-
-
-
-
-
 
     fn handlePing(self: *Node, stream: network.Stream, conn: network.Connection, claimed_id: id.NodeID, port: u16, roles: u8, swarm: [32]u8, announced_addrs: []const network.Address) !void {
         // The handshake authenticated the connection; a PING may not claim
@@ -1293,9 +1271,6 @@ pub const Node = struct {
         try response.send(self.allocator, stream);
     }
 
-
-
-
     fn handleGetSwarm(self: *Node, stream: network.Stream, have: [32]u8) !void {
         const same = if (self.swarm_source) |source| (if (source.digestFn) |f| std.mem.eql(u8, &f(source.ctx), &have) else false) else false;
         const manifest: []u8 = if (same)
@@ -1308,9 +1283,6 @@ pub const Node = struct {
         const response = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .SWARM = .{ .manifest = manifest } } };
         try response.send(self.allocator, stream);
     }
-
-
-
 
     fn handleFindValue(self: *Node, stream: network.Stream, key: id.NodeID) !void {
         // Copy under the lock: the stored slice may be replaced concurrently.
@@ -1352,7 +1324,6 @@ pub const Node = struct {
     }
 };
 
-
 test "localStore enforces value, byte and key limits" {
     const allocator = std.testing.allocator;
     var manager = network.manager.ConnectionManager.initExplicit(allocator, .tcp, network.noise.KeyPair.generate());
@@ -1390,7 +1361,6 @@ test "handler admission is capped and drain permanently stops admission" {
     node.drainHandlers();
     try std.testing.expect(!node.startHandler());
 }
-
 
 test "recent peer maps prune expired deadlines" {
     var map: std.AutoHashMapUnmanaged(id.NodeID, i64) = .empty;

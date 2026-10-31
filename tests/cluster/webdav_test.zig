@@ -72,7 +72,7 @@ test "webdav: the swarm folder is read-write over HTTP, the rest read-only" {
     defer bm.deinit();
     folder.block_manager = bm;
 
-    var server = nomadfs.fs.webdav.Server.init(allocator, bm);
+    var server = nomadfs.webdav.Server.init(allocator, bm);
     defer server.deinit();
     server.swarm = folder;
     try server.start(0);

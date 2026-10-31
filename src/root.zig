@@ -9,6 +9,9 @@ pub const net = @import("net/mod.zig");
 pub const storage = @import("storage/mod.zig");
 pub const device = @import("device/mod.zig");
 pub const fs = @import("fs/mod.zig");
+/// The mount where there is no FUSE: WebDAV on 127.0.0.1, and mounting it.
+pub const webdav = @import("webdav.zig");
+pub const webdav_mount = @import("webdav_mount.zig");
 
 pub const node_info = @import("node_info.zig");
 
@@ -58,6 +61,7 @@ test {
         @import("settings.zig"),
         @import("key_rotation.zig"),
         @import("node_info.zig"),
+        @import("webdav.zig"),
         @import("node.zig"),
         @import("device/auth.zig"),
         @import("device/identity.zig"),

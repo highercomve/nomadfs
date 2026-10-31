@@ -2,6 +2,8 @@
 //! network together, owns their lifecycles, and is the service API the CLI,
 //! the app and the mobile API call (directly or through settings.zig).
 const builtin = @import("builtin");
+const webdav = @import("webdav.zig");
+const webdav_mount = @import("webdav_mount.zig");
 const can_mount = builtin.os.tag == .linux and !builtin.abi.isAndroid();
 const std = @import("std");
 const config = @import("config.zig");
@@ -493,19 +495,22 @@ pub const Node = struct {
         return mount;
     }
 
-    /// Starts a WebDAV server on 127.0.0.1:`port` (0: any free port) with
-    /// this node's devices and swarm folder (fs/webdav.zig). Caller stops
-    /// it with `deinit` and `allocator.destroy`.
-    pub fn newWebDav(self: *Node, allocator: std.mem.Allocator, port: u16) !*fs.webdav.Server {
+    /// The mount where there is no FUSE: a WebDAV server on 127.0.0.1:`port`
+    /// (0: any free port) with this node's devices and swarm folder,
+    /// mounted at `target` when given (a folder on macOS, a drive letter on
+    /// Windows). Stop it with `Mount.stop`, before the node goes.
+    pub fn startWebDav(self: *Node, allocator: std.mem.Allocator, port: u16, target: ?[]const u8) !*webdav_mount.Mount {
         if (self.store == null) return error.StorageDisabled;
-        const server = try allocator.create(fs.webdav.Server);
-        errdefer allocator.destroy(server);
-        server.* = fs.webdav.Server.init(allocator, self.block_manager);
-        errdefer server.deinit();
+        const server = try allocator.create(webdav.Server);
+        server.* = webdav.Server.init(allocator, self.block_manager);
         server.swarm = self.swarm;
         server.read_ahead = self.read_ahead;
-        try server.start(port);
-        return server;
+        server.start(port) catch |err| {
+            server.deinit();
+            allocator.destroy(server);
+            return err;
+        };
+        return webdav_mount.start(allocator, server, target);
     }
 
     pub fn inspectFile(self: *Node, allocator: std.mem.Allocator, source: FileSource) !fs.inspect.Inspection {

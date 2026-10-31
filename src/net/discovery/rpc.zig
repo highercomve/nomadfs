@@ -57,7 +57,7 @@ pub const MessageType = enum(u8) {
     /// Ask a device for its swarm folder manifest. Answered with SWARM.
     GET_SWARM = 18,
     /// Reply to GET_SWARM: the encoded manifest (fs/manifest.zig), or nothing
-/// when the asker's digest (`have`) says it has the same content.
+    /// when the asker's digest (`have`) says it has the same content.
     SWARM = 19,
     /// A new swarm key from a trusted device (device/rotation.zig).
     /// Answered with STORE_ACK.

@@ -42,9 +42,6 @@ jobs:
         run: bash scripts/smoke.sh zig-out/bin/nomadfs
       - name: Platform tests (disk, addresses)
         run: zig test src/node_info.zig
-      - name: WebDAV server (curl)
-        timeout-minutes: 5
-        run: bash scripts/webdav-smoke.sh zig-out/bin/nomadfs.exe serve
       - name: WebDAV mount (mount_webdav, then cp, mv, rm through it)
         timeout-minutes: 5
         run: bash scripts/webdav-smoke.sh zig-out/bin/nomadfs mount
@@ -142,6 +139,9 @@ jobs:
         run: bash scripts/smoke.sh zig-out/bin/nomadfs.exe
       - name: Platform tests (disk, addresses)
         run: zig test src/node_info.zig
+      - name: WebDAV server (curl)
+        timeout-minutes: 5
+        run: bash scripts/webdav-smoke.sh zig-out/bin/nomadfs.exe serve
       - name: WebView2 runtime
         shell: pwsh
         run: |

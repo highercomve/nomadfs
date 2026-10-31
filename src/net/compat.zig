@@ -285,17 +285,18 @@ pub const Server = struct {
 };
 
 pub fn listen(port: u16) !Server {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
-    const s = try addr.listen(io, .{ .reuse_address = true });
-    return .{ .inner = s };
+    return listenOn("0.0.0.0", port);
 }
 
 /// Like listen, on 127.0.0.1 only (this device's own programs). Port 0
 /// picks a free one: `server.inner.socket.address.getPort()`.
 pub fn listenLoopback(port: u16) !Server {
+    return listenOn("127.0.0.1", port);
+}
+
+fn listenOn(ip: []const u8, port: u16) !Server {
     const io = std.Io.Threaded.global_single_threaded.io();
-    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    const addr = try std.Io.net.IpAddress.parse(ip, port);
     const s = try addr.listen(io, .{ .reuse_address = true });
     return .{ .inner = s };
 }

@@ -1,10 +1,54 @@
-//! Mounting the WebDAV server (webdav.zig) where the system's own tools
-//! show it like a disk: macOS's mount_webdav into a folder, Windows's
-//! `net use` on a drive letter (the WebClient service). Shared by the
-//! command line (`nomadfs --mount`) and the app.
+//! The mount where there is no FUSE: the node's WebDAV server
+//! (webdav.zig), mounted where the system's own tools show it like a disk:
+//! macOS's mount_webdav into a folder, Windows's `net use` on a drive
+//! letter (the WebClient service). The command line (`nomadfs --mount`)
+//! and the app start and stop it the same way (Node.startWebDav).
 
 const std = @import("std");
 const builtin = @import("builtin");
+const webdav = @import("webdav.zig");
+
+/// A running server, mounted or not. `stop` unmounts, then stops it.
+pub const Mount = struct {
+    allocator: std.mem.Allocator,
+    server: *webdav.Server,
+    /// Where it is mounted (owned), or null when only served.
+    at: ?[]u8 = null,
+    url_buf: [64]u8 = undefined,
+    url_len: usize = 0,
+
+    pub fn url(self: *const Mount) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+
+    /// Unmounts (if mounted), stops the server and frees everything,
+    /// `self` included.
+    pub fn stop(self: *Mount) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        if (self.at) |at| {
+            unmount(self.allocator, io, at) catch {};
+            self.allocator.free(at);
+        }
+        self.server.deinit();
+        self.allocator.destroy(self.server);
+        self.allocator.destroy(self);
+    }
+};
+
+/// Takes a started `server`; mounts it at `target` when given. On error
+/// the server is stopped and freed.
+pub fn start(allocator: std.mem.Allocator, server: *webdav.Server, target: ?[]const u8) !*Mount {
+    errdefer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    const self = try allocator.create(Mount);
+    errdefer allocator.destroy(self);
+    self.* = .{ .allocator = allocator, .server = server };
+    self.url_len = (try server.url(&self.url_buf)).len;
+    if (target) |t| self.at = try mount(allocator, std.Io.Threaded.global_single_threaded.io(), self.url(), t);
+    return self;
+}
 
 pub const supported = builtin.os.tag == .macos or builtin.os.tag == .windows;
 

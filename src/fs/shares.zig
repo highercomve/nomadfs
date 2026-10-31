@@ -86,7 +86,6 @@ pub const ShareIndex = struct {
         allocator.free(s.path);
     }
 
-
     /// Marks the share `name` for backup, or clears the mark.
     pub fn setBackup(self: *ShareIndex, name: []const u8, on: bool) !void {
         self.mutex.lock();
@@ -108,7 +107,6 @@ pub const ShareIndex = struct {
         for (self.backup_names.items) |n| if (std.mem.eql(u8, n, name)) return true;
         return false;
     }
-
 
     /// Shares `path` as `name`, replacing any share of that name. The
     /// folder is scanned before this returns, so it is listed right away.

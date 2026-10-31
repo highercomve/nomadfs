@@ -17,14 +17,14 @@
 //! address, so a web page can't reach the server through DNS rebinding.
 
 const std = @import("std");
-const cluster = @import("../cluster/mod.zig");
-const compat = @import("../net/compat.zig");
-const sync = @import("../sync.zig");
-const tree = @import("tree.zig");
-const remote_mod = @import("remote.zig");
-const swarm_mod = @import("swarm.zig");
-const devices_mod = @import("devices.zig");
-const ReadAhead = @import("readahead.zig").ReadAhead;
+const cluster = @import("cluster/mod.zig");
+const compat = @import("net/compat.zig");
+const sync = @import("sync.zig");
+const tree = @import("fs/tree.zig");
+const remote_mod = @import("fs/remote.zig");
+const swarm_mod = @import("fs/swarm.zig");
+const devices_mod = @import("fs/devices.zig");
+const ReadAhead = @import("fs/readahead.zig").ReadAhead;
 
 const swarm_name = "Swarm";
 /// Request line and headers.
