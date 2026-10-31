@@ -5,6 +5,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: try -i and URL credentials
+        shell: bash {0}
         run: |
           cat > /tmp/dav.py <<'PY'
           import base64, sys
@@ -31,12 +32,16 @@ jobs:
           python3 /tmp/dav.py 47998 > /tmp/dav.log 2>&1 &
           sleep 2
           mkdir -p /tmp/mi /tmp/mu
-          echo "== -i with stdin"
-          printf 'nomadfs\npass\n' | /sbin/mount_webdav -S -i -v Probe http://127.0.0.1:47998/ /tmp/mi < /dev/stdin; echo "exit $?"
+          echo "== -i alone, stdin"
+          printf 'nomadfs\npass\n' | /sbin/mount_webdav -i http://127.0.0.1:47998/ /tmp/mi; echo "exit $?"
+          mount | grep /tmp/mi || true
+          /sbin/umount /tmp/mi 2>/dev/null || true
+          echo "== -i -v, stdin"
+          printf 'nomadfs\npass\n' | /sbin/mount_webdav -i -v Probe http://127.0.0.1:47998/ /tmp/mi; echo "exit $?"
           mount | grep /tmp/mi || true
           /sbin/umount /tmp/mi 2>/dev/null || true
           echo "== -i, script with a tty"
-          printf 'nomadfs\npass\n' | script -q /dev/null /sbin/mount_webdav -S -i -v Probe http://127.0.0.1:47998/ /tmp/mi; echo "exit $?"
+          printf 'nomadfs\npass\n' | script -q /dev/null /sbin/mount_webdav -i -v Probe http://127.0.0.1:47998/ /tmp/mi; echo "exit $?"
           mount | grep /tmp/mi || true
           /sbin/umount /tmp/mi 2>/dev/null || true
           echo "== credentials in the URL"
