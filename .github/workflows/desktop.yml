@@ -117,23 +117,35 @@ jobs:
           Start-Process $setup -ArgumentList '/silent','/install' -Wait
       - name: Install the release's app and start it
         timeout-minutes: 10
+        shell: pwsh
         run: |
-          tag="${TAG:-$(gh release view --json tagName -q .tagName)}"
-          if ! gh release download "$tag" -p '*-setup.exe' -D "$RUNNER_TEMP/rel"; then
+          $tag = if ($env:TAG) { $env:TAG } else { gh release view --json tagName -q .tagName }
+          $rel = Join-Path $env:RUNNER_TEMP 'rel'
+          gh release download $tag -p '*-setup.exe' -D $rel
+          if ($LASTEXITCODE -ne 0) {
             # A manual run on main before the first Windows release.
-            if [ -z "$TAG" ]; then echo "no Windows installer in $tag yet: skipped"; exit 0; fi
+            if (-not $env:TAG) { "no Windows installer in $tag yet: skipped"; exit 0 }
             exit 1
-          fi
-          setup=$(ls "$RUNNER_TEMP"/rel/*-setup.exe | head -1)
-          "$setup" /S
-          sleep 10
-          exe=$(find "$LOCALAPPDATA/Programs" "$PROGRAMFILES" -iname 'nomadfs-gui.exe' 2>/dev/null | head -1)
-          echo "installed: $exe"
-          test -n "$exe"
-          "$exe" > "$RUNNER_TEMP/app.log" 2>&1 &
-          pid=$!
-          sleep 20
-          tail -30 "$RUNNER_TEMP/app.log" || true
-          # Still running (Git Bash's kill can't end a native GUI process).
-          tasklist //FI "IMAGENAME eq nomadfs-gui.exe" | grep -i nomadfs-gui
-          taskkill //F //IM nomadfs-gui.exe
+          }
+          $setup = (Get-ChildItem $rel -Filter '*-setup.exe' | Select-Object -First 1).FullName
+          "installer: $setup"
+          $p = Start-Process $setup -ArgumentList '/S' -PassThru
+          if (-not $p.WaitForExit(180000)) {
+            "the installer is still running after 3 minutes:"
+            Get-Process | Where-Object { $_.MainWindowTitle } | Format-Table Id, Name, MainWindowTitle -AutoSize | Out-String -Width 200
+            Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $p.Id } | Format-Table ProcessId, Name, CommandLine -AutoSize | Out-String -Width 300
+            $p.Kill(); exit 1
+          }
+          "installer exit code: $($p.ExitCode)"
+          $exe = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Recurse -Filter 'nomadfs-gui.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { "not installed"; exit 1 }
+          "installed: $($exe.FullName)"
+          Get-ChildItem $exe.DirectoryName | Format-Table Name, Length -AutoSize | Out-String
+          $env:USERPROFILE = Join-Path $env:RUNNER_TEMP 'apphome'; New-Item -ItemType Directory -Force $env:USERPROFILE | Out-Null
+          $log = Join-Path $env:RUNNER_TEMP 'app.log'
+          $app = Start-Process $exe.FullName -PassThru -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+          Start-Sleep 20
+          Get-Content $log, "$log.err" -Tail 30 -ErrorAction SilentlyContinue
+          if ($app.HasExited) { "the app exited with $($app.ExitCode)"; exit 1 }
+          "the app is running"
+          Stop-Process -Id $app.Id -Force
