@@ -92,12 +92,26 @@ test "webdav: the swarm folder is read-write over HTTP, the rest read-only" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    // Without the token nothing is served; OPTIONS still answers.
-    try std.testing.expectEqual(@as(u16, 404), (try requestAt(a, port, "PROPFIND", "/", "Depth: 1\r\n", "")).status);
-    try std.testing.expectEqual(@as(u16, 404), (try requestAt(a, port, "PUT", "/Swarm/x.txt", "", "x")).status);
+    // Without the token or the login nothing is served; OPTIONS still answers.
+    const refused = try requestAt(a, port, "PROPFIND", "/", "Depth: 1\r\n", "");
+    try std.testing.expectEqual(@as(u16, 401), refused.status);
+    try std.testing.expect(std.mem.startsWith(u8, refused.header("WWW-Authenticate").?, "Basic"));
+    try std.testing.expectEqual(@as(u16, 401), (try requestAt(a, port, "PUT", "/Swarm/x.txt", "", "x")).status);
     try std.testing.expectEqual(@as(u16, 200), (try requestAt(a, port, "OPTIONS", "/", "", "")).status);
     const wrong = try std.fmt.allocPrint(a, "/{s}/Swarm/", .{"0" ** 32});
-    try std.testing.expectEqual(@as(u16, 404), (try requestAt(a, port, "PROPFIND", wrong, "Depth: 0\r\n", "")).status);
+    try std.testing.expectEqual(@as(u16, 401), (try requestAt(a, port, "PROPFIND", wrong, "Depth: 0\r\n", "")).status);
+    // Logged in (the macOS mount): the plain paths, hrefs without the token.
+    {
+        var pair_buf: [64]u8 = undefined;
+        const pair = try std.fmt.bufPrint(&pair_buf, "{s}:{s}", .{ nomadfs.webdav.user, &server.password });
+        var b64: [96]u8 = undefined;
+        const login = try std.fmt.allocPrint(a, "Authorization: Basic {s}\r\nDepth: 1\r\n", .{std.base64.standard.Encoder.encode(&b64, pair)});
+        const listed = try requestAt(a, port, "PROPFIND", "/", login, "");
+        try std.testing.expectEqual(@as(u16, 207), listed.status);
+        try std.testing.expect(std.mem.indexOf(u8, listed.body, "<D:href>/Swarm/</D:href>") != null);
+        const bad = try std.fmt.allocPrint(a, "Authorization: Basic {s}\r\n", .{std.base64.standard.Encoder.encode(&b64, "nomadfs:not-the-password")});
+        try std.testing.expectEqual(@as(u16, 401), (try requestAt(a, port, "PROPFIND", "/", bad, "")).status);
+    }
 
     // Discovery: it's a class 2 WebDAV server (lockable, so writable).
     const options = try request(a, port, "OPTIONS", "/", "", "");

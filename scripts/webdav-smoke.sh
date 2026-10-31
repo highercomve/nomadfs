@@ -32,6 +32,8 @@ if [ "$mode" = mount ]; then
   pid=$!
   for _ in $(seq 1 30); do mount | grep -q " on $mnt " && break; kill -0 "$pid" 2>/dev/null || break; sleep 1; done
   if ! mount | grep " on $mnt "; then cat "$log"; exit 1; fi
+  # Every account can read the mount table: no token in the URL there.
+  if mount | grep " on $mnt " | grep -Eq '/[0-9a-f]{32}'; then echo "token in the mount table"; exit 1; fi
   ls "$mnt"
   test -d "$mnt/Swarm"
   cp "$dir/hello.txt" "$mnt/Swarm/hello.txt"
@@ -54,7 +56,7 @@ else
     sleep 1
   done
   [ -n "$url" ] || { cat "$log"; exit 1; }
-  test "$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND "http://127.0.0.1:$port/")" = 404
+  test "$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND "http://127.0.0.1:$port/")" = 401
   test "$(curl -s -o /dev/null -w '%{http_code}' -T "$dir/hello.txt" "$url/Swarm/hello.txt")" = 201
   test "$(curl -s -o /dev/null -w '%{http_code}' -X MKCOL "$url/Swarm/notes")" = 201
   test "$(curl -s -o /dev/null -w '%{http_code}' -X MOVE -H "Destination: $url/Swarm/notes/moved.txt" "$url/Swarm/hello.txt")" = 201

@@ -24,7 +24,7 @@ pub const Mount = struct {
     /// Mounts the server at `target` (see `mount`); `at` says where.
     pub fn attach(self: *Mount, target: []const u8) !void {
         std.debug.assert(self.at == null);
-        self.at = try mount(self.allocator, std.Io.Threaded.global_single_threaded.io(), self.url(), target);
+        self.at = try mount(self.allocator, std.Io.Threaded.global_single_threaded.io(), self.server, target);
     }
 
     /// Unmounts, if mounted; the server goes on. Forced when the server
@@ -64,19 +64,25 @@ pub fn start(allocator: std.mem.Allocator, server: *webdav.Server, target: ?[]co
 
 pub const supported = builtin.os.tag == .macos or builtin.os.tag == .windows;
 
-/// Mounts `url` at `target`: a folder (macOS, created if missing) or a
+/// Mounts `server` at `target`: a folder (macOS, created if missing) or a
 /// drive letter like `Z:` (Windows; `*` takes the first free one).
 /// Returns where it is mounted (caller frees).
-pub fn mount(gpa: std.mem.Allocator, io: std.Io, url: []const u8, target: []const u8) ![]u8 {
+pub fn mount(gpa: std.mem.Allocator, io: std.Io, server: *const webdav.Server, target: []const u8) ![]u8 {
+    var url_buf: [96]u8 = undefined;
     switch (builtin.os.tag) {
         .macos => {
             try std.Io.Dir.cwd().createDirPath(io, target);
-            // -S: no dialogs (no credentials are asked); -v: the volume's name.
-            try runOk(gpa, &.{ "/sbin/mount_webdav", "-S", "-v", "NomadFS", url, target });
+            // The plain URL: macOS shows every mount's URL to every account,
+            // so the token stays out of it and the login comes over stdin
+            // (-a 0). -S: no dialogs; -v: the volume's name.
+            var auth_buf: [64]u8 = undefined;
+            const auth = authInput(&auth_buf, webdav.user, &server.password);
+            try runWithInput(gpa, &.{ "/sbin/mount_webdav", "-S", "-a", "0", "-v", "NomadFS", try server.plainUrl(&url_buf), target }, auth);
             return gpa.dupe(u8, target);
         },
         .windows => {
-            const out = try runOut(gpa, &.{ "net", "use", target, url, "/persistent:no" });
+            // A drive mapping is visible to its own user only: the token URL.
+            const out = try runOut(gpa, &.{ "net", "use", target, try server.url(&url_buf), "/persistent:no" });
             defer gpa.free(out);
             if (!std.mem.eql(u8, target, "*")) return gpa.dupe(u8, target);
             // "Drive Z: is now connected to ..." (the letter, in any language).
@@ -120,6 +126,43 @@ fn forceUnmountPath(gpa: std.mem.Allocator, target: []const u8) void {
 const darwin = struct {
     extern "c" fn unmount(dir: [*:0]const u8, flags: c_int) c_int;
 };
+
+/// What mount_webdav reads from `-a <fd>`: the user name's length (a
+/// 32-bit integer in the machine's order), the name, the password's
+/// length, the password.
+fn authInput(buf: []u8, name: []const u8, password: []const u8) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeInt(u32, @intCast(name.len), builtin.cpu.arch.endian()) catch unreachable;
+    w.writeAll(name) catch unreachable;
+    w.writeInt(u32, @intCast(password.len), builtin.cpu.arch.endian()) catch unreachable;
+    w.writeAll(password) catch unreachable;
+    return w.buffered();
+}
+
+/// Runs `argv` with `input` on its standard input and its own output on
+/// ours; error.MountFailed unless it exits 0.
+fn runWithInput(gpa: std.mem.Allocator, argv: []const []const u8, input: []const u8) !void {
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = processEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .pipe, .stdout = .inherit, .stderr = .inherit }) catch |err| {
+        std.debug.print("{s}: {s}\n", .{ argv[0], @errorName(err) });
+        return error.MountFailed;
+    };
+    defer child.kill(io);
+    const written = if (child.stdin.?.writeStreamingAll(io, input)) true else |_| false;
+    child.stdin.?.close(io);
+    child.stdin = null;
+    const term = child.wait(io) catch return error.MountFailed;
+    const ok = written and switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) {
+        std.debug.print("{s} failed ({any})\n", .{ argv[0], term });
+        return error.MountFailed;
+    }
+}
 
 fn runOk(gpa: std.mem.Allocator, argv: []const []const u8) !void {
     gpa.free(try runOut(gpa, argv));

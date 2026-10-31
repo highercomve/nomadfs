@@ -25,6 +25,8 @@ pub const Request = struct {
     /// Decoded path segments (no empty ones).
     segments: []const []const u8,
     head: []const u8,
+    /// The path prefix it came in by ("" or `/<token>`), for hrefs.
+    root: []const u8 = "",
     content_length: ?u64 = null,
     chunked: bool = false,
     body_done: bool = false,
