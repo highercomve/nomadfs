@@ -47,7 +47,8 @@ pub fn build(b: *std.Build) void {
     about.addOption([]const u8, "commit", gitCommit(b) orelse "unknown");
     // -Dplay-store=true: the Google Play build. Play updates it; the app
     // neither checks GitHub nor offers an APK (Play's policy).
-    about.addOption(bool, "play_store", b.option(bool, "play-store", "Google Play build: Play updates the Android app") orelse false);
+    const play_store = b.option(bool, "play-store", "Google Play build: Play updates the Android app") orelse false;
+    about.addOption(bool, "play_store", play_store);
 
     // The NomadFS core, shared with the CLI and mobile bindings.
     const nomadfs_mod = b.createModule(.{
@@ -56,7 +57,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    _ = oriel.addApp(b, dep, .{
+    const app = oriel.addApp(b, dep, .{
         .name = "nomadfs-gui",
         .imports = &.{
             .{ .name = "nomadfs", .module = nomadfs_mod },
@@ -112,6 +113,10 @@ pub fn build(b: *std.Build) void {
         // through isolation/hook.js first, in a frame the page can't reach.
         // .isolation = .{ .hook = b.path("isolation/hook.js") },
     });
+    // The Play build keeps its debug info: Gradle packs it into the bundle
+    // as native debug symbols (Play shows crashes with function names) and
+    // strips the libraries it ships (android/app/build.gradle.kts).
+    if (play_store and target.result.abi.isAndroid()) app.exe.root_module.strip = false;
 
     // zig build test: runs the commands tests with the same imports the
     // app exe gets (nomadfs core + oriel paths).

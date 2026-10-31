@@ -16,7 +16,13 @@ android {
         targetSdk = 36
         versionCode = 314
         versionName = "0.3.14"
+        // The Play build's libraries keep their debug info (-Dplay-store):
+        // the bundle carries it as native debug symbols for Play's crash
+        // reports. Other builds come stripped, with nothing to extract.
+        ndk { debugSymbolLevel = "FULL" }
     }
+    // Strips the libraries the app ships (and extracts the symbols above).
+    ndkVersion = "28.2.13676358"
 
     signingConfigs {
         // Release signing from the environment (`oriel android build`):
@@ -46,9 +52,6 @@ android {
     sourceSets["main"].assets.srcDirs("../../zig-out/android-assets")
 
     packaging {
-        // Release libraries come stripped from Zig, Debug ones keep their
-        // symbols: either way Gradle keeps the libraries as built.
-        jniLibs.keepDebugSymbols += "**/*.so"
         // Extracted on install: liboriel_exec.so (the app's own executable,
         // for helper processes) must be a file Android lets the app run.
         jniLibs.useLegacyPackaging = true
@@ -62,6 +65,14 @@ android {
 
 dependencies {
     implementation("androidx.webkit:webkit:1.12.1")
+}
+
+// Debug builds keep their libraries as built, symbols and all (ndk-stack,
+// lldb); release builds are stripped by Gradle.
+androidComponents {
+    onVariants(selector().withBuildType("debug")) { variant ->
+        variant.packaging.jniLibs.keepDebugSymbols.add("**/*.so")
+    }
 }
 
 kotlin {
