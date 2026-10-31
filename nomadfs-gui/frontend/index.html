@@ -258,7 +258,7 @@
           <svg class="icon" viewBox="0 0 24 24"><path d="M20 6H4c-1.1 0-2 .9-2 2v8c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-1 7H5v-2h14v2zm-2.5 3.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2zm3 0a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>
           <div>
             <h2>Mount</h2>
-            <p class="supporting">Every device's shared folders appear as an ordinary folder on this computer. Any app can open the files; they download as they're read. Read-only.</p>
+            <p class="supporting">The swarm folder and every device's shared folders appear as an ordinary folder on this computer. Any app can open the files; they download as they're read. The swarm folder takes new files, renames and deletes too; devices' shared folders are read-only.</p>
           </div>
         </div>
         <div class="mount-status" id="mount-state" data-state="off">
@@ -274,7 +274,7 @@
           <button id="mount-open" type="button" class="btn tonal" hidden>Open folder</button>
           <button id="mount-toggle" type="button" class="btn filled">Mount</button>
         </div>
-        <p class="hint">Also from a terminal: <code>nomadfs --mount ~/NomadFS</code></p>
+        <p class="hint" id="mount-hint">Also from a terminal: <code>nomadfs --mount ~/NomadFS</code></p>
       </section>
 
       <!-- Join -->

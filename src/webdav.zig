@@ -61,6 +61,8 @@ pub const Server = struct {
         files: std.StringHashMapUnmanaged([]u8) = .empty,
     } = .{},
     next_lock: std.atomic.Value(u64) = .init(1),
+    /// NOMADFS_WEBDAV_LOG set: each request and its status on stderr.
+    log_requests: bool = false,
     next_staging: std.atomic.Value(u64) = .init(1),
 
     pub fn init(allocator: std.mem.Allocator, block_manager: ?*cluster.BlockManager) Server {
@@ -69,6 +71,7 @@ pub const Server = struct {
             .io = std.Io.Threaded.global_single_threaded.io(),
             .block_manager = block_manager,
             .directory = devices_mod.Directory.init(allocator, block_manager),
+            .log_requests = logRequested(),
         };
     }
 
@@ -188,9 +191,11 @@ pub const Server = struct {
             return false;
         }
         const keep = !std.ascii.eqlIgnoreCase(req.header("connection") orelse "", "close");
+        if (self.log_requests) std.debug.print("webdav: {s} /{s} depth={s}\n", .{ req.method, try std.mem.join(arena, "/", req.segments), req.header("depth") orelse "-" });
         self.dispatch(arena, conn, &req) catch |err| {
             // The body may be unread: the connection can't be reused.
             const status = statusOf(err);
+            if (self.log_requests) std.debug.print("webdav: -> {d} ({s})\n", .{ status.code, @errorName(err) });
             conn.respond(status.code, status.text, &.{}, "") catch {};
             return false;
         };
@@ -611,6 +616,13 @@ pub const Server = struct {
         }
     }
 };
+
+fn logRequested() bool {
+    const env = @import("env.zig");
+    const value = env.getEnv(std.heap.page_allocator, "NOMADFS_WEBDAV_LOG") orelse return false;
+    defer std.heap.page_allocator.free(value);
+    return value.len > 0 and !eql(value, "0");
+}
 
 /// Files desktops write beside others: kept in memory, never in the swarm.
 fn isScratchName(name: []const u8) bool {

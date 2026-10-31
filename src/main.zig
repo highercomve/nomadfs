@@ -208,7 +208,7 @@ fn nextValue(args: []const []const u8, index: *usize, flag: []const u8) ![]const
 
 fn selectCommand(options: *Options, command: Command) !void {
     if (options.command != .run) {
-        std.debug.print("Error: only one of --pair, --trust, --devices, --revoke, --mount, --invite, --cache, --clear-cache, --bench-read, --bench-idle or --upgrade may be used\n", .{});
+        std.debug.print("Error: only one of --pair, --trust, --devices, --revoke, --mount, --webdav, --invite, --cache, --clear-cache, --bench-read, --bench-idle or --upgrade may be used\n", .{});
         std.process.exit(1);
     }
     options.command = command;
@@ -225,6 +225,7 @@ fn printHelp() void {
         \\  nomadfs --devices [config_path]
         \\  nomadfs --revoke <device-id-or-fingerprint> [config_path]
         \\  nomadfs --mount <dir> [config_path]
+        \\  nomadfs --webdav <port> [config_path]
         \\  nomadfs --invite [--address ip] [config_path]
         \\  nomadfs --cache | --clear-cache [config_path]
         \\  nomadfs --bench-read <swarm path> [--bench-wait SECONDS] [--bench-cold] [config_path]
@@ -258,9 +259,14 @@ fn printHelp() void {
         \\  --join <code>      Join the swarm of the device showing this invite code:
         \\                     trusts it and saves the swarm key and its address
         \\                     in the config (restart a running node afterwards)
-        \\  --mount <dir>      Run the node and mount every device's shares at
-        \\                     <dir>/<device>/<share>, read-only; files download
-        \\                     on demand (Linux, needs fusermount3)
+        \\  --mount <dir>      Run the node and mount the swarm folder at <dir>/Swarm
+        \\                     (read and write) and every device's shares at
+        \\                     <dir>/<device>/<share> (read only); files download
+        \\                     on demand. Linux: FUSE (fusermount3). macOS: WebDAV
+        \\                     mounted with mount_webdav. Windows: WebDAV on a drive
+        \\                     letter (<dir> like Z:, or * for a free one)
+        \\  --webdav <port>    Serve the same over WebDAV on 127.0.0.1:<port> without
+        \\                     mounting it (0 picks a port)
         \\  --cache            Show the read cache: blocks fetched from other devices
         \\                     to be read, evicted least recently used first past
         \\                     `cache_mb` under [storage] (default 2048, 0 = no limit)

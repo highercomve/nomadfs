@@ -444,9 +444,14 @@ fn setup() !void {
         oriel.extensions.expose("nomadfs.storage", .{ .methods = &.{ "status", "request", "info" } });
 }
 
+fn openFolder(path: [:0]const u8) void {
+    oriel.App.openPath(path, "inode/directory");
+}
+
 pub fn main(init: std.process.Init) !u8 {
     initDataDirs();
     commands.before_node_close = downloads.cancelAll;
+    commands.open_folder = openFolder;
     return oriel.main(init, .{ .commands = Commands, .events = Events }, .{
         .app = app.build,
         // With a tray, closing the window hides it; Quit is in the tray.

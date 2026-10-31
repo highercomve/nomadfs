@@ -1154,9 +1154,17 @@ pub fn swarmReadRange(gpa: std.mem.Allocator, args: SwarmRangeArgs) ![]const u8 
     return readBase64(gpa, .{ .swarm = .{ .cid = try parseHex32(args.cid), .author = try parseHex32(args.author_id) } }, args.offset, args.len);
 }
 
-// ---- Mounting (desktop Linux) ----
+// ---- Mounting: FUSE on desktop Linux, WebDAV on macOS and Windows ----
 
 const can_mount = builtin.os.tag == .linux and !builtin.abi.isAndroid();
+const can_webdav = nomadfs.webdav_mount.supported;
+
+/// The WebDAV mount (macOS, Windows), while mounted.
+var g_webdav: ?*nomadfs.webdav_mount.Mount = null;
+
+/// Opens a folder in the system's file manager where xdg-open isn't the
+/// way (macOS, Windows): set by main.zig to Oriel's App.openPath.
+pub var open_folder: ?*const fn (path: [:0]const u8) void = null;
 
 const MountJob = struct {
     mount: if (can_mount) fs.fuse.Mount else void,
@@ -1197,12 +1205,16 @@ pub fn mountStatus(gpa: std.mem.Allocator) !MountStatus {
     g_mutex.lock();
     defer g_mutex.unlock();
     reapMountLocked();
+    const supported = can_mount or can_webdav;
     const default_path = defaultMountPath(gpa) catch try gpa.dupe(u8, "");
-    if (g_mount) |job| return .{ .supported = can_mount, .mounted = true, .path = try gpa.dupe(u8, job.path), .default_path = default_path };
-    return .{ .supported = can_mount, .mounted = false, .path = "", .default_path = default_path };
+    if (g_webdav) |m| return .{ .supported = supported, .mounted = true, .path = try gpa.dupe(u8, m.at orelse m.url()), .default_path = default_path };
+    if (g_mount) |job| return .{ .supported = supported, .mounted = true, .path = try gpa.dupe(u8, job.path), .default_path = default_path };
+    return .{ .supported = supported, .mounted = false, .path = "", .default_path = default_path };
 }
 
+/// ~/NomadFS; on Windows a free drive letter (`*`).
 fn defaultMountPath(gpa: std.mem.Allocator) ![]const u8 {
+    if (builtin.os.tag == .windows) return gpa.dupe(u8, "*");
     const home = nomadfs.env.getEnv(gpa, "HOME") orelse return error.HomeNotFound;
     defer gpa.free(home);
     return std.fs.path.join(gpa, &.{ home, "NomadFS" });
@@ -1217,9 +1229,9 @@ pub fn mountPeek(buf: []u8) ?MountPeek {
     if (!g_mutex.tryLock()) return null;
     defer g_mutex.unlock();
     reapMountLocked();
-    const job = g_mount orelse return .{ .mounted = false, .path = "" };
-    const n = @min(buf.len, job.path.len);
-    @memcpy(buf[0..n], job.path[0..n]);
+    const path: []const u8 = if (g_webdav) |m| (m.at orelse m.url()) else if (g_mount) |job| job.path else return .{ .mounted = false, .path = "" };
+    const n = @min(buf.len, path.len);
+    @memcpy(buf[0..n], path[0..n]);
     return .{ .mounted = true, .path = buf[0..n] };
 }
 
@@ -1229,12 +1241,17 @@ pub const MountArgs = struct { path: []const u8 };
 /// shares at `path` (created if missing), read-only; files download when
 /// an app reads them. Returns once the kernel shows the mount.
 pub fn mountStart(gpa: std.mem.Allocator, args: MountArgs) !void {
-    if (!can_mount) return error.MountUnsupported;
+    if (!can_mount and !can_webdav) return error.MountUnsupported;
     g_mutex.lock();
     defer g_mutex.unlock();
     reapMountLocked();
-    if (g_mount != null) return error.AlreadyMounted;
+    if (g_mount != null or g_webdav != null) return error.AlreadyMounted;
     const handle = g_node orelse return error.NotRunning;
+    if (!can_mount) {
+        // The swarm folder writable, devices read only, over WebDAV.
+        g_webdav = try handle.node.startWebDav(std.heap.page_allocator, 0, args.path);
+        return;
+    }
     try fs.fuse.prepareMountpoint(gpa, args.path);
     const job = try startMountJob(handle, args.path);
     // From here the job is g_mount's: a failed mount is reaped, once.
@@ -1294,6 +1311,10 @@ pub fn mountStop() void {
 
 /// Caller holds g_mutex.
 fn stopMountLocked() void {
+    if (g_webdav) |m| {
+        m.stop();
+        g_webdav = null;
+    }
     const job = g_mount orelse return;
     if (can_mount and !job.done.load(.acquire)) fs.fuse.unmount(job.path);
     // Unmounting makes the serve loop return.
@@ -1324,7 +1345,16 @@ pub const OpenPathArgs = struct { path: []const u8 };
 /// `invoke("open_path", { path })`: shows a folder or file in the desktop's
 /// file manager / default app (xdg-open).
 pub fn openPath(gpa: std.mem.Allocator, args: OpenPathArgs) !void {
-    if (!can_mount) return error.Unsupported;
+    if (!can_mount) {
+        const open = open_folder orelse return error.Unsupported;
+        // A drive letter alone ("Z:") is the current folder on that drive.
+        const path = if (args.path.len == 2 and args.path[1] == ':')
+            try std.fmt.allocPrintSentinel(gpa, "{s}\\", .{args.path}, 0)
+        else
+            try gpa.dupeZ(u8, args.path);
+        defer gpa.free(path);
+        return open(path);
+    }
     const linux = std.os.linux;
     const programs = [_][:0]const u8{ "/usr/bin/xdg-open", "/bin/xdg-open", "/usr/local/bin/xdg-open" };
     const program = for (programs) |p| {

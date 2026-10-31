@@ -95,7 +95,7 @@ fn runOk(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
 /// logged) otherwise.
 fn runOut(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
     const res = std.process.run(gpa, io, .{ .argv = argv, .stdout_limit = .limited(64 * 1024), .stderr_limit = .limited(64 * 1024) }) catch |err| {
-        std.log.warn("{s}: {s}", .{ argv[0], @errorName(err) });
+        std.debug.print("{s}: {s}\n", .{ argv[0], @errorName(err) });
         return error.MountFailed;
     };
     defer gpa.free(res.stderr);
@@ -104,7 +104,7 @@ fn runOut(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
         else => false,
     };
     if (!ok) {
-        std.log.warn("{s} failed: {s}{s}", .{ argv[0], std.mem.trim(u8, res.stderr, " \r\n"), std.mem.trim(u8, res.stdout, " \r\n") });
+        std.debug.print("{s} failed ({any}): {s} {s}\n", .{ argv[0], res.term, std.mem.trim(u8, res.stderr, " \r\n"), std.mem.trim(u8, res.stdout, " \r\n") });
         gpa.free(res.stdout);
         return error.MountFailed;
     }

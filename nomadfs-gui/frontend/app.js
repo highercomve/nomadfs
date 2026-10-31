@@ -1311,7 +1311,9 @@ function renderMount(status) {
   mounted = status.mounted;
   if (status.mounted) mountPath = status.path;
   else if (!mountPath) mountPath = status.default_path;
-  $("mount-path").textContent = mountPath;
+  // Windows mounts on a drive letter; "*" takes the first free one.
+  $("mount-path").textContent = mountPath === "*" ? "The first free drive letter" : mountPath;
+  $("mount-change").hidden = window.oriel.platform?.os === "windows";
   $("mount-state").dataset.state = mounted ? "on" : "off";
   $("mount-label").textContent = mounted ? `Mounted at ${mountPath}` : "Not mounted";
   $("mount-toggle").textContent = mounted ? "Unmount" : "Mount";
@@ -1323,6 +1325,9 @@ async function loadMount() {
   let status;
   try { status = await invoke("mount_status", null); } catch { return; }
   $("nav-mount").hidden = !status.supported;
+  const os = window.oriel.platform?.os;
+  if (os === "windows") $("mount-hint").innerHTML = "Uses Windows's WebDAV client (the WebClient service). Also from a terminal: <code>nomadfs --mount Z:</code>";
+  else if (os === "macos") $("mount-hint").innerHTML = "Mounted over WebDAV, which macOS reads natively. Also from a terminal: <code>nomadfs --mount ~/NomadFS</code>";
   if (!status.supported && document.body.dataset.view === "mount") setView("browse");
   renderMount(status);
 }

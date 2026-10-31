@@ -27,10 +27,10 @@ printf 'hello from webdav\n' > "$dir/hello.txt"
 
 if [ "$mode" = mount ]; then
   mnt="$dir/NomadFS"
-  "$bin" --mount "$mnt" "$dir/smoke.conf" > "$log" 2>&1 &
+  NOMADFS_WEBDAV_LOG=1 "$bin" --mount "$mnt" "$dir/smoke.conf" > "$log" 2>&1 &
   pid=$!
-  for _ in $(seq 1 30); do mount | grep -q " on $mnt " && break; sleep 1; done
-  mount | grep " on $mnt "
+  for _ in $(seq 1 30); do mount | grep -q " on $mnt " && break; kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  if ! mount | grep " on $mnt "; then cat "$log"; exit 1; fi
   ls "$mnt"
   test -d "$mnt/Swarm"
   cp "$dir/hello.txt" "$mnt/Swarm/hello.txt"
