@@ -3,6 +3,31 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.3.17 - 2026-10-31
+
+Connections that survive the real world: away from home, devices stay listed and come back in
+seconds after a network change. Devices on 0.3.16 and 0.3.17 work together.
+
+### Fixed
+
+- A connection that died without a word (a mobile network dropping it, a phone switching to Wi-Fi)
+  stayed "open" for good: devices behind it vanished until the app was restarted. Idle connections
+  now send a keepalive every 15 seconds, and one that hears nothing for 45 seconds is closed and
+  dialed again.
+- Devices reached through a relay disappeared every few minutes: their relayed connection was
+  closed as idle. They are remembered and checked like any other device now.
+- After losing its relay (the public node, or the device on both networks), a device waited up to
+  several minutes before trying again. It retries every 10 seconds, every 5 while cut off, and
+  every other device at once when the relay is back: about 30 seconds from the network coming back
+  to every device listed.
+
+### Changed
+
+- A device that misses one answer stays listed for 45 seconds, so a network switch or a relay
+  being set up again doesn't empty the list.
+- Each refresh of the device list asks every listed device again, which also sets its relay up
+  again.
+
 ## 0.3.16 - 2026-10-31
 
 Away from home, your devices show up again. Devices on 0.3.15 and 0.3.16 work together.
