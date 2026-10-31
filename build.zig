@@ -44,6 +44,8 @@ pub fn build(b: *std.Build) void {
 
     if (target.result.os.tag == .windows) {
         mod.link_libc = true;
+        // GetAdaptersAddresses: this device's addresses (net/local_addrs.zig).
+        mod.linkSystemLibrary("iphlpapi", .{});
     }
 
     // Define the test_helpers module

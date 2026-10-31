@@ -1,0 +1,128 @@
+# macOS and Windows: build and test on real machines, and attach the
+# macOS app and command line to a published release (scripts/release.sh
+# builds the Linux, Android and Windows assets locally).
+#
+#   macOS:   the app (.dmg, signed with NomadFS's persistent self-signed
+#            identity so macOS keeps its permissions across updates) and the
+#            command line node (Apple silicon).
+#   Windows: the command line smoke test, then the release's installer is
+#            installed silently and the app must stay up.
+name: Desktop
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release to test and attach to (default the latest)
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.16.0
+  GH_TOKEN: ${{ github.token }}
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG || github.ref }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Command line
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Smoke test
+        run: bash scripts/smoke.sh zig-out/bin/nomadfs
+      - name: Import signing identity
+        env:
+          CERT: ${{ secrets.NOMADFS_MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.NOMADFS_MACOS_CERT_PASSWORD }}
+        run: |
+          umask 077
+          printf '%s' "$CERT" | base64 --decode > "$RUNNER_TEMP/nomadfs.p12"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p ci "$keychain"
+          security set-keychain-settings "$keychain"
+          security unlock-keychain -p ci "$keychain"
+          security import "$RUNNER_TEMP/nomadfs.p12" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/nomadfs.p12"
+      - name: App
+        working-directory: nomadfs-gui
+        env:
+          ORIEL_MACOS_SIGN_IDENTITY: ${{ secrets.NOMADFS_MACOS_SIGN_IDENTITY }}
+        run: zig build package -Doptimize=ReleaseSafe
+      - name: Check the app
+        working-directory: nomadfs-gui
+        run: |
+          app=$(find zig-out/package -maxdepth 1 -name '*.app' | head -1)
+          codesign --verify --deep --strict "$app"
+          codesign -dvv "$app" 2>&1 | grep -E 'Authority|Identifier'
+          # Starts and stays up (its own HOME: a fresh device).
+          export HOME="$RUNNER_TEMP/apphome"; mkdir -p "$HOME"
+          "$app"/Contents/MacOS/* > "$RUNNER_TEMP/app.log" 2>&1 &
+          pid=$!
+          sleep 20
+          cat "$RUNNER_TEMP/app.log" | tail -30
+          kill -0 "$pid"
+          kill "$pid"
+      - name: Collect
+        run: |
+          v=$(sed -n 's/^ *const version = "\(.*\)";/\1/p' nomadfs-gui/build.zig | head -n1)
+          mkdir dist
+          cp "$(find nomadfs-gui/zig-out/package -maxdepth 1 -name '*.dmg' | head -1)" "dist/nomadfs-gui-$v-macos-arm64.dmg"
+          cp zig-out/bin/nomadfs "dist/nomadfs-$v-aarch64-macos"
+          (cd dist && shasum -a 256 * > SHA256SUMS-macos)
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: dist/
+      - name: Attach to the release
+        if: env.TAG != ''
+        run: gh release upload "$TAG" dist/* --clobber
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG || github.ref }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Command line
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Smoke test
+        run: bash scripts/smoke.sh zig-out/bin/nomadfs.exe
+      - name: Install the release's app and start it
+        run: |
+          tag="${TAG:-$(gh release view --json tagName -q .tagName)}"
+          if ! gh release download "$tag" -p '*-setup.exe' -D "$RUNNER_TEMP/rel"; then
+            # A manual run on main before the first Windows release.
+            if [ -z "$TAG" ]; then echo "no Windows installer in $tag yet: skipped"; exit 0; fi
+            exit 1
+          fi
+          setup=$(ls "$RUNNER_TEMP"/rel/*-setup.exe | head -1)
+          "$setup" /S
+          sleep 10
+          exe=$(find "$LOCALAPPDATA/Programs" "$PROGRAMFILES" -iname 'nomadfs-gui.exe' 2>/dev/null | head -1)
+          echo "installed: $exe"
+          test -n "$exe"
+          "$exe" > "$RUNNER_TEMP/app.log" 2>&1 &
+          pid=$!
+          sleep 20
+          tail -30 "$RUNNER_TEMP/app.log" || true
+          kill -0 "$pid"
+          kill "$pid" || true

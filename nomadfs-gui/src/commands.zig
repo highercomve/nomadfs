@@ -42,6 +42,10 @@ fn initTmpDir() void {
             const io = std.Io.Threaded.global_single_threaded.io();
             std.Io.Dir.cwd().createDirPath(io, dir) catch {};
         }
+    } else if (builtin.os.tag == .windows) {
+        // %TEMP% (the user's AppData\Local\Temp); there is no /tmp.
+        const temp = nomadfs.env.getEnv(std.heap.page_allocator, "TEMP") orelse return;
+        g_tmp_dir = std.heap.page_allocator.dupeZ(u8, temp) catch null;
     } else {
         g_tmp_dir = std.heap.page_allocator.dupeZ(u8, "/tmp") catch null;
     }

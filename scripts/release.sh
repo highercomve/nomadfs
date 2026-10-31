@@ -3,6 +3,10 @@
 # the apps check (latest.json), for the version in nomadfs-gui/build.zig:
 #
 #   nomadfs-<v>-x86_64-linux, nomadfs-<v>-aarch64-linux   command line node
+#   nomadfs-<v>-x86_64-windows.exe                         command line node (Windows)
+#   nomadfs-gui-<v>-windows-x86_64-setup.exe               desktop app (Windows)
+#   (macOS: .github/workflows/desktop.yml builds and attaches the app and
+#   command line on a Mac once the release is published)
 #   nomadfs-gui-<v>-x86_64.AppImage, .deb, .rpm            desktop app
 #   nomadfs-<v>.apk                                        Android
 #   latest.json                                            signed update manifest (the apps)
@@ -68,12 +72,22 @@ run cli-x86_64 zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl "${x8
 cp "$out/build/x86_64/bin/nomadfs" "$assets/nomadfs-$version-x86_64-linux"
 run cli-aarch64 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl -p "$out/build/aarch64"
 cp "$out/build/aarch64/bin/nomadfs" "$assets/nomadfs-$version-aarch64-linux"
+run cli-windows zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu "${x86_cpu[@]}" -p "$out/build/windows"
+cp "$out/build/windows/bin/nomadfs.exe" "$assets/nomadfs-$version-x86_64-windows.exe"
 
 step "Desktop app (AppImage, deb, rpm)"
 cd "$root/nomadfs-gui"
 rm -rf zig-out/package
 run gui-package zig build package -Doptimize=ReleaseSafe "${x86_cpu[@]}"
 cp zig-out/package/* "$assets/"
+
+step "Desktop app (Windows installer)"
+# The WebView2 loader ships next to the app (`oriel webview2` caches it).
+loader=$(ls -d "$HOME"/.oriel/webview2/*/x64/WebView2Loader.dll 2>/dev/null | sort -V | tail -1)
+[ -n "$loader" ] || { echo "No WebView2Loader.dll: run 'oriel webview2'" >&2; exit 1; }
+run gui-windows zig build package -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu "${x86_cpu[@]}" \
+  -Dwebview2-loader="$loader" -p "$out/build/gui-windows"
+cp "$out/build/gui-windows/package/nomadfs-gui-$version-setup.exe" "$assets/nomadfs-gui-$version-windows-x86_64-setup.exe"
 
 step "Android app"
 run android-aarch64 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-android
@@ -98,6 +112,7 @@ run combine zig build combine-manifests -- "$out"/manifests/update-*.json \
 mkdir -p "$out/manifests-cli"
 sign "nomadfs-$version-x86_64-linux" x86_64-linux raw .cli manifests-cli
 sign "nomadfs-$version-aarch64-linux" aarch64-linux raw .cli manifests-cli
+sign "nomadfs-$version-x86_64-windows.exe" x86_64-windows raw .cli manifests-cli
 run combine-cli zig build combine-manifests -- "$out"/manifests-cli/update-*.json \
   --pub-date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --out "$assets/latest-cli.json"
 

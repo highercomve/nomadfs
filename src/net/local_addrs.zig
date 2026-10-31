@@ -1,8 +1,9 @@
 //! This device's own IPv4 addresses: the home LAN, Tailscale and other VPNs.
 //! A device tells others all of them (PING/PONG), so a phone that learned
 //! the desktop's LAN address at home can still reach it over Tailscale when
-//! it's away. Read straight from the kernel (SIOCGIFCONF), no libc needed;
-//! Linux and Android only, elsewhere the list is empty.
+//! it's away. Linux and Android read them straight from the kernel
+//! (SIOCGIFCONF, no libc needed), macOS from getifaddrs, Windows from
+//! GetAdaptersAddresses; elsewhere the list is empty.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -35,7 +36,149 @@ pub fn list(out: []Address, port: u16) usize {
 
 /// IPv4 interface addresses and their actual kernel netmasks. Empty when unavailable.
 pub fn listNets(out: []Net) usize {
-    if (builtin.os.tag != .linux) return 0;
+    return switch (builtin.os.tag) {
+        .linux => listNetsLinux(out),
+        .macos => listNetsDarwin(out),
+        .windows => if (@sizeOf(usize) == 8) listNetsWindows(out) else 0,
+        else => 0,
+    };
+}
+
+/// Adds `addr`/`mask` unless it's loopback, link-local, unset or already there.
+fn addNet(out: []Net, n: *usize, addr: [4]u8, mask: [4]u8) void {
+    if (n.* == out.len) return;
+    if (addr[0] == 127 or addr[0] == 0) return;
+    if (addr[0] == 169 and addr[1] == 254) return;
+    for (out[0..n.*]) |seen| if (std.mem.eql(u8, &seen.addr, &addr)) return;
+    out[n.*] = .{ .addr = addr, .mask = mask };
+    n.* += 1;
+}
+
+/// The netmask of a prefix length (`/24` → 255.255.255.0).
+fn maskOf(prefix: u8) [4]u8 {
+    const bits: u32 = if (prefix == 0) 0 else ~@as(u32, 0) << @intCast(32 - @min(prefix, 32));
+    return @bitCast(std.mem.nativeToBig(u32, bits));
+}
+
+test maskOf {
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 0 }, maskOf(24));
+    try std.testing.expectEqual([4]u8{ 255, 192, 0, 0 }, maskOf(10));
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, maskOf(32));
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, maskOf(0));
+}
+
+// macOS: struct ifaddrs and BSD sockaddrs (a length byte, then the family).
+const Darwin = struct {
+    const Ifaddrs = extern struct {
+        next: ?*Ifaddrs,
+        name: [*:0]const u8,
+        flags: c_uint,
+        addr: ?*const SockaddrIn,
+        netmask: ?*const SockaddrIn,
+        dstaddr: ?*anyopaque,
+        data: ?*anyopaque,
+    };
+    const SockaddrIn = extern struct { len: u8, family: u8, port: u16, addr: [4]u8, zero: [8]u8 };
+    const af_inet = 2;
+    const iff_up = 0x1;
+    const iff_loopback = 0x8;
+    extern "c" fn getifaddrs(out: *?*Ifaddrs) c_int;
+    extern "c" fn freeifaddrs(list: *Ifaddrs) void;
+};
+
+/// macOS: Tailscale and other VPNs are `utunN`, which stay in the list.
+fn listNetsDarwin(out: []Net) usize {
+    var head: ?*Darwin.Ifaddrs = null;
+    if (Darwin.getifaddrs(&head) != 0) return 0;
+    const first = head orelse return 0;
+    defer Darwin.freeifaddrs(first);
+    var n: usize = 0;
+    var it: ?*Darwin.Ifaddrs = first;
+    while (it) |ifa| : (it = ifa.next) {
+        if (ifa.flags & Darwin.iff_up == 0 or ifa.flags & Darwin.iff_loopback != 0) continue;
+        const addr = ifa.addr orelse continue;
+        if (addr.family != Darwin.af_inet) continue;
+        if (skipped(std.mem.span(ifa.name))) continue;
+        const mask = if (ifa.netmask) |m| m.addr else maskOf(32);
+        addNet(out, &n, addr.addr, mask);
+    }
+    return n;
+}
+
+// Windows (64-bit): the leading fields of IP_ADAPTER_ADDRESSES_LH and
+// IP_ADAPTER_UNICAST_ADDRESS_LH, as iphlpapi lays them out.
+const Win = struct {
+    const SockaddrIn = extern struct { family: u16, port: u16, addr: [4]u8, zero: [8]u8 };
+    const Unicast = extern struct {
+        length: u32,
+        flags: u32,
+        next: ?*Unicast,
+        sockaddr: ?*const SockaddrIn,
+        sockaddr_len: i32,
+        prefix_origin: i32,
+        suffix_origin: i32,
+        dad_state: i32,
+        valid_lifetime: u32,
+        preferred_lifetime: u32,
+        lease_lifetime: u32,
+        on_link_prefix_length: u8,
+    };
+    const Adapter = extern struct {
+        length: u32,
+        if_index: u32,
+        next: ?*Adapter,
+        adapter_name: ?[*:0]const u8,
+        first_unicast: ?*Unicast,
+        first_anycast: ?*anyopaque,
+        first_multicast: ?*anyopaque,
+        first_dns: ?*anyopaque,
+        dns_suffix: ?*anyopaque,
+        description: ?*anyopaque,
+        friendly_name: ?*anyopaque,
+        physical_address: [8]u8,
+        physical_address_length: u32,
+        flags: u32,
+        mtu: u32,
+        if_type: u32,
+        oper_status: i32,
+    };
+    const af_inet = 2;
+    const skip_anycast_multicast_dns = 0x2 | 0x4 | 0x8;
+    const if_type_loopback = 24;
+    const oper_up = 1;
+    const buffer_overflow = 111;
+    extern "iphlpapi" fn GetAdaptersAddresses(family: u32, flags: u32, reserved: ?*anyopaque, addresses: ?*Adapter, size: *u32) callconv(.winapi) u32;
+};
+
+fn listNetsWindows(out: []Net) usize {
+    // Usually ~15 KB; grow once if Windows asks for more.
+    var stack: [32 * 1024]u8 align(8) = undefined;
+    var size: u32 = stack.len;
+    var buf: []align(8) u8 = &stack;
+    var heap_buf: ?[]align(8) u8 = null;
+    defer if (heap_buf) |h| std.heap.page_allocator.free(h);
+    var rc = Win.GetAdaptersAddresses(Win.af_inet, Win.skip_anycast_multicast_dns, null, @ptrCast(buf.ptr), &size);
+    if (rc == Win.buffer_overflow) {
+        heap_buf = std.heap.page_allocator.alignedAlloc(u8, .@"8", size) catch return 0;
+        buf = heap_buf.?;
+        rc = Win.GetAdaptersAddresses(Win.af_inet, Win.skip_anycast_multicast_dns, null, @ptrCast(buf.ptr), &size);
+    }
+    if (rc != 0) return 0;
+    var n: usize = 0;
+    var adapter: ?*Win.Adapter = @ptrCast(buf.ptr);
+    while (adapter) |a| : (adapter = a.next) {
+        if (a.if_type == Win.if_type_loopback or a.oper_status != Win.oper_up) continue;
+        var uni = a.first_unicast;
+        while (uni) |u| : (uni = u.next) {
+            const sa = u.sockaddr orelse continue;
+            if (sa.family != Win.af_inet) continue;
+            addNet(out, &n, sa.addr, maskOf(u.on_link_prefix_length));
+        }
+    }
+    return n;
+}
+
+fn listNetsLinux(out: []Net) usize {
     const linux = std.os.linux;
 
     const fd_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
@@ -64,16 +207,9 @@ pub fn listNets(out: []Net) usize {
         const name = std.mem.sliceTo(&req.name, 0);
         if (skipped(name)) continue;
         const bytes: [4]u8 = @bitCast(req.addr.addr);
-        if (bytes[0] == 127 or bytes[0] == 0) continue;
-        if (bytes[0] == 169 and bytes[1] == 254) continue;
         var mask_req = req;
         if (linux.errno(linux.ioctl(fd, 0x891b, @intFromPtr(&mask_req))) != .SUCCESS) continue;
-        const mask: [4]u8 = @bitCast(mask_req.addr.addr);
-        var dup = false;
-        for (out[0..n]) |seen| dup = dup or std.mem.eql(u8, &seen.addr, &bytes);
-        if (dup) continue;
-        out[n] = .{ .addr = bytes, .mask = mask };
-        n += 1;
+        addNet(out, &n, bytes, @bitCast(mask_req.addr.addr));
     }
     return n;
 }

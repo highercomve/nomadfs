@@ -36,6 +36,8 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options) !u8 {
         std.debug.print("Error: could not check for an update: {s}\n", .{@errorName(err)});
         if (err == error.BadHttpStatus)
             std.debug.print("The latest release may predate command line updates (no latest-cli.json).\n", .{});
+        if (err == error.TargetNotInManifest)
+            std.debug.print("The latest release has no signed command line for {s}: download it from https://github.com/highercomve/nomadfs/releases/latest\n", .{core.DEFAULT_TARGET});
         return 1;
     };
     var update = maybe orelse {

@@ -7,8 +7,16 @@ pub fn getEnv(allocator: std.mem.Allocator, key: []const u8) ?[]const u8 {
     if (builtin.os.tag == .windows) {
         const env: std.process.Environ = .{ .block = .global };
         return env.getAlloc(allocator, key) catch null;
+    } else if (builtin.os.tag.isDarwin()) {
+        // No /proc on macOS; libSystem is always linked there.
+        var key_buf: [256]u8 = undefined;
+        if (key.len >= key_buf.len) return null;
+        @memcpy(key_buf[0..key.len], key);
+        key_buf[key.len] = 0;
+        const value = std.c.getenv(key_buf[0..key.len :0]) orelse return null;
+        return allocator.dupe(u8, std.mem.span(value)) catch null;
     } else {
-        // Read from /proc/self/environ on Linux / Unix
+        // Read from /proc/self/environ on Linux / Android
         const io = std.Io.Threaded.global_single_threaded.io();
         var file = std.Io.Dir.cwd().openFile(io, "/proc/self/environ", .{}) catch return null;
         defer file.close(io);
