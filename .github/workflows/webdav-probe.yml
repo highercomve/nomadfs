@@ -3,6 +3,7 @@ on: workflow_dispatch
 jobs:
   probe:
     runs-on: macos-latest
+    timeout-minutes: 8
     steps:
       - name: try -i and URL credentials
         shell: bash {0}
@@ -32,20 +33,20 @@ jobs:
           python3 /tmp/dav.py 47998 > /tmp/dav.log 2>&1 &
           sleep 2
           mkdir -p /tmp/mi /tmp/mu
-          echo "== -i alone, stdin"
-          printf 'nomadfs\npass\n' | /sbin/mount_webdav -i http://127.0.0.1:47998/ /tmp/mi; echo "exit $?"
-          mount | grep /tmp/mi || true
-          /sbin/umount /tmp/mi 2>/dev/null || true
-          echo "== -i -v, stdin"
-          printf 'nomadfs\npass\n' | /sbin/mount_webdav -i -v Probe http://127.0.0.1:47998/ /tmp/mi; echo "exit $?"
-          mount | grep /tmp/mi || true
-          /sbin/umount /tmp/mi 2>/dev/null || true
-          echo "== -i, script with a tty"
-          printf 'nomadfs\npass\n' | script -q /dev/null /sbin/mount_webdav -i -v Probe http://127.0.0.1:47998/ /tmp/mi; echo "exit $?"
-          mount | grep /tmp/mi || true
-          /sbin/umount /tmp/mi 2>/dev/null || true
+          lim() { perl -e 'alarm shift; exec @ARGV' "$@"; }
           echo "== credentials in the URL"
-          /sbin/mount_webdav -S -v Probe http://nomadfs:pass@127.0.0.1:47998/ /tmp/mu; echo "exit $?"
-          mount | grep /tmp/mu || true
-          /sbin/umount /tmp/mu 2>/dev/null || true
+          lim 20 /sbin/mount_webdav -S -v Probe http://nomadfs:pass@127.0.0.1:47998/ /tmp/mu; echo "exit $?"
+          echo "-- mount table:"; mount | grep /tmp/mu || true
+          echo "-- processes:"; ps -axo user,pid,command | grep -i -E 'webdav|47998' | grep -v grep || true
+          lim 20 /sbin/umount /tmp/mu; echo "umount exit $?"
+          echo "== keychain"
+          security add-internet-password -a nomadfs -s 127.0.0.1 -P 47998 -r 'http' -w pass -U -A; echo "add exit $?"
+          lim 20 /sbin/mount_webdav -S -v Probe http://127.0.0.1:47998/ /tmp/mi; echo "exit $?"
+          echo "-- mount table:"; mount | grep /tmp/mi || true
+          echo "-- processes:"; ps -axo user,pid,command | grep -i -E 'webdav|47998' | grep -v grep || true
+          lim 20 /sbin/umount /tmp/mi; echo "umount exit $?"
+          echo "== keychain, user in URL"
+          lim 20 /sbin/mount_webdav -S -v Probe http://nomadfs@127.0.0.1:47998/ /tmp/mi; echo "exit $?"
+          mount | grep /tmp/mi || true
+          lim 20 /sbin/umount /tmp/mi; echo "umount exit $?"
           echo "== server log"; cat /tmp/dav.log
