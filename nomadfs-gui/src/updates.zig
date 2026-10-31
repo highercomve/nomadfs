@@ -4,6 +4,10 @@
 //! how it was installed:
 //!
 //! - AppImage (Linux): downloads the new AppImage, swaps it in, restarts.
+//! - Windows: downloads the new nomadfs-gui.exe, swaps it in, restarts
+//!   (the installer puts it in the user's own folder, so no admin).
+//! - macOS: downloads the new NomadFS.app (.app.tar.gz) and replaces the
+//!   bundle the app runs from.
 //! - Android: the APK isn't replaced by the app; the page opens the new
 //!   APK's download in the browser, which installs it. The Google Play
 //!   build (`-Dplay-store=true`) checks nothing: Play updates it.
@@ -53,6 +57,8 @@ pub fn info(gpa: std.mem.Allocator, io: std.Io) Info {
     else if (is_android)
         "download"
     else if (builtin.os.tag == .linux and (oriel.updater.runningAsAppImage(io, gpa) catch false))
+        "install"
+    else if (builtin.os.tag == .windows or builtin.os.tag == .macos)
         "install"
     else
         "manual";

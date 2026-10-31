@@ -77,18 +77,44 @@ jobs:
       - name: Collect
         run: |
           v=$(sed -n 's/^ *const version = "\(.*\)";/\1/p' nomadfs-gui/build.zig | head -n1)
+          echo "VERSION=$v" >> "$GITHUB_ENV"
           mkdir dist
           cp "$(find nomadfs-gui/zig-out/package -maxdepth 1 -name '*.dmg' | head -1)" "dist/nomadfs-gui-$v-macos-arm64.dmg"
           cp zig-out/bin/nomadfs "dist/nomadfs-$v-aarch64-macos"
+          # The installed app's update payload: the signed bundle itself.
+          app=$(find nomadfs-gui/zig-out/package -maxdepth 1 -name '*.app' | head -1)
+          tar -C "$(dirname "$app")" -czf "dist/nomadfs-gui-$v-macos-arm64.app.tar.gz" "$(basename "$app")"
           (cd dist && shasum -a 256 * > SHA256SUMS-macos)
           ls -l dist
       - uses: actions/upload-artifact@v4
         with:
           name: macos-arm64
           path: dist/
-      - name: Attach to the release
+      - name: Attach to the release, with signed update entries
         if: env.TAG != ''
-        run: gh release upload "$TAG" dist/* --clobber
+        env:
+          UPDATE_KEY: ${{ secrets.NOMADFS_UPDATE_KEY }}
+        run: |
+          gh release upload "$TAG" dist/* --clobber
+          umask 077
+          key="$RUNNER_TEMP/update.key"
+          printf '%s\n' "$UPDATE_KEY" > "$key"
+          base="https://github.com/highercomve/nomadfs/releases/download/$TAG"
+          mkdir -p "$RUNNER_TEMP/m"
+          sign() { # <asset> <app id> <format> <out>
+            (cd nomadfs-gui && zig build sign-update -- "../dist/$1" --app-id "$2" --version "$VERSION" \
+              --target aarch64-macos --format "$3" --url "$base/$1" --key "$key" --out "$4")
+          }
+          sign "nomadfs-gui-$VERSION-macos-arm64.app.tar.gz" com.foreachdeveloper.nomadfs app.tar.gz "$RUNNER_TEMP/m/app.json"
+          sign "nomadfs-$VERSION-aarch64-macos" com.foreachdeveloper.nomadfs.cli raw "$RUNNER_TEMP/m/cli.json"
+          rm -f "$key"
+          # Each platform's entry is signed on its own: add macOS's to the release's manifests.
+          cd "$RUNNER_TEMP/m"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p latest.json -p latest-cli.json
+          jq --slurpfile e app.json '.platforms["aarch64-macos"] = $e[0]' latest.json > latest.json.new && mv latest.json.new latest.json
+          jq --slurpfile e cli.json '.platforms["aarch64-macos"] = $e[0]' latest-cli.json > latest-cli.json.new && mv latest-cli.json.new latest-cli.json
+          jq -r '.platforms | keys | join(", ")' latest.json latest-cli.json
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" latest.json latest-cli.json --clobber
 
   windows:
     runs-on: windows-latest

@@ -26,8 +26,9 @@ first launch asks:
   signed with the same NomadFS certificate every release, so macOS keeps its
   permissions across updates.
 
-On Windows and macOS the app tells you when a new release is out and links
-it; install it the same way. The folder mount is Linux only.
+On Windows and macOS the app then updates itself, like the AppImage on Linux
+(run the macOS app from Applications, not from the disk image). The folder
+mount is Linux only.
 
 On Linux, this installs the latest release for your user (the app's AppImage
 and the command line in `~/.local/bin`, and a launcher entry), checking every

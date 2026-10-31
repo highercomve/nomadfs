@@ -7,6 +7,28 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.3.13 - 2026-10-31
+
+The Windows and macOS apps update themselves, like the AppImage. Devices on 0.3.12 and 0.3.13
+work together.
+
+## Added
+
+- Windows and macOS: the app checks for new releases and installs them when you choose, then
+  restarts. Updates are signed; the app checks the signature and the download before it replaces
+  itself. Coming from 0.3.12, install 0.3.13 by hand once (0.3.12 only links the release).
+- The macOS command line updates itself too (`nomadfs --upgrade`), like Linux and Windows.
+
+## Fixed
+
+- macOS: local network discovery joined its multicast group with Linux's option numbers, and
+  failed.
+
+## Changed
+
+- Uses Oriel 0.20.7 (its Windows installer no longer waits on a message box when installed
+  silently, `setup.exe /S`).
+
 # 0.3.12 - 2026-10-30
 
 NomadFS runs on Windows and macOS: the desktop app and the command line. Devices on 0.3.11 and

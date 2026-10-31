@@ -5,8 +5,10 @@
 #   nomadfs-<v>-x86_64-linux, nomadfs-<v>-aarch64-linux   command line node
 #   nomadfs-<v>-x86_64-windows.exe                         command line node (Windows)
 #   nomadfs-gui-<v>-windows-x86_64-setup.exe               desktop app (Windows)
-#   (macOS: .github/workflows/desktop.yml builds and attaches the app and
-#   command line on a Mac once the release is published)
+#   nomadfs-gui-<v>-x86_64-windows-update.exe              its self-update payload
+#   (macOS: .github/workflows/desktop.yml builds the app and command line on
+#   a Mac once the release is published, attaches them and adds their signed
+#   entries to latest.json and latest-cli.json)
 #   nomadfs-gui-<v>-x86_64.AppImage, .deb, .rpm            desktop app
 #   nomadfs-<v>.apk                                        Android
 #   latest.json                                            signed update manifest (the apps)
@@ -85,9 +87,12 @@ step "Desktop app (Windows installer)"
 # The WebView2 loader ships next to the app (`oriel webview2` caches it).
 loader=$(ls -d "$HOME"/.oriel/webview2/*/x64/WebView2Loader.dll 2>/dev/null | sort -V | tail -1)
 [ -n "$loader" ] || { echo "No WebView2Loader.dll: run 'oriel webview2'" >&2; exit 1; }
+run gui-windows-exe zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu "${x86_cpu[@]}" -p "$out/build/gui-windows"
 run gui-windows zig build package -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu "${x86_cpu[@]}" \
   -Dwebview2-loader="$loader" -p "$out/build/gui-windows"
 cp "$out/build/gui-windows/package/nomadfs-gui-$version-setup.exe" "$assets/nomadfs-gui-$version-windows-x86_64-setup.exe"
+# What an installed app downloads to update itself: the executable alone.
+cp "$out/build/gui-windows/bin/nomadfs-gui.exe" "$assets/nomadfs-gui-$version-x86_64-windows-update.exe"
 
 step "Android app"
 run android-aarch64 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-android
@@ -102,6 +107,7 @@ sign() { # <asset> <target> <format> [<app id suffix> <manifest dir>]
     --key "$key" --out "$out/${5:-manifests}/update-$2.json"
 }
 sign "nomadfs-gui-$version-x86_64.AppImage" x86_64-linux appimage
+sign "nomadfs-gui-$version-x86_64-windows-update.exe" x86_64-windows raw
 # One APK for both ABIs. The app opens its download; Android installs it.
 sign "nomadfs-$version.apk" aarch64-android raw
 sign "nomadfs-$version.apk" x86_64-android raw
