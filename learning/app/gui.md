@@ -41,7 +41,7 @@ Command groups in `commands.zig` (the page calls them in snake_case, e.g. `node_
 | Browse | `remoteDevices`, `browse`, `readRange`, `download` |
 | Shared folders | `sharesLocal`, `pickedFolder`, `shareAdd`, `shareRemove` |
 | Swarm folder | `swarmList`, `swarmAddFile`, `swarmMkdir`, `swarmDelete`, `swarmRename`, `swarmReadRange`, `swarmDownload`, `swarmSync`, `swarmBackupStatus`, `swarmBackupSet`, `swarmRotateKey` |
-| Mount (Linux) | `mountStatus`, `mountPeek`, `mountStart`, `mountStop`, `emergencyUnmount`, `openPath` |
+| Mount (FUSE on Linux, WebDAV on macOS and Windows) | `mountStatus`, `mountPeek`, `mountStart`, `mountStop`, `emergencyUnmount`, `openPath` |
 | Connect | `inviteCreate`, `inviteStatus`, `inviteCancel`, `inviteAccept`, `joinInfo`, `pairTicket`, `trustDevice`, `devicesList`, `revokeDevice` |
 | Text drop | `putText`, `getText` |
 
@@ -84,8 +84,11 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
   Framework on Android), name it, share it. Shares are saved in the app's configuration. A new
   share reads "Indexing… N files so far" while its first scan runs; other devices already see what
   it has done ([Chapter 5.1](../fs/shares.md)).
-- **Mount** (Linux only): mounts at `~/NomadFS` by default ([Chapter 5.3](../fs/fuse.md)). The
-  tray menu has the same switch.
+- **Mount**: mounts at `~/NomadFS` by default, the first free drive letter on Windows. FUSE on
+  Linux ([Chapter 5.4](../fs/fuse.md)), WebDAV on macOS and Windows ([Chapter 5.5](../fs/webdav.md)):
+  `mountWebDav` starts the server under `g_mutex` and runs `mount_webdav` or `net use` outside it,
+  and `mountStop` unmounts outside it too; if the node closes meanwhile, `stopMountLocked` stops
+  the server and the running call frees the mount. The tray menu has the same switch.
 - **Connect devices**: create a one-time invite (code + QR), or join with a code or a QR scan (the
   page's camera through `BarcodeDetector`, so phones scan and desktops show). See
   [Invites](../security/invites.md).

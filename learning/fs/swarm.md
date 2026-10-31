@@ -92,7 +92,7 @@ refused).
 | `remove(path)` | Tombstones the path and every live entry under it. |
 | `rename(path, new_name)` / `move(path, new_path, .{ .replace })` | For each live entry under `path`: a new entry at the destination with the same CID, then a tombstone at the old path. With `replace`, whatever was at the target is tombstoned first (POSIX rename). A folder can't move inside itself. |
 | `readAt(cid, author, offset, dest)` | Names the file's likely holders (the author, the devices placement gives it, then the cluster's list: swarm backup devices, everyone else) and reads through `ReadAhead`; the fetcher picks a holder per block ([Chapter 4.1](../cluster/fetcher.md)). Any copy of a block will do, since every block is verified. |
-| `fileInfo`, `isEmptyDir`, `stagingDir` | Helpers for the FUSE driver ([Chapter 5.3](./fuse.md)). |
+| `fileInfo`, `isEmptyDir`, `stagingDir` | Helpers for the FUSE driver ([Chapter 5.4](./fuse.md)) and the WebDAV server ([Chapter 5.5](./webdav.md)). |
 
 ### Reading from multiple holders
 

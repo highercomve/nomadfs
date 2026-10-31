@@ -1,4 +1,4 @@
-# Chapter 5.3: The FUSE Mount (`src/fs/fuse.zig`)
+# Chapter 5.4: The FUSE Mount (`src/fs/fuse.zig`)
 
 On Linux, `nomadfs --mount <dir>` (or the desktop app's **Mount** tab and tray menu) shows every
 reachable device's shares and the swarm folder as an ordinary directory:

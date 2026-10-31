@@ -23,7 +23,7 @@ apart, each answered by its own layer.
 | **Distribution** | *Where from*, and *who keeps copies* | "the home server is fastest right now", "this file lives on the phone and the server" |
 | **Transport** | *How* the bytes travel | encrypted connections between your devices, finding each other, relaying when a device is behind a router |
 
-Shared folders, the swarm folder, backups, the Linux mount and the app all sit on
+Shared folders, the swarm folder, backups, the mount and the app all sit on
 the top layer, and they all go through the same distribution layer. None of them
 fetches pieces or makes copies on its own. So an improvement there, such as
 reading from several devices at once, reaches every feature together.

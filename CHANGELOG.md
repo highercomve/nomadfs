@@ -3,6 +3,48 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.3.14 - 2026-10-31
+
+The folder mount comes to macOS and Windows: every reachable device's shares and the swarm folder,
+in Finder and Explorer like any other disk, with the swarm folder writable. Devices on 0.3.13 and
+0.3.14 work together.
+
+### Added
+
+- **macOS and Windows: the mount.** The app's **Mount** tab and `nomadfs --mount` show what the
+  Linux mount shows: `<device>/<share>/…` read-only and `Swarm/…` read and write (copy, rename,
+  delete, new folders). macOS mounts a folder (`~/NomadFS` by default) with its own WebDAV client;
+  Windows maps a drive letter (the first free one by default) through its WebClient service. **Open
+  folder** opens it in Finder or Explorer.
+- `nomadfs --webdav <port>` serves the same over WebDAV on this computer without mounting it (`0`
+  picks a free port) and prints the address to connect to; `NOMADFS_WEBDAV_LOG=1` logs each
+  request.
+
+### Security
+
+- The WebDAV server listens on 127.0.0.1 only, under an address with a random token that is new
+  each time it starts, and refuses requests naming any other host (so a web page can't reach it
+  through DNS rebinding). On Linux and macOS it also serves only your own user's programs: another
+  account on the same computer is refused even when it knows the address (macOS shows every
+  mount's address to every account).
+
+### Changed
+
+- The swarm folder refuses a file over a folder of the same name, which would have hidden what the
+  folder held.
+- The desktop app on macOS unmounts before it exits when it is told to stop (logout, `kill`), so no
+  dead volume stays behind.
+
+### Fixed
+
+- Windows: network timeouts were ignored, so a stalled connection could wait forever.
+
+### Known limits
+
+- Windows: the WebClient service must be running (Windows 10 and 11 start it when needed). It
+  refuses files over 50 MB by default; [Shared folders & mount](https://nomadfs.foreachdeveloper.com/docs/shared-folders/#mount) shows how to
+  raise that.
+
 ## 0.3.13 - 2026-10-31
 
 The Windows and macOS apps update themselves, like the AppImage. Devices on 0.3.12 and 0.3.13

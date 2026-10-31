@@ -11,8 +11,8 @@ NomadFS is a personal filesystem for the devices you own: a laptop, a phone,
 a home server. Each device keeps its own files. What you share is listed on
 every device at once, and a file's bytes travel only when someone opens it.
 
-It is early software. The node, the command line and the Linux mount run on
-Linux; the app runs on the Linux desktop and on Android phones. See the
+It is early software. The node, the command line, the app and the mount run on
+Linux, macOS and Windows; the app also runs on Android phones. See the
 [roadmap](https://github.com/highercomve/nomadfs/blob/main/ROADMAP.md) for
 where it is going.
 
@@ -42,5 +42,5 @@ configuration, shares a folder and brings a second device into the swarm.
   can browse.
 - **Swarm folder**: one folder that belongs to the whole swarm rather than to
   one device.
-- **Mount**: on Linux, all of it as an ordinary folder: `<mount>/<device>/<share>`
-  and `<mount>/Swarm`.
+- **Mount**: all of it as an ordinary folder on the desktop (a drive on
+  Windows): `<mount>/<device>/<share>` and `<mount>/Swarm`.

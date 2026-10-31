@@ -3,7 +3,8 @@
 The [storage stack](../storage/overview.md) stores content-addressed blocks and DAGs. The
 network stack ([transport](../net/transport/overview.md) and [discovery](../net/discovery/overview.md)) moves
 them between devices. `src/fs/` is what a person actually sees: **shared folders**, the **swarm
-folder** and, on Linux, a **FUSE mount** that shows both as ordinary directories.
+folder** and a mount that shows both as ordinary directories: **FUSE** on Linux, **WebDAV** on
+macOS and Windows.
 
 For the concepts with diagrams, see the site's Learn pages:
 [Merkle DAG](https://nomadfs.foreachdeveloper.com/learn/merkle-dag/),
@@ -26,6 +27,7 @@ code-level companion: files, types and functions.
 | `backup.zig` | Folder backup: which members' marked folders to keep, and the merge that keeps what the source deleted. |
 | `readahead.zig` | `ReadAhead`: which blocks a reader needs next; its workers fetch them through the fetcher. |
 | `fuse.zig` | `Mount`: the Linux FUSE driver, speaking the kernel protocol on `/dev/fuse`. |
+| `devices.zig` | `Directory`: the devices a mount shows and their names; FUSE and WebDAV both read it. |
 
 ## 2. Where it sits
 
@@ -83,7 +85,9 @@ graph TD
 
 - [Chapter 5.1: Shared folders and the filestore](./shares.md)
 - [Chapter 5.2: The swarm folder](./swarm.md)
-- [Chapter 5.3: The FUSE mount](./fuse.md)
+- [Chapter 5.3: Folder backup](./backup.md)
+- [Chapter 5.4: The FUSE mount](./fuse.md)
+- [Chapter 5.5: The WebDAV mount (macOS, Windows)](./webdav.md)
 
 User-facing documentation: [Shared folders & mount](https://nomadfs.foreachdeveloper.com/docs/shared-folders/)
 and [Swarm folder](https://nomadfs.foreachdeveloper.com/docs/swarm-folder/).

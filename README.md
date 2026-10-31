@@ -48,6 +48,12 @@ curl -fsSL https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/in
 - **Editor compatibility**: Supports atomic save routines (write temporary file followed by rename).
 - **CLI & daemon**: Run via `nomadfs --mount <dir>`.
 
+### Desktop Mount (macOS and Windows WebDAV)
+- **No driver**: A WebDAV server on `127.0.0.1` shows the same folders, mounted by the system's own client (`mount_webdav` on macOS, `net use` and the WebClient service on Windows).
+- **Same layout**: `<mount>/<device>/<share>/...` read-only, `<mount>/Swarm` read and write (copy, rename, delete, folders). Finder's and Explorer's metadata files stay in memory, out of the swarm.
+- **Private to you**: A random token in the address, new each start; requests naming another host are refused; on macOS and Linux only your own user's programs are served.
+- **CLI**: `nomadfs --mount ~/NomadFS` (macOS), `nomadfs --mount Z:` (Windows), or `nomadfs --webdav <port>` to serve without mounting.
+
 ### One-Time Invites & Mutual Trust
 - **Zero-leak pairing**: Join devices to a swarm without exposing or copy-pasting the master swarm key.
 - **Time-limited single-use tokens**: Invites generate a URI (`nomadfs://invite?addr=..&token=..`) with a 128-bit random token expiring after 10 minutes.
@@ -57,12 +63,12 @@ curl -fsSL https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/in
 
 ### NomadFS App (`nomadfs-gui`)
 Built with [Oriel](https://github.com/highercomve/Oriel) as a lightweight native desktop and mobile application:
-- **Platforms**: Linux, Windows and macOS desktops, and Android (smartphones, tablets, and Chromebooks). The mount is Linux only.
+- **Platforms**: Linux, Windows and macOS desktops, and Android (smartphones, tablets, and Chromebooks). The mount works on all three desktops.
 - **Remote browsing**: Browse shares across all online devices with responsive tree views.
 - **In-app previews**: View images, stream audio and video, view PDFs, and inspect text files without saving them locally first.
 - **Downloads**: Download individual files or directory trees directly to local storage.
 - **Local shares**: Pick and share host folders using the system folder picker.
-- **Mount management**: Dedicated Mount tab and system tray icon to keep the FUSE mount running in the background when the main window is closed.
+- **Mount management**: Dedicated Mount tab and system tray icon to keep the mount (FUSE on Linux, WebDAV on macOS and Windows) running in the background when the main window is closed.
 - **Connect & QR scanner**: Display swarm invites as QR codes and scan incoming invites with the camera.
 - **Text Drop**: Share quick notes and text snippets addressed by CID across devices.
 - **Device management**: Inspect trusted peers and revoke access with a single click, and rotate the swarm key for every trusted device.

@@ -27,8 +27,8 @@ first launch asks:
   permissions across updates.
 
 On Windows and macOS the app then updates itself, like the AppImage on Linux
-(run the macOS app from Applications, not from the disk image). The folder
-mount is Linux only.
+(run the macOS app from Applications, not from the disk image). Its **Mount**
+tab shows everything as a folder in Finder, or a drive in Explorer.
 
 On Linux, this installs the latest release for your user (the app's AppImage
 and the command line in `~/.local/bin`, and a launcher entry), checking every
@@ -140,16 +140,16 @@ the same `swarm_key` and listing each other in `bootstrap_peers`:
 bootstrap_peers = ["tcp://192.168.1.20:9000"]
 ```
 
-# [Mount everything (Linux)]($heading.id('mount'))
+# [Mount everything]($heading.id('mount'))
 
 ```sh
-mkdir -p ~/NomadFS
 ./zig-out/bin/nomadfs --mount ~/NomadFS
 ```
 
 This runs the node and mounts every reachable device's shares at
 `~/NomadFS/<device>/<share>` and the swarm folder at `~/NomadFS/Swarm`. Ctrl-C
-unmounts. See [Shared folders & mount]($link.page('docs/shared-folders')).
+unmounts. On Windows, mount a drive letter instead (`--mount Z:`, or `*` for a
+free one). See [Shared folders & mount]($link.page('docs/shared-folders')).
 
 # [Build the app]($heading.id('app'))
 

@@ -112,10 +112,10 @@ Only devices of your swarm are backed up. On the command line, mark a share
 with `backup = "Camera"` in `nomadfs.conf`, and turn backup on with
 `swarm_backup = true` or `--swarm-backup`.
 
-# [The Linux mount]($heading.id('mount'))
+# [The mount]($heading.id('mount'))
 
-On Linux everything can be mounted as an ordinary folder that any program can
-open:
+On the desktop everything can be mounted as an ordinary folder (a drive on
+Windows) that any program can open:
 
 ```
 <mount>/
@@ -126,24 +126,56 @@ open:
 └── Swarm/…
 ```
 
-- `<mount>/<device>/<share>/…` is read-only (files `0444`, folders `0555`).
+- `<mount>/<device>/<share>/…` is read-only.
 - `<mount>/Swarm` is the [swarm folder]($link.page('docs/swarm-folder')) and is
-  writable.
+  writable: copy files in, rename, delete, make folders.
 
 From the command line:
 
 ```sh
-nomadfs --mount ~/NomadFS
+nomadfs --mount ~/NomadFS     # Linux and macOS: a folder
+nomadfs --mount Z:            # Windows: a drive letter (* takes a free one)
 ```
 
 It runs the node, mounts, and unmounts on Ctrl-C or `SIGTERM`. In the desktop
-app, the **Mount** tab mounts at `~/NomadFS` by default (**Change** picks
-another folder), and **Open folder** opens it in your file manager. The tray
-icon has the same switch, so the mount keeps working with the window closed;
-**Quit** in the tray unmounts before exiting. Mounting over a stale NomadFS
-mount at the same folder clears it first.
+app, the **Mount** tab mounts at `~/NomadFS` by default (on Windows, the first
+free drive letter; **Change** picks another), and **Open folder** opens it in
+your file manager. The tray icon has the same switch, so the mount keeps working
+with the window closed; **Quit** in the tray unmounts before exiting.
+
+## [Linux]($heading.id('mount-linux'))
 
 The driver speaks the kernel's FUSE protocol on `/dev/fuse` directly: there is
 no libfuse or libc dependency. `fusermount3` performs the unprivileged mount, so
-install `fuse3` if it is missing. Mounting is available on Linux only; the
-**Mount** tab does not appear elsewhere.
+install `fuse3` if it is missing. Shares are files `0444` and folders `0555`.
+Mounting over a stale NomadFS mount at the same folder clears it first.
+
+## [macOS and Windows]($heading.id('mount-webdav'))
+
+NomadFS serves the same folders over WebDAV on this computer only
+(`127.0.0.1`), and the system's own WebDAV client mounts them: no driver to
+install. macOS mounts it with `mount_webdav`, as Finder's **Connect to Server**
+does; Windows maps a drive letter with `net use`, through its **WebClient**
+service.
+
+The address has a random token in it, new each time the mount starts, and the
+server refuses requests that name any other host, so a web page can't reach it.
+On macOS every account on the computer can read a mount's address, so the
+server also checks that each connection comes from one of your own programs and
+closes it otherwise.
+
+Desktop metadata (`.DS_Store`, `._*` files, `Thumbs.db`, `desktop.ini`) is kept
+in memory while the mount runs and never reaches the swarm.
+
+On Windows:
+
+- The WebClient service must be running. Windows 10 and 11 start it when
+  needed; if mounting fails, start it in **Services** (`services.msc`).
+- WebClient refuses files over 50 MB by default. To raise the limit, as an
+  administrator set `FileSizeLimitInBytes` (a DWORD, up to `4294967295`) under
+  `HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WebClient\Parameters`,
+  then restart the service: `net stop webclient` and `net start webclient`.
+
+To connect another WebDAV client yourself, `nomadfs --webdav <port>` serves
+without mounting (`0` picks a free port) and prints the address, token
+included. `NOMADFS_WEBDAV_LOG=1` logs each request.
