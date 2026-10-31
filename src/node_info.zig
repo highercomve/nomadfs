@@ -134,14 +134,58 @@ pub fn platform() []const u8 {
 pub const Disk = struct { total: u64, free: u64 };
 
 /// Size and free space (for this user) of the filesystem `path` is on, or
-/// null where that isn't known (not Linux, or the call failed).
+/// null where that isn't known (another OS, or the call failed).
 pub fn disk(path: []const u8) ?Disk {
-    if (builtin.os.tag != .linux or @sizeOf(usize) != 8) return null;
-    const linux = std.os.linux;
     var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
     if (path.len >= path_buf.len) return null;
     @memcpy(path_buf[0..path.len], path);
     path_buf[path.len] = 0;
+    return switch (builtin.os.tag) {
+        .linux => if (@sizeOf(usize) == 8) diskLinux(&path_buf) else null,
+        .macos => diskDarwin(&path_buf),
+        .windows => diskWindows(path),
+        else => null,
+    };
+}
+
+/// macOS's struct statvfs (block counts are 32-bit there, in f_frsize units).
+const DarwinStatvfs = extern struct {
+    f_bsize: c_ulong,
+    f_frsize: c_ulong,
+    f_blocks: c_uint,
+    f_bfree: c_uint,
+    f_bavail: c_uint,
+    f_files: c_uint,
+    f_ffree: c_uint,
+    f_favail: c_uint,
+    f_fsid: c_ulong,
+    f_flag: c_ulong,
+    f_namemax: c_ulong,
+};
+extern "c" fn statvfs(path: [*:0]const u8, buf: *DarwinStatvfs) c_int;
+
+fn diskDarwin(path: [*:0]const u8) ?Disk {
+    var st: DarwinStatvfs = undefined;
+    if (statvfs(path, &st) != 0) return null;
+    const unit: u64 = if (st.f_frsize > 0) st.f_frsize else st.f_bsize;
+    return .{ .total = @as(u64, st.f_blocks) *| unit, .free = @as(u64, st.f_bavail) *| unit };
+}
+
+extern "kernel32" fn GetDiskFreeSpaceExW(dir: [*:0]const u16, free_for_caller: ?*u64, total: ?*u64, total_free: ?*u64) callconv(.winapi) c_int;
+
+fn diskWindows(path: []const u8) ?Disk {
+    var wide: [std.fs.max_path_bytes:0]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide, path) catch return null;
+    if (n >= wide.len) return null;
+    wide[n] = 0;
+    var free: u64 = 0;
+    var total: u64 = 0;
+    if (GetDiskFreeSpaceExW(wide[0..n :0], &free, &total, null) == 0) return null;
+    return .{ .total = total, .free = free };
+}
+
+fn diskLinux(path_buf: *const [std.fs.max_path_bytes:0]u8) ?Disk {
+    const linux = std.os.linux;
     // struct statfs on 64-bit Linux (x86_64, aarch64).
     const Statfs = extern struct {
         f_type: i64,
@@ -158,7 +202,7 @@ pub fn disk(path: []const u8) ?Disk {
         f_spare: [4]i64,
     };
     var st: Statfs = undefined;
-    const rc = linux.syscall2(.statfs, @intFromPtr(&path_buf), @intFromPtr(&st));
+    const rc = linux.syscall2(.statfs, @intFromPtr(path_buf), @intFromPtr(&st));
     if (linux.errno(rc) != .SUCCESS) return null;
     const unit: u64 = @intCast(if (st.f_frsize > 0) st.f_frsize else @max(st.f_bsize, 0));
     return .{ .total = st.f_blocks *| unit, .free = st.f_bavail *| unit };
@@ -200,6 +244,13 @@ test "node info: round trip, and an older device's shorter info" {
 
 test "node info: the disk of the working directory is known on Linux" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const d = disk(".") orelse return error.NoDiskInfo;
+    try std.testing.expect(d.total > 0 and d.free <= d.total);
+}
+
+test "disk: this machine's filesystem" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.os.tag == .linux and @sizeOf(usize) != 8) return error.SkipZigTest;
     const d = disk(".") orelse return error.NoDiskInfo;
     try std.testing.expect(d.total > 0 and d.free <= d.total);
 }

@@ -306,10 +306,11 @@ fn joinExchange(allocator: std.mem.Allocator, code_text: []const u8, my_ticket_u
 }
 
 /// The address this device uses on the LAN: the source address the kernel
-/// picks for an outbound UDP "connection" (nothing is sent). Null where
-/// that can't be determined.
+/// picks for an outbound UDP "connection" (nothing is sent) on Linux, else
+/// the first interface address that isn't a VPN's (Tailscale's 100.64/10).
+/// Null where none is known.
 pub fn lanAddress(buf: *[16]u8) ?[]const u8 {
-    if (@import("builtin").os.tag != .linux) return null;
+    if (@import("builtin").os.tag != .linux) return firstLanNet(buf);
     const linux = std.os.linux;
     const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(rc) != .SUCCESS) return null;
@@ -322,6 +323,23 @@ pub fn lanAddress(buf: *[16]u8) ?[]const u8 {
     if (linux.errno(linux.getsockname(fd, @ptrCast(&local), &len)) != .SUCCESS) return null;
     const a: [4]u8 = @bitCast(local.addr);
     return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ a[0], a[1], a[2], a[3] }) catch null;
+}
+
+/// macOS, Windows: the first address from the interface list that isn't
+/// carrier-grade NAT space (Tailscale), else the first at all.
+fn firstLanNet(buf: *[16]u8) ?[]const u8 {
+    const local_addrs = net.local_addrs;
+    var nets: [32]local_addrs.Net = undefined;
+    const n = local_addrs.listNets(&nets);
+    if (n == 0) return null;
+    var pick = nets[0].addr;
+    for (nets[0..n]) |item| {
+        if (!local_addrs.isCgnat(net.compat.Address.initIp4(item.addr, 1))) {
+            pick = item.addr;
+            break;
+        }
+    }
+    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ pick[0], pick[1], pick[2], pick[3] }) catch null;
 }
 
 const nowSeconds = @import("../sync.zig").nowSeconds;
@@ -467,4 +485,12 @@ test "invite: expires unused" {
     defer host.destroy();
     try std.testing.expectEqual(Host.State.waiting, host.status(1059));
     try std.testing.expectEqual(Host.State.expired, host.status(1060));
+}
+
+test "lanAddress: this machine has one" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
+    var buf: [16]u8 = undefined;
+    const ip = lanAddress(&buf) orelse return error.NoLanAddress;
+    try std.testing.expect(ip.len >= 7);
 }

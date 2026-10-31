@@ -17,5 +17,9 @@ CONF
 "$bin" --version
 "$bin" --pair "$dir/smoke.conf" > "$dir/pair.txt"
 grep -q "nomadfs://pair" "$dir/pair.txt"
+# It knows its own addresses: the ticket lists one besides loopback.
+addrs=$(grep -o "nomadfs://pair[^ ]*" "$dir/pair.txt" | head -1 | sed -n 's/.*&a=\([^&]*\).*/\1/p')
+echo "ticket addresses: $addrs"
+echo "$addrs" | grep -qv "^127\.0\.0\.1"
 "$bin" --bench-idle 5 "$dir/smoke.conf"
 echo "smoke: ok"

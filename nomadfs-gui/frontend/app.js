@@ -8,8 +8,6 @@ let configPath = null;
 let storageExt = false; // Android: all-files access extension present
 
 let snackTimer;
-// The desktop can open folders in the file manager (the same check as mounting).
-let canOpenPaths = false;
 function snack(msg, ms = 3000, onClick = null) {
   const bar = $("snackbar");
   bar.textContent = msg;
@@ -1324,7 +1322,6 @@ function renderMount(status) {
 async function loadMount() {
   let status;
   try { status = await invoke("mount_status", null); } catch { return; }
-  canOpenPaths = status.supported;
   $("nav-mount").hidden = !status.supported;
   if (!status.supported && document.body.dataset.view === "mount") setView("browse");
   renderMount(status);
@@ -2412,7 +2409,7 @@ updateComposer();
 let aboutText = "";
 
 function openLink(url) {
-  invoke("open_path", { path: url }).catch(() => window.open(url, "_blank"));
+  window.oriel.openExternal(url).catch(() => window.open(url, "_blank"));
 }
 
 // ---- Updates: signed releases from GitHub (src/updates.zig) ----

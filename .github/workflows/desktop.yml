@@ -40,6 +40,8 @@ jobs:
         run: zig build -Doptimize=ReleaseSafe
       - name: Smoke test
         run: bash scripts/smoke.sh zig-out/bin/nomadfs
+      - name: Platform tests (disk, addresses)
+        run: zig test src/node_info.zig
       - name: Import signing identity
         env:
           CERT: ${{ secrets.NOMADFS_MACOS_CERT_P12_BASE64 }}
@@ -132,6 +134,8 @@ jobs:
         run: zig build -Doptimize=ReleaseSafe
       - name: Smoke test
         run: bash scripts/smoke.sh zig-out/bin/nomadfs.exe
+      - name: Platform tests (disk, addresses)
+        run: zig test src/node_info.zig
       - name: WebView2 runtime
         shell: pwsh
         run: |
