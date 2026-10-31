@@ -35,4 +35,5 @@ test {
     _ = @import("cluster/device_names_test.zig");
     _ = @import("cluster/traffic_test.zig");
     _ = @import("cluster/webdav_test.zig");
+    _ = @import("cluster/relay_peers_test.zig");
 }

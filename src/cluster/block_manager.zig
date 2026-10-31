@@ -143,22 +143,46 @@ pub const BlockManager = struct {
     /// A connection to `peer_id`, located through the routing table or a
     /// DHT lookup. Pooled by the connection manager: deinit it after use.
     pub fn connectTo(self: *BlockManager, peer_id: NodeID) !network.Connection {
-        const peer = try self.findPeer(peer_id);
+        if (self.net.existingConnection(peer_id)) |conn| return conn;
+        const peer = self.findPeer(peer_id) catch |err| {
+            // A device reached through a relay has no address of its own in
+            // the routing table, nor do other devices list one that answers
+            // from here: the connection manager's relay is the way to it.
+            return self.net.connectToPeerMulti(&.{}, self.dht_node.swarm_key, peer_id) catch return err;
+        };
         return self.net.connectToPeerMulti(peer.addresses[0..peer.addrs_count], self.dht_node.swarm_key, peer_id);
     }
 
     // ---- What the folder layer (fs) asks of the network ----
 
-    /// Every peer the routing table knows (caller frees).
+    /// Every peer the routing table knows, and every device this one has a
+    /// connection to: one reached through a relay is never in the table
+    /// (its only address there would be the relay's). Caller frees.
     pub fn knownPeers(self: *BlockManager, allocator: std.mem.Allocator) ![]NodeID {
-        const node = self.dht_node;
-        node.mutex.lock();
-        defer node.mutex.unlock();
-        const peers = try node.routing_table.getAllPeers();
-        defer node.routing_table.allocator.free(peers);
-        const ids = try allocator.alloc(NodeID, peers.len);
-        for (peers, ids) |p, *out| out.* = p.id;
-        return ids;
+        var ids: std.ArrayList(NodeID) = .empty;
+        errdefer ids.deinit(allocator);
+        {
+            const node = self.dht_node;
+            node.mutex.lock();
+            defer node.mutex.unlock();
+            const peers = try node.routing_table.getAllPeers();
+            defer node.routing_table.allocator.free(peers);
+            try ids.ensureTotalCapacity(allocator, peers.len);
+            for (peers) |p| ids.appendAssumeCapacity(p.id);
+        }
+        const conns = try self.net.liveConnections(allocator);
+        defer {
+            for (conns) |c| c.deinit();
+            allocator.free(conns);
+        }
+        for (conns) |c| {
+            const peer = c.getRemoteNodeID();
+            if (peer.eql(self.net.node_id)) continue;
+            for (ids.items) |known| {
+                if (known.eql(peer)) break;
+            } else try ids.append(allocator, peer);
+        }
+        return ids.toOwnedSlice(allocator);
     }
 
     // @atlas allow: the wire answer (listing bytes); fs.remote.Shares decodes it

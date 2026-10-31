@@ -3,6 +3,17 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.3.16 - 2026-10-31
+
+Away from home, your devices show up again. Devices on 0.3.15 and 0.3.16 work together.
+
+### Fixed
+
+- Away from home, devices reached through a relay (a device on both networks, or a NomadFS node on
+  a cloud server) weren't listed, and their shares couldn't be browsed or their files opened: only
+  devices with a direct route appeared. The swarm folder didn't sync with them either. They are
+  listed and reachable through the relay now, as soon as it carries the connection.
+
 ## 0.3.15 - 2026-10-31
 
 Install from a terminal on every desktop, and crash reports with names from Google Play. Devices
