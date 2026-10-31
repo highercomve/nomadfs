@@ -8,9 +8,26 @@
 ---
 
 Every [release](https://github.com/highercomve/nomadfs/releases/latest) has
-the app for Android (an APK) and Linux (AppImage, deb and rpm), and the
-`nomadfs` command line for Linux. On Android, allow installing from your
-browser or file manager when it asks.
+the app for Android (an APK), Linux (AppImage, deb and rpm), Windows (an
+installer, `nomadfs-gui-<version>-windows-x86_64-setup.exe`) and macOS on Apple
+silicon (`nomadfs-gui-<version>-macos-arm64.dmg`), and the `nomadfs` command
+line for Linux, Windows (`.exe`) and macOS. On Android, allow installing from
+your browser or file manager when it asks.
+
+The Windows and macOS apps aren't signed by Microsoft or Apple yet, so the
+first launch asks:
+
+- **Windows:** SmartScreen says it protected your PC: choose **More info**, then
+  **Run anyway**. The app needs the WebView2 runtime, which Windows 10 and 11
+  have.
+- **macOS:** drag NomadFS to Applications, then open it with right-click (or
+  Control-click) → **Open**, and **Open** again. If macOS says it's damaged,
+  run `xattr -dr com.apple.quarantine /Applications/NomadFS.app` once. It's
+  signed with the same NomadFS certificate every release, so macOS keeps its
+  permissions across updates.
+
+On Windows and macOS the app tells you when a new release is out and links
+it; install it the same way. The folder mount is Linux only.
 
 On Linux, this installs the latest release for your user (the app's AppImage
 and the command line in `~/.local/bin`, and a launcher entry), checking every

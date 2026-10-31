@@ -14,7 +14,7 @@ NomadFS is a private, distributed filesystem and device mesh written in [Zig 0.1
 
 All core features are verified on real hardware across Linux desktop and Android (tested on an Android phone and Linux workstation).
 
-**Download:** the [latest release](https://github.com/highercomve/nomadfs/releases/latest) has the app for Android (APK) and Linux (AppImage, deb, rpm), and the `nomadfs` CLI for Linux. Docs: [nomadfs.foreachdeveloper.com](https://nomadfs.foreachdeveloper.com).
+**Download:** the [latest release](https://github.com/highercomve/nomadfs/releases/latest) has the app for Android (APK, or [Google Play](https://play.google.com/apps/internaltest/4701140950897222942) testing), Linux (AppImage, deb, rpm), Windows (installer) and macOS (Apple silicon, .dmg), and the `nomadfs` CLI for Linux, Windows and macOS. Docs: [nomadfs.foreachdeveloper.com](https://nomadfs.foreachdeveloper.com).
 
 **Install on Linux** (the app and the CLI in `~/.local/bin`, with a launcher entry; the app then updates itself):
 
@@ -57,7 +57,7 @@ curl -fsSL https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/in
 
 ### NomadFS App (`nomadfs-gui`)
 Built with [Oriel](https://github.com/highercomve/Oriel) as a lightweight native desktop and mobile application:
-- **Platforms**: Linux desktop and Android (smartphones, tablets, and Chromebooks).
+- **Platforms**: Linux, Windows and macOS desktops, and Android (smartphones, tablets, and Chromebooks). The mount is Linux only.
 - **Remote browsing**: Browse shares across all online devices with responsive tree views.
 - **In-app previews**: View images, stream audio and video, view PDFs, and inspect text files without saving them locally first.
 - **Downloads**: Download individual files or directory trees directly to local storage.

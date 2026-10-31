@@ -132,7 +132,7 @@ pub const MDNS = struct {
             .imr_multiaddr = mcast_sa.ip4.addr,
             .imr_interface = 0,
         };
-        const add_membership = if (@hasDecl(posix, "IP_ADD_MEMBERSHIP")) posix.IP_ADD_MEMBERSHIP else 35;
+        const add_membership = if (@hasDecl(posix, "IP_ADD_MEMBERSHIP")) posix.IP_ADD_MEMBERSHIP else if (builtin.os.tag.isDarwin()) 12 else 35;
         posix.setsockopt(recv_socket, posix.IPPROTO.IP, add_membership, std.mem.asBytes(&mreq)) catch |err| {
             std.debug.print("mDNS: Failed to join multicast group: {any}\n", .{err});
         };
@@ -144,7 +144,7 @@ pub const MDNS = struct {
 
     fn configureSendSocket(send_socket: posix.socket_t) void {
         const enable: i32 = 1;
-        const multicast_loop = if (@hasDecl(posix, "IP_MULTICAST_LOOP")) posix.IP_MULTICAST_LOOP else 34;
+        const multicast_loop = if (@hasDecl(posix, "IP_MULTICAST_LOOP")) posix.IP_MULTICAST_LOOP else if (builtin.os.tag.isDarwin()) 11 else 34;
         posix.setsockopt(send_socket, posix.IPPROTO.IP, multicast_loop, std.mem.asBytes(&enable)) catch {};
     }
 

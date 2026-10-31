@@ -7,6 +7,36 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.3.12 - 2026-10-30
+
+NomadFS runs on Windows and macOS: the desktop app and the command line. Devices on 0.3.11 and
+0.3.12 work together.
+
+## Added
+
+- **Windows**: an installer for the desktop app (`nomadfs-gui-0.3.12-windows-x86_64-setup.exe`) and
+  the command line (`nomadfs-0.3.12-x86_64-windows.exe`, which `nomadfs --upgrade` keeps up to date).
+- **macOS** (Apple silicon): the desktop app (`nomadfs-gui-0.3.12-macos-arm64.dmg`), signed with
+  NomadFS's own certificate so macOS keeps its permissions across updates, and the command line.
+  Both are built and tested on a Mac by the release workflow.
+- The Windows and macOS apps aren't signed by Microsoft or Apple yet: the first launch asks
+  (Getting started explains what to click).
+
+## Fixed
+
+- Windows and macOS devices announce their own addresses (local network, Tailscale and other
+  VPNs): invites and pings carried none, so other devices could only reach them by the address
+  they happened to see.
+- macOS: the node couldn't find the home folder (it read Linux's `/proc`); local network discovery
+  used Linux's socket option numbers.
+- Windows: the node crashed when it stopped (the listening socket closed under a waiting accept);
+  the app staged files in a `/tmp` that doesn't exist there.
+
+## Changed
+
+- `nomadfs --upgrade` says so plainly when the latest release has no command line for this
+  platform.
+
 # 0.3.11 - 2026-10-30
 
 Videos play in the desktop app's viewer on NVIDIA graphics, sized to the viewer. Devices on 0.3.10
