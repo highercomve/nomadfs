@@ -292,6 +292,11 @@ fn acceptLoop(allocator: std.mem.Allocator, mut_server: network.Server, cfg: Lis
             if (err == error.SocketNotBound or err == error.FileDescriptorClosed or err == error.OperationAborted or err == error.ConnectionAborted) break;
             continue;
         };
+        // Stopping: this is the connection that woke the accept (compat.Server.deinit).
+        if (cfg.running) |r| if (!r.load(.acquire)) {
+            conn.stream.close();
+            break;
+        };
         const slot = handshakes.add(conn.stream) orelse {
             conn.stream.close();
             continue;

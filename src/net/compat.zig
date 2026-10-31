@@ -260,12 +260,27 @@ pub const Server = struct {
         };
     }
 
+    /// Stop listening. The accept loop must stop first (its `running`
+    /// cleared): on Linux the shutdown makes a blocked accept fail; on
+    /// Windows closing the socket under one is fatal (std's AFD wait treats
+    /// the cancellation as unreachable), so a connection from here wakes it
+    /// and the loop, seeing `running` false, ends before the socket closes.
     pub fn deinit(self: *Server) void {
         const io = std.Io.Threaded.global_single_threaded.io();
         if (builtin.os.tag != .windows) {
             _ = std.posix.system.shutdown(@intCast(self.inner.socket.handle), std.posix.SHUT.RDWR);
+        } else {
+            self.wake();
         }
         self.inner.deinit(io);
+    }
+
+    /// Connects to this server from 127.0.0.1 and hangs up: a blocked
+    /// accept returns.
+    fn wake(self: *Server) void {
+        const port = self.inner.socket.address.getPort();
+        const stream = tcpConnectToAddress(Address.initIp4(.{ 127, 0, 0, 1 }, port)) catch return;
+        stream.close();
     }
 };
 
