@@ -108,7 +108,31 @@ In order; each step is useful alone.
 Not planned: hole punching (TCP simultaneous open is unreliable through
 carrier NAT; relays already reach every case).
 
-## 5. Testing it
+## 5. Done so far
+
+| Step | Where | What it does |
+| :--- | :--- | :--- |
+| 1 | `BlockManager.knownPeers`, `connectTo` (0.3.16) | relayed devices listed and reachable |
+| 2 | `yamux.Session.keepAlive`, `tcp.zig` `maintain` | PING after 15 s of silence; nothing received for 45 s closes the connection |
+| 2 | `ConnectionManager.lost`, `Node.sleepUntilNextRound` | a closed connection starts the next maintenance round within seconds |
+| 3 (partly) | `discovery.Node.anchors`, `Node.dialKnownPeers` | bootstrap peers and relays used are anchors: redialed at least every 10 s, rounds every 5 s while none answers, and when one comes back every device is retried at once |
+| 6 | `KnownPeers.rememberReached`, `Node.rememberPeers` | relayed devices remembered without addresses and pinged each round, so their relayed connection isn't closed as idle |
+| — | `devices.Directory.refreshAll` | every listed device is asked again (setting its relay up again), and stays listed through a 45 s gap |
+
+Measured with `scripts/outside-test.sh` and a 75 s black hole on the outside
+node's path (no reset, like a NAT dropping the mapping):
+
+| | Before | After |
+| :--- | :--- | :--- |
+| Home devices listed at start | doew only | all within 10 s |
+| Dead path noticed | never (no keepalive) | 45 s, listed until then |
+| Path back → relay reconnected | 1 min 44 s | 7 s |
+| Path back → every device listed | 1 min 54 s | 27 s |
+
+Still to do: steps 4 (announce "reachable via R"), 5 (direct and relay in
+parallel) and 7 (shorter relay negative caches outside the cut-off case).
+
+## 6. Testing it
 
 - `scripts/outside-test.sh` on the public node: the outside device must list
   every home device within one maintenance round, and keep listing them.

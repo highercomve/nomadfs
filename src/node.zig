@@ -784,7 +784,11 @@ pub const Node = struct {
         // then: look again every 30 s, which costs a few small requests.
         // Then the standard refresh of buckets nobody touched for an hour.
         var round: u32 = 0;
-        while (self.sleepWhileBootstrapping(30 * std.time.ns_per_s)) : (round +%= 1) {
+        var next_round_ns: u64 = round_ns;
+        while (self.sleepUntilNextRound(next_round_ns)) : (round +%= 1) {
+            // Cut off from every anchor (the relay, the bootstrap peers):
+            // look again every few seconds, not every 30.
+            defer next_round_ns = if (self.cutOffFromAnchors()) cut_off_round_ns else round_ns;
             // What PINGs say about this device: the network may have
             // changed under us (Wi-Fi to mobile data and back).
             discovery_node.setRole(net.discovery.rpc.Roles.metered, !net.local_addrs.onUnmeteredNetwork());
@@ -815,6 +819,24 @@ pub const Node = struct {
     }
 
     const Redial = struct { at_ms: i64, failures: u8 };
+    /// The maintenance round, and the faster one while no anchor answers.
+    const round_ns: u64 = 30 * std.time.ns_per_s;
+    const cut_off_round_ns: u64 = 5 * std.time.ns_per_s;
+    /// An anchor that doesn't answer is tried again at least this often.
+    const anchor_redial_max_ms: i64 = 10 * std.time.ms_per_s;
+
+    /// Has anchors and no connection to any of them.
+    fn cutOffFromAnchors(self: *Node) bool {
+        var anchors: [net.discovery.Node.max_anchors]net.id.NodeID = undefined;
+        const n = self.discovery_node.copyAnchors(&anchors);
+        if (n == 0) return false;
+        for (anchors[0..n]) |a| {
+            const conn = self.connection_manager.existingConnection(a) orelse continue;
+            conn.deinit();
+            return false;
+        }
+        return true;
+    }
 
     /// Connects to every remembered device (all its addresses, LAN first,
     /// then Tailscale, then public) and pings it, which refreshes both
@@ -837,18 +859,37 @@ pub const Node = struct {
                 if (self.connection_manager.connectDirect(e.slice(), swarm_key, e.id)) |direct| {
                     std.debug.print("bootstrap: {x} reached directly (was relayed)\n", .{e.id.bytes[0..4]});
                     direct.deinit();
-                } else |_| {}
+                } else |_| if (self.connection_manager.existingConnection(e.id)) |relayed| {
+                    // Still only through the relay: ping it like any other,
+                    // or it goes idle and is closed after five minutes.
+                    defer relayed.deinit();
+                    self.discovery_node.ping(relayed) catch {};
+                }
                 continue;
             }
+            // An anchor (the relay this device goes through) is tried at
+            // once, whatever the connection manager's backoff says.
+            const anchor = self.discovery_node.isAnchor(e.id);
+            if (anchor) self.connection_manager.clearBackoff(e.id);
             const conn = self.connection_manager.connectToPeerMulti(e.slice(), swarm_key, e.id) catch {
                 const failures = if (self.redial.get(e.id)) |r| r.failures +| 1 else 1;
-                const wait_ms = @min(@as(i64, 30_000) << @intCast(@min(failures - 1, 4)), 5 * 60_000);
+                const backoff_ms = @min(@as(i64, 30_000) << @intCast(@min(failures - 1, 4)), 5 * 60_000);
+                const wait_ms = if (anchor) @min(backoff_ms, anchor_redial_max_ms) else backoff_ms;
                 self.redial.put(self.allocator, e.id, .{ .at_ms = now + wait_ms, .failures = failures }) catch {};
                 continue;
             };
             defer conn.deinit();
-            _ = self.redial.remove(e.id);
+            const was_lost = self.redial.remove(e.id);
             self.discovery_node.ping(conn) catch {};
+            if (anchor and was_lost) {
+                // Back in touch with a relay after losing it: every device
+                // that failed meanwhile failed because this one was cut
+                // off. Try them all again now.
+                std.debug.print("bootstrap: anchor {x} back; retrying every device\n", .{e.id.bytes[0..4]});
+                self.redial.clearRetainingCapacity();
+                self.connection_manager.clearAllBackoff();
+                self.discovery_node.forgetRelayMisses();
+            }
         }
     }
 
@@ -876,8 +917,38 @@ pub const Node = struct {
             break :blk self.discovery_node.routing_table.getAllPeers() catch return;
         };
         defer self.discovery_node.routing_table.allocator.free(peers);
-        const changed = self.known_peers.merge(peers) catch return;
+        var changed = self.known_peers.merge(peers) catch return;
+        // Devices reached only through a relay are never in the routing
+        // table: remembered without addresses, dialed through a relay.
+        if (self.connection_manager.liveConnections(self.allocator)) |conns| {
+            defer {
+                for (conns) |c| c.deinit();
+                self.allocator.free(conns);
+            }
+            const now = sync.timestamp();
+            for (conns) |c| {
+                if (!c.getPeerAddress().isUnspecified()) continue;
+                if (self.known_peers.rememberReached(c.getRemoteNodeID(), now) catch false) changed = true;
+            }
+        } else |_| {}
         if (changed) self.known_peers.save() catch |err| std.debug.print("Saving known devices failed: {any}\n", .{err});
+    }
+
+    /// Sleeps until the next maintenance round: `total_ns`, or sooner when a
+    /// connection closed (a network switch, a frozen app's sockets, a relay
+    /// gone), so devices come back in seconds. At least 3 s between rounds.
+    /// Returns whether bootstrapping is still running.
+    fn sleepUntilNextRound(self: *Node, total_ns: u64) bool {
+        const min_ns = 3 * std.time.ns_per_s;
+        const sleep_chunk = 100 * std.time.ns_per_ms;
+        const lost = self.connection_manager.lost.load(.monotonic);
+        var elapsed: u64 = 0;
+        while (elapsed < total_ns) : (elapsed += sleep_chunk) {
+            if (!self.bootstrap_running.load(.acquire)) return false;
+            if (elapsed >= min_ns and self.connection_manager.lost.load(.monotonic) != lost) break;
+            sync.sleep(sleep_chunk);
+        }
+        return self.bootstrap_running.load(.acquire);
     }
 
     /// Sleeps up to `total_ns`, waking early when bootstrapping is cancelled.
@@ -913,6 +984,7 @@ pub const Node = struct {
             defer conn.deinit();
 
             std.debug.print("Successfully connected to bootstrap peer: {s}\n", .{peer_url});
+            self.discovery_node.noteAnchor(conn.getRemoteNodeID());
             self.discovery_node.ping(conn) catch {};
 
             // Request AutoNAT dial-back

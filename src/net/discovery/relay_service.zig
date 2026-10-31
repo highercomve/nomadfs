@@ -82,6 +82,7 @@ pub fn Relay(comptime Node: type) type {
                     continue;
                 }
                 std.debug.print("relay: reached {x} through {x}\n", .{ target.bytes[0..4], via.getRemoteNodeID().bytes[0..4] });
+                self.noteAnchor(via.getRemoteNodeID());
                 // One reference for the manager, one for the caller.
                 conn.retain();
                 self.manager.addConnection(conn) catch conn.deinit();

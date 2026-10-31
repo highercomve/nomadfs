@@ -25,6 +25,9 @@ const refresh_parallel = 8;
 const first_refresh_wait_ms = 3000;
 /// A device not heard from for this long leaves the list.
 const forget_after_ms = 10 * 60 * 1000;
+/// A listed device that misses an answer stays listed this long: a relay
+/// being set up again or a network switch takes a few seconds.
+const offline_grace_ms = 45 * std.time.ms_per_s;
 
 pub const Device = struct {
     name: []u8,
@@ -194,8 +197,16 @@ pub const Directory = struct {
     /// Asks every known peer for its shares, `refresh_parallel` at a time.
     pub fn refreshAll(self: *Directory) void {
         const bm = self.block_manager orelse return;
-        const peers = remote_mod.knownPeers(bm, self.allocator) catch return;
-        defer self.allocator.free(peers);
+        const known = remote_mod.knownPeers(bm, self.allocator) catch return;
+        // And every device listed now: one reached through a relay that
+        // dropped has no connection (so isn't known) until it is asked
+        // again, which sets the relay up again or shows it is gone.
+        const listed = self.withListed(known) catch null;
+        defer {
+            if (listed) |l| self.allocator.free(l);
+            self.allocator.free(known);
+        }
+        const peers = listed orelse known;
 
         {
             self.lock.lock();
@@ -247,18 +258,37 @@ pub const Directory = struct {
                     self.applyShares(peer, res);
                 } else {
                     self.lock.lock();
+                    const now = sync.monotonicMillis();
+                    var gone = true;
                     for (self.devices.items) |*d| {
                         if (d.remote.peer.eql(peer)) {
-                            d.online = false;
+                            gone = now - d.last_seen_ms > offline_grace_ms;
+                            if (gone) d.online = false;
                             break;
                         }
                     }
                     self.lock.unlock();
                     // Reads of its files fail fast until it answers again.
-                    if (bm.fetcher) |*f| f.markDown(peer);
+                    if (gone) if (bm.fetcher) |*f| f.markDown(peer);
                 }
             }
         }
+    }
+
+    /// A copy of `known` plus every online device not in it. Caller frees.
+    fn withListed(self: *Directory, known: []const NodeID) ![]NodeID {
+        var out: std.ArrayList(NodeID) = .empty;
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, known);
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.devices.items) |d| {
+            if (!d.online) continue;
+            for (out.items) |p| {
+                if (p.eql(d.remote.peer)) break;
+            } else try out.append(self.allocator, d.remote.peer);
+        }
+        return out.toOwnedSlice(self.allocator);
     }
 
     /// Records `peer`'s answer (takes ownership of `answer`).

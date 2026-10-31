@@ -4,7 +4,8 @@
 //! phone that left home dial the desktop over Tailscale, and lets any device
 //! find the swarm again without its bootstrap peers.
 //!
-//! File: one device per line, `<node id hex> <last seen> <ip:port>...`.
+//! File: one device per line, `<node id hex> <last seen> <ip:port>...`; a
+//! device reached only through a relay has no addresses.
 
 const std = @import("std");
 const kbucket = @import("kbucket.zig");
@@ -75,6 +76,19 @@ pub const KnownPeers = struct {
         return changed;
     }
 
+    /// Remembers a device reached without an address of its own (through a
+    /// relay): kept with no addresses, so it is dialed again, through a
+    /// relay, after a restart. Returns whether it is new.
+    pub fn rememberReached(self: *KnownPeers, id: NodeID, last_seen: i64) !bool {
+        for (self.entries.items) |*e| if (e.id.eql(id)) {
+            e.last_seen = @max(e.last_seen, last_seen);
+            return false;
+        };
+        if (self.entries.items.len >= max_entries) self.dropOldest();
+        try self.entries.append(self.allocator, .{ .id = id, .last_seen = last_seen });
+        return true;
+    }
+
     fn dropOldest(self: *KnownPeers) void {
         var oldest: usize = 0;
         for (self.entries.items, 0..) |e, i| {
@@ -124,7 +138,9 @@ fn parseLine(line: []const u8) ?Entry {
     var e: Entry = .{ .id = undefined, .last_seen = 0 };
     _ = std.fmt.hexToBytes(&e.id.bytes, hex) catch return null;
     e.last_seen = std.fmt.parseInt(i64, it.next() orelse return null, 10) catch return null;
+    var listed: usize = 0;
     while (it.next()) |tok| {
+        listed += 1;
         const colon = std.mem.lastIndexOfScalar(u8, tok, ':') orelse continue;
         const port = std.fmt.parseInt(u16, tok[colon + 1 ..], 10) catch continue;
         const a = Address.parseIp(tok[0..colon], port) catch continue;
@@ -132,7 +148,9 @@ fn parseLine(line: []const u8) ?Entry {
         addAddr(&e, a);
     }
     dropStrayPorts(&e);
-    if (e.count == 0) return null;
+    // No address at all: a device reached through a relay (rememberReached).
+    // Addresses that were all dropped: nothing left to dial, forgotten.
+    if (e.count == 0 and listed > 0) return null;
     return e;
 }
 
@@ -249,4 +267,29 @@ test "known peers sanitize invalid and loopback destinations on load" {
     const entry = parseLine("51d647593011e46b8a907f94c331a941a64a8538c9f6d86b91c051fdd1667df9 1 127.0.0.1:22 0.0.0.0:0 224.0.0.1:5 192.168.1.5:7865").?;
     try std.testing.expectEqual(@as(u8, 1), entry.count);
     try std.testing.expect(entry.addrs[0].eql(Address.initIp4(.{ 192, 168, 1, 5 }, 7865)));
+}
+
+test "known peers: a device reached through a relay is remembered without addresses" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    const path = try std.fs.path.join(allocator, &.{ dir, "known" });
+    defer allocator.free(path);
+
+    var kp = try KnownPeers.load(allocator, io, path);
+    const id = NodeID{ .bytes = [_]u8{0x42} ** 32 };
+    try std.testing.expect(try kp.rememberReached(id, 10));
+    try std.testing.expect(!try kp.rememberReached(id, 20));
+    try std.testing.expectEqual(@as(i64, 20), kp.entries.items[0].last_seen);
+    try kp.save();
+    kp.deinit();
+
+    var again = try KnownPeers.load(allocator, io, path);
+    defer again.deinit();
+    try std.testing.expectEqual(@as(usize, 1), again.entries.items.len);
+    try std.testing.expect(again.entries.items[0].id.eql(id));
+    try std.testing.expectEqual(@as(u8, 0), again.entries.items[0].count);
 }

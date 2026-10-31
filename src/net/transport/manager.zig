@@ -52,6 +52,10 @@ pub const ConnectionManager = struct {
     /// Reaches a device through another one when none of its addresses
     /// answers (discovery/node.zig sets it; transport/relay.zig).
     relay_dialer: ?RelayDialer = null,
+    /// Counts connections that closed (not those reaped as idle): a device
+    /// that lost one reconnects at once rather than on its next round
+    /// (Node's maintenance loop watches it).
+    lost: std.atomic.Value(u32) = .init(0),
     traffic: tcp.TrafficCounters = .{},
     /// Devices that just failed every address and the relay: dialing them
     /// again fails at once until `until_ms`, so a device that is gone (an
@@ -326,6 +330,7 @@ pub const ConnectionManager = struct {
                 const is_closed = mc.conn.isClosed();
 
                 if (is_closed or is_idle) {
+                    if (is_closed) _ = self.lost.fetchAdd(1, .monotonic);
                     const removed_mc = self.connections.orderedRemove(i);
                     self.mutex.unlock();
                     retireConnection(removed_mc);
@@ -672,6 +677,21 @@ pub const ConnectionManager = struct {
         const failures: u8 = if (slot.peer != null and slot.peer.?.eql(peer)) slot.failures +| 1 else 1;
         const shift: u6 = @intCast(@min(failures - 1, 5));
         slot.* = .{ .peer = peer, .failures = failures, .until_ms = now + @min(backoff_first_ms << shift, backoff_max_ms) };
+    }
+
+    /// Forgets every dial backoff (this device was cut off: the failures
+    /// were its own, not the peers').
+    pub fn clearAllBackoff(self: *ConnectionManager) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.dial_backoff = @splat(.{});
+    }
+
+    /// Forgets `peer`'s dial backoff: the next dial tries it at once.
+    pub fn clearBackoff(self: *ConnectionManager, peer: id.NodeID) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.clearBackoffLocked(peer);
     }
 
     /// A connection to `peer` exists (dialed or accepted): it's reachable.

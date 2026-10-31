@@ -69,7 +69,14 @@ const TcpConnectionImpl = struct {
     /// means the connection is in use.
     fn maintain(ctx: *anyopaque) void {
         const self: *TcpConnectionImpl = @ptrCast(@alignCast(ctx));
-        self.yamux.reapClosed(@import("../../sync.zig").monotonicMillis());
+        const now = @import("../../sync.zig").monotonicMillis();
+        self.yamux.reapClosed(now);
+        // Silent past the keepalive: closed, so the manager counts it as
+        // lost and the node reconnects at once.
+        if (!self.yamux.keepAlive(now)) {
+            std.debug.print("connection: no answer for {d} s, closing\n", .{@divTrunc(@import("yamux.zig").keepalive_dead_ms, 1000)});
+            close(ctx);
+        }
     }
 
     pub fn isInUse(ctx: *anyopaque) bool {

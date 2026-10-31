@@ -86,6 +86,11 @@ pub const Node = struct {
     /// Devices no relay reached lately -> when to try again (ms). Guarded
     /// by `mutex`.
     relay_misses: std.AutoHashMapUnmanaged(id.NodeID, i64) = .empty,
+/// Devices this one depends on to reach the rest: its bootstrap peers and
+/// the relays it went through. Redialed without backoff when lost
+/// (Node.dialKnownPeers). Guarded by `mutex`; the oldest is replaced.
+anchors: [max_anchors]?id.NodeID = .{null} ** max_anchors,
+next_anchor: usize = 0,
     /// Per peer device: the member list last sent to it, so pings don't
     /// re-send an unchanged list. Guarded by `mutex`.
     admit_sent: std.AutoHashMapUnmanaged(id.NodeID, AdmitSent) = .empty,
@@ -102,6 +107,43 @@ pub const Node = struct {
 
     pub const max_handlers = 256;
     pub const max_recent_peers = @import("recent.zig").max_recent_peers;
+pub const max_anchors = 8;
+
+/// Records `peer` as an anchor (see `anchors`).
+pub fn noteAnchor(self: *Node, peer: id.NodeID) void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    for (self.anchors) |a| if (a) |known| if (known.eql(peer)) return;
+    self.anchors[self.next_anchor] = peer;
+    self.next_anchor = (self.next_anchor + 1) % max_anchors;
+}
+
+pub fn isAnchor(self: *Node, peer: id.NodeID) bool {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    for (self.anchors) |a| if (a) |known| if (known.eql(peer)) return true;
+    return false;
+}
+
+/// Forgets which devices no relay reached: failures from a time this
+/// device was cut off from its relays say nothing about them.
+pub fn forgetRelayMisses(self: *Node) void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    self.relay_misses.clearRetainingCapacity();
+}
+
+/// Copies the anchors into `out`; returns how many.
+pub fn copyAnchors(self: *Node, out: *[max_anchors]id.NodeID) usize {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    var n: usize = 0;
+    for (self.anchors) |a| if (a) |known| {
+        out[n] = known;
+        n += 1;
+    };
+    return n;
+}
 
     /// Produces this node's share listing (an encoded dir block, owned by
     /// the caller) on demand. Type-erased so the DHT does not depend on the

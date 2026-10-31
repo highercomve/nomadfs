@@ -123,6 +123,13 @@ pub const YamuxStream = struct {
 /// Lock order: Session.mutex before YamuxStream.mutex. Session.write_mutex is
 /// only ever taken with no other lock held, so a blocked transport write never
 /// stalls frame dispatch or stream bookkeeping.
+/// A session silent this long sends a PING (any frame back counts as an
+/// answer). Below the NAT timeouts of carriers and home routers.
+pub const keepalive_idle_ms: i64 = 15 * std.time.ms_per_s;
+/// Nothing received for this long: the peer or the path is gone (a NAT
+/// that dropped the mapping, a phone that slept), though no reset came.
+pub const keepalive_dead_ms: i64 = 45 * std.time.ms_per_s;
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
     next_stream_id: u32,
@@ -140,6 +147,10 @@ pub const Session = struct {
     closed: bool = false,
     /// The peer sent GO_AWAY: no new streams, existing streams keep working.
     go_away: bool = false,
+    /// When a frame last arrived (monotonic ms): written by the reader.
+    last_rx_ms: std.atomic.Value(i64) = .init(0),
+    /// When keepAlive last sent a PING; only keepAlive's caller touches it.
+    last_ping_ms: i64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, transport: network.Stream, is_server: bool) !*Session {
         const self = try allocator.create(Session);
@@ -152,6 +163,7 @@ pub const Session = struct {
             .accept_waiters = 0,
             .is_server = is_server,
             .closed = false,
+            .last_rx_ms = .init(sync.monotonicMillis()),
         };
         return self;
     }
@@ -304,6 +316,7 @@ pub const Session = struct {
                 }
                 return;
             };
+            self.last_rx_ms.store(sync.monotonicMillis(), .monotonic);
 
             self.handleFrame(&header_buf) catch |err| {
                 std.debug.print("YamuxSession frame handling error: {any}\n", .{err});
@@ -473,6 +486,26 @@ pub const Session = struct {
         _ = self.streams.remove(stream.id);
         stream.deinit(self.allocator);
         self.allocator.destroy(stream);
+    }
+
+    /// Keeps an idle session's path open and notices a dead one: a PING
+    /// when nothing arrived for keepalive_idle_ms, and false once nothing
+    /// arrived for keepalive_dead_ms (the caller closes the connection).
+    /// Called every few seconds from one thread (the connection manager).
+    pub fn keepAlive(self: *Session, now_ms: i64) bool {
+        const idle = now_ms - self.last_rx_ms.load(.monotonic);
+        if (idle >= keepalive_dead_ms) return false;
+        if (idle < keepalive_idle_ms or now_ms - self.last_ping_ms < keepalive_idle_ms) return true;
+        self.last_ping_ms = now_ms;
+        // Not while another frame is being written: traffic is flowing
+        // then, and a write stuck on a dead path mustn't hold this caller.
+        if (!self.write_mutex.tryLock()) return true;
+        defer self.write_mutex.unlock();
+        var h_buf: [12]u8 = undefined;
+        const ping = Header{ .type = .PING, .flags = Flags.SYN, .stream_id = 0, .length = @truncate(@as(u64, @bitCast(now_ms))) };
+        ping.encode(&h_buf);
+        compat.writeFull(self.transport, &h_buf) catch {};
+        return true;
     }
 
     fn writeFrame(self: *Session, header: Header, payload: []const u8) !void {
