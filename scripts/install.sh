@@ -14,7 +14,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/install.sh | bash
 #   scripts/install.sh                    the latest release
-#   VERSION=0.3.14 scripts/install.sh      that release
+#   VERSION=0.3.15 scripts/install.sh      that release
 #   NO_RESTART=1                          leave the app stopped
 #   NO_CLI=1                              skip the command line node
 #   NO_DESKTOP=1                          Linux: skip the launcher entry and icons

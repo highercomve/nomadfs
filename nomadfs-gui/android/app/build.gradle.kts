@@ -14,8 +14,8 @@ android {
         applicationId = "com.foreachdeveloper.nomadfs"
         minSdk = 29
         targetSdk = 36
-        versionCode = 314
-        versionName = "0.3.14"
+        versionCode = 315
+        versionName = "0.3.15"
         // The Play build's libraries keep their debug info (-Dplay-store):
         // the bundle carries it as native debug symbols for Play's crash
         // reports. Other builds come stripped, with nothing to extract.

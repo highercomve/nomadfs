@@ -3,6 +3,27 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.3.15 - 2026-10-31
+
+Install from a terminal on every desktop, and crash reports with names from Google Play. Devices
+on 0.3.14 and 0.3.15 work together.
+
+### Added
+
+- Install scripts for macOS and Windows. On Linux and macOS,
+  `curl -fsSL https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/install.sh | bash`
+  installs the app and the command line (macOS: the app in `/Applications`, Apple silicon); on
+  Windows, `irm https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/install.ps1 | iex`
+  runs the installer silently and puts `nomadfs.exe` on your PATH. Every file is checked against
+  the release's checksums.
+- The website has a download section with every platform's files, Google Play (for invited
+  testers) and the APK.
+
+### Changed
+
+- The Google Play build carries the app's native debug symbols, so crash reports in the Play
+  Console show function names. The app itself is the same size.
+
 ## 0.3.14 - 2026-10-31
 
 The folder mount comes to macOS and Windows: every reachable device's shares and the swarm folder,
