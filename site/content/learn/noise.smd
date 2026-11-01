@@ -1,5 +1,5 @@
 ---
-.title = "Noise XXpsk3",
+.title = "Noise XXpsk0",
 .description = "Every NomadFS connection starts with a three-message Noise handshake. It encrypts the connection, checks that both sides hold the swarm key, and proves each device's identity.",
 .date = .date("2026-10-27T00:00:00"),
 .authors = ["NomadFS"],
@@ -17,11 +17,11 @@ running *chaining key*, and every message goes into a running *handshake
 hash*, so each step depends on everything before it. WireGuard and the
 Lightning Network use Noise too.
 
-NomadFS uses one fixed suite, `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s`:
+NomadFS uses one fixed suite, `Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s`:
 
 - **XX**: both sides send their static (long-lived) public key during the
   handshake, encrypted. Neither has to know the other's key in advance.
-- **psk3**: a 32-byte pre-shared key is mixed in at the end of message 3. In
+- **psk0**: a 32-byte pre-shared key is mixed in before message 1. In
   NomadFS that key is the **swarm key**.
 - **25519**: X25519 for the DH operations.
 - **ChaChaPoly**: ChaCha20-Poly1305 encryption, which also authenticates.
@@ -30,22 +30,23 @@ NomadFS uses one fixed suite, `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s`:
 
 # [The handshake]($heading.id('handshake'))
 
-[Three messages. The tokens are Noise notation: e and s are ephemeral and static public keys; ee, es and se are DH operations; psk mixes in the swarm key.](<$image.siteAsset('learn/noise-xxpsk3.svg').alt('Sequence diagram between the dialer (initiator) and the listener (responder). Message 1, dialer to listener: e, the ephemeral key, in the clear. Message 2, listener to dialer: e, ee, s, es, with the static key encrypted and a signed device hello. Message 3, dialer to listener: s, se, psk, with the static key and a signed hello, sealed with the swarm key; with the wrong key the tag check fails. Then both sides split two keys, one per direction; each frame is ChaCha20-Poly1305 and at most 1024 bytes, and Yamux runs inside.')>)
+[Three messages. The tokens are Noise notation: psk mixes in the swarm key; e and s are ephemeral and static public keys; ee, es and se are DH operations.](<$image.siteAsset('learn/noise-xxpsk0.svg').alt('Sequence diagram between the dialer (initiator) and the listener (responder). Message 1, dialer to listener: psk, e: the ephemeral key and a payload sealed with the swarm key; with the wrong key the listener stops there. Message 2, listener to dialer: e, ee, s, es, with the static key and a signed device hello, encrypted. Message 3, dialer to listener: s, se, with the static key and a signed device hello, encrypted. Then both sides split two keys, one per direction; each frame is ChaCha20-Poly1305 and at most 64 KiB, and Yamux runs inside.')>)
 
-1. **`-> e`.** The dialer creates a fresh ephemeral X25519 key pair and sends
-   the public half. It isn't encrypted yet, but it goes into the handshake
-   hash.
+1. **`-> psk, e`.** Both sides start by mixing in the swarm key. The dialer
+   creates a fresh ephemeral X25519 key pair, sends the public half, and
+   after it an empty payload encrypted with a key derived from the swarm
+   key. The listener checks that payload's tag before it answers.
 2. **`<- e, ee, s, es`.** The listener sends its own ephemeral key. Both sides
    compute `ee` (DH of the two ephemerals), which gives the first encryption
    key. The listener sends its static key encrypted under it, then both mix
    in `es` (dialer's ephemeral with listener's static).
-3. **`-> s, se, psk`.** The dialer sends its static key encrypted, both mix in
-   `se`, and then the swarm key.
+3. **`-> s, se`.** The dialer sends its static key encrypted and both mix in
+   `se`.
 
 Each message is sent with a 2-byte length in front, and the whole handshake
 has 10 seconds to finish. After message 3 both sides derive two keys from the
 chaining key, one per direction. From then on every frame on the connection
-carries at most 1024 bytes of data, is encrypted with ChaCha20-Poly1305 and a
+carries at most 64 KiB of data, is encrypted with ChaCha20-Poly1305 and a
 counter nonce, and is checked on arrival.
 
 Because each connection uses new ephemeral keys, someone who steals a
@@ -53,18 +54,17 @@ device's keys later can't decrypt traffic they recorded earlier.
 
 # [What the swarm key proves]($heading.id('psk'))
 
-The swarm key is mixed in just before message 3's payload is encrypted. A
-dialer with a different key derives different encryption keys, so the
-listener's tag check on that payload fails and the connection is closed.
-Only devices with the same swarm key complete a handshake, and the key itself
-never crosses the network.
+The swarm key is mixed in before anything is sent, so every key in the
+handshake depends on it. A dialer with a different key derives different
+encryption keys: the listener's tag check on message 1 fails and it closes
+the connection without answering. Only devices with the same swarm key
+complete a handshake, and the key itself never crosses the network.
 
-The order matters in one way. The listener's static key and device hello in
-message 2 are encrypted before the swarm key is mixed in. The dialer reads
-them, so it learns who the listener is before either side has proven it holds
-the swarm key. The dialer's own device hello comes after the swarm key is
-mixed in, so the listener learns the dialer's identity only once the swarm
-key checks out.
+The order matters. Because the listener checks the swarm key first, a
+scanner that connects to an open port gets nothing back: not the listener's
+static key, not its device identity, not its node ID. Before 0.4.0 the
+swarm key came last (`psk3`), and message 2 carried the listener's keys to
+anyone who sent a message 1.
 
 # [Binding the device identity]($heading.id('identity'))
 
@@ -81,7 +81,7 @@ signature = Ed25519-sign("nomadfs-device-auth-v1" ‖ handshake hash)
 ```
 
 The signature covers the handshake hash at that moment: both ephemeral keys,
-both static keys, and in message 3 the swarm key too. A hello captured from
+both static keys, and the swarm key. A hello captured from
 one connection is worthless in any other. The receiver verifies the
 signature, and the device ID is BLAKE2s-256 of the Ed25519 public key. Then:
 
@@ -95,7 +95,7 @@ signature, and the device ID is BLAKE2s-256 of the Ed25519 public key. Then:
 # [Invites: the same handshake, a different key]($heading.id('invites'))
 
 A one-time invite has to get the swarm key to a new device that doesn't have
-it yet. It runs the same XXpsk3 handshake with a different pre-shared key:
+it yet. It runs the same XXpsk0 handshake with a different pre-shared key:
 
 ```
 nomadfs://invite?addr=192.168.1.20:9001&token=<32 hex characters>

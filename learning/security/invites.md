@@ -11,7 +11,7 @@ three flows built on them:
 3. **Revocation**: how removing a device on one machine spreads to the rest.
 
 User-facing guide: [Connecting devices](https://nomadfs.foreachdeveloper.com/docs/connecting-devices/).
-Handshake background: [Learn: Noise XXpsk3](https://nomadfs.foreachdeveloper.com/learn/noise/#invites).
+Handshake background: [Learn: Noise XXpsk0](https://nomadfs.foreachdeveloper.com/learn/noise/#invites).
 
 ---
 
@@ -39,10 +39,10 @@ Both sides turn the token into a Noise pre-shared key:
 pub fn derivePsk(token: [16]u8) [32]u8 // SHA-256("nomadfs-invite-v1:" ‖ token)
 ```
 
-The invite channel is an ordinary `Noise_XXpsk3` connection
+The invite channel is an ordinary `Noise_XXpsk0` connection
 ([Chapter 1.1](../net/transport/noise.md)) whose `psk` is this value instead
 of the swarm key. The invite channel uses the same v2-only Noise handshake,
-including the `nomadfs-noise-v2` prologue and tagged 48-byte first message.
+including the `nomadfs-noise-v3` prologue and tagged 48-byte first message.
 Only a holder of the token can finish the handshake. A 128-bit random token
 cannot be guessed offline, which is why there is no PAKE (a short PIN would
 need one).

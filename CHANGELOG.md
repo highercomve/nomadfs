@@ -3,6 +3,22 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.4.0 - 2026-11-01
+
+A clean break in the handshake: **every device needs 0.4.0**. Devices on 0.3.x and 0.4.0 can't
+connect to each other, so update them all; nothing needs pairing again. The apps and
+`nomadfs --upgrade` update themselves as before.
+
+### Security
+
+- A device answered anyone who connected to its port with its keys: its transport key, its device
+  identity and its node ID, before checking the swarm key. The swarm key is now checked first
+  (`Noise_XXpsk0`), and a device without it gets nothing back.
+
+### Fixed
+
+- The Learn pages said encrypted frames carry at most 1024 bytes; they carry up to 64 KiB.
+
 ## 0.3.18 - 2026-11-01
 
 Steadier connections on weak and changing networks. Devices on 0.3.17 and 0.3.18 work together.

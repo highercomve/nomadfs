@@ -7,7 +7,7 @@
 //!
 //! The token is 128 random bits, valid once and for a few minutes. Both
 //! sides derive a pre-shared key from it and run the transport's usual
-//! Noise_XXpsk3 handshake with throwaway static keys, so only a holder of
+//! Noise_XXpsk0 handshake with throwaway static keys, so only a holder of
 //! the token can complete it, and a code read off the screen afterwards is
 //! useless. A short PIN would need a PAKE to resist offline guessing; a
 //! 128-bit token does not.

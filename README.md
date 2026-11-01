@@ -68,7 +68,7 @@ irm https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/install.p
 ### One-Time Invites & Mutual Trust
 - **Zero-leak pairing**: Join devices to a swarm without exposing or copy-pasting the master swarm key.
 - **Time-limited single-use tokens**: Invites generate a URI (`nomadfs://invite?addr=..&token=..`) with a 128-bit random token expiring after 10 minutes.
-- **Noise XXpsk3 security**: Both devices derive a pre-shared key from the token and perform a `Noise_XXpsk3` handshake with ephemeral keys.
+- **Noise XXpsk0 security**: Both devices derive a pre-shared key from the token and perform a `Noise_XXpsk0` handshake with ephemeral keys.
 - **Ticket exchange**: Devices swap signed pairing tickets inside the encrypted tunnel, mutually registering cryptographic identities and trust before exchanging the swarm key.
 - **QR code workflows**: Invites display as terminal and GUI QR codes; the Android app scans them directly with the device camera.
 
@@ -88,7 +88,7 @@ Built with [Oriel](https://github.com/highercomve/Oriel) as a lightweight native
 ### Core Architecture
 - **Content-addressed storage**: Merkle DAG representation using FastCDC content-defined chunking; every block is addressed by its SHA-256 hash.
 - **Discovery & routing**: Kademlia DHT for decentralized peer discovery and addressing.
-- **Encrypted transport**: Native persistent TCP connections secured with the Noise Protocol Framework (`XXpsk3` / `IK`) and multiplexed with Yamux streams.
+- **Encrypted transport**: Native persistent TCP connections secured with the Noise Protocol Framework (`XXpsk0` / `IK`) and multiplexed with Yamux streams.
 - **Identity & trust**: Ed25519 and X25519 pinned identities with local revocable trust stores.
 - **Mobile C ABI**: Unified C API (`src/mobile/api.zig`) providing the foundation for Android JNI and Oriel GUI bindings.
 

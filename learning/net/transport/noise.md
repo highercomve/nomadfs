@@ -3,21 +3,23 @@
 Every TCP connection in NomadFS is encrypted with Noise, implemented
 from scratch in `src/net/transport/noise.zig` on top of Zig's `std.crypto`.
 
-## 1. The Protocol: `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s`
+## 1. The Protocol: `Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s`
 
 This string is the protocol name. `SymmetricState.init` hashes it into the
 initial chaining key and handshake hash. NomadFS then mixes the prologue
-`nomadfs-noise-v2` into the hash. v2 is the only supported handshake; the
-previous 32-byte message 1 is rejected. All devices must be updated together.
+`nomadfs-noise-v3` into the hash. v3 (0.4.0) is the only supported
+handshake: v2 (`XXpsk0`, until 0.3.18) fails its first tag check. All
+devices must be updated together.
 Each `e` token is followed by both `MixHash(e)` and `MixKey(e)`, as required
-by the Noise PSK modifier. The implementation is checked against the
-Cacophony XXpsk3 vector, including its transport keys.
+by the Noise PSK modifier. Cacophony has no XXpsk0 vector, so the test uses
+its inputs with expected bytes from snow 0.9, an independent implementation,
+including the transport keys.
 
 *   **XX**: both sides transmit their static public key during the handshake,
     encrypted. Neither needs to know the other's key in advance.
-*   **psk3**: the Swarm Key is mixed into the key material at step 3, after
-    both static keys are exchanged. A peer without the Swarm Key cannot
-    complete the handshake.
+*   **psk0**: the Swarm Key is mixed into the key material before message 1.
+    A peer without the Swarm Key fails the first tag check and gets no
+    answer.
 *   **25519**: X25519 Diffie-Hellman (`std.crypto.dh.X25519`).
 *   **ChaChaPoly**: ChaCha20-Poly1305 AEAD (`std.crypto.aead.chacha_poly`).
 *   **BLAKE2s**: BLAKE2s-256 for the handshake hash, and HMAC-BLAKE2s HKDF for
@@ -50,18 +52,20 @@ exactly the expected size (`error.HandshakeFailed`).
 sequenceDiagram
     participant I as Dialer (initiator)
     participant R as Listener (responder)
-    I->>R: msg 1 (48 B): e + empty payload tag
+    I->>R: msg 1 (48 B): psk, e + empty payload tag
     R->>I: msg 2 (193 B): e, ee, s, es + device hello
-    I->>R: msg 3 (161 B): s, se, psk + device hello
+    I->>R: msg 3 (161 B): s, se + device hello
     Note over I,R: split() gives two CipherStates, one per direction
 ```
 
-### Message 1: `-> e` (`writeMessage1` / `readMessage1`)
-The initiator generates `e` and sends its 32-byte public key in the clear.
-`mixHash(e.pub)` binds it to the transcript, and `mixKey(e.pub)` initializes
-the cipher. Encrypting an empty payload adds a 16-byte tag, making message 1
-48 bytes. This tag is checked by the responder; it does not authenticate
-swarm membership because the ephemeral public key is public.
+### Message 1: `-> psk, e` (`buildMessage1` / `consumeMessage1`)
+Both sides first call `mixKeyAndHash(swarm_key)`. The initiator generates
+`e` and sends its 32-byte public key in the clear. `mixHash(e.pub)` binds it
+to the transcript, and `mixKey(e.pub)` derives the cipher key from the
+chaining key, which already holds the swarm key. Encrypting an empty payload
+adds a 16-byte tag, making message 1 48 bytes. The responder checks the tag
+before anything else: a dialer without the swarm key fails here, and the
+responder closes the connection without sending message 2.
 
 ### Message 2: `<- e, ee, s, es` (`writeMessage2` / `readMessage2`)
 1.  **`e`**: the responder's ephemeral public key (32 B), mixed into `h` and the chaining key.
@@ -70,23 +74,21 @@ swarm membership because the ephemeral public key is public.
 4.  **`es`**: `mixKey(DH(e_I, s_R))`.
 5.  **Payload**: the responder's encrypted **device hello** (97 + 16 B).
 
-### Message 3: `-> s, se, psk` (`writeMessage3` / `readMessage3`)
+### Message 3: `-> s, se` (`writeMessage3` / `readMessage3`)
 1.  **`s`**: the initiator's static key, encrypted (32 + 16 B).
 2.  **`se`**: `mixKey(DH(s_I, e_R))`.
-3.  **`psk`**: `mixKeyAndHash(swarm_key)`. This is where the swarm key enters.
-4.  **Payload**: the initiator's encrypted **device hello** (97 + 16 B).
+3.  **Payload**: the initiator's encrypted **device hello** (97 + 16 B).
 
 **Verification.** A responder with a different swarm key derives a different
-key after `psk`, so decrypting the message 3 payload fails its Poly1305 tag
-check. The error propagates from message 3 payload verification, and the
-connection is closed.
+key from the start, so the tag on message 1's empty payload fails and the
+connection is closed. A responder with a different key fails the initiator
+the same way, at message 2.
 
-**What leaks before the PSK check.** The responder's static key and device
-hello in message 2 are encrypted only with keys from `ee` and `es`, before
-the PSK is mixed in. A dialer that does not know the swarm key cannot finish
-the handshake, but it *can* read message 2 and learn the identity of the
-device it reached. The initiator's static key in message 3 is likewise
-decrypted before the PSK is mixed in, but its device hello comes after.
+**Nothing leaks before the PSK check.** Every key, from message 1 on,
+depends on the swarm key. A scanner without it gets no message 2, so it
+learns neither the responder's static key nor its device identity. With
+`psk3` (v2, until 0.3.18) message 2 was encrypted only with keys from `ee`
+and `es`, and any dialer could read who it had reached.
 
 ## 4. Device Identity: the Device Hello (`src/device/auth.zig`)
 
@@ -99,8 +101,8 @@ hello = version (1, = 1) ‖ Ed25519 public key (32) ‖ signature (64)
 signature = Ed25519.sign("nomadfs-device-auth-v1" ‖ h)
 ```
 
-`h` is the handshake hash at the moment the hello is encrypted. In message 3
-that hash already includes the PSK. The receiver captures `h` before
+`h` is the handshake hash at the moment the hello is encrypted. It includes
+the PSK in both messages. The receiver captures `h` before
 decrypting the payload and calls `Authenticator.verifyHello(hello, h, rs)`:
 
 1. checks the version byte and length (`error.InvalidDeviceHello`);
@@ -146,7 +148,7 @@ frame on the socket looks like this:
 
 ## 6. Why Noise vs. TLS?
 
-| Feature | TLS 1.3 | Noise (XXpsk3) in NomadFS |
+| Feature | TLS 1.3 | Noise (XXpsk0) in NomadFS |
 | :--- | :--- | :--- |
 | **Identity** | X.509 certificates, a CA | raw public keys; an Ed25519 device key signs the transcript |
 | **Membership** | not part of TLS | the swarm key, as a PSK |

@@ -17,7 +17,7 @@ Lines worth recognising:
 | `NomadFS Node: <nick> (Storage: true)`, `Listening on port: …` | `src/main.zig` | Startup |
 | `Node Initialized. Local ID: …` / `Device ID: …` | `src/main.zig` | Transport node ID and Ed25519 device ID (hex) |
 | `Sharing '<name>' from <path> (indexing in the background)` | `src/node.zig` | A share was registered |
-| `* Noise_XXpsk3 handshake start (Initiator)` … `* Noise Handshake complete` | `src/net/transport/noise.zig` | One line per handshake step |
+| `* Noise_XXpsk0 handshake start (Initiator)` … `* Noise Handshake complete` | `src/net/transport/noise.zig` | One line per handshake step |
 | `* Noise Error at step 'Message 3 Decrypt (payload/psk verify)'` | `noise.zig` | The peer has a different swarm key |
 | `… device identity: error.UntrustedDevice` / `TransportKeyMismatch` | `noise.zig`, `src/device/auth.zig` | Trust policy refused the peer |
 | `Bootstrapping: Connecting to …`, `Retry n/5 …` | `src/node.zig` | Bootstrap dials |

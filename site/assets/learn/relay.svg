@@ -68,6 +68,6 @@ text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Conso
 <text class="s" x="380" y="456" text-anchor="middle">reads none</text>
 <path class="lno" d="M119 410 L298 410" marker-start="url(#aro)"/>
 <path class="lno" d="M462 410 L641 410" marker-end="url(#aro)"/>
-<text class="b" x="380" y="496" text-anchor="middle">Noise XXpsk3, then Yamux: phone ⇄ server</text>
+<text class="b" x="380" y="496" text-anchor="middle">Noise XXpsk0, then Yamux: phone ⇄ server</text>
 <text class="s" x="380" y="520" text-anchor="middle">the same handshake as a direct connection, with the swarm key</text>
 </svg>

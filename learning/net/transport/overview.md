@@ -8,7 +8,7 @@ stream of a pipe.
 
 > For a short, diagram-led introduction see the site's Learn pages:
 > [TCP: finding and reaching devices](https://nomadfs.foreachdeveloper.com/learn/tcp/),
-> [Noise XXpsk3](https://nomadfs.foreachdeveloper.com/learn/noise/) and
+> [Noise XXpsk0](https://nomadfs.foreachdeveloper.com/learn/noise/) and
 > [Yamux](https://nomadfs.foreachdeveloper.com/learn/yamux/). This chapter is
 > the code-level companion.
 
@@ -26,7 +26,7 @@ graph TD
    `src/net/transport/tcp.zig`). TCP is the only transport: the config parser
    rejects `transport = "quic"`, and `ConnectionManager` returns
    `error.QuicNotImplemented` for it.
-2. **Security (Noise)**: `NoiseStream` runs the `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s`
+2. **Security (Noise)**: `NoiseStream` runs the `Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s`
    handshake and then encrypts every frame. The handshake also carries a
    signed Ed25519 *device hello* that binds the device identity to the
    session. See [Chapter 1.1](./noise.md).

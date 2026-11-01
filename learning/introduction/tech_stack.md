@@ -17,14 +17,14 @@ as one diagram. This chapter maps each layer to its code.
  │ RPCs & Kademlia DHT           src/net/discovery/             │
  ├──────────────────────────────────────────────────────────────┤
  │ Yamux                         src/net/transport/yamux.zig    │
- │ Noise XXpsk3 + device hello   noise.zig, src/device/auth.zig │
+ │ Noise XXpsk0 + device hello   noise.zig, src/device/auth.zig │
  │ TCP                           tcp.zig, manager.zig           │
  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Layer 1: Connectivity (the roads)
 *   **Problem**: how do two of my devices find each other and talk safely?
-*   **Solution**: TCP, then a Noise `XXpsk3` handshake keyed by the swarm key
+*   **Solution**: TCP, then a Noise `XXpsk0` handshake keyed by the swarm key
     and carrying each device's signed Ed25519 identity, then Yamux streams.
     Addresses come from `bootstrap_peers`, invites, LAN announcements
     and the DHT.

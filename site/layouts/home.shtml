@@ -17,7 +17,7 @@
 						<a class="btn btn-ghost" href="https://github.com/highercomve/nomadfs">View on GitHub</a>
 					</div>
 					<dl class="readouts">
-						<div><dt>transport</dt><dd><a href="$site.page('learn/noise').link()">Noise XXpsk3</a> · <a href="$site.page('learn/yamux').link()">Yamux</a> · <a href="$site.page('learn/tcp').link()">TCP</a></dd></div>
+						<div><dt>transport</dt><dd><a href="$site.page('learn/noise').link()">Noise XXpsk0</a> · <a href="$site.page('learn/yamux').link()">Yamux</a> · <a href="$site.page('learn/tcp').link()">TCP</a></dd></div>
 						<div><dt>storage</dt><dd><a href="$site.page('learn/merkle-dag').link()">Merkle DAG</a> · <a href="$site.page('learn/fastcdc').link()">FastCDC</a> · <a href="$site.page('learn/sha-256').link()">SHA-256</a></dd></div>
 						<div><dt>mount</dt><dd><a href="$site.page('learn/fuse').link()">FUSE, no libfuse</a> · <a href="$site.page('docs/shared-folders').link().suffix('#mount-webdav')">WebDAV</a></dd></div>
 					</dl>
@@ -63,7 +63,7 @@
 				<article class="feature plate">
 					<div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v6c0 4.4 3 7.6 7 9 4-1.4 7-4.6 7-9V6l-7-3z"/><path d="m9 12 2 2 4-4"/></svg></div>
 					<h3>Encrypted, device to device</h3>
-					<p>Devices talk over Noise <code>XXpsk3</code> sessions keyed by your swarm, with Ed25519 device identities you can list and revoke. Every block is checked against its hash when it arrives.</p>
+					<p>Devices talk over Noise <code>XXpsk0</code> sessions keyed by your swarm, with Ed25519 device identities you can list and revoke. Every block is checked against its hash when it arrives.</p>
 				</article>
 				<article class="feature plate">
 					<div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="4" width="14" height="11" rx="1.5"/><path d="M6 19h6M9 15v4"/><rect x="16" y="9" width="6" height="11" rx="1.5"/></svg></div>

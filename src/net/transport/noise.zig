@@ -12,7 +12,13 @@ const Hkdf = std.crypto.kdf.hkdf.Hkdf(Hmac);
 const Aead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 const X25519 = std.crypto.dh.X25519;
 
-pub const prologue_v2 = "nomadfs-noise-v2";
+/// v3: the swarm key is mixed in first (psk0), so a peer without it learns
+/// nothing; v2 mixed it in last (psk3) and answered anyone with this
+/// device's keys. Versions don't mix: the prologue makes that fail cleanly.
+pub const prologue_v3 = "nomadfs-noise-v3";
+
+/// The handshake: XX with the swarm key as a PSK before message 1.
+pub const handshake_pattern = "Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s";
 
 pub const KeyPair = struct {
     public_key: [32]u8,
@@ -233,8 +239,8 @@ pub const HandshakeState = struct {
     fixed_e: ?KeyPair = null, // Deterministic test input; production generates a fresh key.
 
     pub fn init(initiator: bool, static_key: KeyPair, swarm_key: [32]u8, auth: *const device_auth.Authenticator) HandshakeState {
-        var symmetric = SymmetricState.init("Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s");
-        symmetric.mixHash(prologue_v2);
+        var symmetric = SymmetricState.init(handshake_pattern);
+        symmetric.mixHash(prologue_v3);
         return .{
             .symmetric = symmetric,
             .s = static_key,
@@ -333,7 +339,10 @@ pub const NoiseStream = struct {
         hs.symmetric.mixKey(public_key);
     }
 
+    /// Message 1: -> psk, e. The payload is encrypted under the swarm key,
+    /// so a responder answers only a peer that holds it.
     fn buildMessage1(hs: *HandshakeState, payload: []const u8, out: []u8) ![]u8 {
+        hs.symmetric.mixKeyAndHash(&hs.psk);
         hs.e = hs.fixed_e orelse KeyPair.generate();
         mixE(hs, &hs.e.?.public_key);
         @memcpy(out[0..32], &hs.e.?.public_key);
@@ -343,12 +352,14 @@ pub const NoiseStream = struct {
 
     fn consumeMessage1(hs: *HandshakeState, msg: []const u8, payload: []u8) !void {
         if (msg.len != 48 + payload.len) return error.HandshakeFailed;
+        hs.symmetric.mixKeyAndHash(&hs.psk);
         hs.re = msg[0..32].*;
         mixE(hs, msg[0..32]);
         try hs.symmetric.decryptAndHash(msg[32..], payload);
     }
 
-    /// Message 1: -> e, encrypted empty payload (48 bytes).
+    /// Message 1: e and an encrypted empty payload (48 bytes): its tag
+    /// proves the swarm key.
     fn writeMessage1(inner: network.Stream, hs: *HandshakeState) !void {
         var buf: [48]u8 = undefined;
         try writeHandshakeMessage(inner, try buildMessage1(hs, "", &buf));
@@ -434,12 +445,12 @@ pub const NoiseStream = struct {
         hs.symmetric.mixKey(&es);
     }
 
-    /// Message 3 (initiator): -> s, se, psk
+    /// Message 3 (initiator): -> s, se
     fn writeMessage3(inner: network.Stream, hs: *HandshakeState) !void {
         var msg3: [48 + device_auth.hello_len + 16]u8 = undefined;
         try buildMessage3Prefix(hs, &msg3);
 
-        // Payload: device identity, signed over the psk-mixed handshake hash.
+        // Payload: device identity, signed over the handshake hash.
         const hello = try hs.auth.createHello(hs.symmetric.h);
         var payload_ct: [device_auth.hello_len + 16]u8 = undefined;
         try hs.symmetric.encryptAndHash(&hello, &payload_ct);
@@ -456,20 +467,17 @@ pub const NoiseStream = struct {
         var se = X25519.scalarmult(hs.s.private_key, hs.re.?) catch |err| return logError("Message 3 DH (se)", err);
         defer std.crypto.secureZero(u8, &se);
         hs.symmetric.mixKey(&se);
-
-        // psk
-        hs.symmetric.mixKeyAndHash(&hs.psk);
     }
 
-    /// Message 3 (responder): -> s, se, psk
+    /// Message 3 (responder): -> s, se
     fn readMessage3(inner: network.Stream, hs: *HandshakeState) !void {
         var buf: [48 + device_auth.hello_len + 16]u8 = undefined;
         readHandshakeMessage(inner, &buf) catch |err| return logError("Message 3 read", err);
 
         try consumeMessage3Prefix(hs, &buf);
 
-        // payload: device identity (also verifies the PSK-derived key)
-        try readDeviceHello(hs, buf[48..], "Message 3 Decrypt (payload/psk verify)", "Message 3 device identity");
+        // payload: device identity
+        try readDeviceHello(hs, buf[48..], "Message 3 Decrypt (device hello)", "Message 3 device identity");
     }
 
     fn consumeMessage3Prefix(hs: *HandshakeState, buf: []const u8) !void {
@@ -482,9 +490,6 @@ pub const NoiseStream = struct {
         var se = X25519.scalarmult(hs.e.?.private_key, hs.rs.?) catch |err| return logError("Message 3 DH (se)", err);
         defer std.crypto.secureZero(u8, &se);
         hs.symmetric.mixKey(&se);
-
-        // psk
-        hs.symmetric.mixKeyAndHash(&hs.psk);
     }
 
     fn logError(step: []const u8, err: anyerror) anyerror {
@@ -654,8 +659,10 @@ fn testKey(comptime hex: []const u8) !KeyPair {
     return .{ .private_key = secret, .public_key = try X25519.recoverPublicKey(secret) };
 }
 
-test "noise v2: cacophony XXpsk3 vector" {
-    // https://github.com/mcginty/snow/blob/main/tests/vectors/cacophony.txt
+test "noise v3: XXpsk0 vector" {
+    // Cacophony's inputs (keys, PSK, prologue, payloads); cacophony.txt has
+    // no XXpsk0 entry, so the expected bytes come from snow 0.9
+    // (github.com/mcginty/snow), an independent implementation.
     const auth: device_auth.Authenticator = .{
         .identity = try identity_mod.Identity.fromSeed(.{0x31} ** 32),
     };
@@ -665,14 +672,14 @@ test "noise v2: cacophony XXpsk3 vector" {
     initiator.fixed_e = try testKey("893e28b9dc6ca8d611ab664754b8ceb7bac5117349a4439a6b0569da977c464a");
     responder.fixed_e = try testKey("bbdb4cdbd309f1a1f2e1456967fe288cadd6f712d65dc7b7793d5e63da6b375b");
     // Replace the application's prologue with the published vector's prologue.
-    initiator.symmetric = SymmetricState.init("Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s");
+    initiator.symmetric = SymmetricState.init(handshake_pattern);
     initiator.symmetric.mixHash("John Galt");
     responder.symmetric = initiator.symmetric;
     const payloads = .{ "Ludwig von Mises", "Murray Rothbard", "F. A. Hayek" };
     const expected = .{
-        testHex("ca35def5ae56cec33dc2036731ab14896bc4c75dbb07a61f879f8e3afa4c7944325ea71699951ece20f284b6ad9604a029eb335bf84564c308b6ade90ae45078"),
-        testHex("95ebc60d2b1fa672c1f46a8aa265ef51bfe38e7ccb39ec5be34069f1448088432645535233ffe1432564d66a85227b677ced6fc2730ae0998ff49aa1dc56b8186e31b16e416f5d9c03c71f6c34fd37ec013105020070a8b00c000ce7ed56629c119795f96463274bc05519d5c24dc1"),
-        testHex("adf16c5375ec4172576783fd59f2bfa5c7a320d0a13b759592e1a2ddf5524cce59ccbb92ff5d321fced3bdb2840596df562c0e68aad41b090abd285f6d300130072e06964a6ba494e58d47"),
+        testHex("ca35def5ae56cec33dc2036731ab14896bc4c75dbb07a61f879f8e3afa4c79443c3fd598c99d7683f0e5f5a4b4923e0827d143e3e0aff22bee14094c90354ee7"),
+        testHex("95ebc60d2b1fa672c1f46a8aa265ef51bfe38e7ccb39ec5be34069f1448088435943c247f365da0d0ea2a6458884f059985e016646f2619cf5bd160acf805c11547268d1010b91548e3b8ead31e920ef17598013851378cca787e617f8cc3a6b6834b6bfdd412b7730826913d8b693"),
+        testHex("0f11eb94d969552f082c1feb8a3a0c7098f3f7bb59555ba505dacad1d350196e8ff625348a534302de7ff7bd26aa2eaf37078fc60e47c2a37a379f2ea59b0f127d2f0cc484971104230719"),
     };
     var out: [256]u8 = undefined;
     var plain: [32]u8 = undefined;
@@ -692,12 +699,12 @@ test "noise v2: cacophony XXpsk3 vector" {
     try NoiseStream.consumeMessage3Prefix(&responder, &out);
     try responder.symmetric.decryptAndHash(out[48..expected[2].len], plain[0..payloads[2].len]);
     try std.testing.expectEqualStrings(payloads[2], plain[0..payloads[2].len]);
-    const hash = testHex("fc0819f08aebc23de9a783653d8d7d6395b7d243d9deec12f5d6fe2f4c206673");
+    const hash = testHex("bdf8ffc744e8b066eeec3df9ed04d2fb15b64c825ec769f47f1d3dd232b627de");
     try std.testing.expectEqualSlices(u8, &hash, &initiator.symmetric.h);
     try std.testing.expectEqualSlices(u8, &hash, &responder.symmetric.h);
     var i_ciphers = initiator.symmetric.split();
     var r_ciphers = responder.symmetric.split();
-    const transport = testHex("dcdc045c8e9ec36c8ea4078552e5849f87cb9bdfbd2a4eee3baaf6");
+    const transport = testHex("f5bea5e5b030b0386daaf77d5430fb4452c208204713881d55ba84");
     // The responder sends the first transport message using Split's second key.
     try r_ciphers[1].encryptWithAd("", "Carl Menger", &out);
     try std.testing.expectEqualSlices(u8, &transport, out[0..transport.len]);
@@ -705,7 +712,7 @@ test "noise v2: cacophony XXpsk3 vector" {
     try std.testing.expectEqualStrings("Carl Menger", plain[0..11]);
 }
 
-test "noise v2: message 1 rejects legacy lengths and tampered tags" {
+test "noise v3: message 1 rejects legacy lengths and tampered tags" {
     const auth: device_auth.Authenticator = .{
         .identity = try identity_mod.Identity.fromSeed(.{0x32} ** 32),
     };
@@ -719,6 +726,19 @@ test "noise v2: message 1 rejects legacy lengths and tampered tags" {
     try std.testing.expectError(error.AuthenticationFailed, NoiseStream.consumeMessage1(&responder, &buf, &.{}));
 }
 
+test "noise v3: a responder answers nothing to a peer without the swarm key" {
+    const auth: device_auth.Authenticator = .{
+        .identity = try identity_mod.Identity.fromSeed(.{0x34} ** 32),
+    };
+    // A scanner: any swarm key but the right one.
+    var scanner = HandshakeState.init(true, KeyPair.generate(), .{0x01} ** 32, &auth);
+    var responder = HandshakeState.init(false, KeyPair.generate(), .{0x02} ** 32, &auth);
+    var first: [48]u8 = undefined;
+    _ = try NoiseStream.buildMessage1(&scanner, "", &first);
+    // Message 1 fails, so message 2 (the responder's keys) is never sent.
+    try std.testing.expectError(error.AuthenticationFailed, NoiseStream.consumeMessage1(&responder, &first, &.{}));
+}
+
 test "noise symmetric state passes through unkeyed payloads" {
     var sender = SymmetricState.init("test");
     var receiver = sender;
@@ -730,7 +750,7 @@ test "noise symmetric state passes through unkeyed payloads" {
     try std.testing.expectEqualSlices(u8, &sender.h, &receiver.h);
 }
 
-test "noise v2: replayed first message cannot reuse an old session" {
+test "noise v3: replayed first message cannot reuse an old session" {
     const auth: device_auth.Authenticator = .{
         .identity = try identity_mod.Identity.fromSeed(.{0x33} ** 32),
     };

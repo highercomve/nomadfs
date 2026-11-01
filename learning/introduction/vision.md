@@ -55,7 +55,7 @@ the only writer.
 NomadFS assumes the network is hostile:
 
 *   **Private swarms.** Only devices with the swarm key complete a handshake.
-    The key is the pre-shared key of a Noise `XXpsk3` handshake, so it never
+    The key is the pre-shared key of a Noise `XXpsk0` handshake, so it never
     crosses the network ([Chapter 1.1](../net/transport/noise.md)).
 *   **Encrypted, authenticated transport.** Every connection is encrypted
     with ChaCha20-Poly1305, with fresh ephemeral keys for each connection.

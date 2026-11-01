@@ -45,7 +45,7 @@ no TLS or crypto libraries. The app adds Oriel.
 
 | Part | Code | Purpose |
 | :--- | :--- | :--- |
-| **Transport** | `src/net/transport/` | TCP, the Noise `XXpsk3` handshake, Yamux streams, LAN announcements, UPnP. |
+| **Transport** | `src/net/transport/` | TCP, the Noise `XXpsk0` handshake, Yamux streams, LAN announcements, UPnP. |
 | **Discovery** | `src/net/discovery/` | The Kademlia DHT and every RPC (`GET_BLOCK`, `GET_SHARES`, `GET_SWARM`, …). |
 | **Storage** | `src/storage/` | FastCDC chunking, SHA-256 content addressing, Merkle DAG blocks, the block store. |
 | **Cluster** | `src/cluster/` | Distribution: where each block comes from (the fetcher), who holds what, who keeps each swarm file (placement), copying (the keeper). |
@@ -60,7 +60,7 @@ no TLS or crypto libraries. The app adds Oriel.
 ## 3. Recommended Reading
 
 * **Distributed hash tables**: [Kademlia: A Peer-to-peer Information System Based on the XOR Metric](https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf).
-* **Cryptography and networking**: [The Noise Protocol Framework](https://noiseprotocol.org/noise.html) (NomadFS uses `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s`) and the [Yamux specification](https://github.com/hashicorp/yamux/blob/master/spec.md).
+* **Cryptography and networking**: [The Noise Protocol Framework](https://noiseprotocol.org/noise.html) (NomadFS uses `Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s`) and the [Yamux specification](https://github.com/hashicorp/yamux/blob/master/spec.md).
 * **Chunking**: [FastCDC: a Fast and Efficient Content-Defined Chunking Approach for Data Deduplication](https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia) (USENIX ATC 2016).
 * **Data structures**: [Merkle DAGs](https://docs.ipfs.tech/concepts/merkle-dag/), and Shapiro et al., [Conflict-free Replicated Data Types](https://hal.inria.fr/inria-00609399) (2011), for the swarm folder.
 * **FUSE**: the kernel's [FUSE documentation](https://www.kernel.org/doc/html/latest/filesystems/fuse.html) and `include/uapi/linux/fuse.h`.

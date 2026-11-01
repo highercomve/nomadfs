@@ -2,7 +2,7 @@
 
 This chapter states what NomadFS protects, against whom, and where the
 protection stops. The handshake itself is explained step by step on the site
-([Learn: Noise XXpsk3](https://nomadfs.foreachdeveloper.com/learn/noise/));
+([Learn: Noise XXpsk0](https://nomadfs.foreachdeveloper.com/learn/noise/));
 this chapter is the code-level summary.
 
 ## 1. Security Goals
@@ -49,7 +49,7 @@ tombstone in the local trust store is rejected with `UntrustedDevice`.
 | Threat | Mitigation | Status |
 | :--- | :--- | :--- |
 | Eavesdropping | ChaCha20-Poly1305 on every Noise frame (`src/net/transport/noise.zig`) | Implemented |
-| Man-in-the-middle | `Noise_XXpsk3`: both static keys authenticated, swarm key mixed in | Implemented |
+| Man-in-the-middle | `Noise_XXpsk0`: both static keys authenticated, swarm key mixed in | Implemented |
 | Tampered or forged blocks | SHA-256 CID checked on `put`, `get` and every fetched block | Implemented |
 | Unknown device with the swarm key | Signed device hello; `require_trusted_devices` rejects unknown IDs | Implemented, strict policy opt-in |
 | Stolen `node.key` posing as a paired device | Trust store pins the X25519 key; `TransportKeyMismatch` | Implemented |
@@ -75,9 +75,9 @@ tombstone in the local trust store is rejected with `UntrustedDevice`.
 | Content IDs | SHA-256 over tag byte + block bytes | `src/storage/dag/codec.zig` |
 | Invite PSK | SHA-256(`"nomadfs-invite-v1:"` ‖ token) | `src/device/invite.zig` |
 
-Protocol name: `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` (v2).
+Protocol name: `Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s` (v3).
 
-> NomadFS uses standard `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` with the prologue `nomadfs-noise-v2`. Each ephemeral public key is mixed into both the transcript hash and chaining key. The handshake and transport keys are checked against the published Cacophony vector. v2 is the only accepted handshake; earlier 32-byte first messages are rejected, so all devices must be updated together.
+> NomadFS uses standard `Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s` with the prologue `nomadfs-noise-v3`. The swarm key is mixed in before message 1, so a peer without it fails the first tag check and learns nothing about the responder (v2 used `psk3` and sent the responder's static key and device identity to any dialer). Each ephemeral public key is mixed into both the transcript hash and chaining key. The handshake and transport keys are checked against a vector from snow 0.9 on Cacophony's inputs. v3 is the only accepted handshake, so all devices must be updated together.
 
 ## 5. The Swarm Key
 

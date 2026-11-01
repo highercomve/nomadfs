@@ -15,10 +15,10 @@ of the connection to the relay instead of over a TCP socket:
 ```
 A ── TCP / Noise / Yamux ── R ── TCP / Noise / Yamux ── U
      └ stream ─────────────────┘└ stream ────────────────┘   piped by R
-       └ Noise XXpsk3 + Yamux, end to end between A and U ┘
+       └ Noise XXpsk0 + Yamux, end to end between A and U ┘
 ```
 
-- A and U run the full Noise `XXpsk3` handshake with the swarm key and the
+- A and U run the full Noise `XXpsk0` handshake with the swarm key and the
   device hello over the piped stream, then a Yamux session. R only ever sees
   ciphertext, and A and U authenticate each other exactly as they would
   directly.

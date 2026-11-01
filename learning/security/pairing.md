@@ -169,7 +169,7 @@ NMDFSTR2
 
 ## 6. Handshake Binding
 
-The Noise pattern stays `XXpsk3`. The Ed25519 identity travels inside the
+The Noise pattern stays `XXpsk0`. The Ed25519 identity travels inside the
 existing encrypted handshake payloads rather than adding a new message:
 
 | Message | Direction | Plaintext payload |

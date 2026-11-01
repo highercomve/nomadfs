@@ -10,7 +10,7 @@
 				<a href="$site.page('learn').link()">How NomadFS works</a>
 				<h4>Transport</h4>
 				<a href="$site.page('learn/tcp').link()">TCP: finding devices</a>
-				<a href="$site.page('learn/noise').link()">Noise XXpsk3</a>
+				<a href="$site.page('learn/noise').link()">Noise XXpsk0</a>
 				<a href="$site.page('learn/yamux').link()">Yamux</a>
 				<a href="$site.page('learn/relay').link()">Relays: across networks</a>
 				<h4>Storage</h4>

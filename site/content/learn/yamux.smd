@@ -37,7 +37,7 @@ Every frame starts with the same header, integers big-endian:
 
 Yamux sits inside [Noise]($link.page('learn/noise')): a Yamux frame is
 written to the Noise stream, which seals it in encrypted frames of at most
-1024 bytes. The other side decrypts, reads the header, and appends the
+64 KiB. The other side decrypts, reads the header, and appends the
 payload to the right stream's buffer. Unknown versions or frame types are
 rejected.
 

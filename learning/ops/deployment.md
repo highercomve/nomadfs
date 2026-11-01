@@ -132,7 +132,7 @@ contact.
 ## 6. Troubleshooting
 
 - **Output**: everything goes to stderr (see [Chapter 8.3](./observability.md)).
-  `Noise Handshake FAILED` with a decrypt error at message 3 means the two
+  `Noise Handshake FAILED` with a decrypt error at message 1 (on the listener) or 2 (on the dialer) means the two
   devices have different swarm keys.
 - **Reachability**: the TCP `port` (default 9000; 14700 in the app's
   generated config) must be reachable; invites use `port + 1`. UPnP is

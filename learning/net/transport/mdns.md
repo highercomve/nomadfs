@@ -77,7 +77,7 @@ The beacon is plaintext and unauthenticated. Anyone on the LAN can read a
 node's ID and port, and anyone can send fake announcements. That is
 acceptable because an announcement only suggests an address to try:
 
-1.  The dial runs the full [Noise XXpsk3 handshake](./noise.md). Without the
+1.  The dial runs the full [Noise XXpsk0 handshake](./noise.md). Without the
     swarm key it fails.
 2.  `connectToPeer` is given the announced node ID. If the handshake proves a
     different static key, the dial fails with `error.PeerIdMismatch`.

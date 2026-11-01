@@ -51,7 +51,7 @@ side can reconnect after a restart.
 
 The inviting device opens a short-lived listener on its node port + 1. The
 token in the code is 128 random bits; both sides derive a pre-shared key from
-it and run a Noise `XXpsk3` handshake, so only a holder of the token gets
+it and run a Noise `XXpsk0` handshake, so only a holder of the token gets
 through. A 128-bit token resists offline guessing, and a code read off the
 screen after it has been used opens nothing.
 
