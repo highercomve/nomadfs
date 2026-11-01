@@ -826,7 +826,6 @@ fn writeResponse(w: *std.Io.Writer, root: []const u8, segments: []const []const 
     try w.writeAll("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\n");
 }
 
-
 test "webdav: desktop metadata files are bounded" {
     var server = Server.init(std.testing.allocator, null);
     defer server.deinit();

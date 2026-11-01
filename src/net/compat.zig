@@ -215,6 +215,23 @@ pub const Stream = struct {
         try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
     }
 
+    /// Bounds how long a single write may wait for room in the send buffer
+    /// (0: forever); reads are left as they are.
+    pub fn setSendTimeout(self: Stream, timeout_ms: u32) !void {
+        const handle = self.inner.socket.handle;
+        if (builtin.os.tag == .windows) {
+            const ws = std.os.windows.ws2_32;
+            const ms: u32 = timeout_ms;
+            if (winsock.setsockopt(handle, ws.SOL.SOCKET, ws.SO.SNDTIMEO, std.mem.asBytes(&ms), @sizeOf(u32)) != 0) return error.Unexpected;
+            return;
+        }
+        const tv = std.posix.timeval{
+            .sec = @intCast(timeout_ms / std.time.ms_per_s),
+            .usec = @intCast((timeout_ms % std.time.ms_per_s) * std.time.us_per_ms),
+        };
+        try std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
+    }
+
     /// Unblocks pending reads and writes without releasing the descriptor.
     /// Safe to call while another thread is blocked on this stream.
     pub fn shutdown(self: Stream) void {

@@ -370,6 +370,8 @@ fn handleIncomingConnection(
 
 /// Bound on a TCP connect; the Noise handshake keeps its own, longer one.
 pub const connect_timeout_ms: u32 = 3000;
+/// How long one write on an established connection may wait for room.
+pub const established_send_timeout_ms: u32 = 15_000;
 
 pub fn connect(
     allocator: std.mem.Allocator,
@@ -455,6 +457,10 @@ fn establish(
     impl.tcp_stream.deadline_ms = null;
     // Established connections idle legitimately; Yamux reads block forever.
     try net_stream.setTimeout(0);
+    // A write that finds no room for this long is on a dead path: it fails
+    // instead of holding its caller (the keepalive's ping runs on the
+    // thread that maintains every connection).
+    net_stream.setSendTimeout(established_send_timeout_ms) catch {};
 
     impl.yamux = try YamuxSession.init(allocator, impl.noise_stream.stream(), !initiator);
     errdefer impl.yamux.deinit();

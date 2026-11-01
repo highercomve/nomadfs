@@ -86,11 +86,16 @@ pub const Node = struct {
     /// Devices no relay reached lately -> when to try again (ms). Guarded
     /// by `mutex`.
     relay_misses: std.AutoHashMapUnmanaged(id.NodeID, i64) = .empty,
-/// Devices this one depends on to reach the rest: its bootstrap peers and
-/// the relays it went through. Redialed without backoff when lost
-/// (Node.dialKnownPeers). Guarded by `mutex`; the oldest is replaced.
-anchors: [max_anchors]?id.NodeID = .{null} ** max_anchors,
-next_anchor: usize = 0,
+    /// Devices this one depends on to reach the rest: its bootstrap peers and
+    /// the relays it went through. Redialed without backoff when lost
+    /// (Node.dialKnownPeers). Guarded by `mutex`; the oldest is replaced.
+    anchors: [max_anchors]?id.NodeID = .{null} ** max_anchors,
+    next_anchor: usize = 0,
+    /// Devices revoked since the maintenance loop last looked (node and device
+    /// IDs), so it forgets them (Node.rememberPeers). Guarded by `mutex`;
+    /// bounded, the oldest is dropped.
+    revoked_queue: [max_revoked_queue]?id.NodeID = .{null} ** max_revoked_queue,
+    next_revoked: usize = 0,
     /// Per peer device: the member list last sent to it, so pings don't
     /// re-send an unchanged list. Guarded by `mutex`.
     admit_sent: std.AutoHashMapUnmanaged(id.NodeID, AdmitSent) = .empty,
@@ -107,43 +112,71 @@ next_anchor: usize = 0,
 
     pub const max_handlers = 256;
     pub const max_recent_peers = @import("recent.zig").max_recent_peers;
-pub const max_anchors = 8;
+    pub const max_anchors = 8;
+    pub const max_revoked_queue = 16;
 
-/// Records `peer` as an anchor (see `anchors`).
-pub fn noteAnchor(self: *Node, peer: id.NodeID) void {
-    self.mutex.lock();
-    defer self.mutex.unlock();
-    for (self.anchors) |a| if (a) |known| if (known.eql(peer)) return;
-    self.anchors[self.next_anchor] = peer;
-    self.next_anchor = (self.next_anchor + 1) % max_anchors;
-}
+    /// Queues `peer` (a revoked device's node or device ID) for the
+    /// maintenance loop to forget.
+    pub fn noteRevoked(self: *Node, peer: id.NodeID) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.revoked_queue[self.next_revoked] = peer;
+        self.next_revoked = (self.next_revoked + 1) % max_revoked_queue;
+    }
 
-pub fn isAnchor(self: *Node, peer: id.NodeID) bool {
-    self.mutex.lock();
-    defer self.mutex.unlock();
-    for (self.anchors) |a| if (a) |known| if (known.eql(peer)) return true;
-    return false;
-}
+    /// Moves the queued revoked IDs into `out` and empties the queue.
+    pub fn takeRevoked(self: *Node, out: *[max_revoked_queue]id.NodeID) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var n: usize = 0;
+        for (&self.revoked_queue) |*slot| if (slot.*) |peer| {
+            out[n] = peer;
+            n += 1;
+            slot.* = null;
+        };
+        return n;
+    }
 
-/// Forgets which devices no relay reached: failures from a time this
-/// device was cut off from its relays say nothing about them.
-pub fn forgetRelayMisses(self: *Node) void {
-    self.mutex.lock();
-    defer self.mutex.unlock();
-    self.relay_misses.clearRetainingCapacity();
-}
+    /// `peer`'s slot among the anchors, or null. Caller holds `mutex`.
+    fn anchorIndexLocked(self: *const Node, peer: id.NodeID) ?usize {
+        for (self.anchors, 0..) |a, i| if (a) |known| if (known.eql(peer)) return i;
+        return null;
+    }
 
-/// Copies the anchors into `out`; returns how many.
-pub fn copyAnchors(self: *Node, out: *[max_anchors]id.NodeID) usize {
-    self.mutex.lock();
-    defer self.mutex.unlock();
-    var n: usize = 0;
-    for (self.anchors) |a| if (a) |known| {
-        out[n] = known;
-        n += 1;
-    };
-    return n;
-}
+    /// Records `peer` as an anchor (see `anchors`).
+    pub fn noteAnchor(self: *Node, peer: id.NodeID) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.anchorIndexLocked(peer) != null) return;
+        self.anchors[self.next_anchor] = peer;
+        self.next_anchor = (self.next_anchor + 1) % max_anchors;
+    }
+
+    pub fn isAnchor(self: *Node, peer: id.NodeID) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.anchorIndexLocked(peer) != null;
+    }
+
+    /// Forgets which devices no relay reached: failures from a time this
+    /// device was cut off from its relays say nothing about them.
+    pub fn forgetRelayMisses(self: *Node) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.relay_misses.clearRetainingCapacity();
+    }
+
+    /// Copies the anchors into `out`; returns how many.
+    pub fn copyAnchors(self: *Node, out: *[max_anchors]id.NodeID) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var n: usize = 0;
+        for (self.anchors) |a| if (a) |known| {
+            out[n] = known;
+            n += 1;
+        };
+        return n;
+    }
 
     /// Produces this node's share listing (an encoded dir block, owned by
     /// the caller) on demand. Type-erased so the DHT does not depend on the

@@ -120,9 +120,6 @@ pub const YamuxStream = struct {
     }
 };
 
-/// Lock order: Session.mutex before YamuxStream.mutex. Session.write_mutex is
-/// only ever taken with no other lock held, so a blocked transport write never
-/// stalls frame dispatch or stream bookkeeping.
 /// A session silent this long sends a PING (any frame back counts as an
 /// answer). Below the NAT timeouts of carriers and home routers.
 pub const keepalive_idle_ms: i64 = 15 * std.time.ms_per_s;
@@ -130,6 +127,9 @@ pub const keepalive_idle_ms: i64 = 15 * std.time.ms_per_s;
 /// that dropped the mapping, a phone that slept), though no reset came.
 pub const keepalive_dead_ms: i64 = 45 * std.time.ms_per_s;
 
+/// Lock order: Session.mutex before YamuxStream.mutex. Session.write_mutex is
+/// only ever taken with no other lock held, so a blocked transport write never
+/// stalls frame dispatch or stream bookkeeping.
 pub const Session = struct {
     allocator: std.mem.Allocator,
     next_stream_id: u32,
@@ -425,6 +425,9 @@ pub const Session = struct {
         while (remaining > 0) {
             const n: u32 = @min(remaining, @as(u32, chunk.len));
             try compat.readFull(self.transport, chunk[0..n]);
+            // Every byte proves the path alive, not only a frame's header:
+            // a 1 MiB frame takes longer than the keepalive on a slow link.
+            self.last_rx_ms.store(sync.monotonicMillis(), .monotonic);
             remaining -= n;
             if (!keep_data) continue;
 
@@ -530,6 +533,7 @@ pub const Session = struct {
         while (remaining > 0) {
             const to_read = @min(remaining, @as(u32, @intCast(buf.len)));
             try compat.readFull(self.transport, buf[0..to_read]);
+            self.last_rx_ms.store(sync.monotonicMillis(), .monotonic);
             remaining -= to_read;
         }
     }
@@ -795,4 +799,64 @@ test "locally closed streams release buffers and expire without peer FIN" {
     defer std.testing.allocator.free(large);
     try session.writeFrame(.{ .type = .DATA, .flags = 0, .stream_id = 7, .length = @intCast(large.len) }, large);
     try std.testing.expectEqual(@as(usize, 0), session.write_buffer.capacity);
+}
+
+test "keepalive: a ping after the idle time, dead after the limit" {
+    const Sink = struct {
+        pings: usize = 0,
+        fn read(_: *anyopaque, _: []u8) anyerror!usize {
+            return 0;
+        }
+        fn write(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (bytes.len >= 12 and (try Header.decode(bytes[0..12].*)).type == .PING) self.pings += 1;
+            return bytes.len;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable: network.Stream.StreamVTable = .{ .read = read, .write = write, .close = close };
+    };
+    var sink: Sink = .{};
+    const session = try Session.init(std.testing.allocator, network.Stream.init(&sink, &Sink.vtable), false);
+    defer session.deinit();
+    const t0 = session.last_rx_ms.load(.monotonic);
+
+    try std.testing.expect(session.keepAlive(t0 + 1000));
+    try std.testing.expectEqual(@as(usize, 0), sink.pings);
+    try std.testing.expect(session.keepAlive(t0 + keepalive_idle_ms));
+    try std.testing.expectEqual(@as(usize, 1), sink.pings);
+    // Not again before another idle period.
+    try std.testing.expect(session.keepAlive(t0 + keepalive_idle_ms + 1000));
+    try std.testing.expectEqual(@as(usize, 1), sink.pings);
+    // Anything received counts as an answer.
+    session.last_rx_ms.store(t0 + 30_000, .monotonic);
+    try std.testing.expect(session.keepAlive(t0 + 30_000 + keepalive_dead_ms - 1));
+    try std.testing.expect(!session.keepAlive(t0 + 30_000 + keepalive_dead_ms));
+}
+
+test "keepalive: every chunk of a large frame counts as received" {
+    // A transport that hands out a DATA payload and nothing else.
+    const Source = struct {
+        left: usize,
+        fn read(ctx: *anyopaque, buf: []u8) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const n = @min(buf.len, self.left);
+            @memset(buf[0..n], 'x');
+            self.left -= n;
+            return n;
+        }
+        fn write(_: *anyopaque, bytes: []const u8) anyerror!usize {
+            return bytes.len;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable: network.Stream.StreamVTable = .{ .read = read, .write = write, .close = close };
+    };
+    const len: u32 = 200 * 1024;
+    var source: Source = .{ .left = len };
+    const session = try Session.init(std.testing.allocator, network.Stream.init(&source, &Source.vtable), false);
+    defer session.deinit();
+    const stream = try session.newStream();
+    session.last_rx_ms.store(0, .monotonic);
+    try session.handleData(.{ .type = .DATA, .flags = 0, .stream_id = stream.id, .length = len });
+    try std.testing.expect(session.last_rx_ms.load(.monotonic) > 0);
+    try std.testing.expectEqual(@as(usize, 0), source.left);
 }

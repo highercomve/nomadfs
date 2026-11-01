@@ -82,4 +82,3 @@ test httpDate {
     try std.testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", httpDate(&buf, 0));
     try std.testing.expectEqualStrings("Sat, 31 Oct 2026 12:34:56 GMT", httpDate(&buf, 1793450096));
 }
-

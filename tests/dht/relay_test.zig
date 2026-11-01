@@ -106,3 +106,68 @@ test "relay: a relay that can't reach the target says no" {
     a.manager.relay_dialer = null;
     r.manager.relay_dialer = null;
 }
+
+test "relay: a closed connection is counted as lost" {
+    std.debug.print("\n=== Running Test: relay: lost connections are counted ===\n", .{});
+    const allocator = std.testing.allocator;
+    var a = try TestPeer.init(allocator, 13405);
+    defer a.deinit();
+    var b = try TestPeer.init(allocator, 13406);
+    defer b.deinit();
+    var dht_a = Node.init(allocator, a.manager, a.config.node.swarm_key);
+    defer dht_a.deinit();
+    var dht_b = Node.init(allocator, b.manager, b.config.node.swarm_key);
+    defer dht_b.deinit();
+    a.manager.reap_interval_ms = 100;
+    try setUp(&a, &dht_a);
+    try setUp(&b, &dht_b);
+    defer {
+        a.manager.relay_dialer = null;
+        b.manager.relay_dialer = null;
+        a.stop();
+        b.stop();
+    }
+
+    const conn = try a.manager.connectToPeer(b.listen_addr, a.config.node.swarm_key, b.manager.node_id);
+    conn.deinit();
+    const before = a.manager.lost.load(.monotonic);
+    // b drops it (a network switch, a frozen app): a notices and counts it.
+    // b registers the accepted connection a moment after a's dial returns.
+    var closed: usize = 0;
+    var tries: usize = 0;
+    while (closed == 0 and tries < 40) : (tries += 1) {
+        closed = b.manager.closePeer(a.manager.node_id);
+        if (closed == 0) nomadfs.sync.sleep(25 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(closed > 0);
+    var waited: usize = 0;
+    while (a.manager.lost.load(.monotonic) == before and waited < 50) : (waited += 1) {
+        nomadfs.sync.sleep(50 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(a.manager.lost.load(.monotonic) > before);
+}
+
+test "relay: anchors are bounded and revoked devices are queued once taken" {
+    const allocator = std.testing.allocator;
+    var a = try TestPeer.init(allocator, 13407);
+    defer a.deinit();
+    var dht_a = Node.init(allocator, a.manager, a.config.node.swarm_key);
+    defer dht_a.deinit();
+
+    const first = nomadfs.net.id.NodeID{ .bytes = [_]u8{1} ** 32 };
+    dht_a.noteAnchor(first);
+    dht_a.noteAnchor(first);
+    var anchors: [Node.max_anchors]nomadfs.net.id.NodeID = undefined;
+    try std.testing.expectEqual(@as(usize, 1), dht_a.copyAnchors(&anchors));
+    try std.testing.expect(dht_a.isAnchor(first));
+    // More than fit: the oldest goes, the count stays bounded.
+    for (0..Node.max_anchors) |i| dht_a.noteAnchor(.{ .bytes = [_]u8{@intCast(i + 2)} ** 32 });
+    try std.testing.expectEqual(@as(usize, Node.max_anchors), dht_a.copyAnchors(&anchors));
+    try std.testing.expect(!dht_a.isAnchor(first));
+
+    dht_a.noteRevoked(first);
+    var revoked: [Node.max_revoked_queue]nomadfs.net.id.NodeID = undefined;
+    try std.testing.expectEqual(@as(usize, 1), dht_a.takeRevoked(&revoked));
+    try std.testing.expect(revoked[0].eql(first));
+    try std.testing.expectEqual(@as(usize, 0), dht_a.takeRevoked(&revoked));
+}

@@ -76,6 +76,15 @@ pub const KnownPeers = struct {
         return changed;
     }
 
+    /// Forgets `id` (a revoked device). Returns whether it was known.
+    pub fn forget(self: *KnownPeers, id: NodeID) bool {
+        for (self.entries.items, 0..) |e, i| if (e.id.eql(id)) {
+            _ = self.entries.swapRemove(i);
+            return true;
+        };
+        return false;
+    }
+
     /// Remembers a device reached without an address of its own (through a
     /// relay): kept with no addresses, so it is dialed again, through a
     /// relay, after a restart. Returns whether it is new.
@@ -292,4 +301,22 @@ test "known peers: a device reached through a relay is remembered without addres
     try std.testing.expectEqual(@as(usize, 1), again.entries.items.len);
     try std.testing.expect(again.entries.items[0].id.eql(id));
     try std.testing.expectEqual(@as(u8, 0), again.entries.items[0].count);
+}
+
+test "known peers: a revoked device is forgotten" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    const path = try std.fs.path.join(allocator, &.{ dir, "known" });
+    defer allocator.free(path);
+    var kp = try KnownPeers.load(allocator, io, path);
+    defer kp.deinit();
+    const id = NodeID{ .bytes = [_]u8{0x24} ** 32 };
+    _ = try kp.rememberReached(id, 1);
+    try std.testing.expect(kp.forget(id));
+    try std.testing.expect(!kp.forget(id));
+    try std.testing.expectEqual(@as(usize, 0), kp.entries.items.len);
 }

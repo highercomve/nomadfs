@@ -70,6 +70,9 @@ pub const Node = struct {
     /// When to try an unreachable known device again (ms), and how many
     /// tries failed in a row. Bootstrap thread only.
     redial: std.AutoHashMapUnmanaged(net.id.NodeID, Redial) = .empty,
+    /// When this device lost its last anchor (monotonic ms), or null while
+    /// one answers. Only the maintenance loop touches it.
+    cut_off_since_ms: ?i64 = null,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !Node {
         // First: nothing is opened or written while another node runs here.
@@ -788,7 +791,7 @@ pub const Node = struct {
         while (self.sleepUntilNextRound(next_round_ns)) : (round +%= 1) {
             // Cut off from every anchor (the relay, the bootstrap peers):
             // look again every few seconds, not every 30.
-            defer next_round_ns = if (self.cutOffFromAnchors()) cut_off_round_ns else round_ns;
+            defer next_round_ns = self.nextRoundNs();
             // What PINGs say about this device: the network may have
             // changed under us (Wi-Fi to mobile data and back).
             discovery_node.setRole(net.discovery.rpc.Roles.metered, !net.local_addrs.onUnmeteredNetwork());
@@ -824,6 +827,28 @@ pub const Node = struct {
     const cut_off_round_ns: u64 = 5 * std.time.ns_per_s;
     /// An anchor that doesn't answer is tried again at least this often.
     const anchor_redial_max_ms: i64 = 10 * std.time.ms_per_s;
+
+    /// How long until the next maintenance round. Cut off from every
+    /// anchor: fast at first (a network switch, a relay restarting), then
+    /// slower, so a relay that is gone for good doesn't keep a phone awake;
+    /// with no network at all, nothing is gained by trying sooner.
+    fn nextRoundNs(self: *Node) u64 {
+        if (!self.cutOffFromAnchors()) {
+            self.cut_off_since_ms = null;
+            return round_ns;
+        }
+        var addrs: [4]net.compat.Address = undefined;
+        if (net.local_addrs.list(&addrs, 0) == 0) return round_ns;
+        const now = sync.monotonicMillis();
+        const since = self.cut_off_since_ms orelse blk: {
+            self.cut_off_since_ms = now;
+            break :blk now;
+        };
+        const cut_off_ms = now - since;
+        if (cut_off_ms < 2 * std.time.ms_per_min) return cut_off_round_ns;
+        if (cut_off_ms < 5 * std.time.ms_per_min) return 15 * std.time.ns_per_s;
+        return round_ns;
+    }
 
     /// Has anchors and no connection to any of them.
     fn cutOffFromAnchors(self: *Node) bool {
@@ -918,6 +943,12 @@ pub const Node = struct {
         };
         defer self.discovery_node.routing_table.allocator.free(peers);
         var changed = self.known_peers.merge(peers) catch return;
+        // Revoked devices: not dialed again, through a relay or otherwise.
+        var revoked: [net.discovery.Node.max_revoked_queue]net.id.NodeID = undefined;
+        for (revoked[0..self.discovery_node.takeRevoked(&revoked)]) |id| {
+            if (self.known_peers.forget(id)) changed = true;
+            _ = self.redial.remove(id);
+        }
         // Devices reached only through a relay are never in the routing
         // table: remembered without addresses, dialed through a relay.
         if (self.connection_manager.liveConnections(self.allocator)) |conns| {
@@ -1028,6 +1059,10 @@ fn membershipTrusted(_: *anyopaque, _: *const device.pairing.Ticket) void {}
 fn membershipRevoked(ctx: *anyopaque, device_id: net.id.NodeID, transport_key: ?[32]u8) void {
     const bm: *cluster.BlockManager = @ptrCast(@alignCast(ctx));
     _ = bm.net.closePeer(device_id);
+    // Forgotten from the devices this one remembers and redials too
+    // (Node.rememberPeers drains this).
+    bm.dht_node.noteRevoked(device_id);
+    if (transport_key) |tk| bm.dht_node.noteRevoked(net.id.NodeID.fromPublicKey(tk));
     if (bm.holders) |*h| h.forget(device_id);
     if (transport_key) |tk| {
         const node_id = net.id.NodeID.fromPublicKey(tk);
