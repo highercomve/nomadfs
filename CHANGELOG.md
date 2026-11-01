@@ -3,6 +3,23 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.3.18 - 2026-11-01
+
+Steadier connections on weak and changing networks. Devices on 0.3.17 and 0.3.18 work together.
+
+### Fixed
+
+- On a weak mobile signal, a large piece of a file could take longer to arrive than the
+  keepalive's 45 seconds, and the connection was closed in the middle of it, again and again.
+  Every byte received now counts as an answer.
+- A connection whose path died with data still waiting to be sent could hold up the checks of
+  every other connection for many minutes. A write now gives up after 15 seconds.
+- With no relay answering, a device kept retrying every 5 seconds for as long as it lasted, which
+  costs battery on a phone. It retries every 5 seconds for 2 minutes, then every 15, then every 30,
+  and with no network at all it waits the usual 30 seconds.
+- Revoked devices were still dialed again from the list of devices a device remembers. They are
+  forgotten now.
+
 ## 0.3.17 - 2026-10-31
 
 Connections that survive the real world: away from home, devices stay listed and come back in
