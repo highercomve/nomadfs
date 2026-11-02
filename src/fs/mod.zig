@@ -13,6 +13,7 @@ pub const remote = @import("remote.zig");
 pub const filestore = @import("filestore.zig");
 pub const manifest = @import("manifest.zig");
 pub const swarm = @import("swarm.zig");
+pub const notes = @import("notes.zig");
 pub const readahead = @import("readahead.zig");
 pub const device_names = @import("device_names.zig");
 pub const backup_import = @import("backup_import.zig");
@@ -38,6 +39,7 @@ test {
     _ = filestore;
     _ = manifest;
     _ = swarm;
+    _ = notes;
     _ = backup_import;
     _ = device_names;
     _ = devices;

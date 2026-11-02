@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oriel = @import("oriel");
+const nomadfs = @import("nomadfs");
 const app = @import("oriel_app");
 const commands = @import("commands.zig");
 const downloads = @import("downloads.zig");
@@ -15,6 +16,8 @@ const tray = @import("tray.zig");
 const background = @import("background.zig");
 const media = @import("media.zig");
 const updates = @import("updates.zig");
+const notes_events = @import("notes_events.zig");
+const notes = @import("notes_commands.zig");
 
 pub const std_options: std.Options = .{ .logFn = oriel.log.logFn };
 
@@ -35,6 +38,8 @@ pub const Events = struct {
     @"updater://progress": struct { downloaded: u64, total: ?u64 },
     /// While a download copies, and when it ends (downloads.zig).
     @"download://progress": downloads.Progress,
+    /// The swarm's Notes/ changed after a sync (notes_events.zig).
+    @"notes://changed": notes_events.Changed,
 };
 
 /// @atlas allow: the webview calls these by name
@@ -45,7 +50,57 @@ pub const Commands = struct {
     /// worker thread: they share one lock, and a command waiting on it on
     /// the UI thread would freeze the window (node_open behind a share scan
     /// did, for 20 s on a phone). Only quick config-file reads stay inline.
-    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_move", "swarm_read_range", "swarm_download", "downloads_list", "download_cancel", "download_remove", "downloads_clear", "downloads_dir", "download_open", "downloads_open_folder", "download_read_range", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set", "swarm_copies_set", "accept_copies_set", "media_url", "about_info", "update_info", "note_store", "cache_info", "cache_clear", "cache_set_limit", "share_backup_set", "backup_status", "file_details", "device_info" } ++ updates.Updater.async_commands;
+    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_rename", "swarm_move", "swarm_read_range", "swarm_download", "downloads_list", "download_cancel", "download_remove", "downloads_clear", "downloads_dir", "download_open", "downloads_open_folder", "download_read_range", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "swarm_backup_set", "swarm_copies_set", "accept_copies_set", "media_url", "about_info", "update_info", "notes_list", "note_read", "note_create", "note_from_share", "note_keep_both", "note_resolve_copy", "note_save", "note_rename", "note_move", "note_delete", "note_restore", "note_pin", "notes_search", "note_export", "cache_info", "cache_clear", "cache_set_limit", "share_backup_set", "backup_status", "file_details", "device_info" } ++ updates.Updater.async_commands;
+
+    /// The notes commands (fs/notes.zig through notes_commands.zig).
+    pub fn notes_list(gpa: std.mem.Allocator) !notes.NotesList {
+        return notes.list(gpa);
+    }
+    pub fn note_read(gpa: std.mem.Allocator, args: notes.NotesArgs) !notes.NoteRead {
+        return notes.read(gpa, args);
+    }
+    pub fn note_create(gpa: std.mem.Allocator, args: notes.NotesArgs) !notes.NoteView {
+        return notes.create(gpa, args);
+    }
+    pub fn note_from_share(gpa: std.mem.Allocator, args: notes.NotesArgs) !notes.NoteView {
+        return notes.fromShare(gpa, args);
+    }
+    pub fn note_save(gpa: std.mem.Allocator, args: notes.NotesArgs) !notes.NoteResult {
+        return notes.save(gpa, args);
+    }
+    pub fn note_rename(gpa: std.mem.Allocator, args: notes.NotesArgs) !notes.NoteResult {
+        return notes.rename(gpa, args);
+    }
+    pub fn note_move(gpa: std.mem.Allocator, args: notes.NotesArgs) !notes.NoteView {
+        return notes.move(gpa, args);
+    }
+    pub fn note_delete(gpa: std.mem.Allocator, args: notes.NotesArgs) !notes.NoteDeleted {
+        return notes.delete(gpa, args);
+    }
+    pub fn note_restore(gpa: std.mem.Allocator, args: notes.NotesArgs) !notes.NoteView {
+        return notes.restore(gpa, args);
+    }
+    pub fn note_pin(gpa: std.mem.Allocator, args: notes.NotesArgs) !void {
+        return notes.pin(gpa, args);
+    }
+    pub fn notes_search(gpa: std.mem.Allocator, args: notes.NotesArgs) ![]nomadfs.fs.notes.Notes.Hit {
+        return notes.search(gpa, args);
+    }
+    pub fn note_keep_both(gpa: std.mem.Allocator, args: notes.NotesArgs) !notes.NoteView {
+        return notes.keepBoth(gpa, args);
+    }
+    pub fn note_resolve_copy(gpa: std.mem.Allocator, args: notes.NotesArgs) !notes.NoteMerged {
+        return notes.resolveCopy(gpa, args);
+    }
+
+    /// `invoke("note_export", { text })`: writes the text to a file the user
+    /// picks in the system save dialog. False when they cancel.
+    pub fn note_export(gpa: std.mem.Allocator, args: notes.NotesArgs) !bool {
+        const path = try oriel.dialog.saveFile(gpa, .{ .title = "Export note" }) orelse return false;
+        defer gpa.free(path);
+        try oriel.dialog.writeFile(std.Io.Threaded.global_single_threaded.io(), path, args.text);
+        return true;
+    }
 
     /// `invoke("invite_create", { config_path })`: one-time invite code.
     pub fn invite_create(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.InviteInfo {
@@ -320,7 +375,7 @@ pub const Commands = struct {
 
     /// `invoke("node_open", { config_path })`.
     pub fn node_open(gpa: std.mem.Allocator, args: commands.NodeOpenArgs) !void {
-        return commands.nodeOpen(gpa, args);
+        try commands.nodeOpen(gpa, args);
     }
 
     /// `invoke("node_close")`.
@@ -336,12 +391,6 @@ pub const Commands = struct {
     /// `invoke("put_text", { text })` returns the CID.
     pub fn put_text(gpa: std.mem.Allocator, args: commands.PutTextArgs) ![]const u8 {
         return @import("commands.zig").putText(gpa, args);
-    }
-
-    /// `invoke("note_store", { text })`: a note in the swarm folder's
-    /// Notes, for every device.
-    pub fn note_store(gpa: std.mem.Allocator, args: commands.PutTextArgs) !commands.NoteStored {
-        return commands.noteStore(gpa, args);
     }
 
     /// `invoke("get_text", { cid })` returns the file contents.
@@ -463,6 +512,7 @@ fn openFolder(path: [:0]const u8) void {
 pub fn main(init: std.process.Init) !u8 {
     initDataDirs();
     commands.before_node_close = downloads.cancelAll;
+    commands.after_node_open = notes_events.subscribe;
     commands.open_folder = openFolder;
     return oriel.main(init, .{ .commands = Commands, .events = Events }, .{
         .app = app.build,

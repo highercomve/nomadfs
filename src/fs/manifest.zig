@@ -78,6 +78,7 @@ pub const Entry = struct {
     /// Whether this version has `v` in its past (or is `v`).
     pub fn descendsFrom(self: Entry, v: Version) bool {
         if (self.version.eql(v)) return true;
+        if (std.mem.eql(u8, &self.version.device, &v.device) and self.version.clock > v.clock) return true;
         for (self.history) |h| {
             if (h) |hv| if (hv.eql(v)) return true;
         }
@@ -116,6 +117,12 @@ pub const Manifest = struct {
 
     pub fn get(self: *Manifest, path: []const u8) ?Entry {
         return self.entries.get(path);
+    }
+
+    /// Raises the clock to at least `to` (never lowers it): a device that
+    /// kept its high-water mark outside the manifest starts above it.
+    pub fn raiseClock(self: *Manifest, to: u64) void {
+        if (to <= max_remote_clock and to > self.clock) self.clock = to;
     }
 
     fn observe(self: *Manifest, v: Version) void {
@@ -272,6 +279,19 @@ pub const Manifest = struct {
         return out.items;
     }
 
+    /// Every live file at any depth below `dir` ("Notes"), one pass over the
+    /// entries; the entries are borrowed from the manifest (valid while the
+    /// caller holds its lock). Allocated in `arena`.
+    pub fn listUnder(self: *Manifest, arena: std.mem.Allocator, dir: []const u8) ![]Entry {
+        var out: std.ArrayList(Entry) = .empty;
+        for (self.entries.values()) |e| {
+            if (e.deleted or e.kind != .file) continue;
+            if (!(std.mem.startsWith(u8, e.path, dir) and e.path.len > dir.len and e.path[dir.len] == '/')) continue;
+            try out.append(arena, e);
+        }
+        return out.items;
+    }
+
     pub const Listed = struct {
         name: []const u8,
         kind: Kind,
@@ -313,8 +333,15 @@ pub const Manifest = struct {
     /// two devices that converged have the same one, so a sync can skip
     /// sending a manifest that wouldn't change anything.
     pub fn digest(self: *Manifest) [32]u8 {
+        return self.digestUnder("");
+    }
+
+    /// The digest of the entries whose path starts with `prefix` ("Notes/"):
+    /// a front end tells from it whether a sync changed what it shows.
+    pub fn digestUnder(self: *Manifest, prefix: []const u8) [32]u8 {
         var out = [_]u8{0} ** 32;
         for (self.entries.values()) |e| {
+            if (!std.mem.startsWith(u8, e.path, prefix)) continue;
             var h = std.crypto.hash.blake2.Blake2s256.init(.{});
             var num: [8]u8 = undefined;
             h.update(e.path);
@@ -444,14 +471,15 @@ fn parseHex32(text: []const u8) ![32]u8 {
     return out;
 }
 
-/// "dir/name.ext" -> "dir/name (conflict from <author>).ext".
-pub fn conflictPath(allocator: std.mem.Allocator, path: []const u8, author: []const u8) ![]u8 {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/');
-    const dir = if (slash) |s| path[0 .. s + 1] else "";
-    const base = path[dir.len..];
-    const dot = std.mem.lastIndexOfScalar(u8, base, '.');
-    const stem = if (dot) |d| (if (d == 0) base else base[0..d]) else base;
-    const ext = if (dot) |d| (if (d == 0) "" else base[d..]) else "";
+/// The words between a note's name and the device that lost the edit:
+/// "Ideas (conflict from Desk).md". Written by `conflictPath`, read by
+/// `conflictOf`.
+pub const conflict_marker = " (conflict from ";
+
+/// `stem` as the stem of a conflict copy made on `author`'s behalf:
+/// "Ideas" -> "Ideas (conflict from Desk)". The author is cleaned like a
+/// file name part. Caller frees.
+pub fn conflictStem(allocator: std.mem.Allocator, stem: []const u8, author: []const u8) ![]u8 {
     var who_buf: [max_author_len]u8 = undefined;
     var who_len: usize = 0;
     for (author) |c| {
@@ -460,7 +488,31 @@ pub fn conflictPath(allocator: std.mem.Allocator, path: []const u8, author: []co
         who_len += 1;
     }
     const who = if (who_len == 0) "another device" else who_buf[0..who_len];
-    const name = try std.fmt.allocPrint(allocator, "{s}{s} (conflict from {s}){s}", .{ dir, stem, who, ext });
+    return std.fmt.allocPrint(allocator, "{s}{s}{s})", .{ stem, conflict_marker, who });
+}
+
+/// "Ideas" for "Ideas (conflict from Desk).md": the loser of two concurrent
+/// edits is named after the note it was a version of. Null for any other
+/// name.
+pub fn conflictOf(name: []const u8) ?[]const u8 {
+    const ext = std.fs.path.extension(name);
+    const stem = name[0 .. name.len - ext.len];
+    const start = std.mem.indexOf(u8, stem, conflict_marker) orelse return null;
+    if (start == 0 or stem[stem.len - 1] != ')') return null;
+    return stem[0..start];
+}
+
+/// "dir/name.ext" -> "dir/name (conflict from <author>).ext".
+pub fn conflictPath(allocator: std.mem.Allocator, path: []const u8, author: []const u8) ![]u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/');
+    const dir = if (slash) |s| path[0 .. s + 1] else "";
+    const base = path[dir.len..];
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.');
+    const stem = if (dot) |d| (if (d == 0) base else base[0..d]) else base;
+    const ext = if (dot) |d| (if (d == 0) "" else base[d..]) else "";
+    const named = try conflictStem(allocator, stem, author);
+    defer allocator.free(named);
+    const name = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ dir, named, ext });
     if (validPath(name)) return name;
     allocator.free(name);
     const short = try std.fmt.allocPrint(allocator, "{s}conflict{s}", .{ dir, ext });
@@ -474,6 +526,48 @@ pub fn conflictPath(allocator: std.mem.Allocator, path: []const u8, author: []co
 }
 
 // ---- Tests ----
+
+test "manifest: conflict names are written and read back" {
+    const a = std.testing.allocator;
+    const path = try conflictPath(a, "Notes/Ideas.md", "Desk");
+    defer a.free(path);
+    try std.testing.expectEqualStrings("Notes/Ideas (conflict from Desk).md", path);
+    const stem = try conflictStem(a, "Ideas", "Pi/xel");
+    defer a.free(stem);
+    try std.testing.expectEqualStrings("Ideas (conflict from Pi_xel)", stem);
+    try std.testing.expectEqualStrings("Ideas", conflictOf("Ideas (conflict from Desk).md").?);
+    try std.testing.expectEqualStrings("Ideas", conflictOf("Ideas (conflict from Desk) (conflict from Pixel).md").?);
+    try std.testing.expect(conflictOf("Ideas.md") == null);
+    try std.testing.expect(conflictOf("Ideas (conflict from Desk) and more.md") == null);
+    try std.testing.expect(conflictOf(" (conflict from Desk).md") == null);
+}
+
+test "manifest: listUnder returns the live files below a folder in one pass" {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var m = Manifest.init(a);
+    defer m.deinit();
+    const dev = [_]u8{1} ** 32;
+    _ = try m.edit("Notes/a.md", .{ .size = 1 }, dev, "Desk");
+    _ = try m.edit("Notes/Work/b.md", .{ .size = 1 }, dev, "Desk");
+    _ = try m.edit("Notes/gone.md", .{ .size = 1 }, dev, "Desk");
+    _ = try m.edit("Notes/gone.md", .{ .deleted = true }, dev, "Desk");
+    _ = try m.edit("Notes/Empty", .{ .kind = .dir }, dev, "Desk");
+    _ = try m.edit("Notesx/c.md", .{ .size = 1 }, dev, "Desk");
+    _ = try m.edit("Other/d.md", .{ .size = 1 }, dev, "Desk");
+    try std.testing.expectEqual(@as(usize, 2), (try m.listUnder(arena_state.allocator(), "Notes")).len);
+}
+
+test "manifest: raiseClock only goes up" {
+    var m = Manifest.init(std.testing.allocator);
+    defer m.deinit();
+    m.raiseClock(10);
+    m.raiseClock(3);
+    try std.testing.expectEqual(@as(u64, 10), m.clock);
+    m.raiseClock(std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(u64, 10), m.clock);
+}
 
 test "manifest: a conflict copy's name is always a valid path" {
     const a = std.testing.allocator;
@@ -520,6 +614,37 @@ test "manifest: an edit propagates and a later edit replaces it" {
     // Syncing again changes nothing.
     try testing.expectEqual(@as(usize, 0), try syncInto(&a, &b));
     try testing.expectEqual(@as(usize, 0), try syncInto(&b, &a));
+}
+
+test "manifest: same-device clock orders edits beyond history and preserves offline conflict copies" {
+    var a = Manifest.init(testing.allocator);
+    defer a.deinit();
+    var b = Manifest.init(testing.allocator);
+    defer b.deinit();
+    _ = try a.edit("notes.md", .{ .cid = cid1 }, dev_a, "Desk");
+    _ = try syncInto(&b, &a);
+    for (0..20) |i| _ = try a.edit("notes.md", .{ .cid = [_]u8{@intCast(i + 2)} ** 32 }, dev_a, "Desk");
+    _ = try syncInto(&b, &a);
+    try testing.expectEqual(@as(usize, 1), b.entries.count());
+    try testing.expectEqualSlices(u8, &a.get("notes.md").?.cid, &b.get("notes.md").?.cid);
+}
+
+test "manifest: concurrent devices keep a conflict copy and later same-device edit replaces it" {
+    var a = Manifest.init(testing.allocator);
+    defer a.deinit();
+    var b = Manifest.init(testing.allocator);
+    defer b.deinit();
+    _ = try a.edit("notes.md", .{ .cid = cid1 }, dev_a, "Desk");
+    _ = try syncInto(&b, &a);
+    _ = try a.edit("notes.md", .{ .cid = cid2 }, dev_a, "Desk");
+    _ = try b.edit("notes.md", .{ .cid = cid3 }, dev_b, "Phone");
+    _ = try syncInto(&a, &b);
+    try testing.expect(a.get("notes (conflict from Desk).md") != null);
+    _ = try a.edit("notes.md", .{ .cid = [_]u8{4} ** 32 }, dev_a, "Desk");
+    _ = try syncInto(&b, &a);
+    try testing.expectEqualSlices(u8, &[_]u8{4} ** 32, &b.get("notes.md").?.cid);
+    // The copy keeps the earlier version of the device that lost.
+    try testing.expectEqualSlices(u8, &cid2, &b.get("notes (conflict from Desk).md").?.cid);
 }
 
 test "manifest: concurrent edits keep both, identically on both sides" {

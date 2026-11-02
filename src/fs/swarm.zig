@@ -45,15 +45,33 @@ pub const SwarmFolder = struct {
     /// Serialises manifest writes; taken before `mutex`, never inside it.
     save_mutex: sync.Mutex = .{},
     manifest: Manifest,
+    /// The manifest file was missing when the folder was opened.
+    manifest_missing: bool = false,
+    /// The clock file (`<manifest>.clock`) was found. It holds a bound above
+    /// every clock value this device has used, so the clock never goes back
+    /// even when the manifest file is lost or older than what peers pulled.
+    clock_found: bool = false,
+    /// Written ahead: the clock may be used up to here without a write.
+    clock_reserved: u64 = 0,
+    /// Without both files the clock restarted from zero, and an edit made now
+    /// could look older than versions the swarm already holds. Local edits
+    /// wait (error.NotSynced) until a sync round merged a reached peer's
+    /// manifest, or `alone_grace_ms` passed (a device truly on its own).
+    awaiting_pull: bool = false,
+    awaiting_since_ms: i64 = 0,
+    alone_grace_ms: i64 = 60 * 1000,
     last_sync: u64 = 0,
     peers_synced: u32 = 0,
     peers_failed: u32 = 0,
     sync_interval_ns: u64 = 10 * std.time.ns_per_s,
     /// Serialises sync rounds (the loop and syncNow).
     sync_mutex: sync.Mutex = .{},
-    /// Runs after each sync round on the folder's thread: backed-up shares
-    /// coming in (backup_import.zig). Set before start().
-    after_sync: ?AfterSync = null,
+    /// Run after each sync round on the folder's thread (backed-up shares
+    /// coming in, the notes' legacy renames); added with addAfterSyncHook.
+    after_sync: HookList = .{},
+    /// Run when a sync round merged something from a peer, on the same
+    /// thread; added with addChangeHook.
+    on_change: HookList = .{},
     /// The background thread (sync.Worker); its loop watches worker.running.
     worker: sync.Worker = .{},
 
@@ -98,7 +116,60 @@ pub const SwarmFolder = struct {
         errdefer self.manifest.deinit();
         self.cleanStaging();
         try self.load();
+        self.loadClock();
         return self;
+    }
+
+    /// Clock values reserved ahead of use, and how close to the end of the
+    /// reservation the next one is made (an operation edits many entries).
+    const clock_block: u64 = 1 << 20;
+    const clock_margin: u64 = 1 << 18;
+
+    fn clockPath(self: *SwarmFolder) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}.clock", .{self.file_path});
+    }
+
+    /// The clock starts at max(saved bound, manifest's). A file that can't be
+    /// read is moved aside and counts as missing.
+    fn loadClock(self: *SwarmFolder) void {
+        const path = self.clockPath() catch return;
+        defer self.allocator.free(path);
+        var buf: [32]u8 = undefined;
+        const bytes = blk: {
+            var file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch return;
+            defer file.close(self.io);
+            const n = file.readPositionalAll(self.io, &buf, 0) catch 0;
+            break :blk buf[0..n];
+        };
+        const saved = std.fmt.parseInt(u64, std.mem.trim(u8, bytes, " \n"), 10) catch {
+            const aside = std.fmt.allocPrint(self.allocator, "{s}.corrupt-{d}", .{ path, self.now() }) catch return;
+            defer self.allocator.free(aside);
+            std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), aside, self.io) catch {};
+            return;
+        };
+        self.clock_found = true;
+        self.clock_reserved = saved;
+        self.manifest.raiseClock(saved);
+    }
+
+    /// Caller holds `mutex`. Makes sure the clock can be used for a whole
+    /// operation: writes a new bound, before any edit that uses it exists.
+    fn reserveClockLocked(self: *SwarmFolder) !void {
+        if (self.manifest.clock +| clock_margin <= self.clock_reserved) return;
+        const bound = self.manifest.clock +| clock_block;
+        const path = try self.clockPath();
+        defer self.allocator.free(path);
+        const tmp = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
+        defer self.allocator.free(tmp);
+        var text: [24]u8 = undefined;
+        const out = try std.fmt.bufPrint(&text, "{d}\n", .{bound});
+        {
+            var file = try std.Io.Dir.cwd().createFile(self.io, tmp, .{ .truncate = true });
+            defer file.close(self.io);
+            try file.writePositionalAll(self.io, out, 0);
+        }
+        try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, self.io);
+        self.clock_reserved = bound;
     }
 
     pub fn destroy(self: *SwarmFolder) void {
@@ -114,7 +185,10 @@ pub const SwarmFolder = struct {
 
     fn load(self: *SwarmFolder) !void {
         var file = std.Io.Dir.cwd().openFile(self.io, self.file_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return,
+            error.FileNotFound => {
+                self.manifest_missing = true;
+                return;
+            },
             else => return err,
         };
         defer file.close(self.io);
@@ -146,6 +220,16 @@ pub const SwarmFolder = struct {
     /// before the lock), writes it.
     fn saveLocked(self: *SwarmFolder) !void {
         self.dirty = true;
+    }
+
+    /// Caller holds `mutex`. Local edits are refused while the folder waits
+    /// for its first pull (see `awaiting_pull`).
+    fn editAllowedLocked(self: *SwarmFolder) !void {
+        if (self.awaiting_pull) {
+            if (sync.monotonicMillis() - self.awaiting_since_ms < self.alone_grace_ms) return error.NotSynced;
+            self.awaiting_pull = false; // nobody to pull from: this device is on its own
+        }
+        try self.reserveClockLocked();
     }
 
     /// Writes the manifest if it changed and the last write was a second
@@ -206,6 +290,7 @@ pub const SwarmFolder = struct {
         defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
+        try self.editAllowedLocked();
         const e = self.manifest.get(path) orelse return error.FileNotFound;
         if (e.deleted) return error.FileNotFound;
         if (e.mtime == mtime) return;
@@ -266,12 +351,73 @@ pub const SwarmFolder = struct {
         defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
+        try self.editAllowedLocked();
         // A file never replaces a folder: its contents would be left under a file.
         if (self.folderAtLocked(path)) return error.IsDirectory;
         _ = try self.manifest.edit(path, .{ .cid = root[0..32].*, .size = reader.offset, .mtime = modified }, self.self_id.bytes, self.self_name);
         try self.saveLocked();
         // The devices that keep copies pull it (their keepers), once their
         // manifest has it: nothing is pushed from here.
+    }
+
+    pub const PutResult = struct { cid: [32]u8, size: u64, mtime: u64 };
+
+    /// Writes bytes at `path` if its current content still matches `base`
+    /// (null: only if nothing is live there).
+    pub fn putBytes(self: *SwarmFolder, path: []const u8, bytes: []const u8, base: ?[32]u8) !PutResult {
+        if (!manifest_mod.validPath(path)) return error.InvalidPath;
+        if (bytes.len > 8 * 1024 * 1024) return error.FileTooLarge;
+        // Refused before any block is built: a stale save, a taken name or a
+        // gated folder leaves nothing in the store. (Checked again below,
+        // under the lock that edits: a race can still lose after building.)
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.awaiting_pull and sync.monotonicMillis() - self.awaiting_since_ms < self.alone_grace_ms) return error.NotSynced;
+            if (self.folderAtLocked(path)) return error.IsDirectory;
+            try self.checkBaseLocked(path, base);
+        }
+        var reader = storage.chunker.SliceReader{ .buffer = bytes };
+        var builder = storage.dag.DagBuilder{ .allocator = self.allocator, .store = self.store, .layout = .Balanced };
+        const root = try builder.build(&reader);
+        defer self.allocator.free(root);
+        const cid: [32]u8 = root[0..32].*;
+        defer self.flushSave();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.editAllowedLocked();
+        if (self.folderAtLocked(path)) return error.IsDirectory;
+        try self.checkBaseLocked(path, base);
+        const mtime = self.now();
+        _ = try self.manifest.edit(path, .{ .cid = cid, .size = bytes.len, .mtime = mtime }, self.self_id.bytes, self.self_name);
+        try self.saveLocked();
+        return .{ .cid = cid, .size = bytes.len, .mtime = mtime };
+    }
+
+    /// Caller holds `mutex`. error.Changed unless the live file at `path` is
+    /// `base` (null: nothing is live there).
+    fn checkBaseLocked(self: *SwarmFolder, path: []const u8, base: ?[32]u8) !void {
+        const old = self.manifest.get(path);
+        if (base) |expected| {
+            if (old == null or old.?.deleted or old.?.kind != .file or !std.mem.eql(u8, &old.?.cid, &expected)) return error.Changed;
+        } else if (old != null and !old.?.deleted) return error.Changed;
+    }
+
+    /// Moves a file only while its content still matches `base`.
+    pub fn moveIfUnchanged(self: *SwarmFolder, path: []const u8, new_path: []const u8, base: [32]u8) !void {
+        if (!manifest_mod.validPath(path) or !manifest_mod.validPath(new_path)) return error.InvalidPath;
+        defer self.flushSave();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.editAllowedLocked();
+        const entry = self.manifest.get(path) orelse return error.FileNotFound;
+        if (entry.deleted or entry.kind != .file) return error.FileNotFound;
+        if (!std.mem.eql(u8, &entry.cid, &base)) return error.Changed;
+        if (self.folderAtLocked(new_path)) return error.IsDirectory;
+        if (self.manifest.get(new_path)) |target| if (!target.deleted) return error.PathAlreadyExists;
+        _ = try self.manifest.edit(new_path, .{ .cid = entry.cid, .size = entry.size, .mtime = entry.mtime }, self.self_id.bytes, self.self_name);
+        _ = try self.manifest.edit(path, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+        try self.saveLocked();
     }
 
     /// Root CIDs of the files this device must keep: the ones it wrote or
@@ -299,6 +445,7 @@ pub const SwarmFolder = struct {
         defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
+        try self.editAllowedLocked();
         _ = try self.manifest.edit(path, .{ .kind = .dir, .mtime = self.now() }, self.self_id.bytes, self.self_name);
         try self.saveLocked();
     }
@@ -308,6 +455,7 @@ pub const SwarmFolder = struct {
         defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
+        try self.editAllowedLocked();
         const doomed = try self.liveUnderLocked(path);
         defer freePaths(self.allocator, doomed);
         if (doomed.len == 0) return error.FileNotFound;
@@ -338,6 +486,7 @@ pub const SwarmFolder = struct {
         defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
+        try self.editAllowedLocked();
         const moving = try self.liveUnderLocked(path);
         defer freePaths(self.allocator, moving);
         if (moving.len == 0) return error.FileNotFound;
@@ -392,6 +541,40 @@ pub const SwarmFolder = struct {
         const e = self.manifest.get(path) orelse return null;
         if (e.deleted or e.kind != .file) return null;
         return .{ .cid = e.cid, .size = e.size, .mtime = e.mtime, .author = e.version.device };
+    }
+
+    /// Whether `path` is known to be deleted: a tombstone, or no entry at
+    /// all once a sync round has run (a tombstone is pruned after 90 days).
+    /// Before the first round an unknown path may just not have arrived.
+    pub fn isGone(self: *SwarmFolder, path: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const e = self.manifest.get(path) orelse return self.last_sync != 0;
+        return e.deleted;
+    }
+
+    /// Live files that were moved here from `old_path`, which another device
+    /// (or this one) moved: a move writes the new path and then the old
+    /// path's tombstone as the very next version of the same device, so the
+    /// new entry's version (or one of its history) is the one just before
+    /// the tombstone's. A path that was only deleted has none. Paths
+    /// allocated in `arena`; usually one, more only by coincidence.
+    pub fn movedFrom(self: *SwarmFolder, arena: std.mem.Allocator, old_path: []const u8) ![]const []const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const tomb = self.manifest.get(old_path) orelse return &.{};
+        if (!tomb.deleted) return &.{};
+        const before = manifest_mod.Version{ .clock = tomb.version.clock -| 1, .device = tomb.version.device };
+        var out: std.ArrayList([]const u8) = .empty;
+        for (self.manifest.entries.values()) |e| {
+            if (e.deleted or e.kind != .file) continue;
+            var linked = e.version.eql(before);
+            for (e.history) |h| {
+                if (h) |hv| linked = linked or hv.eql(before);
+            }
+            if (linked) try out.append(arena, try arena.dupe(u8, e.path));
+        }
+        return out.items;
     }
 
     /// Whether `path` is a folder with nothing live in it.
@@ -485,6 +668,41 @@ pub const SwarmFolder = struct {
         return out;
     }
 
+    /// Every live file at any depth below the folder `dir`, in one pass over
+    /// the manifest (listing each folder separately costs a pass per folder).
+    /// `name` is the file name, `path` the whole path. Allocated in `arena`.
+    pub fn listUnder(self: *SwarmFolder, arena: std.mem.Allocator, dir: []const u8) ![]Item {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const found = try self.manifest.listUnder(arena, dir);
+        const out = try arena.alloc(Item, found.len);
+        for (found, out) |e, *o| o.* = try itemOf(arena, e);
+        return out;
+    }
+
+    /// The live file at `path`, or null.
+    pub fn fileItem(self: *SwarmFolder, arena: std.mem.Allocator, path: []const u8) !?Item {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const e = self.manifest.get(path) orelse return null;
+        if (e.deleted or e.kind != .file) return null;
+        return try itemOf(arena, e);
+    }
+
+    fn itemOf(arena: std.mem.Allocator, e: Entry) !Item {
+        const path = try arena.dupe(u8, e.path);
+        return .{
+            .name = splitParent(path).name,
+            .path = path,
+            .dir = false,
+            .size = e.size,
+            .mtime = e.mtime,
+            .cid = e.cid,
+            .author = try arena.dupe(u8, e.author),
+            .author_id = e.version.device,
+        };
+    }
+
     /// Reads a file's bytes: from the local store, else likely holders
     /// (cluster/holders.zig): the device that added it, devices that keep
     /// swarm backups, then any other known peer.
@@ -495,6 +713,13 @@ pub const SwarmFolder = struct {
         if (self.read_ahead) |ra| return ra.readAt(allocator, peers, cid, offset, dest);
         var from = remote_mod.Source{ .block_manager = bm, .root = cid, .holders = peers };
         return tree.readAt(allocator, from.loader(), cid, offset, dest);
+    }
+
+    /// Like readAt, but only from this device's block store: error.BlockNotFound
+    /// when a block isn't here, and no network, so it is safe to call for
+    /// every file of a list (snippets, search).
+    pub fn readLocal(self: *SwarmFolder, allocator: std.mem.Allocator, cid: [32]u8, offset: u64, dest: []u8) !usize {
+        return tree.readAt(allocator, tree.Loader.local(self.store), cid, offset, dest);
     }
 
     /// The devices likely to hold a swarm file, best first: its author, the
@@ -568,6 +793,9 @@ pub const SwarmFolder = struct {
         var changed: usize = 0;
         var reached: u32 = 0;
         var failed: u32 = 0;
+        // Peers whose manifest this round compared or merged: what lifts
+        // `awaiting_pull` (a reached peer whose manifest failed doesn't).
+        var merged_from: u32 = 0;
         for (peers) |peer| {
             const have = blk: {
                 self.mutex.lock();
@@ -578,6 +806,7 @@ pub const SwarmFolder = struct {
             // quiet swarm costs no traffic at all here.
             if (bm.peerSwarmDigest(peer)) |theirs| if (std.mem.eql(u8, &theirs, &have)) {
                 reached += 1;
+                merged_from += 1;
                 continue;
             };
             const conn = bm.connectTo(peer) catch continue; // offline: not a failure
@@ -590,34 +819,113 @@ pub const SwarmFolder = struct {
             };
             defer self.allocator.free(bytes);
             reached += 1;
-            if (bytes.len == 0) continue;
-            // Parsed outside the lock: reads through the mount don't wait on it.
-            var parsed = Manifest.parse(self.allocator, bytes) catch |err| {
-                std.debug.print("swarm: {x}'s manifest can't be merged: {any}\n", .{ peer.bytes[0..4], err });
+            if (bytes.len == 0) {
+                merged_from += 1;
+                continue;
+            }
+            changed += self.mergePeerBytes(bytes, peer) orelse {
                 failed += 1;
                 continue;
             };
-            defer parsed.deinit();
+            merged_from += 1;
+        }
+        var hooks: HookList = .{};
+        {
+            defer self.flushSave(); // after the unlock: writes outside the lock
             self.mutex.lock();
             defer self.mutex.unlock();
-            changed += self.manifest.mergeParsed(&parsed);
+            self.peers_synced = reached;
+            self.peers_failed = failed;
+            self.last_sync = self.now();
+            self.roundDoneLocked(merged_from);
+            if (changed > 0) {
+                self.saveLocked() catch |err| std.debug.print("swarm: saving the manifest failed: {any}\n", .{err});
+                // New files may be ones this device keeps.
+                if (self.keeper) |k| k.wake();
+                hooks = self.on_change;
+            }
         }
-        defer self.flushSave(); // after the unlock: writes outside the lock
+        // Outside the locks: the hook may read the folder.
+        hooks.run();
+        return changed;
+    }
+
+    /// Caller holds `mutex`. A round that merged no reached peer's manifest
+    /// (none known yet, offline, or unreadable) doesn't lift `awaiting_pull`.
+    fn roundDoneLocked(self: *SwarmFolder, merged_from: u32) void {
+        if (merged_from > 0) self.awaiting_pull = false;
+    }
+
+    /// Parses a peer's manifest outside the lock (reads through the mount
+    /// don't wait on it) and merges it. Null when it can't be read; else how
+    /// many entries changed.
+    fn mergePeerBytes(self: *SwarmFolder, bytes: []const u8, peer: NodeID) ?usize {
+        var parsed = Manifest.parse(self.allocator, bytes) catch |err| {
+            std.debug.print("swarm: {x}'s manifest can't be merged: {any}\n", .{ peer.bytes[0..4], err });
+            return null;
+        };
+        defer parsed.deinit();
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.peers_synced = reached;
-        self.peers_failed = failed;
-        self.last_sync = self.now();
-        if (changed > 0) {
-            self.saveLocked() catch |err| std.debug.print("swarm: saving the manifest failed: {any}\n", .{err});
-            // New files may be ones this device keeps.
-            if (self.keeper) |k| k.wake();
+        return self.manifest.mergeParsed(&parsed);
+    }
+
+    /// A callback of the folder's thread. Hooks run outside the folder's
+    /// locks (they may read it), one after the other, never concurrently.
+    pub const Hook = struct { ctx: *anyopaque, runFn: *const fn (ctx: *anyopaque) void };
+
+    /// A small fixed list of hooks: the node wires the few services that
+    /// watch the folder (the backup import, the notes).
+    pub const HookList = struct {
+        items: [max_hooks]Hook = undefined,
+        len: usize = 0,
+
+        pub const max_hooks = 4;
+
+        pub fn run(self: HookList) void {
+            for (self.items[0..self.len]) |h| h.runFn(h.ctx);
         }
-        return changed;
+    };
+
+    /// Runs `hook` after every sync round.
+    pub fn addAfterSyncHook(self: *SwarmFolder, hook: Hook) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try addHook(&self.after_sync, hook);
+    }
+
+    /// Runs `hook` after a sync round that merged something from a peer.
+    pub fn addChangeHook(self: *SwarmFolder, hook: Hook) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try addHook(&self.on_change, hook);
+    }
+
+    fn addHook(hooks: *HookList, hook: Hook) !void {
+        if (hooks.len >= HookList.max_hooks) return error.TooManyHooks;
+        hooks.items[hooks.len] = hook;
+        hooks.len += 1;
+    }
+
+    /// The manifest digest of the entries under `prefix` (see
+    /// Manifest.digestUnder).
+    pub fn digestUnder(self: *SwarmFolder, prefix: []const u8) [32]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.manifest.digestUnder(prefix);
+    }
+
+    /// Whether the clock may have restarted from zero (see `awaiting_pull`).
+    fn needsPull(self: *const SwarmFolder) bool {
+        return self.manifest_missing and !self.clock_found;
     }
 
     pub fn start(self: *SwarmFolder, block_manager: *cluster.BlockManager) !void {
         self.block_manager = block_manager;
+        self.mutex.lock();
+        self.awaiting_pull = self.needsPull();
+        self.awaiting_since_ms = sync.monotonicMillis();
+        self.mutex.unlock();
         try self.worker.start(loop, .{self});
     }
 
@@ -635,11 +943,14 @@ pub const SwarmFolder = struct {
             if (waited < self.sync_interval_ns) continue;
             waited = 0;
             _ = self.syncNow() catch {};
-            if (self.after_sync) |h| h.runFn(h.ctx);
+            const hooks = blk: {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                break :blk self.after_sync;
+            };
+            hooks.run();
         }
     }
-
-    pub const AfterSync = struct { ctx: *anyopaque, runFn: *const fn (ctx: *anyopaque) void };
 
     pub const Import = struct { path: []const u8, cid: [32]u8, size: u64, mtime: u64 };
 
@@ -662,6 +973,7 @@ pub const SwarmFolder = struct {
         defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
+        try self.editAllowedLocked();
         var added: usize = 0;
         for (files) |f| {
             if (!manifest_mod.validPath(f.path)) continue;
@@ -1034,4 +1346,302 @@ test "swarm: files keep their own modified time" {
     // A move keeps it.
     try folder.move("photo.jpg", "moved.jpg", .{});
     try testing.expectEqual(@as(u64, 1_400_000_000), folder.fileInfo("moved.jpg").?.mtime);
+}
+
+const TestFolder = @import("test_fixture.zig").Fixture(SwarmFolder);
+
+test "swarm: putBytes writes new content and replaces it only from its base" {
+    var t: TestFolder = undefined;
+    try t.open(0x21, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    const first = try folder.putBytes("Notes/one.md", "one", null);
+    try std.testing.expectEqual(@as(u64, 3), first.size);
+    try std.testing.expectEqualSlices(u8, &first.cid, &folder.fileInfo("Notes/one.md").?.cid);
+    var buf: [8]u8 = undefined;
+    const n = try folder.readLocal(std.testing.allocator, first.cid, 0, &buf);
+    try std.testing.expectEqualStrings("one", buf[0..n]);
+
+    const second = try folder.putBytes("Notes/one.md", "two", first.cid);
+    try std.testing.expect(!std.mem.eql(u8, &first.cid, &second.cid));
+    // The stale base no longer matches.
+    try std.testing.expectError(error.Changed, folder.putBytes("Notes/one.md", "three", first.cid));
+    try std.testing.expectEqualSlices(u8, &second.cid, &folder.fileInfo("Notes/one.md").?.cid);
+}
+
+test "swarm: putBytes with no base refuses an existing path but not a deleted one" {
+    var t: TestFolder = undefined;
+    try t.open(0x22, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    _ = try folder.putBytes("Notes/one.md", "one", null);
+    try std.testing.expectError(error.Changed, folder.putBytes("Notes/one.md", "two", null));
+    try std.testing.expectError(error.Changed, folder.putBytes("Notes/none.md", "x", [_]u8{1} ** 32));
+    try folder.remove("Notes/one.md");
+    _ = try folder.putBytes("Notes/one.md", "again", null);
+    try std.testing.expect(folder.fileInfo("Notes/one.md") != null);
+}
+
+test "swarm: a refused putBytes builds no blocks" {
+    var t: TestFolder = undefined;
+    try t.open(0x2d, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    const first = try folder.putBytes("Notes/one.md", "one", null);
+    const before = try t.store.keptUsage();
+    // A taken name, a stale base: refused before the text is hashed and stored.
+    try std.testing.expectError(error.Changed, folder.putBytes("Notes/one.md", "different text " ** 100, null));
+    try std.testing.expectError(error.Changed, folder.putBytes("Notes/one.md", "other text " ** 100, [_]u8{9} ** 32));
+    folder.awaiting_pull = true;
+    folder.awaiting_since_ms = sync.monotonicMillis();
+    try std.testing.expectError(error.NotSynced, folder.putBytes("Notes/two.md", "gated text " ** 100, null));
+    folder.awaiting_pull = false;
+    const after = try t.store.keptUsage();
+    try std.testing.expectEqual(before.blocks, after.blocks);
+    try std.testing.expectEqual(before.bytes, after.bytes);
+    _ = first;
+}
+
+test "swarm: a file moved by a device is found from the tombstone of its old path" {
+    var t: TestFolder = undefined;
+    try t.open(0x2e, "Desk");
+    defer t.close();
+    const folder = t.folder;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try folder.putBytes("Notes/a.md", "a", null);
+    _ = try folder.putBytes("Notes/other.md", "o", null);
+    try folder.move("Notes/a.md", "Notes/b.md", .{});
+    const moved = try folder.movedFrom(arena, "Notes/a.md");
+    try std.testing.expectEqual(@as(usize, 1), moved.len);
+    try std.testing.expectEqualStrings("Notes/b.md", moved[0]);
+    // A delete is no move, even with a note written just before it.
+    _ = try folder.putBytes("Notes/c.md", "c", null);
+    _ = try folder.putBytes("Notes/last.md", "l", null);
+    try folder.remove("Notes/c.md");
+    try std.testing.expectEqual(@as(usize, 1), (try folder.movedFrom(arena, "Notes/c.md")).len); // coincidence: the caller checks content or name
+    try std.testing.expectEqual(@as(usize, 0), (try folder.movedFrom(arena, "Notes/never.md")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try folder.movedFrom(arena, "Notes/b.md")).len); // live
+}
+
+test "swarm: hooks run in order, up to a small fixed number" {
+    var t: TestFolder = undefined;
+    try t.open(0x2f, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    const Order = struct {
+        var seen: [8]u8 = undefined;
+        var n: usize = 0;
+        fn first(_: *anyopaque) void {
+            seen[n] = 1;
+            n += 1;
+        }
+        fn second(_: *anyopaque) void {
+            seen[n] = 2;
+            n += 1;
+        }
+    };
+    var token: u8 = 0;
+    Order.n = 0;
+    try folder.addAfterSyncHook(.{ .ctx = &token, .runFn = Order.first });
+    try folder.addAfterSyncHook(.{ .ctx = &token, .runFn = Order.second });
+    folder.after_sync.run();
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, Order.seen[0..Order.n]);
+    try folder.addChangeHook(.{ .ctx = &token, .runFn = Order.first });
+    try folder.addChangeHook(.{ .ctx = &token, .runFn = Order.first });
+    try folder.addChangeHook(.{ .ctx = &token, .runFn = Order.first });
+    try folder.addChangeHook(.{ .ctx = &token, .runFn = Order.first });
+    try std.testing.expectError(error.TooManyHooks, folder.addChangeHook(.{ .ctx = &token, .runFn = Order.first }));
+}
+
+test "swarm: putBytes never replaces a folder" {
+    var t: TestFolder = undefined;
+    try t.open(0x23, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    try folder.makeDir("Notes", "folder");
+    try std.testing.expectError(error.IsDirectory, folder.putBytes("Notes/folder", "x", null));
+    // A folder that exists only because of what is inside it.
+    _ = try folder.putBytes("Notes/Work/a.md", "a", null);
+    try std.testing.expectError(error.IsDirectory, folder.putBytes("Notes/Work", "x", null));
+    try std.testing.expectError(error.InvalidPath, folder.putBytes("../x", "x", null));
+}
+
+test "swarm: moveIfUnchanged moves only an unchanged file to a free name" {
+    var t: TestFolder = undefined;
+    try t.open(0x24, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    const first = try folder.putBytes("Notes/one.md", "one", null);
+    const second = try folder.putBytes("Notes/one.md", "two", first.cid);
+    try std.testing.expectError(error.Changed, folder.moveIfUnchanged("Notes/one.md", "Notes/two.md", first.cid));
+    try std.testing.expectError(error.FileNotFound, folder.moveIfUnchanged("Notes/none.md", "Notes/x.md", second.cid));
+    _ = try folder.putBytes("Notes/taken.md", "t", null);
+    try std.testing.expectError(error.PathAlreadyExists, folder.moveIfUnchanged("Notes/one.md", "Notes/taken.md", second.cid));
+    try folder.moveIfUnchanged("Notes/one.md", "Notes/two.md", second.cid);
+    try std.testing.expect(folder.fileInfo("Notes/one.md") == null);
+    const moved = folder.fileInfo("Notes/two.md").?;
+    try std.testing.expectEqualSlices(u8, &second.cid, &moved.cid);
+    try std.testing.expectEqual(second.mtime, moved.mtime);
+    try folder.makeDir("Notes", "dir");
+    try std.testing.expectError(error.IsDirectory, folder.moveIfUnchanged("Notes/two.md", "Notes/dir", second.cid));
+}
+
+test "swarm: a folder whose manifest was missing takes no local edit before its first pull" {
+    var t: TestFolder = undefined;
+    try t.open(0x25, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    // No manifest file at open; the clock may have restarted.
+    try std.testing.expect(folder.manifest_missing);
+    // Before start() nothing waits (tests, tools); start() sets the gate.
+    _ = try folder.putBytes("Notes/a.md", "a", null);
+    folder.awaiting_pull = folder.manifest_missing;
+    folder.awaiting_since_ms = sync.monotonicMillis();
+    try std.testing.expectError(error.NotSynced, folder.putBytes("Notes/b.md", "b", null));
+    try std.testing.expectError(error.NotSynced, folder.makeDir("Notes", "d"));
+    try std.testing.expectError(error.NotSynced, folder.remove("Notes/a.md"));
+    try std.testing.expectError(error.NotSynced, folder.move("Notes/a.md", "Notes/c.md", .{}));
+    try std.testing.expectError(error.NotSynced, folder.setMtime("Notes/a.md", 5));
+    // Reading is unaffected.
+    try std.testing.expect(folder.fileInfo("Notes/a.md") != null);
+    // A sync round that merged a reached peer's manifest lifts it.
+    folder.mutex.lock();
+    folder.roundDoneLocked(1);
+    folder.mutex.unlock();
+    try std.testing.expect(!folder.awaiting_pull);
+    _ = try folder.putBytes("Notes/b.md", "b", null);
+}
+
+test "swarm: the first round with no peers known yet, or an unreadable peer manifest, keeps the gate" {
+    var t: TestFolder = undefined;
+    try t.open(0x27, "Desk");
+    defer t.close();
+    const folder = t.folder;
+    folder.awaiting_pull = true;
+    folder.awaiting_since_ms = sync.monotonicMillis();
+
+    // No peer in the routing table yet: nothing merged.
+    folder.mutex.lock();
+    folder.roundDoneLocked(0);
+    folder.mutex.unlock();
+    try std.testing.expect(folder.awaiting_pull);
+    try std.testing.expectError(error.NotSynced, folder.putBytes("Notes/a.md", "a", null));
+
+    // A peer answered with something that isn't a manifest: not a pull.
+    const peer = NodeID{ .bytes = [_]u8{0x31} ** 32 };
+    try std.testing.expect(folder.mergePeerBytes("not a manifest {", peer) == null);
+    try std.testing.expect(folder.awaiting_pull);
+
+    // A readable one is.
+    var other: TestFolder = undefined;
+    try other.open(0x28, "Pixel");
+    defer other.close();
+    _ = try other.folder.putBytes("Notes/theirs.md", "t", null);
+    const bytes = try other.folder.manifest.encode(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), folder.mergePeerBytes(bytes, peer).?);
+    folder.mutex.lock();
+    folder.roundDoneLocked(1);
+    folder.mutex.unlock();
+    _ = try folder.putBytes("Notes/a.md", "a", null);
+}
+
+test "swarm: a device that is truly alone may edit after the grace period" {
+    var t: TestFolder = undefined;
+    try t.open(0x29, "Desk");
+    defer t.close();
+    const folder = t.folder;
+    folder.awaiting_pull = true;
+    folder.awaiting_since_ms = sync.monotonicMillis();
+    try std.testing.expectError(error.NotSynced, folder.putBytes("Notes/a.md", "a", null));
+    folder.awaiting_since_ms -= folder.alone_grace_ms + 1;
+    _ = try folder.putBytes("Notes/a.md", "a", null);
+    try std.testing.expect(!folder.awaiting_pull);
+}
+
+test "swarm: the clock never goes back when the manifest file is lost" {
+    var t: TestFolder = undefined;
+    try t.open(0x2a, "Desk");
+    defer t.close();
+    var note = try t.folder.putBytes("Notes/a.md", "v1", null);
+    for (0..5) |i| {
+        var text: [8]u8 = undefined;
+        const body = try std.fmt.bufPrint(&text, "v{d}", .{i + 2});
+        note = try t.folder.putBytes("Notes/a.md", body, note.cid);
+    }
+    const used = t.folder.manifest.clock;
+    try std.testing.expect(used >= 6);
+
+    // The manifest is lost; the clock file is not.
+    try t.reopen(true);
+    try std.testing.expect(t.folder.manifest_missing);
+    try std.testing.expect(t.folder.clock_found);
+    try std.testing.expect(t.folder.manifest.clock >= used);
+    // The clock file was there: no reason to wait for a peer.
+    try std.testing.expect(!t.folder.needsPull());
+    _ = try t.folder.putBytes("Notes/b.md", "b", null);
+    try std.testing.expect(t.folder.manifest.get("Notes/b.md").?.version.clock > used);
+
+    // Both files lost: the clock restarted, so the gate applies.
+    try t.reopen(true);
+    std.Io.Dir.cwd().deleteFile(std.testing.io, t.clock_path) catch {};
+    try t.reopen(false);
+    try std.testing.expect(t.folder.needsPull());
+}
+
+test "swarm: a crash that lost unsaved edits does not lower the clock" {
+    var t: TestFolder = undefined;
+    try t.open(0x2b, "Desk");
+    defer t.close();
+    _ = try t.folder.putBytes("Notes/a.md", "a", null);
+    // Edited, but the manifest is not written yet (the 1 s batch): a restart
+    // that loses the edit still starts above it.
+    _ = try t.folder.putBytes("Notes/c.md", "c", null);
+    const used = t.folder.manifest.clock;
+    t.folder.dirty = false; // the "crash": destroy writes nothing
+    try t.reopen(true);
+    try std.testing.expect(t.folder.manifest.clock >= used);
+}
+
+test "swarm: a corrupt clock file is moved aside" {
+    var t: TestFolder = undefined;
+    try t.open(0x2c, "Desk");
+    defer t.close();
+    _ = try t.folder.putBytes("Notes/a.md", "a", null);
+    try t.reopen(false);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = t.clock_path, .data = "garbage" });
+    try t.reopen(false);
+    try std.testing.expect(!t.folder.clock_found);
+    // Written fresh by the next edit.
+    _ = try t.folder.putBytes("Notes/b.md", "b", null);
+    var buf: [32]u8 = undefined;
+    const bytes = try std.Io.Dir.cwd().readFile(std.testing.io, t.clock_path, &buf);
+    try std.testing.expect(bytes.len > 0 and bytes[0] != 'g');
+}
+
+test "swarm: digestUnder tells whether something under a folder changed" {
+    var t: TestFolder = undefined;
+    try t.open(0x26, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    const empty = folder.digestUnder("Notes/");
+    _ = try folder.putBytes("Docs/a.txt", "a", null);
+    try std.testing.expectEqualSlices(u8, &empty, &folder.digestUnder("Notes/"));
+    const note = try folder.putBytes("Notes/a.md", "a", null);
+    const with_note = folder.digestUnder("Notes/");
+    try std.testing.expect(!std.mem.eql(u8, &empty, &with_note));
+    _ = try folder.putBytes("Notes/a.md", "b", note.cid);
+    try std.testing.expect(!std.mem.eql(u8, &with_note, &folder.digestUnder("Notes/")));
+    try std.testing.expectEqualSlices(u8, &folder.manifest.digest(), &folder.digestUnder(""));
 }

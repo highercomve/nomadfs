@@ -20,6 +20,7 @@ const storage = @import("../storage/mod.zig");
 const device_trust = @import("../device/trust.zig");
 
 const Cid = [32]u8;
+const Fixture = @import("test_fixture.zig").Fixture(swarm_mod.SwarmFolder);
 
 /// Folder levels walked below a share.
 const max_depth = 32;
@@ -79,7 +80,7 @@ pub const BackupImport = struct {
     }
 
     /// The swarm folder's after-sync hook.
-    pub fn hook(self: *BackupImport) swarm_mod.SwarmFolder.AfterSync {
+    pub fn hook(self: *BackupImport) swarm_mod.SwarmFolder.Hook {
         return .{ .ctx = self, .runFn = runErased };
     }
 
@@ -324,32 +325,25 @@ test "backup import: a marked share goes into the swarm folder, as a backup" {
     const testing = std.testing;
     const allocator = testing.allocator;
     const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fx: Fixture = undefined;
+    try fx.open(0x11, "Pixel");
+    defer fx.close();
+    const tmp = &fx.tmp;
     try tmp.dir.createDirPath(io, "Camera/2024");
-    try tmp.dir.createDirPath(io, "blocks");
     try tmp.dir.writeFile(io, .{ .sub_path = "Camera/a.jpg", .data = "photo a" });
     try tmp.dir.writeFile(io, .{ .sub_path = "Camera/2024/b.jpg", .data = "photo b" });
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    const blocks = try std.fs.path.join(allocator, &.{ base, "blocks" });
-    defer allocator.free(blocks);
-    const camera = try std.fs.path.join(allocator, &.{ base, "Camera" });
+    const camera = try std.fs.path.join(allocator, &.{ fx.dir, "Camera" });
     defer allocator.free(camera);
-    const manifest_path = try std.fs.path.join(allocator, &.{ base, "swarm.json" });
-    defer allocator.free(manifest_path);
-    const imported_path = try std.fs.path.join(allocator, &.{ base, "imported" });
+    const imported_path = try std.fs.path.join(allocator, &.{ fx.dir, "imported" });
     defer allocator.free(imported_path);
 
-    var store = try storage.engine.StorageEngine.init(allocator, blocks);
-    defer store.deinit();
-    const index = try shares_mod.ShareIndex.create(allocator, io, &store);
+    const store = &fx.store;
+    const folder = fx.folder;
+    const index = try shares_mod.ShareIndex.create(allocator, io, store);
     defer index.destroy();
     try index.add("Camera", camera);
-    const folder = try swarm_mod.SwarmFolder.create(allocator, io, &store, .{ .bytes = [_]u8{0x11} ** 32 }, "Pixel", manifest_path);
-    defer folder.destroy();
-    const imp = try BackupImport.create(allocator, io, folder, index, &store, "Pixel 8", imported_path, alwaysAllowed);
+    const imp = try BackupImport.create(allocator, io, folder, index, store, "Pixel 8", imported_path, alwaysAllowed);
     defer imp.destroy();
 
     // Not marked: nothing comes in.
@@ -372,7 +366,7 @@ test "backup import: a marked share goes into the swarm folder, as a backup" {
     try testing.expect(folder.fileInfo("Pixel 8/Camera/c.jpg") != null);
 
     // Remembered across restarts.
-    const again = try BackupImport.create(allocator, io, folder, index, &store, "Pixel 8", imported_path, alwaysAllowed);
+    const again = try BackupImport.create(allocator, io, folder, index, store, "Pixel 8", imported_path, alwaysAllowed);
     defer again.destroy();
     try testing.expectEqual(@as(usize, 0), try again.run());
 }
@@ -381,40 +375,33 @@ test "backup import: the old folder backups move into the swarm folder" {
     const testing = std.testing;
     const allocator = testing.allocator;
     const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fx: Fixture = undefined;
+    try fx.open(0x22, "Plex");
+    defer fx.close();
+    const tmp = &fx.tmp;
     // A kept tree as the old backup device left it: a file deleted at the
     // source in an overflow folder.
     try tmp.dir.createDirPath(io, "kept/2024");
     try tmp.dir.createDirPath(io, "kept/Deleted before 2026-10-01");
-    try tmp.dir.createDirPath(io, "blocks");
     try tmp.dir.writeFile(io, .{ .sub_path = "kept/a.jpg", .data = "a" });
     try tmp.dir.writeFile(io, .{ .sub_path = "kept/2024/b.jpg", .data = "b" });
     try tmp.dir.writeFile(io, .{ .sub_path = "kept/Deleted before 2026-10-01/gone.jpg", .data = "gone" });
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    const blocks = try std.fs.path.join(allocator, &.{ base, "blocks" });
-    defer allocator.free(blocks);
-    const kept = try std.fs.path.join(allocator, &.{ base, "kept" });
+    const kept = try std.fs.path.join(allocator, &.{ fx.dir, "kept" });
     defer allocator.free(kept);
-    const manifest_path = try std.fs.path.join(allocator, &.{ base, "swarm.json" });
-    defer allocator.free(manifest_path);
-    const state_path = try std.fs.path.join(allocator, &.{ base, "store.backups" });
+    const state_path = try std.fs.path.join(allocator, &.{ fx.dir, "store.backups" });
     defer allocator.free(state_path);
-    const trust_path = try std.fs.path.join(allocator, &.{ base, "trust.store" });
+    const trust_path = try std.fs.path.join(allocator, &.{ fx.dir, "trust.store" });
     defer allocator.free(trust_path);
 
-    var store = try storage.engine.StorageEngine.init(allocator, blocks);
-    defer store.deinit();
-    const index = try shares_mod.ShareIndex.create(allocator, io, &store);
+    const store = &fx.store;
+    const folder = fx.folder;
+    const index = try shares_mod.ShareIndex.create(allocator, io, store);
     defer index.destroy();
     try index.add("kept", kept);
     const snap = try index.snapshot(allocator);
     defer shares_mod.ShareIndex.freeSnapshot(allocator, snap);
     const root = snap[0].root.?;
-    const folder = try swarm_mod.SwarmFolder.create(allocator, io, &store, .{ .bytes = [_]u8{0x22} ** 32 }, "Plex", manifest_path);
-    defer folder.destroy();
     var trust = try device_trust.Store.load(allocator, trust_path, null);
     defer trust.deinit();
 
@@ -432,12 +419,12 @@ test "backup import: the old folder backups move into the swarm folder" {
     defer allocator.free(line);
     try tmp.dir.writeFile(io, .{ .sub_path = "store.backups", .data = line });
 
-    try testing.expectEqual(@as(usize, 3), try migrateOldBackups(allocator, io, folder, &store, &trust, state_path));
+    try testing.expectEqual(@as(usize, 3), try migrateOldBackups(allocator, io, folder, store, &trust, state_path));
     try testing.expect(folder.fileInfo("Pixel/Camera/a.jpg") != null);
     try testing.expect(folder.fileInfo("Pixel/Camera/2024/b.jpg") != null);
     try testing.expect(folder.fileInfo("Pixel/Camera/gone.jpg") != null); // unwrapped
     // Done once: the state is set aside.
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "store.backups", .{}));
     _ = try tmp.dir.statFile(io, "store.backups.migrated", .{});
-    try testing.expectEqual(@as(usize, 0), try migrateOldBackups(allocator, io, folder, &store, &trust, state_path));
+    try testing.expectEqual(@as(usize, 0), try migrateOldBackups(allocator, io, folder, store, &trust, state_path));
 }

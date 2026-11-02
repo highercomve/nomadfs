@@ -22,7 +22,8 @@ works as well. `oriel doctor` checks that the system has everything needed.
 | Path | What |
 |---|---|
 | `src/main.zig` | The Zig side: `Commands` the page can call and `Events` pushed to it |
-| `frontend/` | The page: plain HTML + JavaScript (no build step) |
+| `frontend/` | The page: plain HTML + JavaScript (no build step). `notes.js` is the Notes screen, `markdown.js` its renderer, `notes-model.js` what the list decides |
+| `frontend-test/` | Node tests of the page's logic: `zig build test-frontend` (needs `node`) |
 | `build.zig` | Which Oriel modules are compiled in, packaging metadata |
 | `build.zig.zon` | Package manifest; Oriel is a dependency |
 | `src/android/` (optional) | App-owned Kotlin/Java helpers and Android platform hooks (`OrielAndroidHooks`) |

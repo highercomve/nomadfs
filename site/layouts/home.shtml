@@ -68,7 +68,7 @@
 				<article class="feature plate">
 					<div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="4" width="14" height="11" rx="1.5"/><path d="M6 19h6M9 15v4"/><rect x="16" y="9" width="6" height="11" rx="1.5"/></svg></div>
 					<h3>An app for desktop and phone</h3>
-					<p>Browse devices, preview images, video, audio, PDF and text, manage the swarm folder, mount from a tab or the tray, connect devices, and drop notes between them. Built with <a href="https://oriel.foreachdeveloper.com">Oriel</a>.</p>
+					<p>Browse devices, preview images, video, audio, PDF and text, manage the swarm folder, write and edit Markdown notes across your devices, mount from a tab or the tray, and connect devices. Built with <a href="https://oriel.foreachdeveloper.com">Oriel</a>.</p>
 				</article>
 			</div>
 		</section>

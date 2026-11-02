@@ -51,9 +51,9 @@
         <svg viewBox="0 0 24 24"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>
         <span>Connect devices</span>
       </button>
-      <button class="nav-item" data-view="text">
+      <button class="nav-item" data-view="notes">
         <svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>
-        <span>Text drop</span>
+        <span>Notes</span>
       </button>
       <button class="nav-item" data-view="settings">
         <svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
@@ -337,58 +337,57 @@
         </form>
       </section>
 
-      <!-- Text drop: notes in the swarm folder's Notes, on every device -->
-      <section class="card" id="text-drop" data-view="text">
-        <div class="card-head">
-          <svg class="icon" viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
-          <div>
-            <h2>Text drop</h2>
-            <p class="supporting">Notes for all your devices. They're saved in the swarm folder's Notes folder, so every device sees them and backup devices keep a copy.</p>
-          </div>
-        </div>
-
-        <div class="notes">
-          <h3 class="sub-heading">Write a note</h3>
-          <form id="put-form" class="composer">
-            <textarea id="text-in" rows="4" placeholder="Paste a link, an address, a snippet…"></textarea>
-            <div class="composer-bar">
-              <span id="text-count" class="meta">0 characters</span>
-              <span class="meta hint-keys">Ctrl+Enter</span>
-              <button type="submit" class="btn filled" id="put-submit" disabled>Store note</button>
+      <!-- Notes: Markdown files in the swarm folder's Notes, on every device -->
+      <section class="card notes-view" id="notes-view" data-view="notes">
+        <div class="notes-layout">
+          <aside class="notes-list-pane" id="notes-list-pane">
+            <div class="notes-search-row">
+              <input id="notes-search" type="search" placeholder="Search notes" aria-label="Search notes" autocomplete="off" spellcheck="false">
+              <button id="notes-new" class="btn filled" type="button" aria-label="New note" title="New note (Ctrl+N)">+</button>
+              <button id="notes-more" class="icon-btn" type="button" aria-label="More" title="More"></button>
             </div>
-          </form>
-          <div id="cid-box" class="saved" hidden>
-            <svg viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
-            <div class="saved-text">
-              <span class="headline">Saved</span>
-              <code id="cid-output" class="meta mono" title=""></code>
+            <div id="notes-filters" class="notes-filters" role="tablist" aria-label="Notebooks"></div>
+            <div id="notes-empty-state" class="empty-state" hidden>
+              <p id="notes-empty-text"></p>
+              <button id="notes-empty-action" class="btn outlined" type="button"></button>
             </div>
-            <button id="cid-copy" class="btn text" type="button">Copy code</button>
-          </div>
-
-          <h3 class="sub-heading">Open a note</h3>
-          <form id="fetch-form" class="open-row">
-            <label class="field grow">
-              <input id="cid-in" class="mono" placeholder=" " spellcheck="false" autocomplete="off" />
-              <span class="field-label">Note code (CID)</span>
-            </label>
-            <button id="cid-paste" type="button" class="btn outlined">Paste</button>
-            <button id="fetch" type="submit" class="btn filled">Open</button>
-          </form>
-          <article id="note-view" class="note-card" hidden>
-            <header>
-              <span id="note-meta" class="meta"></span>
-              <button id="note-copy" type="button" class="btn text">Copy text</button>
-            </header>
-            <pre id="text-out"></pre>
+            <ul id="notes-items" class="notes-items" role="listbox" aria-label="Notes"></ul>
+            <h3 id="notes-others-head" class="sub-heading" hidden>Other files</h3>
+            <ul id="notes-others" class="notes-items" hidden></ul>
+          </aside>
+          <article class="note-editor-pane" id="notes-editor-pane">
+            <div id="notes-placeholder" class="notes-placeholder">Select a note, or write a new one.</div>
+            <div id="notes-editor" class="note-editor" hidden>
+              <div class="note-editor-toolbar">
+                <button id="notes-back" class="btn text note-back" type="button" aria-label="Back to notes">← Notes</button>
+                <span class="grow"></span>
+                <button id="notes-preview-toggle" class="btn text" type="button" title="Preview (Ctrl+E)">Preview</button>
+                <button id="notes-share" class="btn text" type="button" hidden>Share</button>
+                <button id="notes-menu" class="icon-btn" type="button" aria-label="Note actions" title="More"></button>
+              </div>
+              <div id="notes-banner" class="note-banner" role="alert" hidden></div>
+              <input id="notes-title" class="note-title" placeholder="Untitled" aria-label="Note title" autocomplete="off" spellcheck="false">
+              <p id="notes-title-error" class="note-title-error" role="alert" hidden></p>
+              <p id="notes-status" class="meta note-status"></p>
+              <textarea id="notes-body" class="note-body" placeholder="Start writing…" aria-label="Note body"></textarea>
+              <div id="notes-preview" class="note-preview" hidden></div>
+            </div>
+            <div id="notes-merge" class="note-merge" hidden></div>
           </article>
-
-          <div class="recent-head">
-            <h3 class="sub-heading">Notes in your swarm</h3>
-          </div>
-          <ul id="notes-list" class="list rows"></ul>
-          <p id="notes-empty" class="empty-state">Notes stored on any of your devices show up here.</p>
         </div>
+        <dialog id="notes-dialog" class="notes-dialog">
+          <form method="dialog" id="notes-dialog-form">
+            <h3 id="notes-dialog-title"></h3>
+            <p id="notes-dialog-text" class="supporting" hidden></p>
+            <label class="field"><input id="notes-dialog-input" placeholder=" " autocomplete="off" spellcheck="false"><span id="notes-dialog-label" class="field-label"></span></label>
+            <div class="notes-dialog-actions">
+              <button id="notes-dialog-paste" class="btn text" type="button" hidden>Paste</button>
+              <span class="grow"></span>
+              <button id="notes-dialog-cancel" class="btn text" type="button">Cancel</button>
+              <button id="notes-dialog-ok" class="btn filled" type="submit"></button>
+            </div>
+          </form>
+        </dialog>
       </section>
 
       <!-- Trusted devices -->
@@ -548,9 +547,9 @@
     <div id="more-sheet" class="sheet" hidden>
       <div class="sheet-panel" role="menu" aria-label="More">
         <div class="sheet-grip"></div>
-        <button class="sheet-item" data-view="text" role="menuitem">
+        <button class="sheet-item" data-view="notes" role="menuitem">
           <svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
-          <span><strong>Text drop</strong><small>Store a note, open it anywhere</small></span>
+          <span><strong>Notes</strong><small>Write and edit notes across your devices</small></span>
         </button>
         <button class="sheet-item" data-view="settings" role="menuitem">
           <svg viewBox="0 0 24 24"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16l-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z"/></svg>

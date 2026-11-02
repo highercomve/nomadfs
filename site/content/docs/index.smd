@@ -28,6 +28,8 @@ configuration, shares a folder and brings a second device into the swarm.
   mount.
 - [Swarm folder]($link.page('docs/swarm-folder')): the one folder every
   device reads and writes, how edits merge and what happens on a conflict.
+- [Notes]($link.page('docs/notes')): write, edit, share and resolve conflicts
+  in Markdown notes that sync across your devices.
 - [Connecting devices]($link.page('docs/connecting-devices')): swarms, one-time
   invites and QR codes, trusted devices and revocation.
 - [How it works]($link.page('docs/how-it-works')): the three layers, how a file

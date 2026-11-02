@@ -53,6 +53,10 @@ pub const Node = struct {
     /// The swarm-wide folder every device reads and writes; null without
     /// block storage.
     swarm: ?*fs.SwarmFolder,
+    /// The notes service over the swarm folder: the one every front end
+    /// uses. Its pins are this device's (`<storage_path>.notes-pinned`).
+    /// Null with the swarm folder.
+    notes: ?*fs.notes.Notes,
     /// Fetches ahead of reads of other devices' files (the mount, the app's
     /// previews, the swarm folder); null without block storage.
     read_ahead: ?*fs.ReadAhead,
@@ -163,6 +167,14 @@ pub const Node = struct {
         var backup_import: ?*fs.BackupImport = null;
         errdefer if (backup_import) |b| b.destroy();
 
+        // Declared before the swarm folder too: its hooks run on the folder's
+        // thread, which stops first.
+        var notes: ?*fs.notes.Notes = null;
+        errdefer if (notes) |n| {
+            n.deinit();
+            allocator.destroy(n);
+        };
+
         var swarm: ?*fs.SwarmFolder = null;
         if (store) |s| {
             const manifest_path = try std.fmt.allocPrint(allocator, "{s}.swarm.json", .{cfg.storage.storage_path});
@@ -181,8 +193,23 @@ pub const Node = struct {
                     return err;
                 };
                 backup_import = imp;
-                folder.after_sync = imp.hook();
+                folder.addAfterSyncHook(imp.hook()) catch |err| std.debug.print("backup: import hook not added: {any}\n", .{err});
             }
+            // The notes service: it hears of sync rounds (renames this
+            // device's legacy notes, tells the app when notes changed).
+            const pins_path = try std.fmt.allocPrint(allocator, "{s}.notes-pinned", .{cfg.storage.storage_path});
+            defer allocator.free(pins_path);
+            const service = allocator.create(fs.notes.Notes) catch |err| {
+                folder.destroy();
+                return err;
+            };
+            service.* = fs.notes.Notes.init(allocator, folder, pins_path) catch |err| {
+                allocator.destroy(service);
+                folder.destroy();
+                return err;
+            };
+            notes = service;
+            service.attach() catch |err| std.debug.print("notes: not hooked into the swarm folder: {any}\n", .{err});
             folder.start(block_manager) catch |err| std.debug.print("swarm: sync thread not started: {any}\n", .{err});
             if (cfg.storage.swarm_backup) folder.setBackup(true) catch |err| std.debug.print("swarm backup: not started: {any}\n", .{err});
             swarm = folder;
@@ -331,6 +358,7 @@ pub const Node = struct {
             .info_provider = info_provider,
             .shares = shares,
             .swarm = swarm,
+            .notes = notes,
             .read_ahead = read_ahead,
             .policy = policy,
             .membership = membership,
@@ -366,6 +394,10 @@ pub const Node = struct {
         if (self.read_ahead) |ra| ra.destroy(); // joins its workers
         // Then freed, users before what they use.
         if (self.swarm) |folder| folder.destroy();
+        if (self.notes) |n| { // its hooks ran on the folder's thread, now gone
+            n.deinit();
+            self.allocator.destroy(n);
+        }
         if (self.backup_import) |b| b.destroy(); // its thread (the swarm's) is stopped
         if (self.shares) |index| index.destroy();
         if (self.keeper) |k| self.allocator.destroy(k);

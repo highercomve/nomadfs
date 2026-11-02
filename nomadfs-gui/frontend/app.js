@@ -1,4 +1,5 @@
 // `window.oriel` is injected by Oriel: `invoke()` talks typed Zig.
+import { initNotes } from "./notes.js";
 const { invoke } = window.oriel;
 const extensions = window.oriel.extensions;
 
@@ -6,6 +7,8 @@ const $ = (id) => document.getElementById(id);
 
 let configPath = null;
 let storageExt = false; // Android: all-files access extension present
+
+let notesApi = null; // the Notes screen (notes.js), set once the page is wired
 
 let snackTimer;
 function snack(msg, ms = 3000, onClick = null) {
@@ -33,6 +36,16 @@ function formatSize(bytes) {
   return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
 }
 
+function timeAgo(ms) {
+  const s = Math.max(1, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} h ago`;
+  return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
 function formatDate(seconds) {
   if (!seconds) return "";
   return new Date(seconds * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
@@ -54,6 +67,9 @@ const ICONS = {
   backup_off: "M19.35 10.04C18.67 6.59 15.64 4 12 4c-1.48 0-2.85.43-4.01 1.17l1.46 1.46C10.21 6.23 11.08 6 12 6c3.04 0 5.5 2.46 5.5 5.5v.5H19c1.66 0 3 1.34 3 3 0 1.13-.64 2.11-1.56 2.62l1.45 1.45C23.16 18.16 24 16.68 24 15c0-2.64-2.05-4.78-4.65-4.96zM3 5.27l2.75 2.74C2.56 8.15 0 10.77 0 14c0 3.31 2.69 6 6 6h11.73l2 2L21 20.73 4.27 4 3 5.27zM7.73 10l8 8H6c-2.21 0-4-1.79-4-4s1.79-4 4-4h1.73z",
   info: "M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z",
   open_in: "M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0-2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z",
+  pin: "M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z",
+  more: "M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z",
+  share: "M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92-1.31-2.92-2.92-2.92z",
   link: "M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z",
   move: "M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2zm4 13v-3h-4v-2h4V9l4 4-4 4z",
   more: "M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z",
@@ -198,7 +214,7 @@ function attachMenu(li, items) {
 }
 
 function showMenu(x, y, items) {
-  closeMenu();
+  closeMenu(false); // replaced by the new one: same history step
   menuEl = document.createElement("div");
   menuEl.className = "row-menu";
   menuEl.setAttribute("role", "menu");
@@ -213,7 +229,8 @@ function showMenu(x, y, items) {
     b.setAttribute("role", "menuitem");
     b.appendChild(svg(ICONS[it.icon]));
     b.appendChild(document.createTextNode(it.label));
-    b.addEventListener("click", (e) => { e.stopPropagation(); closeMenu(); it.run(); });
+    // One history step for the whole tap: the menu closes and the item may open a level.
+    b.addEventListener("click", (e) => { e.stopPropagation(); closeMenu(false); it.run(); syncBack(); });
     menuEl.appendChild(b);
   }
   document.body.appendChild(menuEl);
@@ -223,16 +240,22 @@ function showMenu(x, y, items) {
   menuEl.style.left = `${Math.max(8, Math.min(x, innerWidth - r.width - 8))}px`;
   menuEl.style.top = `${Math.max(8, Math.min(y, innerHeight - r.height - 8))}px`;
   menuEl.querySelector("button")?.focus();
+  syncBack(); // Back closes the menu first
 }
 
-function closeMenu() {
+function closeMenu(sync = true) {
   if (!menuEl) return;
   menuEl.remove();
   menuEl = null;
   syncVideoCover();
+  if (sync) syncBack();
 }
 
-document.addEventListener("pointerdown", (e) => { if (menuEl && !menuEl.contains(e.target)) closeMenu(); }, true);
+// A tap outside closes the menu; the history catches up after the tap's own
+// click (which may open a level), as one step.
+let menuSyncPending = false;
+document.addEventListener("pointerdown", (e) => { if (menuEl && !menuEl.contains(e.target)) { closeMenu(false); menuSyncPending = true; } }, true);
+document.addEventListener("click", () => { if (menuSyncPending) { menuSyncPending = false; syncBack(); } });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && menuEl) { closeMenu(); e.stopPropagation(); } }, true);
 addEventListener("scroll", closeMenu, true);
 addEventListener("resize", closeMenu);
@@ -295,9 +318,11 @@ async function copyLink(source, e, network = "") {
 // go up. They're added as the app goes deeper, right after the tap that
 // took it there: the WebView skips entries a page adds on its own.
 function upTarget() {
+  if (menuEl) return () => closeMenu(false);
   if (pv) return closePreview;
   if (!$("more-sheet").hidden) return closeMore;
   const view = document.body.dataset.view || "browse";
+  if (view === "notes" && notesApi?.editing()) return notesApi.closeEditor;
   if (view === "swarm" && swarmDir) return () => { swarmDir = swarmDir.split("/").slice(0, -1).join("/"); loadSwarm(); };
   if (view !== "browse") return () => { setView("browse"); if (path.length) showLocation(); };
   if (path.length) return () => { path.pop(); path.length ? showLocation() : showDevices(); };
@@ -309,9 +334,11 @@ function upLevels() {
   const view = document.body.dataset.view || "browse";
   let n = path.length;
   if (view !== "browse") n += 1;
+  if (view === "notes" && notesApi?.editing()) n += 1;
   if (view === "swarm" && swarmDir) n += swarmDir.split("/").length;
   if (!$("more-sheet").hidden) n += 1;
   if (pv) n += 1;
+  if (menuEl) n += 1;
   return n;
 }
 
@@ -359,13 +386,14 @@ function setView(view) {
   for (const item of document.querySelectorAll(".nav-item[data-view], .bar-item[data-view]")) {
     item.classList.toggle("active", item.dataset.view === view);
   }
-  $("bar-more").classList.toggle("active", view === "text" || view === "settings" || view === "about");
+  $("bar-more").classList.toggle("active", view === "notes" || view === "settings" || view === "about");
   window.scrollTo(0, 0);
   try { localStorage.setItem("view", view); } catch {}
   if (view === "settings") { $("devices-refresh").click(); loadBackup(); }
   if (view === "swarm") loadSwarm();
   if (view === "downloads") loadDownloads();
-  if (view === "text") loadSwarmNotes();
+  if (view === "notes") notesApi?.show();
+  else notesApi?.hide();
   if (view === "about") loadAbout();
   renderNavDevices();
   syncBack();
@@ -430,8 +458,8 @@ async function nodeState() {
     const state = await invoke("node_state", null);
     const started = state.running && !running;
     running = state.running;
-    // The swarm's notes, and moving this device's old ones there.
-    if (started) loadSwarmNotes();
+    // The swarm's notes (the first listing also renames this device's old ones).
+    if (started) notesApi?.refresh();
     $("node-state").textContent = state.running
       ? `Running · device ${state.device_id.slice(0, 12)}…`
       : "Not running";
@@ -2204,130 +2232,7 @@ $("nick-form").addEventListener("submit", async (e) => {
   }
 });
 
-// ---- Text drop: notes in the swarm folder's Notes, on every device ----
-
-const NOTES_DIR = "Notes";
-// Before 0.3.6 each device kept its own list of notes it had stored or
-// opened here; the ones it stored move into the swarm (migrateOldNotes).
-const OLD_NOTES_KEY = "notes";
-
-function shortCid(cid) {
-  return cid.length > 16 ? `${cid.slice(0, 8)}…${cid.slice(-6)}` : cid;
-}
-
-function timeAgo(ms) {
-  const s = Math.max(1, Math.round((Date.now() - ms) / 1000));
-  if (s < 60) return "just now";
-  const m = Math.round(s / 60);
-  if (m < 60) return `${m} min ago`;
-  const h = Math.round(m / 60);
-  if (h < 24) return `${h} h ago`;
-  return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
-
-let swarmNotes = []; // swarm_list items of Notes, newest first
-
-/** "2026-10-28 17-49-03 Shopping list.txt" -> "Shopping list". */
-function noteTitle(name) {
-  return name.replace(/^\d{4}-\d\d-\d\d \d\d-\d\d-\d\d /, "").replace(/\.txt$/i, "") || name;
-}
-
-async function loadSwarmNotes() {
-  if (!running) {
-    swarmNotes = [];
-    renderNotes();
-    return;
-  }
-  try {
-    const res = await invoke("swarm_list", { dir: NOTES_DIR });
-    swarmNotes = res.items.filter((it) => !it.dir).sort((a, b) => b.mtime - a.mtime);
-  } catch {
-    swarmNotes = [];
-  }
-  renderNotes();
-  migrateOldNotes();
-}
-
-function renderNotes() {
-  const list = $("notes-list");
-  list.replaceChildren();
-  $("notes-empty").hidden = swarmNotes.length > 0;
-  for (const n of swarmNotes) {
-    list.appendChild(row({
-      icon: "file",
-      headline: noteTitle(n.name),
-      meta: `${n.author || "A device"} · ${timeAgo(n.mtime * 1000)} · ${formatSize(n.size)}`,
-      onClick: () => showNote(n),
-      action: { icon: "copy", label: "Copy code", run: () => copyText(n.cid, "Code copied") },
-    }));
-  }
-}
-
-/** A note's text, from its author or any device that has it. */
-async function readSwarmNote(n) {
-  const parts = [];
-  for (let offset = 0; offset < n.size;) {
-    const len = Math.min(RANGE, n.size - offset);
-    const bytes = decodeBase64(await invoke("swarm_read_range", { cid: n.cid, author_id: n.author_id, offset, len }));
-    if (bytes.length === 0) break;
-    parts.push(bytes);
-    offset += bytes.length;
-  }
-  return new TextDecoder().decode(concat(parts));
-}
-
-/** Shows a note in the viewer: `load` resolves to its text. */
-async function viewNote(label, cid, load) {
-  const view = $("note-view");
-  view.hidden = false;
-  view.classList.remove("error");
-  $("note-meta").textContent = `Opening ${label}…`;
-  $("text-out").textContent = "";
-  $("note-copy").hidden = true;
-  try {
-    const text = await load();
-    $("text-out").textContent = text;
-    $("note-meta").textContent = `${label} · ${formatSize(new TextEncoder().encode(text).length)} · ${shortCid(cid)}`;
-    $("note-copy").hidden = false;
-    $("note-copy").onclick = () => copyText(text, "Text copied");
-    view.scrollIntoView({ block: "nearest", behavior: "smooth" });
-  } catch (err) {
-    view.classList.add("error");
-    $("note-meta").textContent = label;
-    $("text-out").textContent = `Couldn't open this note: ${err}. The devices that have it may be offline.`;
-  }
-}
-
-function showNote(n) {
-  $("cid-in").value = n.cid;
-  return viewNote(noteTitle(n.name), n.cid, () => readSwarmNote(n));
-}
-
-/** Notes this device stored before they went into the swarm: copied into
- *  Notes once, then dropped from the old list. */
-let migrating = false;
-async function migrateOldNotes() {
-  if (migrating || !running) return;
-  let old;
-  try { old = JSON.parse(localStorage.getItem(OLD_NOTES_KEY) || "[]"); } catch { old = []; }
-  if (!old.length) return;
-  migrating = true;
-  const keep = [];
-  for (const n of old) {
-    if (n.kind !== "stored" || swarmNotes.some((x) => x.cid === n.cid)) continue;
-    try {
-      await invoke("note_store", { text: await invoke("get_text", { cid: n.cid }) });
-    } catch {
-      keep.push(n); // try again next time
-    }
-  }
-  try {
-    if (keep.length) localStorage.setItem(OLD_NOTES_KEY, JSON.stringify(keep));
-    else localStorage.removeItem(OLD_NOTES_KEY);
-  } catch {}
-  migrating = false;
-  if (keep.length < old.length) loadSwarmNotes();
-}
+// ---- Notes: Markdown files in the swarm folder (notes.js) ----
 
 async function copyText(text, done) {
   try {
@@ -2338,76 +2243,21 @@ async function copyText(text, done) {
   }
 }
 
-function updateComposer() {
-  const t = $("text-in");
-  t.style.height = "auto";
-  t.style.height = `${t.scrollHeight}px`;
-  const n = t.value.length;
-  $("text-count").textContent = `${n.toLocaleString()} character${n === 1 ? "" : "s"}`;
-  $("put-submit").disabled = n === 0;
-}
-
-$("text-in").addEventListener("input", updateComposer);
-$("text-in").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-    e.preventDefault();
-    $("put-form").requestSubmit();
-  }
+notesApi = initNotes({
+  invoke,
+  snack,
+  icons: ICONS,
+  svg,
+  showMenu,
+  copyText,
+  syncBack,
+  isRunning: () => running,
+  startNode,
+  deviceName: () => $("device-name").textContent.trim(),
+  openDetails,
+  openInFiles: (dir) => { swarmDir = dir; setView("swarm"); },
+  showNotesView: () => setView("notes"),
 });
-
-$("put-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const text = $("text-in").value;
-  if (!text) return;
-  if (!running) {
-    snack("Start the node first");
-    return;
-  }
-  $("put-submit").disabled = true;
-  try {
-    const note = await invoke("note_store", { text });
-    $("cid-output").textContent = `${NOTES_DIR}/${note.name}`;
-    $("cid-output").title = note.cid;
-    $("cid-copy").onclick = () => copyText(note.cid, "Code copied");
-    $("cid-box").hidden = false;
-    $("text-in").value = "";
-    loadSwarmNotes();
-  } catch (err) {
-    snack(`Store failed: ${err}`);
-  }
-  updateComposer();
-});
-
-/** By code: a note in the swarm's Notes, else any file with that CID. */
-async function openNote(cid) {
-  if (!/^[0-9a-fA-F]{64}$/.test(cid)) {
-    snack("A note code is 64 hex characters");
-    return;
-  }
-  cid = cid.toLowerCase();
-  const known = swarmNotes.find((n) => n.cid === cid);
-  if (known) return showNote(known);
-  return viewNote(shortCid(cid), cid, () => invoke("get_text", { cid }));
-}
-
-$("fetch-form").addEventListener("submit", (e) => {
-  e.preventDefault();
-  openNote($("cid-in").value.trim());
-});
-
-$("cid-paste").addEventListener("click", async () => {
-  try {
-    const text = (await navigator.clipboard.readText()).trim();
-    $("cid-in").value = text;
-    if (/^[0-9a-fA-F]{64}$/.test(text)) openNote(text);
-  } catch {
-    snack("Clipboard unavailable: paste with Ctrl+V");
-    $("cid-in").focus();
-  }
-});
-
-renderNotes();
-updateComposer();
 
 // ---- About ----
 

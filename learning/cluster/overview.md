@@ -129,8 +129,8 @@ yet is looked up through the DHT once, and the fetcher backs off if it can't be 
 It also keeps the mobile C API's own path (`nomadfs_put_file` / `nomadfs_get_file`): `put`
 stores a file and announces it as a DHT provider record; `get` copies a whole DAG with the keeper's
 copy, the providers and closest peers as holders ([4.5](./repair.md)). Nothing is pushed: there is
-no message that writes to another device's store. The app's text drop no longer uses it: notes are
-swarm folder files.
+no message that writes to another device's store. The app doesn't use it for notes: notes are
+swarm folder files ([Notes](../fs/notes.md)).
 
 ---
 

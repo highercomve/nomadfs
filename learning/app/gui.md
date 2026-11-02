@@ -43,7 +43,7 @@ Command groups in `commands.zig` (the page calls them in snake_case, e.g. `node_
 | Swarm folder | `swarmList`, `swarmAddFile`, `swarmMkdir`, `swarmDelete`, `swarmRename`, `swarmReadRange`, `swarmDownload`, `swarmSync`, `swarmBackupStatus`, `swarmBackupSet`, `swarmRotateKey` |
 | Mount (FUSE on Linux, WebDAV on macOS and Windows) | `mountStatus`, `mountPeek`, `mountStart`, `mountStop`, `emergencyUnmount`, `openPath` |
 | Connect | `inviteCreate`, `inviteStatus`, `inviteCancel`, `inviteAccept`, `joinInfo`, `pairTicket`, `trustDevice`, `devicesList`, `revokeDevice` |
-| Text drop | `putText`, `getText` |
+| Notes | `notesList`, `noteRead`, `noteCreate`, `noteSave`, `noteRename`, `noteMove`, `noteDelete`, `noteRestore`, `notePin`, `notesSearch`, `noteExport`, `getText` (open by code), event `notes://changed` |
 
 ## 2. Sections of the app
 
@@ -92,8 +92,12 @@ The navigation (a drawer on wide windows, a bottom bar on phones) has:
 - **Connect devices**: create a one-time invite (code + QR), or join with a code or a QR scan (the
   page's camera through `BarcodeDetector`, so phones scan and desktops show). See
   [Invites](../security/invites.md).
-- **Text drop**: store a short note in the swarm and open it on another device with its code (the
-  CID returned by `nomadfs_put_file`).
+- **Notes**: Markdown notes in the swarm folder's `Notes/`, written and edited in place with autosave,
+  on every device. The commands (`notes_commands.zig`) only parse arguments and call the node's
+  `fs.Notes` (`src/fs/notes.zig`, `node.notes`), so the command line and the mobile API can use the
+  same service; the page (`notes.js` with `notes-list.js`, `notes-editor.js`, `notes-merge.js`)
+  presents it. See
+  [Notes](../fs/notes.md).
 - **Node & trust**: node state and device ID, nickname, trusted devices and revocation
   ([Device identity & pairing](../security/pairing.md)), swarm key rotation (cross-referencing online
   devices by authenticated fingerprint rather than claimed nickname), the "Back up the swarm here"
@@ -145,7 +149,7 @@ write_quorum = 0
 accept_copies = false   # phones only
 ```
 
-`write_quorum = 0` keeps `nomadfs_put_file` (Text drop) from failing when no peer is there to
+`write_quorum = 0` keeps `nomadfs_put_file` from failing when no peer is there to
 acknowledge a provider record ([Quorum](../cluster/quorum.md)). LAN announcements and UPnP
 are off by default: devices find each other through the addresses saved by invites.
 

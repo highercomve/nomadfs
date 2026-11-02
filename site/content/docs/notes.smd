@@ -1,0 +1,85 @@
+---
+.title = "Notes",
+.description = "Write and edit Markdown notes that sync across your NomadFS devices.",
+.date = .date("2026-11-01T00:00:00"),
+.authors = ["NomadFS"],
+.layout = "docs.shtml",
+.custom = { "label": "04 · notes" },
+---
+
+Notes live in the swarm folder, so each device sees the same files. Open
+**Notes** in the app to write and edit them; the same files are at
+`<mount>/Swarm/Notes` and over WebDAV, and any text editor can open them.
+
+# [Write and edit]($heading.id('writing'))
+
+A new note is a Markdown file named after its title, such as
+`Notes/Shopping list.md`. Existing `.txt` notes keep working, and the ones this
+device wrote under the old `2026-10-28 17-49-03 …` names are renamed to their
+title. The title is the file name: change it in the editor and the file is
+renamed. Two notes can't share a title in a notebook.
+
+The editor saves a draft on this device as you type and sends the note to the
+swarm a couple of seconds after you stop, when you leave it, when the window is
+hidden and on Ctrl+S. The line under the title tells you: "Saving…", "Saved on
+this device · syncing" or "Not saved: …" with the reason. A note is only
+editable once its text was loaded; if the devices that have it are offline you
+see "Can't open" and **Retry**, never an empty note.
+
+Notebooks are folders under `Notes/`. Use **Move to notebook…** with a new name
+to make one; a notebook with no notes in it is gone. **Pin** keeps a note at the
+top of this device's list; pins are not shared with your other devices. Delete
+removes a note at once with an undo for ten seconds.
+
+Search looks at titles as you type, then at the text of the notes this device
+has.
+
+| Keys | |
+| :--- | :--- |
+| Ctrl+N | New note |
+| Ctrl+F or Ctrl+K | Search |
+| Ctrl+S | Save now |
+| Ctrl+E | Preview or edit |
+| Ctrl+Shift+P | Pin or unpin |
+| Esc | Leave the editor (narrow window) or clear the search |
+| Up, Down, Enter | Move through the list and open a note |
+
+# [Markdown]($heading.id('markdown'))
+
+The preview shows headings, paragraphs, bold, italic, strikethrough, inline code
+and code blocks, links, bullet, numbered and task lists, quotes and rules.
+Nothing else is interpreted: HTML is shown as the text it is, and images are not
+loaded. Tick a task box in the preview and the line in the note changes.
+
+# [Share notes]($heading.id('sharing'))
+
+Where the system has a share sheet (Android, Windows, macOS), **Share** sends
+the note's text to another app. Everywhere, **Copy text**, **Export…** (a save
+dialog) and **Copy link** are in the note's menu. A `nomadfs://note/…` link
+opens that note in NomadFS on any device of the swarm. On Linux there is no
+system share sheet, so Share is hidden.
+
+Share text or a text file to NomadFS from another app ("Save to NomadFS notes")
+and it becomes a note: the subject, or the first line, is the title. If the node
+isn't running yet, the note waits and is written when it starts.
+
+**Open by code** (the menu next to the search field) opens any text file of the
+swarm by its CID, read only, with a button to save it as a note.
+
+# [Conflicts]($heading.id('conflicts'))
+
+If another device saved the note while you were editing it, nothing is
+overwritten. The editor says who changed it and offers three choices: **See
+their version** (your text waits behind **Restore my draft** until you leave the
+note), **Keep both** (yours is saved as `<title> (from <this device>)`) and
+**Replace with mine**, the one choice that discards their version. If you
+haven't typed anything, a change from another device just reloads the note.
+
+If two devices edit while they can't reach each other, the swarm keeps both: the
+newer edit stays at the note's name and the other becomes `<title> (conflict
+from <device>)`. The list shows that copy under its note with a **Conflict**
+tag, and **Merge into note** shows both side by side with **Use this one**,
+**Append to the note** and **Delete this copy**.
+
+One race is not resolved for you: renaming a note on one device while another
+device edits it leaves the note under both names. Delete the one you don't need.

@@ -32,6 +32,12 @@ The swarm folder's listing is a **manifest**: a map from path (like
 - a **history** of the last 8 versions this one replaced;
 - a `deleted` flag, and the author's nickname (for display).
 
+The history keeps only eight replaced versions, but one device's own edits
+are still ordered by its Lamport clock. A later edit from the same device has
+seen all its earlier edits even after they fall out of that short history.
+This prevents a device that made many offline edits from creating a false
+conflict copy when another device reconnects with an older version.
+
 File bytes are not in the manifest. An entry only names the file's
 [root CID]($link.page('learn/merkle-dag')), and the blocks stay on the device
 that added the file until someone opens it.

@@ -26,6 +26,8 @@ pub fn build(b: *std.Build) void {
         .sql = false,
         .fs_watch = false,
         .media_server = true, // streams video/audio previews with range requests
+        .share = true, // share sheet out, "Save to NomadFS notes" in (notes)
+        .deep_link = true, // nomadfs://note/<path> opens a note on any swarm device
         .video = true, // native player for video previews (more formats, GPU)
         .global_shortcut = false,
         .input = false,
@@ -68,6 +70,8 @@ pub fn build(b: *std.Build) void {
         // Release manifests (latest.json) are signed with the matching
         // private key, kept out of the repository (scripts/release.sh).
         .update_public_key = "fVWa5YivLO9rnCOY27zfM7wBASax5JcA/ZnwAImSSB8=",
+        .share_target = .{ .types = &.{ "text/plain", "text/markdown", "text/*" }, .label = "Save to NomadFS notes" },
+        .url_schemes = &.{"nomadfs"},
         .frontend = .{
             // A static page: embedded as-is, no npm and no dev server.
             .dir = "frontend",
@@ -132,6 +136,13 @@ pub fn build(b: *std.Build) void {
     const run_test = b.addRunArtifact(app_test);
     const test_step = b.step("test", "Run the GUI command tests");
     test_step.dependOn(&run_test.step);
+
+    // zig build test-frontend: the page's own logic (the Markdown renderer,
+    // what the notes list decides), in Node. Needs `node` (22 or newer).
+    const frontend_test = b.addSystemCommand(&.{ "node", "--test", "frontend-test/markdown.test.mjs", "frontend-test/notes-model.test.mjs" });
+    frontend_test.setCwd(b.path("."));
+    const frontend_step = b.step("test-frontend", "Run the page's Node tests (Markdown renderer, notes list logic)");
+    frontend_step.dependOn(&frontend_test.step);
 }
 
 /// The `.version` in a dependency's build.zig.zon.
