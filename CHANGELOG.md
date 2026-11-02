@@ -3,6 +3,35 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.5.0 - 2026-11-02
+
+Notes, rebuilt: Markdown notes that follow you across devices. Devices on 0.4.0 and 0.5.0 work
+together; update them all to see notes the same way everywhere.
+
+### Added
+
+- **Notes.** Notes are Markdown files in the swarm folder's `Notes` folder: a note's title is its
+  file name, and notebooks are folders. The Notes screen has a list with search (titles and text),
+  pinned and notebook filters, and an editor that saves as you type, with a preview, rename, pin,
+  move to a notebook, and delete with undo. Pins belong to each device.
+- **Conflicts you can settle.** When another device changed a note you are editing, a banner offers
+  to keep both, use theirs, or replace it with yours; conflict copies are grouped under their note,
+  with a view to merge them.
+- **Sharing.** Share a note to another app, copy its text or export it; share text from another
+  app into a new note (Android), and open a note from a `nomadfs://note/` link (Copy link).
+- Notes from earlier versions are renamed after their title (`.md`) the first time.
+
+### Changed
+
+- The list updates when another device changes a note, instead of on a timer.
+- Back on phones closes an open menu before it leaves the screen.
+
+### Fixed
+
+- A device's own edits made one after another while it was away no longer turn into conflict copies.
+- A device that lost its swarm folder's state waits for a peer before it edits, so its new edits
+  can't be dropped as older than its own earlier ones.
+
 ## 0.4.0 - 2026-11-01
 
 A clean break in the handshake: **every device needs 0.4.0**. Devices on 0.3.x and 0.4.0 can't
