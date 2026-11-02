@@ -428,3 +428,81 @@ test "backup import: the old folder backups move into the swarm folder" {
     _ = try tmp.dir.statFile(io, "store.backups.migrated", .{});
     try testing.expectEqual(@as(usize, 0), try migrateOldBackups(allocator, io, folder, store, &trust, state_path));
 }
+
+test "backup import: a photo deleted on the phone before any backup copied it is removed on both devices" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = testing.io;
+    const cluster = @import("../cluster/mod.zig");
+    var phone: Fixture = undefined;
+    try phone.open(0x11, "Pixel");
+    defer phone.close();
+    var backup: Fixture = undefined;
+    try backup.open(0x12, "Backup");
+    defer backup.close();
+
+    try phone.tmp.dir.createDirPath(io, "Camera");
+    try phone.tmp.dir.writeFile(io, .{ .sub_path = "Camera/a.jpg", .data = "photo a" });
+    const camera = try std.fs.path.join(allocator, &.{ phone.dir, "Camera" });
+    defer allocator.free(camera);
+    const imported_path = try std.fs.path.join(allocator, &.{ phone.dir, "imported" });
+    defer allocator.free(imported_path);
+    const index = try shares_mod.ShareIndex.create(allocator, io, &phone.store);
+    defer index.destroy();
+    try index.add("Camera", camera);
+    try index.setBackup("Camera", true);
+    const imp = try BackupImport.create(allocator, io, phone.folder, index, &phone.store, "Pixel 8", imported_path, alwaysAllowed);
+    defer imp.destroy();
+    try testing.expectEqual(@as(usize, 1), try imp.run());
+
+    // The backup device learns the entry; the photo is deleted on the phone
+    // (its blocks are gone: the phone answers "not found").
+    const path = "Pixel 8/Camera/a.jpg";
+    try testing.expect(phone.folder.fileInfo(path) != null);
+    const cid = phone.folder.fileInfo(path).?.cid;
+    try syncManifest(backup.folder, phone.folder);
+    try testing.expect(backup.folder.fileInfo(path) != null);
+    try phone.tmp.dir.deleteFile(io, "Camera/a.jpg");
+
+    const FakeNet = cluster.fetcher.FakeNet;
+    const phone_id: @import("../net/id.zig").NodeID = .{ .bytes = [_]u8{0x11} ** 32 };
+    var peers = [_]FakeNet.Peer{.{ .id = phone_id, .has = false }};
+    var net: FakeNet = .{ .peers = &peers };
+    var fetcher = cluster.fetcher.Fetcher.init(&backup.store, net.transport());
+    const provider = backup.folder.keeperProvider();
+    backup.folder.backup_enabled.store(true, .release);
+    backup.folder.lost_span_ms = 0;
+    var go: std.atomic.Value(bool) = .init(true);
+    // Keeper rounds: the copy fails with the phone's "not found" each time.
+    for (0..3) |round| {
+        try testing.expect(backup.folder.fileInfo(path) != null or round == 3);
+        backup.folder.want_round += 1; // what `wants` does at a round's start
+        var want = cluster.keeper.Want.init(cid, &.{phone_id});
+        want.author = phone_id;
+        const outcome: cluster.keeper.Outcome = if (cluster.keeper.copy(allocator, &fetcher, &backup.store, cid, want.holders(), want.author, &go)) |_| .kept else |err| cluster.keeper.failure(err, &want);
+        try testing.expectEqual(cluster.keeper.Outcome.lost, outcome);
+        provider.doneFn(provider.ctx, cid, outcome);
+    }
+    try testing.expect(backup.folder.fileInfo(path) == null);
+
+    // The tombstone reaches the phone, which doesn't import the photo again.
+    try syncManifest(phone.folder, backup.folder);
+    try testing.expect(phone.folder.fileInfo(path) == null);
+    try index.add("Camera", camera); // rescan
+    try testing.expectEqual(@as(usize, 0), try imp.run());
+    try testing.expect(phone.folder.fileInfo(path) == null);
+}
+
+/// Merges `from`'s manifest into `into`'s, as a sync round does.
+fn syncManifest(into: *swarm_mod.SwarmFolder, from: *swarm_mod.SwarmFolder) !void {
+    from.mutex.lock();
+    const bytes = from.manifest.encode(std.testing.allocator) catch |err| {
+        from.mutex.unlock();
+        return err;
+    };
+    from.mutex.unlock();
+    defer std.testing.allocator.free(bytes);
+    into.mutex.lock();
+    defer into.mutex.unlock();
+    _ = try into.manifest.mergeEncoded(bytes);
+}

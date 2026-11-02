@@ -1104,6 +1104,12 @@ function closePreview() {
 // shown over the whole window. Null where the platform has none.
 const nativeVideo = window.oriel.video?.available ? window.oriel.video : null;
 
+/** A read error as the user should see it: a file whose blocks no device
+ * has (a photo deleted on the phone before any backup copied it). */
+function readFailure(err) {
+  return /BlockNotFound/.test(String(err)) ? "This file's data isn't on any device you can reach" : String(err);
+}
+
 async function streamPreview(entry, kind, token) {
   let url;
   try {
@@ -1111,7 +1117,7 @@ async function streamPreview(entry, kind, token) {
     // "Open in another app" works (Android's in-app scheme is WebView-only).
     url = await pv.source.mediaUrl(entry, kind === "video" && !!nativeVideo);
   } catch (err) {
-    if (pv && token === pv.token) previewMessage("file", `Preview failed: ${err}`);
+    if (pv && token === pv.token) previewMessage("file", `Preview failed: ${readFailure(err)}`);
     return;
   }
   if (!pv || token !== pv.token) return;
@@ -1235,7 +1241,7 @@ async function showPreview() {
       msg.querySelector("p").textContent = `Loading ${formatSize(offset)} of ${formatSize(total)}…`;
     }
   } catch (err) {
-    if (pv && token === pv.token) previewMessage("file", `Preview failed: ${err}`);
+    if (pv && token === pv.token) previewMessage("file", `Preview failed: ${readFailure(err)}`);
     return;
   }
 

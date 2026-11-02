@@ -103,7 +103,7 @@ test "cluster: put on one node, get from another, then sync only the diff" {
     defer allocator.free(root2);
 
     var go: std.atomic.Value(bool) = .init(true);
-    const copied = try nomadfs.cluster.keeper.copy(allocator, &bm2.fetcher.?, &engine2, root2[0..32].*, &.{peer1.manager.node_id}, &go);
+    const copied = try nomadfs.cluster.keeper.copy(allocator, &bm2.fetcher.?, &engine2, root2[0..32].*, &.{peer1.manager.node_id}, null, &go);
     try std.testing.expect(copied.blocks >= 2 and copied.blocks <= 4);
 
     // 4. Reads honour the size cap.

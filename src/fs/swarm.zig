@@ -97,6 +97,19 @@ pub const SwarmFolder = struct {
     round_failed: usize = 0,
     unsaved: usize = 0,
     saved_at: i64 = 0,
+    /// Keeper rounds started (counted in `wants`); a root counts once a round.
+    want_round: u64 = 0,
+    /// Files whose data the keeper found on no device (see `lostRoot`); a
+    /// small table, guarded by `backup_mutex`.
+    lost: [max_lost]Lost = undefined,
+    lost_count: usize = 0,
+    /// A backup device removes an entry whose data is on no device after
+    /// this many rounds that found it lost, over at least `lost_span_ms`.
+    lost_rounds: u8 = 3,
+    lost_span_ms: i64 = 10 * std.time.ms_per_min,
+
+    const max_lost = 64;
+    const Lost = struct { root: [32]u8, version: manifest_mod.Version, first_ms: i64, count: u8, round: u64 };
 
     pub fn create(allocator: std.mem.Allocator, io: std.Io, store: *storage.engine.StorageEngine, self_id: NodeID, self_name: []const u8, file_path: []const u8) !*SwarmFolder {
         const self = try allocator.create(SwarmFolder);
@@ -1059,9 +1072,9 @@ pub const SwarmFolder = struct {
         return self.wants(allocator, out, max);
     }
 
-    fn doneErased(ctx: *anyopaque, root: cluster.keeper.Cid, ok: bool) void {
+    fn doneErased(ctx: *anyopaque, root: cluster.keeper.Cid, outcome: cluster.keeper.Outcome) void {
         const self: *SwarmFolder = @ptrCast(@alignCast(ctx));
-        self.kept(root, ok);
+        self.kept(root, outcome);
     }
 
     /// The live files this device should keep and doesn't yet: all of them
@@ -1080,6 +1093,7 @@ pub const SwarmFolder = struct {
             self.backup_unreachable = self.round_failed;
             self.round_failed = 0;
             self.backup_last_round = self.now();
+            self.want_round +%= 1;
         }
         const backup = self.backup_enabled.load(.acquire);
         const copies: u8 = if (self.placement) |p| p.policy.copies() else 1;
@@ -1113,7 +1127,9 @@ pub const SwarmFolder = struct {
                 var more = remote_mod.holdersBuffer();
                 for (holds.forSwarm(author, &more)) |h| addHint(&hints, &n, h, self.self_id);
             } else for (known) |h| addHint(&hints, &n, h, self.self_id);
-            try out.append(allocator, cluster.keeper.Want.init(e.cid, hints[0..n]));
+            var want = cluster.keeper.Want.init(e.cid, hints[0..n]);
+            want.author = author;
+            try out.append(allocator, want);
         }
     }
 
@@ -1132,10 +1148,12 @@ pub const SwarmFolder = struct {
 
     /// A copy finished (or failed); the list is saved now and then, so a
     /// long first backup survives a restart.
-    fn kept(self: *SwarmFolder, root: [32]u8, ok: bool) void {
+    fn kept(self: *SwarmFolder, root: [32]u8, outcome: cluster.keeper.Outcome) void {
+        if (outcome == .lost) return self.lostRoot(root);
         self.backup_mutex.lock();
         defer self.backup_mutex.unlock();
-        if (!ok) {
+        self.forgetLostLocked(root);
+        if (outcome != .kept) {
             self.round_failed += 1;
             return;
         }
@@ -1147,6 +1165,77 @@ pub const SwarmFolder = struct {
             self.unsaved = 0;
             self.saved_at = at;
         }
+    }
+
+    /// A copy of `root` found its data on no device (every holder asked,
+    /// the author among them, answered "not found"; cluster/keeper.zig). A
+    /// photo deleted on the phone before any backup device copied it. The
+    /// entry stays at first ("backup, not mirror"; the data may come back
+    /// with the phone's next sync); only when the same file came out lost in
+    /// `lost_rounds` rounds spanning `lost_span_ms`, and the entry is still
+    /// the version that failed, this backup device deletes it, as any edit,
+    /// so the tombstone reaches every device. The phone's import remembers
+    /// the content, so it isn't added again.
+    fn lostRoot(self: *SwarmFolder, root: [32]u8) void {
+        defer self.flushSave(); // after the unlock: writes outside the lock
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.backup_mutex.lock();
+        defer self.backup_mutex.unlock();
+        self.round_failed += 1;
+        // The entry that wanted it (the same checks `wants` makes).
+        var target: ?Entry = null;
+        if (self.backup_enabled.load(.acquire)) {
+            for (self.manifest.entries.values()) |e| {
+                if (e.deleted or e.kind != .file or !std.mem.eql(u8, &e.cid, &root)) continue;
+                if (std.mem.eql(u8, &e.version.device, &self.self_id.bytes)) continue;
+                target = e;
+                break;
+            }
+        }
+        const entry = target orelse return self.forgetLostLocked(root);
+        const at = sync.monotonicMillis();
+        const row = blk: {
+            for (self.lost[0..self.lost_count]) |*r| if (std.mem.eql(u8, &r.root, &root)) {
+                if (!r.version.eql(entry.version)) { // changed meanwhile: start over
+                    r.* = .{ .root = root, .version = entry.version, .first_ms = at, .count = 1, .round = self.want_round };
+                } else if (r.round != self.want_round) {
+                    r.count +|= 1;
+                    r.round = self.want_round;
+                }
+                break :blk r;
+            };
+            const fresh: Lost = .{ .root = root, .version = entry.version, .first_ms = at, .count = 1, .round = self.want_round };
+            if (self.lost_count < max_lost) {
+                self.lost[self.lost_count] = fresh;
+                self.lost_count += 1;
+                break :blk &self.lost[self.lost_count - 1];
+            }
+            var oldest: usize = 0; // full: the one lost longest ago makes room
+            for (self.lost[0..self.lost_count], 0..) |r, i| if (r.first_ms < self.lost[oldest].first_ms) {
+                oldest = i;
+            };
+            self.lost[oldest] = fresh;
+            break :blk &self.lost[oldest];
+        };
+        if (row.count < self.lost_rounds or at - row.first_ms < self.lost_span_ms) return;
+        // Still the version that failed (we hold the lock that edits).
+        const path = self.allocator.dupe(u8, entry.path) catch return;
+        defer self.allocator.free(path);
+        self.editAllowedLocked() catch return; // the same gate as any edit; tried again next round
+        _ = self.manifest.edit(path, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name) catch return;
+        self.saveLocked() catch return;
+        self.forgetLostLocked(root);
+        std.debug.print("swarm: removed {s}: its data is on no device (deleted before any backup copied it)\n", .{path});
+    }
+
+    /// Caller holds `backup_mutex`.
+    fn forgetLostLocked(self: *SwarmFolder, root: [32]u8) void {
+        for (self.lost[0..self.lost_count], 0..) |r, i| if (std.mem.eql(u8, &r.root, &root)) {
+            self.lost_count -= 1;
+            self.lost[i] = self.lost[self.lost_count];
+            return;
+        };
     }
 
     pub fn backupStatus(self: *SwarmFolder) BackupStatus {
@@ -1186,8 +1275,8 @@ pub const SwarmFolder = struct {
         try self.wants(self.allocator, &todo, std.math.maxInt(usize));
         var go: std.atomic.Value(bool) = .init(true);
         for (todo.items) |*w| {
-            const ok = if (cluster.keeper.copy(self.allocator, fetcher, self.store, w.root, w.holders(), &go)) |_| true else |_| false;
-            self.kept(w.root, ok);
+            const outcome: cluster.keeper.Outcome = if (cluster.keeper.copy(self.allocator, fetcher, self.store, w.root, w.holders(), w.author, &go)) |_| .kept else |err| cluster.keeper.failure(err, w);
+            self.kept(w.root, outcome);
         }
         self.backup_mutex.lock();
         defer self.backup_mutex.unlock();
@@ -1689,4 +1778,158 @@ test "swarm: digestUnder tells whether something under a folder changed" {
     _ = try folder.putBytes("Notes/a.md", "b", note.cid);
     try std.testing.expect(!std.mem.eql(u8, &with_note, &folder.digestUnder("Notes/")));
     try std.testing.expectEqualSlices(u8, &folder.manifest.digest(), &folder.digestUnder(""));
+}
+
+/// Merges `from`'s manifest into `into`'s, as a sync round does.
+fn mergeManifest(into: *SwarmFolder, from: *SwarmFolder) !void {
+    from.mutex.lock();
+    const bytes = from.manifest.encode(std.testing.allocator) catch |err| {
+        from.mutex.unlock();
+        return err;
+    };
+    from.mutex.unlock();
+    defer std.testing.allocator.free(bytes);
+    into.mutex.lock();
+    defer into.mutex.unlock();
+    _ = try into.manifest.mergeEncoded(bytes);
+}
+
+/// One keeper round that found `root` with `outcome`.
+fn lostRound(folder: *SwarmFolder, root: [32]u8, outcome: cluster.keeper.Outcome) void {
+    folder.want_round += 1;
+    folder.kept(root, outcome);
+}
+
+fn liveAt(folder: *SwarmFolder, path: []const u8) bool {
+    folder.mutex.lock();
+    defer folder.mutex.unlock();
+    const e = folder.manifest.get(path) orelse return false;
+    return !e.deleted;
+}
+
+test "swarm: a file lost in three rounds over the time threshold is removed by a backup device" {
+    var phone: TestFolder = undefined;
+    try phone.open(0x31, "Phone");
+    defer phone.close();
+    var backup: TestFolder = undefined;
+    try backup.open(0x32, "Backup");
+    defer backup.close();
+    const b = backup.folder;
+    b.backup_enabled.store(true, .release);
+    b.lost_span_ms = 0;
+
+    const put = try phone.folder.putBytes("Phone/Camera/a.jpg", "photo a", null);
+    try mergeManifest(b, phone.folder);
+    try std.testing.expect(liveAt(b, "Phone/Camera/a.jpg"));
+    lostRound(b, put.cid, .lost);
+    lostRound(b, put.cid, .lost);
+    try std.testing.expect(liveAt(b, "Phone/Camera/a.jpg"));
+    lostRound(b, put.cid, .lost);
+    try std.testing.expect(!liveAt(b, "Phone/Camera/a.jpg"));
+    // A tombstone made by the backup device, so it reaches the others.
+    const e = b.manifest.get("Phone/Camera/a.jpg").?;
+    try std.testing.expect(e.deleted and std.mem.eql(u8, &e.version.device, &b.self_id.bytes));
+    try mergeManifest(phone.folder, b);
+    try std.testing.expect(!liveAt(phone.folder, "Phone/Camera/a.jpg"));
+    try std.testing.expectEqual(@as(usize, 0), b.lost_count);
+}
+
+test "swarm: a lost file stays under the time threshold, with fewer rounds, or on a device that isn't a backup" {
+    var phone: TestFolder = undefined;
+    try phone.open(0x33, "Phone");
+    defer phone.close();
+    var backup: TestFolder = undefined;
+    try backup.open(0x34, "Backup");
+    defer backup.close();
+    const b = backup.folder;
+    b.backup_enabled.store(true, .release);
+
+    const put = try phone.folder.putBytes("Phone/Camera/a.jpg", "photo a", null);
+    try mergeManifest(b, phone.folder);
+    // Default threshold (10 minutes): many rounds in a moment change nothing.
+    for (0..5) |_| lostRound(b, put.cid, .lost);
+    try std.testing.expect(liveAt(b, "Phone/Camera/a.jpg"));
+    // Time is there but only two rounds; one root counts once per round.
+    b.lost_span_ms = 0;
+    b.lost_count = 0;
+    lostRound(b, put.cid, .lost);
+    b.kept(put.cid, .lost); // same round again (a second entry with this content)
+    lostRound(b, put.cid, .lost);
+    try std.testing.expect(liveAt(b, "Phone/Camera/a.jpg"));
+    // Not a backup device: never.
+    b.backup_enabled.store(false, .release);
+    for (0..4) |_| lostRound(b, put.cid, .lost);
+    try std.testing.expect(liveAt(b, "Phone/Camera/a.jpg"));
+}
+
+test "swarm: kept or failed in between starts the lost count over" {
+    var phone: TestFolder = undefined;
+    try phone.open(0x35, "Phone");
+    defer phone.close();
+    var backup: TestFolder = undefined;
+    try backup.open(0x36, "Backup");
+    defer backup.close();
+    const b = backup.folder;
+    b.backup_enabled.store(true, .release);
+    b.lost_span_ms = 0;
+
+    const put = try phone.folder.putBytes("Phone/Camera/a.jpg", "photo a", null);
+    try mergeManifest(b, phone.folder);
+    lostRound(b, put.cid, .lost);
+    lostRound(b, put.cid, .lost);
+    lostRound(b, put.cid, .failed); // the phone was unreachable once
+    lostRound(b, put.cid, .lost);
+    lostRound(b, put.cid, .lost);
+    try std.testing.expect(liveAt(b, "Phone/Camera/a.jpg"));
+    lostRound(b, put.cid, .lost);
+    try std.testing.expect(!liveAt(b, "Phone/Camera/a.jpg"));
+}
+
+test "swarm: an entry that changed while it was lost is kept" {
+    var phone: TestFolder = undefined;
+    try phone.open(0x37, "Phone");
+    defer phone.close();
+    var backup: TestFolder = undefined;
+    try backup.open(0x38, "Backup");
+    defer backup.close();
+    const b = backup.folder;
+    b.backup_enabled.store(true, .release);
+    b.lost_span_ms = 0;
+
+    const old = try phone.folder.putBytes("Phone/Camera/a.jpg", "photo a", null);
+    try mergeManifest(b, phone.folder);
+    lostRound(b, old.cid, .lost);
+    lostRound(b, old.cid, .lost);
+    // The phone edits the file; the old content is no entry any more.
+    const new = try phone.folder.putBytes("Phone/Camera/a.jpg", "photo a, edited", old.cid);
+    try mergeManifest(b, phone.folder);
+    lostRound(b, old.cid, .lost);
+    try std.testing.expect(liveAt(b, "Phone/Camera/a.jpg"));
+    // The new content starts its own count.
+    lostRound(b, new.cid, .lost);
+    lostRound(b, new.cid, .lost);
+    try std.testing.expect(liveAt(b, "Phone/Camera/a.jpg"));
+    lostRound(b, new.cid, .lost);
+    try std.testing.expect(!liveAt(b, "Phone/Camera/a.jpg"));
+}
+
+test "swarm: same content under a new version restarts the count" {
+    var phone: TestFolder = undefined;
+    try phone.open(0x39, "Phone");
+    defer phone.close();
+    var backup: TestFolder = undefined;
+    try backup.open(0x3a, "Backup");
+    defer backup.close();
+    const b = backup.folder;
+    b.backup_enabled.store(true, .release);
+    b.lost_span_ms = 0;
+
+    const put = try phone.folder.putBytes("Phone/Camera/a.jpg", "photo a", null);
+    try mergeManifest(b, phone.folder);
+    lostRound(b, put.cid, .lost);
+    lostRound(b, put.cid, .lost);
+    try phone.folder.setMtime("Phone/Camera/a.jpg", 12345); // a new version, same content
+    try mergeManifest(b, phone.folder);
+    lostRound(b, put.cid, .lost);
+    try std.testing.expect(liveAt(b, "Phone/Camera/a.jpg"));
 }

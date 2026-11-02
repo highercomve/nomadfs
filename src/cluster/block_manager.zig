@@ -130,7 +130,7 @@ pub const BlockManager = struct {
         if (n == 0) return error.NoProvider;
 
         var go: std.atomic.Value(bool) = .init(true);
-        _ = try keeper_mod.copy(self.allocator, fetcher, store, cid, holders[0..n], &go);
+        _ = try keeper_mod.copy(self.allocator, fetcher, store, cid, holders[0..n], null, &go);
     }
 
     fn addHolder(out: *[fetcher_mod.max_holders]NodeID, n: *usize, id: NodeID) void {

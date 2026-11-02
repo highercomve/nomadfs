@@ -7,6 +7,21 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.5.2 - 2026-11-02
+
+Devices on 0.4.0 and later work together. Only swarm backup devices need 0.5.2 for the fix below.
+
+## Fixed
+
+- A photo deleted on the phone before any backup device copied it stayed in the swarm folder for
+  good: it failed to open on every device ("BlockNotFound") and the backup device retried it every
+  minute. A backup device now removes such an entry, and the removal reaches every device, once the
+  phone and every other device it can reach have said for 10 minutes that they don't have the data.
+  A photo a backup device already copied always stays ("backup, not mirror"), a device that can't be
+  reached doesn't hold the cleanup back, and a phone that can't be reached never loses anything.
+- Opening a file whose data isn't on any device you can reach says so, instead of "Error:
+  BlockNotFound".
+
 # 0.5.1 - 2026-11-02
 
 A fix for 0.5.0. Devices on 0.4.0, 0.5.0 and 0.5.1 work together.

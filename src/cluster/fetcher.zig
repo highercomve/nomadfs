@@ -96,6 +96,17 @@ pub const Fetcher = struct {
     /// cache. `root` is the file it belongs to (misses are remembered per
     /// file). Rates are measured on leaf blocks (file data) only.
     pub fn fetch(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, allocator: std.mem.Allocator) ![]u8 {
+        return self.fetchVerdict(root, cid, holders, allocator, null, null);
+    }
+
+    /// Like `fetch`; when it fails, `lost` (if given) tells whether the block
+    /// is on none of the devices that can be asked now: `author` answered
+    /// "not found" (now, or a moment ago), and every other holder did too or
+    /// can't be reached (offline, refusing, backing off). Unreachable devices
+    /// don't count, so one that is away for days doesn't hold the verdict
+    /// back; a reachable one that answers anything but "not found" does.
+    pub fn fetchVerdict(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, allocator: std.mem.Allocator, author: ?NodeID, lost: ?*bool) ![]u8 {
+        if (lost) |l| l.* = false;
         if (try self.store.get(cid, allocator)) |block| {
             self.count(.local, 0);
             return @constCast(block.data);
@@ -103,6 +114,8 @@ pub const Fetcher = struct {
         const list = holders[0..@min(holders.len, max_holders)];
         var tried = [_]bool{false} ** max_holders;
         var last: anyerror = error.NoHolder;
+        var any_failed = false;
+        var not_found = [_]bool{false} ** max_holders;
         while (self.pick(root, cid, list, &tried)) |i| {
             tried[i] = true;
             const peer = list[i];
@@ -112,11 +125,13 @@ pub const Fetcher = struct {
             const maybe = result catch |err| {
                 self.done(peer, root, cid, .{ .failed = err });
                 last = err;
+                if (!unreachable_error(err)) any_failed = true;
                 continue;
             };
             const bytes = maybe orelse {
                 self.done(peer, root, cid, .not_found);
                 last = error.BlockNotFound;
+                not_found[i] = true;
                 continue;
             };
             // put() checks the bytes hash to `cid` before keeping them.
@@ -124,12 +139,37 @@ pub const Fetcher = struct {
                 allocator.free(bytes);
                 self.done(peer, root, cid, .{ .failed = err });
                 last = err;
+                any_failed = true;
                 continue;
             };
             self.done(peer, root, cid, .{ .served = .{ .len = bytes.len, .ms = elapsed, .leaf = bytes.len > 0 and bytes[0] == leaf_tag } });
             return bytes;
         }
+        if (lost) |l| l.* = !any_failed and author != null and self.authorMissed(root, cid, list, &tried, &not_found, author.?);
         return last;
+    }
+
+    /// The author is among `holders` and said "not found": in this fetch, or
+    /// a moment ago (skipped for it now).
+    fn authorMissed(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, tried: *const [max_holders]bool, not_found: *const [max_holders]bool, author: NodeID) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now = sync.monotonicMillis();
+        for (holders, 0..) |peer, i| {
+            if (!peer.eql(author)) continue;
+            if (tried[i]) return not_found[i];
+            return self.missedLocked(peer, root, cid, now);
+        }
+        return false;
+    }
+
+    /// Errors that mean the device couldn't be reached at all, as opposed
+    /// to one that answered with a failure.
+    fn unreachable_error(err: anyerror) bool {
+        return switch (err) {
+            error.ConnectionRefused, error.ConnectionTimedOut, error.NoRelay, error.PeerIdMismatch, error.NetworkUnreachable, error.HostUnreachable, error.PeerDown, error.ConnectionResetByPeer, error.BrokenPipe, error.NoHolder, error.Timeout => true,
+            else => false,
+        };
     }
 
     const Outcome = union(enum) {
@@ -335,13 +375,14 @@ pub const Fetcher = struct {
 
 const testing = std.testing;
 
-const FakeNet = struct {
-    /// Per peer: has the blocks, delay in ms, fails to connect.
-    const Peer = struct { id: NodeID, has: bool = true, delay_ms: u64 = 0, down: bool = false, served: std.atomic.Value(u32) = .init(0) };
+pub const FakeNet = struct {
+    /// Per peer: has the blocks, delay in ms, fails to connect, answers
+    /// with an error (reachable but failing).
+    pub const Peer = struct { id: NodeID, has: bool = true, delay_ms: u64 = 0, down: bool = false, broken: bool = false, served: std.atomic.Value(u32) = .init(0) };
     peers: []Peer,
     blocks: std.AutoHashMapUnmanaged(Cid, []const u8) = .empty,
 
-    fn transport(self: *FakeNet) Transport {
+    pub fn transport(self: *FakeNet) Transport {
         return .{ .ctx = self, .getFn = get };
     }
 
@@ -349,6 +390,7 @@ const FakeNet = struct {
         const self: *FakeNet = @ptrCast(@alignCast(ctx));
         for (self.peers) |*p| if (p.id.eql(peer)) {
             if (p.down) return error.ConnectionRefused;
+            if (p.broken) return error.InvalidResponse;
             if (p.delay_ms > 0) sync.sleep(p.delay_ms * std.time.ns_per_ms);
             if (!p.has) return null;
             const data = self.blocks.get(cid.*) orelse return null;
@@ -474,4 +516,78 @@ test "fetcher: concurrent fetches spread across holders, more to the faster one"
     // Every holder served some; the fast ones most of it.
     try testing.expect(peers[0].served.load(.monotonic) > 0 and peers[1].served.load(.monotonic) > 0);
     try testing.expect(fast > slow * 3);
+}
+
+test "fetcher: lost when the author and every reachable holder said not found" {
+    const path = "test_fetcher_lost";
+    var store = try testStore(path);
+    defer {
+        store.deinit();
+        std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), path) catch {};
+    }
+    var peers = [_]FakeNet.Peer{
+        .{ .id = idOf(1), .has = false }, // the author
+        .{ .id = idOf(2), .has = false },
+        .{ .id = idOf(3), .down = true }, // away: doesn't count
+        .{ .id = idOf(4), .broken = true }, // reachable, answers an error
+    };
+    var net: FakeNet = .{ .peers = &peers };
+    var f = Fetcher.init(&store, net.transport());
+    const root = [_]u8{9} ** 32;
+    const cid = [_]u8{7} ** 32;
+    const author = idOf(1);
+    var lost = false;
+    try testing.expectError(error.BlockNotFound, f.fetchVerdict(&root, &cid, &.{ idOf(1), idOf(2) }, testing.allocator, author, &lost));
+    try testing.expect(lost);
+    // Asked again right away: both are skipped for their recent miss; still lost.
+    _ = f.fetchVerdict(&root, &cid, &.{ idOf(1), idOf(2) }, testing.allocator, author, &lost) catch {};
+    try testing.expect(lost);
+    // A device that can't be reached doesn't hold the verdict back, now or
+    // while it is backing off.
+    _ = f.fetchVerdict(&root, &cid, &.{ idOf(1), idOf(2), idOf(3) }, testing.allocator, author, &lost) catch {};
+    try testing.expect(lost);
+    _ = f.fetchVerdict(&root, &cid, &.{ idOf(1), idOf(2), idOf(3) }, testing.allocator, author, &lost) catch {};
+    try testing.expect(lost);
+    // No author given, or the author not among the holders: never lost.
+    _ = f.fetchVerdict(&root, &cid, &.{ idOf(1), idOf(2) }, testing.allocator, null, &lost) catch {};
+    try testing.expect(!lost);
+    _ = f.fetchVerdict(&root, &cid, &.{idOf(2)}, testing.allocator, author, &lost) catch {};
+    try testing.expect(!lost);
+    // No holder at all: not lost.
+    try testing.expectError(error.NoHolder, f.fetchVerdict(&root, &cid, &.{}, testing.allocator, author, &lost));
+    try testing.expect(!lost);
+}
+
+test "fetcher: a reachable holder that answers with an error keeps it from being lost" {
+    const path = "test_fetcher_lost_broken";
+    var store = try testStore(path);
+    defer {
+        store.deinit();
+        std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), path) catch {};
+    }
+    var peers = [_]FakeNet.Peer{ .{ .id = idOf(1), .has = false }, .{ .id = idOf(4), .broken = true } };
+    var net: FakeNet = .{ .peers = &peers };
+    var f = Fetcher.init(&store, net.transport());
+    const root = [_]u8{9} ** 32;
+    const cid = [_]u8{7} ** 32;
+    var lost = true;
+    _ = f.fetchVerdict(&root, &cid, &.{ idOf(1), idOf(4) }, testing.allocator, idOf(1), &lost) catch {};
+    try testing.expect(!lost);
+}
+
+test "fetcher: an author that can't be reached never makes it lost" {
+    const path = "test_fetcher_lost_author_away";
+    var store = try testStore(path);
+    defer {
+        store.deinit();
+        std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), path) catch {};
+    }
+    var peers = [_]FakeNet.Peer{ .{ .id = idOf(1), .down = true }, .{ .id = idOf(2), .has = false } };
+    var net: FakeNet = .{ .peers = &peers };
+    var f = Fetcher.init(&store, net.transport());
+    const root = [_]u8{9} ** 32;
+    const cid = [_]u8{7} ** 32;
+    var lost = true;
+    _ = f.fetchVerdict(&root, &cid, &.{ idOf(1), idOf(2) }, testing.allocator, idOf(1), &lost) catch {};
+    try testing.expect(!lost);
 }

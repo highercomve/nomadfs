@@ -26,6 +26,9 @@ pub const Want = struct {
     root: Cid,
     hints: [fetcher_mod.max_holders]NodeID = undefined,
     hint_count: u8 = 0,
+    /// The device that wrote the file, if the provider knows it (it is
+    /// normally among the hints). Needed for `Outcome.lost`.
+    author: ?NodeID = null,
 
     pub fn holders(self: *const Want) []const NodeID {
         return self.hints[0..self.hint_count];
@@ -40,14 +43,34 @@ pub const Want = struct {
     }
 };
 
+/// How copying one wanted file ended.
+pub const Outcome = enum {
+    /// Held in full.
+    kept,
+    /// Couldn't be copied this round (a holder unreachable, cancelled, ...).
+    failed,
+    /// A block was answered "not found" by EVERY holder asked, none failing
+    /// or unreachable, and the file's author was among them: the data is on
+    /// no device that could be asked. `fs/` decides what that means.
+    lost,
+};
+
+/// The outcome of a copy that failed with `err` for `want`.
+pub fn failure(err: anyerror, want: *const Want) Outcome {
+    if (err != error.LostEverywhere) return .failed;
+    const author = want.author orelse return .failed;
+    for (want.holders()) |h| if (h.eql(author)) return .lost;
+    return .failed;
+}
+
 /// What `fs/` wants held. Both functions run on the keeper's thread.
 pub const Provider = struct {
     ctx: *anyopaque,
     /// Appends the files this device should hold and doesn't yet (as far as
     /// the provider knows), at most `max` of them.
     wantsFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, out: *std.ArrayList(Want), max: usize) anyerror!void,
-    /// `root` is now held in full (`ok`), or couldn't be copied this round.
-    doneFn: *const fn (ctx: *anyopaque, root: Cid, ok: bool) void,
+    /// How the copy of `root` ended this round.
+    doneFn: *const fn (ctx: *anyopaque, root: Cid, outcome: Outcome) void,
 };
 
 pub const Copied = struct { blocks: usize, bytes: u64 };
@@ -62,9 +85,10 @@ const wants_per_round = 64;
 
 /// Copies the whole DAG `root` into `store`, kept (pinned), through
 /// `fetcher` from `hints`. Stops with error.Cancelled when `keep_going`
-/// turns false.
-pub fn copy(allocator: std.mem.Allocator, fetcher: *fetcher_mod.Fetcher, store: *storage.engine.StorageEngine, root: Cid, hints: []const NodeID, keep_going: *const std.atomic.Value(bool)) !Copied {
-    var job: CopyJob = .{ .allocator = allocator, .fetcher = fetcher, .store = store, .root = root, .hints = hints, .keep_going = keep_going };
+/// turns false; with error.LostEverywhere when a block is on none of the
+/// hints (all answered "not found"; see `failure`).
+pub fn copy(allocator: std.mem.Allocator, fetcher: *fetcher_mod.Fetcher, store: *storage.engine.StorageEngine, root: Cid, hints: []const NodeID, author: ?NodeID, keep_going: *const std.atomic.Value(bool)) !Copied {
+    var job: CopyJob = .{ .allocator = allocator, .fetcher = fetcher, .store = store, .root = root, .hints = hints, .author = author, .keep_going = keep_going };
     defer {
         job.stack.deinit(allocator);
         job.visited.deinit(allocator);
@@ -85,6 +109,8 @@ const CopyJob = struct {
     store: *storage.engine.StorageEngine,
     root: Cid,
     hints: []const NodeID,
+    /// Whose "not found" makes a miss final (see Fetcher.fetchVerdict).
+    author: ?NodeID,
     keep_going: *const std.atomic.Value(bool),
 
     mutex: sync.Mutex = .{},
@@ -128,7 +154,8 @@ const CopyJob = struct {
         // File data already here: keep it, no read needed.
         if (self.store.heldLeaf(cid)) return self.store.pin(cid);
         const was_here = self.store.has(cid);
-        const data = try self.fetcher.fetch(&self.root, cid, self.hints, self.allocator);
+        var lost = false;
+        const data = self.fetcher.fetchVerdict(&self.root, cid, self.hints, self.allocator, self.author, &lost) catch |err| return if (lost) error.LostEverywhere else err;
         defer self.allocator.free(data);
         try self.store.pin(cid);
         if (!was_here) {
@@ -220,15 +247,15 @@ pub const Keeper = struct {
             try p.wantsFn(p.ctx, self.allocator, &wants, wants_per_round);
             for (wants.items) |*w| {
                 if (!self.worker.isRunning()) return held;
-                const ok = if (copy(self.allocator, self.fetcher, self.store, w.root, w.holders(), &self.worker.running)) |c| blk: {
+                const outcome: Outcome = if (copy(self.allocator, self.fetcher, self.store, w.root, w.holders(), w.author, &self.worker.running)) |c| blk: {
                     if (c.blocks > 0) std.debug.print("keeper: kept {x} ({d} blocks, {d} KiB fetched)\n", .{ w.root[0..4], c.blocks, c.bytes >> 10 });
-                    break :blk true;
+                    break :blk .kept;
                 } else |err| blk: {
                     if (err != error.Cancelled) std.debug.print("keeper: {x} not kept: {any}\n", .{ w.root[0..4], err });
-                    break :blk false;
+                    break :blk failure(err, w);
                 };
-                if (ok) held += 1;
-                p.doneFn(p.ctx, w.root, ok);
+                if (outcome == .kept) held += 1;
+                p.doneFn(p.ctx, w.root, outcome);
             }
         }
         return held;
@@ -303,14 +330,14 @@ test "keeper: copies a whole file, kept, and a second copy fetches nothing" {
     var net: StoreNet = .{ .from = &a, .peer = peer };
     var f = fetcher_mod.Fetcher.init(&b, net.transport());
     var go: std.atomic.Value(bool) = .init(true);
-    const c = try copy(testing.allocator, &f, &b, root, &.{peer}, &go);
+    const c = try copy(testing.allocator, &f, &b, root, &.{peer}, null, &go);
     try testing.expect(c.blocks > 3);
     try testing.expect(try walk.isComplete(testing.allocator, &b, &root));
     try testing.expectEqual(storage.engine.StorageEngine.Where.kept, b.locate(&root));
 
     // Held already: nothing fetched.
     const before = net.served.load(.monotonic);
-    const again = try copy(testing.allocator, &f, &b, root, &.{peer}, &go);
+    const again = try copy(testing.allocator, &f, &b, root, &.{peer}, null, &go);
     try testing.expectEqual(@as(usize, 0), again.blocks);
     try testing.expectEqual(before, net.served.load(.monotonic));
 
@@ -322,7 +349,7 @@ test "keeper: copies a whole file, kept, and a second copy fetches nothing" {
     }
     var f2 = fetcher_mod.Fetcher.init(&c_path_store, net.transport());
     var stop: std.atomic.Value(bool) = .init(false);
-    try testing.expectError(error.Cancelled, copy(testing.allocator, &f2, &c_path_store, root, &.{peer}, &stop));
+    try testing.expectError(error.Cancelled, copy(testing.allocator, &f2, &c_path_store, root, &.{peer}, null, &stop));
 }
 
 test "keeper: a round copies each provider's wants and reports them" {
@@ -353,13 +380,18 @@ test "keeper: a round copies each provider's wants and reports them" {
         peer: NodeID,
         ok: usize = 0,
         failed: usize = 0,
+        lost: usize = 0,
         fn wants(ctx: *anyopaque, allocator: std.mem.Allocator, out: *std.ArrayList(Want), max: usize) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             for (self.roots[0..@min(max, 2)]) |r| try out.append(allocator, Want.init(r, &.{self.peer}));
         }
-        fn done(ctx: *anyopaque, _: Cid, ok: bool) void {
+        fn done(ctx: *anyopaque, _: Cid, outcome: Outcome) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (ok) self.ok += 1 else self.failed += 1;
+            switch (outcome) {
+                .kept => self.ok += 1,
+                .failed => self.failed += 1,
+                .lost => self.lost += 1,
+            }
         }
     };
     var w: Wants = .{ .roots = .{ root, missing }, .peer = peer };
@@ -370,4 +402,55 @@ test "keeper: a round copies each provider's wants and reports them" {
     try testing.expectEqual(@as(usize, 1), w.ok);
     try testing.expectEqual(@as(usize, 1), w.failed);
     try testing.expectEqual(storage.engine.StorageEngine.Where.kept, b.locate(&root));
+}
+
+/// Runs one keeper round for `want` over a fake network where `peers`
+/// answer: returns the outcome the provider heard.
+fn lostRound(path: []const u8, net: *fetcher_mod.FakeNet, hints: []const NodeID, author: ?NodeID) !Outcome {
+    var b = try freshStore(path);
+    defer {
+        b.deinit();
+        cleanup(path);
+    }
+    const missing: Cid = [_]u8{9} ** 32;
+    const Wants = struct {
+        want: Want,
+        got: ?Outcome = null,
+        fn wants(ctx: *anyopaque, allocator: std.mem.Allocator, out: *std.ArrayList(Want), _: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try out.append(allocator, self.want);
+        }
+        fn done(ctx: *anyopaque, _: Cid, outcome: Outcome) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.got = outcome;
+        }
+    };
+    var w: Wants = .{ .want = Want.init(missing, hints) };
+    w.want.author = author;
+    var f = fetcher_mod.Fetcher.init(&b, net.transport());
+    var k = Keeper.init(testing.allocator, &f, &b);
+    try k.register(.{ .ctx = &w, .wantsFn = Wants.wants, .doneFn = Wants.done });
+    k.worker.running.store(true, .release);
+    _ = try k.round();
+    return w.got.?;
+}
+
+test "keeper: lost when the author and every reachable holder say not found" {
+    const FakeNet = fetcher_mod.FakeNet;
+    const author = NodeID{ .bytes = [_]u8{1} ** 32 };
+    const other = NodeID{ .bytes = [_]u8{2} ** 32 };
+    const down = NodeID{ .bytes = [_]u8{3} ** 32 };
+    var peers = [_]FakeNet.Peer{ .{ .id = author, .has = false }, .{ .id = other, .has = false }, .{ .id = down, .down = true } };
+    var net: FakeNet = .{ .peers = &peers };
+
+    try testing.expectEqual(Outcome.lost, try lostRound("test_keeper_lost_a", &net, &.{ author, other }, author));
+    // A holder that can't be reached doesn't count: still lost.
+    try testing.expectEqual(Outcome.lost, try lostRound("test_keeper_lost_b", &net, &.{ author, other, down }, author));
+    // The author can't be reached: never lost.
+    var away = [_]FakeNet.Peer{ .{ .id = author, .down = true }, .{ .id = other, .has = false } };
+    var net_away: FakeNet = .{ .peers = &away };
+    try testing.expectEqual(Outcome.failed, try lostRound("test_keeper_lost_e", &net_away, &.{ author, other }, author));
+    // The author isn't among the holders asked: failed.
+    try testing.expectEqual(Outcome.failed, try lostRound("test_keeper_lost_c", &net, &.{other}, author));
+    try testing.expectEqual(Outcome.failed, try lostRound("test_keeper_lost_d", &net, &.{ author, other }, null));
 }

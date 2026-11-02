@@ -44,6 +44,23 @@ stack:
   waits for a whole copy;
 * at most 2²⁰ blocks per DAG.
 
+### Data that is nowhere
+
+A copy ends **kept**, **failed** or **lost**. The keeper asks the whole swarm: the author, the
+devices placement or a backup role names, then every other known device (a reader's cache counts).
+Lost means the author (`Want.author`) answered "not found" (now, or a moment ago) and so did every
+other device that could be reached (`fetchVerdict`); a device that can't be reached (offline,
+refusing, backing off) doesn't count, so one that is away for days doesn't hold cleanup back, while
+a reachable one that answers anything but "not found" does. Nothing new on the network, only what
+the fetcher already saw per device. The keeper only reports it. The swarm
+folder decides (`src/fs/swarm.zig`, `lostRoot`): a photo deleted on the phone before any backup
+device copied it stays "backup, not mirror" at first, but when the same file comes out lost on 3
+rounds spanning 10 minutes and the entry is still the version that failed, the backup device deletes
+it with a normal edit, so the tombstone reaches every device and the phone's import, which
+remembers what it brought in, does not add it again. Any kept or failed round in between starts the
+count over, and an author that can't be reached never makes a file lost, so a phone that is merely
+offline never loses its photos.
+
 ## 4. Folder backup
 
 Folder backup still polls members' shares replies on its own 60 s round: deciding which members'
