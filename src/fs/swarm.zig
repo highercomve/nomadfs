@@ -225,11 +225,31 @@ pub const SwarmFolder = struct {
     /// Caller holds `mutex`. Local edits are refused while the folder waits
     /// for its first pull (see `awaiting_pull`).
     fn editAllowedLocked(self: *SwarmFolder) !void {
-        if (self.awaiting_pull) {
-            if (sync.monotonicMillis() - self.awaiting_since_ms < self.alone_grace_ms) return error.NotSynced;
-            self.awaiting_pull = false; // nobody to pull from: this device is on its own
-        }
+        if (self.awaitingLocked()) return error.NotSynced;
         try self.reserveClockLocked();
+    }
+
+    /// Caller holds `mutex`. Whether local edits must still wait for the
+    /// first pull: a device that trusts no other device has nobody whose
+    /// copy could hold its older versions, and one that waited
+    /// `alone_grace_ms` without reaching anyone goes ahead on its own.
+    fn awaitingLocked(self: *SwarmFolder) bool {
+        if (!self.awaiting_pull) return false;
+        if (self.nobodyToPullFrom() or sync.monotonicMillis() - self.awaiting_since_ms >= self.alone_grace_ms) {
+            self.awaiting_pull = false;
+            return false;
+        }
+        return true;
+    }
+
+    /// No other device is trusted (a first device, or one not paired yet).
+    /// Without placement wired (tests), membership is unknown: keep waiting.
+    fn nobodyToPullFrom(self: *const SwarmFolder) bool {
+        const p = self.placement orelse return false;
+        for (p.trust.list()) |e| {
+            if (!std.mem.eql(u8, &e.device_id.bytes, &p.self_device.bytes)) return false;
+        }
+        return true;
     }
 
     /// Writes the manifest if it changed and the last write was a second
@@ -373,7 +393,7 @@ pub const SwarmFolder = struct {
         {
             self.mutex.lock();
             defer self.mutex.unlock();
-            if (self.awaiting_pull and sync.monotonicMillis() - self.awaiting_since_ms < self.alone_grace_ms) return error.NotSynced;
+            if (self.awaitingLocked()) return error.NotSynced;
             if (self.folderAtLocked(path)) return error.IsDirectory;
             try self.checkBaseLocked(path, base);
         }
@@ -1567,6 +1587,31 @@ test "swarm: a device that is truly alone may edit after the grace period" {
     folder.awaiting_since_ms -= folder.alone_grace_ms + 1;
     _ = try folder.putBytes("Notes/a.md", "a", null);
     try std.testing.expect(!folder.awaiting_pull);
+}
+
+test "swarm: a device that trusts no other device doesn't wait for a pull" {
+    var t: TestFolder = undefined;
+    try t.open(0x2b, "Desk");
+    defer t.close();
+    const path = "test_swarm_alone_trust.store";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var trust = try device.trust.Store.load(std.testing.allocator, path, null);
+    defer trust.deinit();
+    var policy: device.policy.Policy = undefined; // not read by the edit gate
+    const folder = t.folder;
+    folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = folder.self_id };
+    defer folder.placement = null;
+    folder.awaiting_pull = true;
+    folder.awaiting_since_ms = sync.monotonicMillis();
+    _ = try folder.putBytes("Notes/a.md", "a", null); // first device: nobody to pull from
+    try std.testing.expect(!folder.awaiting_pull);
+
+    // Once another device is trusted, a lost manifest waits for it again.
+    _ = try trust.upsert([_]u8{7} ** 32, [_]u8{8} ** 32, "Phone", 1);
+    folder.awaiting_pull = true;
+    folder.awaiting_since_ms = sync.monotonicMillis();
+    try std.testing.expectError(error.NotSynced, folder.putBytes("Notes/b.md", "b", null));
 }
 
 test "swarm: the clock never goes back when the manifest file is lost" {

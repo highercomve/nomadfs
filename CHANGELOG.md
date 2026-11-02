@@ -3,6 +3,16 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.5.1 - 2026-11-02
+
+A fix for 0.5.0. Devices on 0.4.0, 0.5.0 and 0.5.1 work together.
+
+### Fixed
+
+- A device that isn't paired with any other device yet (the first one, or a fresh install) couldn't
+  add, save or move anything in the swarm folder for its first minute in 0.5.0; it got an error. Only a
+  device whose swarm folder state was lost, and that has other devices to pull it from, waits for them.
+
 ## 0.5.0 - 2026-11-02
 
 Notes, rebuilt: Markdown notes that follow you across devices. Devices on 0.4.0 and 0.5.0 work
