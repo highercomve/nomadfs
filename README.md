@@ -51,6 +51,7 @@ irm https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/install.p
 - **Edit precedence**: Concurrent edits always win over deletes. Deletes propagate as tombstones.
 - **Distributed content fetching**: File content remains on the author's device and is pulled on demand by peers, after which any caching peer can serve it.
 - **Backup devices**: A desktop or server with `swarm_backup = true` (`--swarm-backup`, or Settings → Swarm backup in the app) keeps a copy of every file, so the folder stays readable while the device that added a file is offline.
+- **No mount needed**: the running node (the app or a service) serves the swarm folder to local programs over a small HTTP API on `127.0.0.1`, under a random token it writes to `<device dir>/api.json` (mode 0600, removed on exit). Only your user can call it: the token file is yours alone, and on Linux and macOS the node also checks that each connection comes from the node's user. Every file carries its content id as an ETag; `PUT` with `If-Match: "<etag>"` or `If-None-Match: *` and `DELETE` with `If-Match` are conditional, and answer 412 when the file changed. `nomadfs swarm` is its command-line client, and [Locket](https://github.com/highercomve/locket) uses it to share a secrets vault between your devices.
 
 ### Desktop Mount (Linux FUSE)
 - **Direct kernel protocol**: Speaks the FUSE kernel protocol on `/dev/fuse` directly (no `libfuse`), mounting unprivileged through `fusermount3`.
@@ -114,6 +115,18 @@ nomadfs --devices
 
 # Revoke a device's trust
 nomadfs --revoke <device-id-or-fingerprint>
+```
+
+The swarm folder from the command line, through the running node (no mount):
+
+```bash
+nomadfs swarm status                      # the swarm folder's state
+nomadfs swarm ls [dir]                    # names, sizes and etags (JSON)
+nomadfs swarm get notes/todo.md           # a file, on stdout
+nomadfs swarm put notes/todo.md [file]    # from the file, or stdin; prints the new etag
+nomadfs swarm put notes/todo.md --if-match <etag>   # only over that version
+nomadfs swarm put notes/new.md --create   # only where nothing is yet
+nomadfs swarm rm notes/old.md [--if-match <etag>]
 ```
 
 ---
