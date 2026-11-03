@@ -7,6 +7,23 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.6.0 - 2026-11-03
+
+Devices on 0.4.0 and later work together. Only a device that runs a program using the swarm
+folder through the new local API (like Locket) needs 0.6.0.
+
+## Added
+
+- **The swarm folder without a mount.** The running node (the app or a service) serves the swarm
+  folder to programs on the same device over a small HTTP API on `127.0.0.1`, behind a random token
+  it writes to `<device folder>/api.json` (readable by you only, removed on exit). Only your own
+  user's programs can connect: on Linux and macOS, every connection is checked to come from a process
+  of yours. Files carry their content id as an ETag, so writes and removals can be conditional
+  (`If-Match`, `If-None-Match: *`) and never overwrite an edit made meanwhile.
+  [Locket](https://github.com/highercomve/locket) uses it to share a secrets vault between devices.
+- **`nomadfs swarm`**, its command-line client: `status`, `ls`, `get`, `put` (with `--if-match`
+  or `--create`) and `rm`.
+
 # 0.5.2 - 2026-11-02
 
 Devices on 0.4.0 and later work together. Only swarm backup devices need 0.5.2 for the fix below.
