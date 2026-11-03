@@ -4,6 +4,7 @@
 const builtin = @import("builtin");
 const webdav = @import("webdav.zig");
 const webdav_mount = @import("webdav_mount.zig");
+const swarm_api = @import("swarm_api.zig");
 const can_mount = builtin.os.tag == .linux and !builtin.abi.isAndroid();
 const std = @import("std");
 const config = @import("config.zig");
@@ -57,6 +58,10 @@ pub const Node = struct {
     /// uses. Its pins are this device's (`<storage_path>.notes-pinned`).
     /// Null with the swarm folder.
     notes: ?*fs.notes.Notes,
+    /// The local swarm API other programs of this user use (Locket,
+    /// `nomadfs swarm`): swarm_api.zig. Null without the swarm folder, or
+    /// when it couldn't start (the node runs without it).
+    swarm_api: ?*swarm_api.Server = null,
     /// Fetches ahead of reads of other devices' files (the mount, the app's
     /// previews, the swarm folder); null without block storage.
     read_ahead: ?*fs.ReadAhead,
@@ -344,7 +349,19 @@ pub const Node = struct {
         // after this, so the manager never outlives the node it points to.
         discovery_node.enableRelay();
 
+        // The local swarm API, published next to the device files. Optional:
+        // a node that can't serve it still runs.
+        var api: ?*swarm_api.Server = null;
+        if (swarm) |folder| {
+            const dir = std.fs.path.dirname(device_paths.identity) orelse ".";
+            api = swarm_api.Server.start(allocator, folder, dir) catch |err| blk: {
+                std.debug.print("swarm api: not started: {any}\n", .{err});
+                break :blk null;
+            };
+        }
+
         return Node{
+            .swarm_api = api,
             .allocator = allocator,
             .connection_manager = connection_manager,
             .store = store,
@@ -382,6 +399,9 @@ pub const Node = struct {
         // Stop network traffic, then wait for request handlers still running
         // on detached threads. Everything freed below is reachable from them,
         // so nothing is freed before this returns.
+        // First: its requests read and write the swarm folder.
+        if (self.swarm_api) |api| api.stop();
+        self.swarm_api = null;
         self.connection_manager.stop();
         self.discovery_node.drainHandlers();
         self.connection_manager.relay_dialer = null;

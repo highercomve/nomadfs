@@ -12,6 +12,8 @@ pub const fs = @import("fs/mod.zig");
 /// The mount where there is no FUSE: WebDAV on 127.0.0.1, and mounting it.
 pub const webdav = @import("webdav.zig");
 pub const webdav_mount = @import("webdav_mount.zig");
+/// The local swarm API the running node serves (`nomadfs swarm`, Locket).
+pub const swarm_api = @import("swarm_api.zig");
 
 pub const node_info = @import("node_info.zig");
 
@@ -87,6 +89,7 @@ test {
         @import("fs/tree.zig"),
         @import("metrics.zig"),
         @import("net/compat.zig"),
+        @import("swarm_api.zig"),
         @import("net/discovery/kbucket.zig"),
         @import("net/discovery/lookup.zig"),
         @import("net/discovery/node.zig"),

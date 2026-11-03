@@ -7,6 +7,7 @@ const device = nomadfs.device;
 const Identity = device.identity.Identity;
 const Ticket = device.pairing.Ticket;
 
+const swarm_cli = @import("swarm_cli.zig");
 const upgrade = @import("upgrade.zig");
 
 const Command = enum { run, pair, trust, devices, revoke, mount, webdav, invite, join, cache, clear_cache, bench_read, bench_idle, upgrade };
@@ -40,6 +41,19 @@ pub fn main(init: std.process.Init) !void {
     // which records a stack trace for every allocation.)
     const allocator = if (@import("builtin").mode == .Debug) init.gpa else std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+
+    // `nomadfs swarm ...`: a client of the running node's local API.
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "swarm")) {
+        const arena = init.arena.allocator();
+        const key_path: ?[]const u8 = kp: {
+            const path = config_mod.findConfigPath(arena) catch break :kp null;
+            var cfg = config_mod.parseConfig(arena, path) catch break :kp null;
+            const kp = if (cfg.node.key_path) |k| arena.dupe(u8, k) catch null else null;
+            cfg.deinit(arena);
+            break :kp kp;
+        };
+        std.process.exit(try swarm_cli.run(init.io, arena, args[2..], key_path));
+    }
 
     var options: Options = .{};
     if (!try parseArgs(init.arena.allocator(), args, &options)) return;
@@ -230,6 +244,8 @@ fn printHelp() void {
         \\  nomadfs --cache | --clear-cache [config_path]
         \\  nomadfs --bench-read <swarm path> [--bench-wait SECONDS] [--bench-cold] [config_path]
         \\  nomadfs --bench-idle SECONDS [config_path]
+        \\  nomadfs swarm status | ls [dir] | get <path> | put <path> [file] | rm <path>
+        \\                     the swarm folder through the running node, no mount
         \\  nomadfs --upgrade [--check] [--yes]
         \\  nomadfs --version
         \\
@@ -858,4 +874,8 @@ fn benchIdleCommand(allocator: std.mem.Allocator, config: config_mod.Config, sec
     , .{ wire_sent, wire_received });
     defer allocator.free(out);
     try writeStdout(out);
+}
+
+test {
+    _ = swarm_cli; // nomadfs swarm: its parsing tests
 }

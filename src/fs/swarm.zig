@@ -802,6 +802,16 @@ pub const SwarmFolder = struct {
 
     /// `peers_failed`: reached in the last round, but their manifest couldn't
     /// be read or merged (too large, corrupt): edits stop flowing from them.
+    /// True until the folder has synced with its peers once since this
+    /// device started (or found none to sync with): writes wait for that
+    /// (error.NotSynced), so an empty folder on a waking device never
+    /// overwrites the swarm's.
+    pub fn awaitingFirstSync(self: *SwarmFolder) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.awaitingLocked();
+    }
+
     pub const Status = struct { entries: usize, peers_synced: u32, peers_failed: u32, last_sync: u64 };
 
     pub fn status(self: *SwarmFolder) Status {
