@@ -496,6 +496,24 @@ pub const SwarmFolder = struct {
         try self.saveLocked();
     }
 
+    /// Removes one file, and only while its content is still `base` (null:
+    /// whatever it is), all under one lock: an edit that lands between a
+    /// caller's check and the removal is never deleted. A folder is
+    /// refused (error.IsDirectory): `remove` is for those.
+    pub fn removeFile(self: *SwarmFolder, path: []const u8, base: ?[32]u8) !void {
+        if (!manifest_mod.validPath(path)) return error.InvalidPath;
+        defer self.flushSave(); // after the unlock: writes outside the lock
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.editAllowedLocked();
+        if (self.folderAtLocked(path)) return error.IsDirectory;
+        const entry = self.manifest.get(path) orelse return error.FileNotFound;
+        if (entry.deleted or entry.kind != .file) return error.FileNotFound;
+        if (base) |expected| if (!std.mem.eql(u8, &entry.cid, &expected)) return error.Changed;
+        _ = try self.manifest.edit(path, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+        try self.saveLocked();
+    }
+
     /// Renames a file or folder in place (same parent folder).
     pub fn rename(self: *SwarmFolder, path: []const u8, new_name: []const u8) !void {
         const new_path = try join(self.allocator, splitParent(path).dir, new_name);
@@ -1501,6 +1519,26 @@ test "swarm: putBytes with no base refuses an existing path but not a deleted on
     try folder.remove("Notes/one.md");
     _ = try folder.putBytes("Notes/one.md", "again", null);
     try std.testing.expect(folder.fileInfo("Notes/one.md") != null);
+}
+
+test "swarm: removeFile removes one file, only from its base, never a folder" {
+    var t: TestFolder = undefined;
+    try t.open(0x23, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    const one = try folder.putBytes("locket/vault (conflict).enc", "one", null);
+    _ = try folder.putBytes("locket/vault.enc", "main", null);
+    // Edited after the caller read it: the stale version isn't removed.
+    const two = try folder.putBytes("locket/vault (conflict).enc", "two", one.cid);
+    try std.testing.expectError(error.Changed, folder.removeFile("locket/vault (conflict).enc", one.cid));
+    try std.testing.expect(folder.fileInfo("locket/vault (conflict).enc") != null);
+    try folder.removeFile("locket/vault (conflict).enc", two.cid);
+    try std.testing.expect(folder.fileInfo("locket/vault (conflict).enc") == null);
+    try std.testing.expectError(error.FileNotFound, folder.removeFile("locket/vault (conflict).enc", null));
+    // A folder, and what's in it, stays.
+    try std.testing.expectError(error.IsDirectory, folder.removeFile("locket", null));
+    try std.testing.expect(folder.fileInfo("locket/vault.enc") != null);
 }
 
 test "swarm: a refused putBytes builds no blocks" {

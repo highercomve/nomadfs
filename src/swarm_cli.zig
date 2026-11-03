@@ -13,6 +13,7 @@
 //! @atlas layer: frontend
 
 const std = @import("std");
+const builtin = @import("builtin");
 const nomadfs = @import("nomadfs");
 const compat = nomadfs.net.compat;
 const swarm_api = nomadfs.swarm_api;
@@ -32,9 +33,14 @@ pub const Endpoint = struct {
         if (!std.mem.startsWith(u8, url, prefix)) return error.BadApiFile;
         const rest = url[prefix.len..];
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.BadApiFile;
+        const base = rest[slash..];
+        // It goes into the request line as is: no spaces or control bytes
+        // that could add headers or a second request.
+        if (!std.mem.endsWith(u8, base, "/")) return error.BadApiFile;
+        for (base) |c| if (c <= ' ' or c >= 0x7f) return error.BadApiFile;
         return .{
             .port = std.fmt.parseInt(u16, rest[0..slash], 10) catch return error.BadApiFile,
-            .base = rest[slash..],
+            .base = base,
         };
     }
 };
@@ -46,6 +52,16 @@ pub fn findEndpoint(arena: std.mem.Allocator, io: std.Io, key_path: ?[]const u8)
     const dir = std.fs.path.dirname(paths.identity) orelse ".";
     const file = try std.fs.path.join(arena, &.{ dir, swarm_api.api_file });
     paths.deinit(arena);
+    // The node writes it 0600: one another user could read or plant isn't
+    // trusted (it would get the files sent to it).
+    const st = std.Io.Dir.cwd().statFile(io, file, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return error.NodeNotRunning,
+        else => return err,
+    };
+    if (st.kind != .file) return error.InsecureApiFile;
+    if (comptime builtin.os.tag != .windows) {
+        if (st.permissions.toMode() & 0o077 != 0) return error.InsecureApiFile;
+    }
     const text = std.Io.Dir.cwd().readFileAlloc(io, file, arena, .limited(4096)) catch |err| switch (err) {
         error.FileNotFound => return error.NodeNotRunning,
         else => return err,
@@ -82,7 +98,9 @@ pub fn request(arena: std.mem.Allocator, ep: Endpoint, method: []const u8, path:
     var raw: std.ArrayList(u8) = .empty;
     var buf: [64 * 1024]u8 = undefined;
     while (true) {
-        const n = stream.read(&buf) catch break;
+        // A failed read (the timeout, the node stopping) is an error, not
+        // the end of the answer.
+        const n = stream.read(&buf) catch return error.ReadFailed;
         if (n == 0) break;
         if (raw.items.len + n > max_response) return error.ResponseTooLarge;
         try raw.appendSlice(arena, buf[0..n]);
@@ -111,6 +129,11 @@ fn parseResponse(raw: []const u8) !Response {
         const value = std.mem.trim(u8, line[colon + 1 ..], " ");
         if (std.ascii.eqlIgnoreCase(name, "etag")) r.etag = value;
         if (std.ascii.eqlIgnoreCase(name, "x-nomadfs-error")) r.err = value;
+        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            // Shorter than announced: the node stopped mid-answer.
+            const want = std.fmt.parseInt(usize, value, 10) catch return error.BadResponse;
+            if (want != r.body.len) return error.TruncatedResponse;
+        }
     }
     return r;
 }
@@ -123,19 +146,19 @@ pub fn run(io: std.Io, arena: std.mem.Allocator, args: []const []const u8, key_p
     const eql = std.mem.eql;
     if (eql(u8, cmd, "status")) {
         const r = request(arena, ep, "GET", "status", &.{}, "") catch |err| return fail(err);
-        return printBody(io, r);
+        return printBody(io, r, true);
     }
     if (eql(u8, cmd, "ls")) {
         const dir = if (args.len > 1) args[1] else "";
         const r = request(arena, ep, "GET", try std.fmt.allocPrint(arena, "list/{s}", .{dir}), &.{}, "") catch |err| return fail(err);
-        return printBody(io, r);
+        return printBody(io, r, true);
     }
     if (args.len < 2) return usage();
     const path = args[1];
     const files = try std.fmt.allocPrint(arena, "files/{s}", .{path});
     if (eql(u8, cmd, "get")) {
         const r = request(arena, ep, "GET", files, &.{}, "") catch |err| return fail(err);
-        return printBody(io, r);
+        return printBody(io, r, false);
     }
     if (eql(u8, cmd, "put") or eql(u8, cmd, "rm")) {
         var headers: std.ArrayList([2][]const u8) = .empty;
@@ -153,7 +176,7 @@ pub fn run(io: std.Io, arena: std.mem.Allocator, args: []const []const u8, key_p
         }
         const body = if (eql(u8, cmd, "rm")) "" else try readSource(io, arena, source);
         const r = request(arena, ep, if (eql(u8, cmd, "rm")) "DELETE" else "PUT", files, headers.items, body) catch |err| return fail(err);
-        if (r.code >= 300) return printBody(io, r);
+        if (r.code >= 300) return printBody(io, r, false);
         if (r.etag) |e| std.debug.print("{s}\n", .{e});
         return 0;
     }
@@ -167,7 +190,9 @@ fn readSource(io: std.Io, arena: std.mem.Allocator, source: ?[]const u8) ![]u8 {
     return stdin.interface.allocRemaining(arena, .limited(swarm_api.max_file + 1));
 }
 
-fn printBody(io: std.Io, r: Response) u8 {
+/// The answer on stdout; `newline`: end JSON with one (status, ls). A
+/// file (`get`) is written exactly as it is.
+fn printBody(io: std.Io, r: Response, newline: bool) u8 {
     if (r.code >= 300) {
         std.debug.print("nomadfs swarm: {d} {s}\n", .{ r.code, explain(r) });
         return 1;
@@ -175,7 +200,7 @@ fn printBody(io: std.Io, r: Response) u8 {
     var buf: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writerStreaming(io, &buf);
     out.interface.writeAll(r.body) catch {};
-    if (r.body.len > 0 and r.body[r.body.len - 1] != '\n' and std.mem.startsWith(u8, r.body, "{") or std.mem.startsWith(u8, r.body, "[")) out.interface.writeAll("\n") catch {};
+    if (newline and r.body.len > 0 and r.body[r.body.len - 1] != '\n') out.interface.writeAll("\n") catch {};
     out.interface.flush() catch {};
     return 0;
 }
@@ -194,6 +219,8 @@ fn fail(err: anyerror) u8 {
     std.debug.print("nomadfs swarm: {s}\n", .{switch (err) {
         error.NodeNotRunning => "no NomadFS node is running (start the app, or `nomadfs` as a service)",
         error.BadApiFile => "the running node's api.json is damaged",
+        error.InsecureApiFile => "api.json is readable by other users or isn't a plain file: not trusted (restart the node)",
+        error.TruncatedResponse, error.ReadFailed => "the node's answer was cut short (it stopped, or timed out): try again",
         else => @errorName(err),
     }});
     return 1;
@@ -217,6 +244,8 @@ test "Endpoint.parse" {
     try std.testing.expectEqual(@as(u16, 41234), ep.port);
     try std.testing.expectEqualStrings("/abcd/v1/", ep.base);
     try std.testing.expectError(error.BadApiFile, Endpoint.parse("http://example.com:1/x/"));
+    try std.testing.expectError(error.BadApiFile, Endpoint.parse("http://127.0.0.1:1/x/v1/ HTTP/1.1\r\nX: y\r\n/"));
+    try std.testing.expectError(error.BadApiFile, Endpoint.parse("http://127.0.0.1:1/x/v1"));
 }
 
 test parseResponse {
@@ -225,4 +254,6 @@ test parseResponse {
     try std.testing.expectEqualStrings("\"ab\"", r.etag.?);
     try std.testing.expectEqualStrings("Changed", r.err.?);
     try std.testing.expectEqualStrings("body", r.body);
+    try std.testing.expectError(error.TruncatedResponse, parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nbody"));
+    try std.testing.expectEqualStrings("body", (try parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody")).body);
 }

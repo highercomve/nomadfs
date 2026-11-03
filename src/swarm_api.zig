@@ -134,11 +134,19 @@ pub const Server = struct {
         const tmp = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.info_path});
         defer self.allocator.free(tmp);
         const cwd = std.Io.Dir.cwd();
+        // A leftover temp file (or a link planted in its place) is removed,
+        // and the new one created afresh: it can only be 0600 and ours.
+        cwd.deleteFile(self.io, tmp) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
         {
-            const f = try cwd.createFile(self.io, tmp, .{ .permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600) });
+            const f = try cwd.createFile(self.io, tmp, .{ .exclusive = true, .permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600) });
+            errdefer cwd.deleteFile(self.io, tmp) catch {};
             defer f.close(self.io);
             try f.writeStreamingAll(self.io, json);
         }
+        errdefer cwd.deleteFile(self.io, tmp) catch {};
         try cwd.rename(tmp, cwd, self.info_path, self.io);
     }
 
@@ -146,7 +154,10 @@ pub const Server = struct {
     /// same files may have replaced it).
     fn unpublish(self: *Server) void {
         const text = std.Io.Dir.cwd().readFileAlloc(self.io, self.info_path, self.allocator, .limited(4096)) catch return;
-        defer self.allocator.free(text);
+        defer {
+            std.crypto.secureZero(u8, text); // it holds the token
+            self.allocator.free(text);
+        }
         if (std.mem.indexOf(u8, text, &self.token) == null) return;
         std.Io.Dir.cwd().deleteFile(self.io, self.info_path) catch {};
     }
@@ -289,13 +300,22 @@ pub const Server = struct {
         return conn.respond(200, "OK", &.{ .{ "ETag", etag }, .{ "Connection", "close" } }, "");
     }
 
+    /// Removes one file (never a folder), with `If-Match` checked under the
+    /// same lock as the removal.
     fn delete(self: *Server, conn: *Conn, req: *Request, path: []const u8) !void {
+        var base: ?[32]u8 = null;
         if (req.header("if-match")) |want| {
-            const info = self.folder.fileInfo(path) orelse return conn.respond(412, "Precondition Failed", &close, "");
-            var buf: [66]u8 = undefined;
-            if (!std.mem.eql(u8, unquote(want), etagHex(&buf, info.cid))) return conn.respond(412, "Precondition Failed", &close, "");
+            const hex = unquote(want);
+            var cid: [32]u8 = undefined;
+            if (hex.len != 64) return conn.respond(400, "Bad Request", &close, "");
+            _ = std.fmt.hexToBytes(&cid, hex) catch return conn.respond(400, "Bad Request", &close, "");
+            base = cid;
         }
-        self.folder.remove(path) catch |err| return answerError(conn, err);
+        self.folder.removeFile(path, base) catch |err| return switch (err) {
+            // Nothing there for the version asked: it changed meanwhile.
+            error.FileNotFound => if (base != null) conn.respond(412, "Precondition Failed", &close, "") else answerError(conn, err),
+            else => answerError(conn, err),
+        };
         return conn.respond(204, "No Content", &close, "");
     }
 };
@@ -316,14 +336,6 @@ fn tokenMatches(given: []const u8, token: *const [64]u8) bool {
 /// "a/b/c" from the URL's segments (each already checked by splitPath).
 fn joinPath(arena: std.mem.Allocator, segments: []const []const u8) ![]const u8 {
     return std.mem.join(arena, "/", segments);
-}
-
-fn etagHex(buf: *[66]u8, cid: [32]u8) []const u8 {
-    buf[0] = '"';
-    const hex = std.fmt.bytesToHex(cid, .lower);
-    @memcpy(buf[1..65], &hex);
-    buf[65] = '"';
-    return buf[1..65];
 }
 
 /// `"<hex cid>"`, the ETag a GET sends and a PUT's If-Match takes.
