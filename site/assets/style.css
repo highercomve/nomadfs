@@ -326,6 +326,7 @@ code {
 
 /* ---- Code ---- */
 .code-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: start; }
+.route + .code-pair { margin-top: 56px; }
 .code-card { margin: 0; overflow: hidden; }
 .code-card figcaption {
   display: flex;

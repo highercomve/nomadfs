@@ -27,6 +27,8 @@ with and when. From there:
 
 On Linux it is also `<mount>/Swarm` in the [mount]($link.page('docs/shared-folders').ref('mount')),
 where any program can write to it (see [below]($link.ref('from-the-mount'))).
+Without a mount, on every platform, programs reach it through the
+[local API]($link.ref('api')).
 
 # [How changes travel]($heading.id('sync'))
 
@@ -130,3 +132,59 @@ shell:
   (a cross-device move); writing to a device share fails with `EROFS`.
 
 Files in `Swarm` show as `0644`, folders as `0755`.
+
+# [From other programs: the local API]($heading.id('api'))
+
+The running node (the app, or `nomadfs` as a service) serves the swarm folder
+to the programs of your user over HTTP on `127.0.0.1`, so another app can keep
+its data on all your devices with no mount and no server of its own.
+[Locket](https://locket.foreachdeveloper.com) keeps its shared secrets vault
+this way. It needs NomadFS 0.6.0 or later.
+
+**Finding it.** The node writes `api.json` in its device folder, next to its
+keys (under `~/.nomadfs` by default), owner-only, and removes it when it stops:
+
+```json
+{ "version": 1, "url": "http://127.0.0.1:<port>/<token>/v1/" }
+```
+
+The token is the secret: only your user can read the file. On Linux and macOS
+the node also closes connections that come from another user's process. A
+client should refuse an `api.json` that other users can read.
+
+**Endpoints**, under that URL:
+
+| Request | Answer |
+|---|---|
+| `GET status` | `{"synced", "entries", "peers_synced", "last_sync"}` |
+| `GET list/<dir>` | `[{"name", "dir", "size", "mtime", "etag"}]`, at most 10,000 |
+| `GET files/<path>` | the file, with `ETag: "<content id>"` |
+| `PUT files/<path>` | the body becomes the file, 8 MiB at most |
+| `DELETE files/<path>` | removes the file |
+
+**Writing without losing edits.** Every file's ETag is its content id.
+
+- `PUT` with `If-Match: "<etag>"` writes only while the file is still that
+  version; with `If-None-Match: *`, only while nothing is there. Otherwise the
+  answer is `412 Precondition Failed`: read the file again, merge, retry.
+- `DELETE` honours `If-Match` the same way.
+- Until the node has synced the swarm folder with its peers once since it
+  started, writes answer `503`. A device that just woke up holds an empty or
+  old folder, and it shouldn't overwrite the swarm's.
+- Two devices that write before they meet still produce a
+  [conflict copy]($link.ref('conflicts')): look for
+  `name (conflict from <device>).ext` and merge it.
+
+Other answers: `404` for a missing file, `413` for a body over 8 MiB, `503`
+when a file's data is on no reachable device.
+
+**From the shell**, `nomadfs swarm` is a client of the same API:
+
+```bash
+nomadfs swarm status
+nomadfs swarm ls notes                            # JSON, with etags
+nomadfs swarm get notes/todo.md > todo.md
+nomadfs swarm put notes/todo.md todo.md --if-match <etag>
+nomadfs swarm put notes/new.md --create < new.md
+nomadfs swarm rm notes/old.md --if-match <etag>
+```
