@@ -1,6 +1,6 @@
 # macOS and Windows: build and test on real machines, and attach the
-# macOS app and command line to a published release (scripts/release.sh
-# builds the Linux, Android and Windows assets locally).
+# macOS app and command line to a published release (release.yml builds the
+# Linux, Android and Windows assets from the tag, then calls this).
 #
 #   macOS:   the app (.dmg, signed with NomadFS's persistent self-signed
 #            identity so macOS keeps its permissions across updates) and the
@@ -12,6 +12,13 @@ name: Desktop
 on:
   release:
     types: [published]
+  # From release.yml, once it has published the release.
+  workflow_call:
+    inputs:
+      tag:
+        description: Release to test and attach to
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       tag:
@@ -46,10 +53,10 @@ jobs:
       - name: WebDAV server (curl; another user refused)
         timeout-minutes: 5
         run: bash scripts/webdav-smoke.sh zig-out/bin/nomadfs serve
-      # The install scripts, against the latest release (a release run is
-      # skipped: its macOS files are attached later in this workflow).
+      # The install scripts, against the latest release (skipped for a
+      # release run: its macOS files are attached later in this workflow).
       - name: install.sh (latest release)
-        if: github.event_name != 'release'
+        if: env.TAG == ''
         timeout-minutes: 5
         run: |
           export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
@@ -76,7 +83,7 @@ jobs:
         timeout-minutes: 5
         run: bash scripts/webdav-smoke.sh zig-out/bin/nomadfs mount
       - name: install.sh (latest release)
-        if: github.event_name != 'release'
+        if: env.TAG == ''
         timeout-minutes: 5
         run: |
           export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
@@ -224,7 +231,7 @@ jobs:
           "the app is running"
           Stop-Process -Id $app.Id -Force
       - name: install.ps1 (latest release; PowerShell 5.1, then 7 through iex)
-        if: github.event_name != 'release'
+        if: env.TAG == ''
         timeout-minutes: 10
         shell: pwsh
         run: |

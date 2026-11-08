@@ -1,0 +1,262 @@
+# A NomadFS release from a tag: push vX.Y.Z (matching the version in
+# nomadfs-gui/build.zig) and this builds every asset, publishes the GitHub
+# release with its notes from CHANGELOG.md and the signed update manifests,
+# then runs Desktop (macOS assets and entries, the Windows install test) and
+# rebuilds the site so its download links list every platform.
+#
+#   linux-app    nomadfs-gui .AppImage, .deb, .rpm (Arch: GNOME 50's GTK/WebKit)
+#   cross        command line (x86_64, aarch64 Linux; Windows), the Windows
+#                app (installer and update payload), the Android APK
+#   publish      latest.json, latest-cli.json, SHA256SUMS; the release
+#   desktop      .github/workflows/desktop.yml (macOS, Windows test)
+#   site         .github/workflows/site.yml
+#
+# Secrets: NOMADFS_UPDATE_KEY (signs the manifests the apps check), and
+# NOMADFS_ANDROID_DEBUG_KEYSTORE_BASE64 (the keystore every published APK
+# was signed with: another key and Android refuses the update). Desktop's
+# macOS secrets and the site's Cloudflare ones as there.
+#
+# A release made with the workflow's token starts no other workflow, hence
+# Desktop and the site are called from here. Re-run a tag by hand with
+# "Run workflow" (it updates the release's assets if it exists).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and release (vX.Y.Z)
+        required: true
+
+permissions:
+  contents: write
+  deployments: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  ZIG_VERSION: 0.16.0
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - id: v
+        name: Tag matches every version field
+        run: |
+          v=$(sed -n 's/^ *const version = "\(.*\)";/\1/p' nomadfs-gui/build.zig | head -n1)
+          [ "v$v" = "$TAG" ] || { echo "::error::$TAG doesn't match nomadfs-gui/build.zig ($v)"; exit 1; }
+          for zon in build.zig.zon nomadfs-gui/build.zig.zon; do
+            grep -q "\.version = \"$v\"" "$zon" || { echo "::error::$zon isn't at $v"; exit 1; }
+          done
+          grep -q "^pub const version = \"$v\";" src/node_info.zig || { echo "::error::src/node_info.zig isn't at $v"; exit 1; }
+          IFS=. read -r major minor patch <<<"${v%%[-+]*}"
+          code=$((major * 10000 + minor * 100 + patch))
+          gradle=nomadfs-gui/android/app/build.gradle.kts
+          grep -q "versionName = \"$v\"" "$gradle" && grep -q "versionCode = $code\$" "$gradle" ||
+            { echo "::error::$gradle needs versionName = \"$v\" and versionCode = $code"; exit 1; }
+          grep -q "^## $v " CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## $v' entry"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  linux-app:
+    needs: version
+    runs-on: ubuntu-latest
+    container: ghcr.io/archlinux/archlinux:latest
+    steps:
+      - name: System packages
+        run: >-
+          pacman -Syu --noconfirm --needed git pkgconf gtk4 webkitgtk-6.0 wayland wayland-protocols
+          libxkbcommon libx11 dbus squashfs-tools desktop-file-utils go
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: nfpm (for .deb and .rpm)
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+      - name: Packages (.AppImage, .deb, .rpm)
+        working-directory: nomadfs-gui
+        # Baseline x86_64: without it Zig targets the runner's CPU.
+        run: zig build package -Doptimize=ReleaseSafe -Dcpu=baseline
+      - run: ls -la nomadfs-gui/zig-out/package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-app
+          path: |
+            nomadfs-gui/zig-out/package/*.AppImage
+            nomadfs-gui/zig-out/package/*.deb
+            nomadfs-gui/zig-out/package/*.rpm
+          if-no-files-found: error
+
+  cross:
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      V: ${{ needs.version.outputs.version }}
+      NDK_VERSION: 28.2.13676358
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build tools (NSIS for the Windows installer)
+        run: sudo apt-get update -q && sudo apt-get install -yq nsis libwayland-dev wayland-protocols pkg-config
+      - name: Command line
+        run: |
+          mkdir -p dist
+          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dcpu=baseline -p out/x86_64
+          zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl -p out/aarch64
+          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu -Dcpu=baseline -p out/windows
+          cp out/x86_64/bin/nomadfs "dist/nomadfs-$V-x86_64-linux"
+          cp out/aarch64/bin/nomadfs "dist/nomadfs-$V-aarch64-linux"
+          cp out/windows/bin/nomadfs.exe "dist/nomadfs-$V-x86_64-windows.exe"
+      - name: WebView2 loader (NuGet, as `oriel webview2` gets it)
+        run: |
+          ver=$(curl -fsSL https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/index.json |
+            jq -r '[.versions[] | select(test("-") | not)] | last')
+          curl -fsSL -o "$RUNNER_TEMP/wv2.nupkg" \
+            "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/$ver/microsoft.web.webview2.$ver.nupkg"
+          unzip -q -o "$RUNNER_TEMP/wv2.nupkg" 'runtimes/win-x64/native/WebView2Loader.dll' -d "$RUNNER_TEMP/wv2"
+          echo "WEBVIEW2_LOADER=$RUNNER_TEMP/wv2/runtimes/win-x64/native/WebView2Loader.dll" >> "$GITHUB_ENV"
+          echo "WebView2 $ver"
+      - name: Windows app (installer and update payload)
+        working-directory: nomadfs-gui
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu -Dcpu=baseline -p ../out/gui-windows
+          zig build package -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu -Dcpu=baseline \
+            -Dwebview2-loader="$WEBVIEW2_LOADER" -p ../out/gui-windows
+          cp "../out/gui-windows/package/nomadfs-gui-$V-setup.exe" "../dist/nomadfs-gui-$V-windows-x86_64-setup.exe"
+          # What an installed app downloads to update itself: the executable alone.
+          cp ../out/gui-windows/bin/nomadfs-gui.exe "../dist/nomadfs-gui-$V-x86_64-windows-update.exe"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Android SDK (platform, build tools, NDK)
+        run: |
+          sdk="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-36" "build-tools;35.0.0" "ndk;$NDK_VERSION" >/dev/null
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$sdk/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+      - name: Signing key (the one every published APK carries)
+        env:
+          KEYSTORE: ${{ secrets.NOMADFS_ANDROID_DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          [ -n "$KEYSTORE" ] || { echo "::error::NOMADFS_ANDROID_DEBUG_KEYSTORE_BASE64 is not set: an APK signed with another key can't update the installed app"; exit 1; }
+          mkdir -p ~/.android && umask 077
+          printf '%s' "$KEYSTORE" | base64 --decode > ~/.android/debug.keystore
+      - name: Android app
+        working-directory: nomadfs-gui
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-android
+          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-android -Dcpu=baseline
+          (cd android && ./gradlew --no-daemon assembleDebug)
+          cp android/app/build/outputs/apk/debug/app-debug.apk "../dist/nomadfs-$V.apk"
+          rm -f ~/.android/debug.keystore
+      - run: ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cross
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, linux-app, cross]
+    runs-on: ubuntu-latest
+    env:
+      V: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build tools
+        run: sudo apt-get update -q && sudo apt-get install -yq libwayland-dev wayland-protocols pkg-config
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Assets
+        run: |
+          mkdir -p assets
+          cp artifacts/cross/* assets/
+          cp artifacts/linux-app/* assets/
+          ls -la assets
+      - name: Update manifests (latest.json, latest-cli.json)
+        env:
+          UPDATE_KEY: ${{ secrets.NOMADFS_UPDATE_KEY }}
+        run: |
+          [ -n "$UPDATE_KEY" ] || { echo "::error::NOMADFS_UPDATE_KEY is not set"; exit 1; }
+          umask 077
+          key="$RUNNER_TEMP/update.key"
+          printf '%s\n' "$UPDATE_KEY" > "$key"
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          mkdir -p "$RUNNER_TEMP/m" "$RUNNER_TEMP/mcli"
+          sign() { # <asset> <target> <format> <app id suffix> <out dir>
+            (cd nomadfs-gui && zig build sign-update -- "../assets/$1" --app-id "com.foreachdeveloper.nomadfs$4" \
+              --version "$V" --target "$2" --format "$3" --url "$base/$1" --key "$key" --out "$5/update-$2.json")
+          }
+          sign "nomadfs-gui-$V-x86_64.AppImage" x86_64-linux appimage "" "$RUNNER_TEMP/m"
+          sign "nomadfs-gui-$V-x86_64-windows-update.exe" x86_64-windows raw "" "$RUNNER_TEMP/m"
+          # One APK for both ABIs. The app opens its download; Android installs it.
+          sign "nomadfs-$V.apk" aarch64-android raw "" "$RUNNER_TEMP/m"
+          sign "nomadfs-$V.apk" x86_64-android raw "" "$RUNNER_TEMP/m"
+          # The command line node: its own app id, so the app's manifest
+          # can't replace it with an AppImage (both are x86_64-linux).
+          sign "nomadfs-$V-x86_64-linux" x86_64-linux raw .cli "$RUNNER_TEMP/mcli"
+          sign "nomadfs-$V-aarch64-linux" aarch64-linux raw .cli "$RUNNER_TEMP/mcli"
+          sign "nomadfs-$V-x86_64-windows.exe" x86_64-windows raw .cli "$RUNNER_TEMP/mcli"
+          rm -f "$key"
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          (cd nomadfs-gui && zig build combine-manifests -- "$RUNNER_TEMP"/m/update-*.json --pub-date "$now" --out ../assets/latest.json)
+          (cd nomadfs-gui && zig build combine-manifests -- "$RUNNER_TEMP"/mcli/update-*.json --pub-date "$now" --out ../assets/latest-cli.json)
+          jq -r '.platforms | keys | join(", ")' assets/latest.json assets/latest-cli.json
+      - name: Checksums
+        run: cd assets && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - name: Release notes (CHANGELOG.md)
+        run: |
+          awk -v v="$V" '$0 ~ "^## "v" " {f=1; next} /^## / {f=0} f' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "::error::no notes for $V in CHANGELOG.md"; exit 1; }
+          title=$(git log -1 --format=%s HEAD | sed -n 's/^Release [0-9.]*: //p')
+          echo "TITLE=NomadFS $V${title:+: $title}" >> "$GITHUB_ENV"
+      - name: Publish
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes-file notes.md
+            gh release upload "$TAG" assets/* --clobber
+          else
+            gh release create "$TAG" assets/* --verify-tag --title "$TITLE" --notes-file notes.md
+          fi
+
+  desktop:
+    needs: publish
+    uses: ./.github/workflows/desktop.yml
+    with:
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
+    secrets: inherit
+
+  # After Desktop (it adds the macOS files and entries), so the site's
+  # download links list every platform. Rebuilt even if Desktop failed:
+  # the release itself is out.
+  site:
+    needs: [publish, desktop]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/site.yml
+    secrets: inherit
