@@ -269,10 +269,12 @@ jobs:
         with:
           path: artifacts
       - name: Assets
+        # The release's files only: the top-level files of each artifact
+        # (packaging can leave directories next to them, like brand/).
         run: |
+          find artifacts -maxdepth 3 | sort
           mkdir -p assets
-          cp artifacts/cross/* assets/
-          cp artifacts/linux-app/* assets/
+          find artifacts/cross artifacts/linux-app -maxdepth 1 -type f -exec cp -t assets {} +
           ls -la assets
       - name: Update manifests (latest.json, latest-cli.json)
         env:
@@ -304,7 +306,7 @@ jobs:
           (cd nomadfs-gui && zig build combine-manifests -- "$RUNNER_TEMP"/mcli/update-*.json --pub-date "$now" --out ../assets/latest-cli.json)
           jq -r '.platforms | keys | join(", ")' assets/latest.json assets/latest-cli.json
       - name: Checksums
-        run: cd assets && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+        run: cd assets && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort | xargs sha256sum -- > SHA256SUMS && cat SHA256SUMS
       - name: Release notes (CHANGELOG.md)
         run: |
           awk -v v="$V" '$0 ~ "^## "v" " {f=1; next} /^## / {f=0} f' CHANGELOG.md > notes.md
