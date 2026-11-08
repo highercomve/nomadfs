@@ -33,6 +33,11 @@ pub const Transport = struct {
     ctx: *anyopaque,
     /// Caller-owned bytes from `allocator`, or null for "not found".
     getFn: *const fn (ctx: *anyopaque, peer: NodeID, cid: *const Cid, allocator: std.mem.Allocator) anyerror!?[]u8,
+    /// Whether a live connection to `peer` exists right now (direct or
+    /// relayed). A connected device is asked even while backing off: the
+    /// failure that started the backoff is over. Null: never assumed.
+    /// Called with the fetcher's mutex held; it must not call back.
+    connectedFn: ?*const fn (ctx: *anyopaque, peer: NodeID) bool = null,
 };
 
 pub const Fetcher = struct {
@@ -112,11 +117,13 @@ pub const Fetcher = struct {
             return @constCast(block.data);
         }
         const list = holders[0..@min(holders.len, max_holders)];
+        if (list.len == 0) return error.NoHolders;
         var tried = [_]bool{false} ** max_holders;
-        var last: anyerror = error.NoHolder;
-        var any_failed = false;
+        var last: anyerror = error.BlockNotFound;
+        var tally: Tally = .{};
         var not_found = [_]bool{false} ** max_holders;
-        while (self.pick(root, cid, list, &tried)) |i| {
+        while (self.pick(root, cid, list, &tried, if (tally.only_refused) .may_probe else .no_probe)) |picked| {
+            const i = picked.index;
             tried[i] = true;
             const peer = list[i];
             const started = sync.monotonicMillis();
@@ -125,13 +132,14 @@ pub const Fetcher = struct {
             const maybe = result catch |err| {
                 self.done(peer, root, cid, .{ .failed = err });
                 last = err;
-                if (!unreachable_error(err)) any_failed = true;
+                tally.note(.{ .failed = err }, picked.probe);
                 continue;
             };
             const bytes = maybe orelse {
                 self.done(peer, root, cid, .not_found);
                 last = error.BlockNotFound;
                 not_found[i] = true;
+                tally.note(.not_found, picked.probe);
                 continue;
             };
             // put() checks the bytes hash to `cid` before keeping them.
@@ -139,15 +147,72 @@ pub const Fetcher = struct {
                 allocator.free(bytes);
                 self.done(peer, root, cid, .{ .failed = err });
                 last = err;
-                any_failed = true;
+                tally.note(.bad_answer, picked.probe);
                 continue;
             };
             self.done(peer, root, cid, .{ .served = .{ .len = bytes.len, .ms = elapsed, .leaf = bytes.len > 0 and bytes[0] == leaf_tag } });
             return bytes;
         }
-        if (lost) |l| l.* = !any_failed and author != null and self.authorMissed(root, cid, list, &tried, &not_found, author.?);
+        if (lost) |l| l.* = !tally.any_failed and author != null and self.authorMissed(root, cid, list, &tried, &not_found, author.?);
+        // Nobody asked: every holder said "not found" a moment ago (`last`
+        // is BlockNotFound). Every one asked out of reach: say so, whatever
+        // the transport called it.
+        if (tally.failed_attempts > 0 and tally.all_unreachable) return error.HoldersUnreachable;
         return last;
     }
+
+    /// One failed attempt of a fetch.
+    const Attempt = union(enum) {
+        /// The transport failed (could not connect, or the holder answered
+        /// with an error).
+        failed: anyerror,
+        /// The holder answered "not found".
+        not_found,
+        /// The holder answered with bytes that couldn't be kept (they don't
+        /// hash to the CID, or the store failed).
+        bad_answer,
+    };
+
+    /// What the failed attempts of one fetch add up to; every attempt goes
+    /// through `note`, so the three flags can't drift apart.
+    const Tally = struct {
+        /// Attempts that failed (a fetch that succeeds returns before
+        /// the tally is read).
+        failed_attempts: usize = 0,
+        /// A reachable holder answered something other than "not found":
+        /// holds the lost verdict back.
+        any_failed: bool = false,
+        /// Every holder asked failed to be reached (none answered at all).
+        all_unreachable: bool = true,
+        /// Every holder asked was refused at once by the connection
+        /// manager's backoff (error.PeerUnreachable: no traffic, no wait),
+        /// so probing the next one costs nothing either.
+        only_refused: bool = true,
+
+        fn note(self: *Tally, attempt: Attempt, probe: bool) void {
+            self.failed_attempts += 1;
+            switch (attempt) {
+                .failed => |err| {
+                    // A holder asked only because every one was backing
+                    // off (a probe) would have been skipped before: its
+                    // failure, whatever the transport calls it, leaves the
+                    // verdict as it was.
+                    if (!unreachable_error(err) and !probe) self.any_failed = true;
+                    if (!cant_reach(err)) self.all_unreachable = false;
+                    if (err != error.PeerUnreachable) self.only_refused = false;
+                },
+                .not_found => {
+                    self.all_unreachable = false;
+                    self.only_refused = false;
+                },
+                .bad_answer => {
+                    self.any_failed = true;
+                    self.all_unreachable = false;
+                    self.only_refused = false;
+                },
+            }
+        }
+    };
 
     /// The author is among `holders` and said "not found": in this fetch, or
     /// a moment ago (skipped for it now).
@@ -167,7 +232,19 @@ pub const Fetcher = struct {
     /// to one that answered with a failure.
     fn unreachable_error(err: anyerror) bool {
         return switch (err) {
-            error.ConnectionRefused, error.ConnectionTimedOut, error.NoRelay, error.PeerIdMismatch, error.NetworkUnreachable, error.HostUnreachable, error.PeerDown, error.ConnectionResetByPeer, error.BrokenPipe, error.NoHolder, error.Timeout => true,
+            error.ConnectionRefused, error.ConnectionTimedOut, error.NoRelay, error.PeerIdMismatch, error.NetworkUnreachable, error.HostUnreachable, error.PeerDown, error.ConnectionResetByPeer, error.BrokenPipe, error.Timeout => true,
+            else => false,
+        };
+    }
+
+    /// Errors that say no connection to the device could be had: what
+    /// unreachable_error counts, plus the connection manager's "every
+    /// address failed" and "backing off". Only names the error a read
+    /// reports (HoldersUnreachable); the lost verdict keeps the narrower
+    /// set, so a holder that fails that way still holds it back.
+    fn cant_reach(err: anyerror) bool {
+        return unreachable_error(err) or switch (err) {
+            error.AllAddressesFailed, error.PeerUnreachable, error.ProviderUnreachable => true,
             else => false,
         };
     }
@@ -178,20 +255,37 @@ pub const Fetcher = struct {
         failed: anyerror,
     };
 
+    /// Whether pick may fall back to a holder backing off: only while
+    /// nobody was asked yet in this fetch, or every one asked was refused
+    /// at once by the connection manager's backoff (a dead holder ranked
+    /// first must not use up the only chance of a reachable one after it).
+    const ProbePolicy = enum { may_probe, no_probe };
+
     /// The holder to ask next, or null when none is left; counts the
-    /// request in flight.
-    fn pick(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, tried: *[max_holders]bool) ?usize {
+    /// request in flight. Holders backing off are skipped, unless connected
+    /// again, or unless `policy` is may_probe and they are all that is
+    /// left: then the first of them in the caller's order (the author, the
+    /// backups, connected peers first) is asked anyway, so a read never
+    /// fails without asking anyone. (The connection manager's own backoff
+    /// keeps that from redialing a dead device for every block, and
+    /// BlockManager skips the DHT lookup while it lasts.)
+    fn pick(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, tried: *[max_holders]bool, policy: ProbePolicy) ?Picked {
         self.mutex.lock();
         defer self.mutex.unlock();
         const now = sync.monotonicMillis();
         const fallback = self.bestRateLocked();
         var best: ?usize = null;
         var best_cost: u64 = std.math.maxInt(u64);
+        // The first holder backing off, in the caller's order.
+        var probe: ?usize = null;
         for (holders, 0..) |peer, i| {
             if (tried[i]) continue;
             if (self.missedLocked(peer, root, cid, now)) continue;
             const st = self.findLocked(peer);
-            if (st) |s| if (now < s.down_until) continue;
+            if (st) |s| if (now < s.down_until and !self.connectedLocked(peer)) {
+                if (probe == null) probe = i;
+                continue;
+            };
             const rate: u64 = if (st) |s| (if (s.rate > 0) s.rate else fallback) else fallback;
             const in_flight: u64 = if (st) |s| s.in_flight else 0;
             // Expected wait for one more block, scaled to stay an integer.
@@ -201,12 +295,17 @@ pub const Fetcher = struct {
                 best_cost = c;
             }
         }
-        const i = best orelse return null;
+        const is_probe = best == null;
+        const i = best orelse (if (policy == .may_probe) probe else null) orelse return null;
         const st = self.getOrAddLocked(holders[i], now);
         st.in_flight +|= 1;
         st.last_used = now;
-        return i;
+        return .{ .index = i, .probe = is_probe };
     }
+
+    /// What pick chose: the holder's index, and whether it is backing off
+    /// and asked only because nothing else was left (a probe).
+    const Picked = struct { index: usize, probe: bool };
 
     fn done(self: *Fetcher, peer: NodeID, root: *const Cid, cid: *const Cid, outcome: Outcome) void {
         self.mutex.lock();
@@ -276,6 +375,25 @@ pub const Fetcher = struct {
         const st = self.findLocked(peer) orelse return;
         st.fails = 0;
         st.down_until = 0;
+    }
+
+    /// Forgets every device's backoff: this node was cut off, so the
+    /// failures were its own, not the devices' (Node clears the connection
+    /// manager's backoff at the same moment).
+    pub fn clearAllBackoff(self: *Fetcher) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.peers[0..self.peer_count]) |*s| {
+            s.fails = 0;
+            s.down_until = 0;
+        }
+    }
+
+    /// Whether the transport has a live connection to `peer`. Caller holds
+    /// `mutex`.
+    fn connectedLocked(self: *Fetcher, peer: NodeID) bool {
+        const f = self.transport.connectedFn orelse return false;
+        return f(self.transport.ctx, peer);
     }
 
     /// A copy of what is known about each device, for measuring.
@@ -378,18 +496,31 @@ const testing = std.testing;
 pub const FakeNet = struct {
     /// Per peer: has the blocks, delay in ms, fails to connect, answers
     /// with an error (reachable but failing).
-    pub const Peer = struct { id: NodeID, has: bool = true, delay_ms: u64 = 0, down: bool = false, broken: bool = false, served: std.atomic.Value(u32) = .init(0) };
+    /// `connected`: the transport reports a live connection to it.
+    /// `offline`: fails like the real connection manager does for a device
+    /// none of whose addresses answers (error.AllAddressesFailed, which
+    /// unreachable_error doesn't count). `refused`: refused at once by the
+    /// manager's dial backoff (error.PeerUnreachable).
+    pub const Peer = struct { id: NodeID, has: bool = true, delay_ms: u64 = 0, down: bool = false, offline: bool = false, refused: bool = false, broken: bool = false, connected: bool = false, served: std.atomic.Value(u32) = .init(0) };
     peers: []Peer,
     blocks: std.AutoHashMapUnmanaged(Cid, []const u8) = .empty,
 
     pub fn transport(self: *FakeNet) Transport {
-        return .{ .ctx = self, .getFn = get };
+        return .{ .ctx = self, .getFn = get, .connectedFn = connected };
+    }
+
+    fn connected(ctx: *anyopaque, peer: NodeID) bool {
+        const self: *FakeNet = @ptrCast(@alignCast(ctx));
+        for (self.peers) |p| if (p.id.eql(peer)) return p.connected;
+        return false;
     }
 
     fn get(ctx: *anyopaque, peer: NodeID, cid: *const Cid, allocator: std.mem.Allocator) anyerror!?[]u8 {
         const self: *FakeNet = @ptrCast(@alignCast(ctx));
         for (self.peers) |*p| if (p.id.eql(peer)) {
             if (p.down) return error.ConnectionRefused;
+            if (p.offline) return error.AllAddressesFailed;
+            if (p.refused) return error.PeerUnreachable;
             if (p.broken) return error.InvalidResponse;
             if (p.delay_ms > 0) sync.sleep(p.delay_ms * std.time.ns_per_ms);
             if (!p.has) return null;
@@ -554,7 +685,7 @@ test "fetcher: lost when the author and every reachable holder said not found" {
     _ = f.fetchVerdict(&root, &cid, &.{idOf(2)}, testing.allocator, author, &lost) catch {};
     try testing.expect(!lost);
     // No holder at all: not lost.
-    try testing.expectError(error.NoHolder, f.fetchVerdict(&root, &cid, &.{}, testing.allocator, author, &lost));
+    try testing.expectError(error.NoHolders, f.fetchVerdict(&root, &cid, &.{}, testing.allocator, author, &lost));
     try testing.expect(!lost);
 }
 
@@ -590,4 +721,167 @@ test "fetcher: an author that can't be reached never makes it lost" {
     var lost = true;
     _ = f.fetchVerdict(&root, &cid, &.{ idOf(1), idOf(2) }, testing.allocator, idOf(1), &lost) catch {};
     try testing.expect(!lost);
+}
+
+test "fetcher: every holder backing off: the first in the caller's order is asked, never none" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = "test_fetcher_probe";
+    var store = try testStore(path);
+    defer {
+        store.deinit();
+        std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), path) catch {};
+    }
+    var peers = [_]FakeNet.Peer{ .{ .id = idOf(1) }, .{ .id = idOf(2) } };
+    var net: FakeNet = .{ .peers = &peers };
+    var cids: [1]Cid = undefined;
+    try addBlocks(&net, arena.allocator(), cids.len, 1024, &cids);
+    var f = Fetcher.init(&store, net.transport());
+    const root = [_]u8{9} ** 32;
+    const holders = [_]NodeID{ idOf(1), idOf(2) };
+    // Both down (say, the mount saw them fail); 1 twice, so 2 is due back
+    // sooner, but 1 is listed first (the caller ranks the backup first).
+    f.markDown(idOf(1));
+    f.markDown(idOf(1));
+    f.markDown(idOf(2));
+    // Both are back: the read asks 1 instead of failing.
+    testing.allocator.free(try f.fetch(&root, &cids[0], &holders, testing.allocator));
+    try testing.expectEqual(@as(u32, 1), peers[0].served.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), peers[1].served.load(.monotonic));
+    try testing.expect(!f.isDown(idOf(1)));
+}
+
+test "fetcher: every holder out of reach reads as HoldersUnreachable; no holder as NoHolders" {
+    const path = "test_fetcher_unreachable";
+    var store = try testStore(path);
+    defer {
+        store.deinit();
+        std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), path) catch {};
+    }
+    var peers = [_]FakeNet.Peer{ .{ .id = idOf(1), .down = true }, .{ .id = idOf(2), .down = true } };
+    var net: FakeNet = .{ .peers = &peers };
+    var f = Fetcher.init(&store, net.transport());
+    const root = [_]u8{9} ** 32;
+    const cid = [_]u8{7} ** 32;
+    const holders = [_]NodeID{ idOf(1), idOf(2) };
+    try testing.expectError(error.HoldersUnreachable, f.fetch(&root, &cid, &holders, testing.allocator));
+    // Both backing off now: one is still asked, and the answer is the same.
+    try testing.expectError(error.HoldersUnreachable, f.fetch(&root, &cid, &holders, testing.allocator));
+    try testing.expectEqual(@as(u64, 3), f.totals().failed);
+    try testing.expectError(error.NoHolders, f.fetch(&root, &cid, &.{}, testing.allocator));
+    // One reachable holder without the block: "not found" wins.
+    peers[1].down = false;
+    peers[1].has = false;
+    f.clearAllBackoff();
+    try testing.expectError(error.BlockNotFound, f.fetch(&root, &cid, &holders, testing.allocator));
+}
+
+test "fetcher: a holder backing off is asked once it is connected again" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = "test_fetcher_connected";
+    var store = try testStore(path);
+    defer {
+        store.deinit();
+        std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), path) catch {};
+    }
+    var peers = [_]FakeNet.Peer{ .{ .id = idOf(1), .delay_ms = 20 }, .{ .id = idOf(2) } };
+    var net: FakeNet = .{ .peers = &peers };
+    var cids: [2]Cid = undefined;
+    try addBlocks(&net, arena.allocator(), cids.len, 1024, &cids);
+    var f = Fetcher.init(&store, net.transport());
+    const root = [_]u8{9} ** 32;
+    const holders = [_]NodeID{ idOf(2), idOf(1) };
+    // 2 is backing off: 1 serves.
+    f.markDown(idOf(2));
+    testing.allocator.free(try f.fetch(&root, &cids[0], &holders, testing.allocator));
+    try testing.expectEqual(@as(u32, 1), peers[0].served.load(.monotonic));
+    // 2 is connected again (say, through a relay): asked despite its
+    // backoff, first as listed first (both unmeasured: small blocks).
+    peers[1].connected = true;
+    testing.allocator.free(try f.fetch(&root, &cids[1], &holders, testing.allocator));
+    try testing.expectEqual(@as(u32, 1), peers[1].served.load(.monotonic));
+}
+
+test "fetcher: a probe of a device backing off never holds the lost verdict back" {
+    const path = "test_fetcher_probe_lost";
+    var store = try testStore(path);
+    defer {
+        store.deinit();
+        std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), path) catch {};
+    }
+    // 1, the author, said "not found"; 2 is away (the real manager's error).
+    var peers = [_]FakeNet.Peer{ .{ .id = idOf(1), .has = false }, .{ .id = idOf(2), .offline = true } };
+    var net: FakeNet = .{ .peers = &peers };
+    var f = Fetcher.init(&store, net.transport());
+    const root = [_]u8{9} ** 32;
+    const cid = [_]u8{7} ** 32;
+    const holders = [_]NodeID{ idOf(1), idOf(2) };
+    var lost = true;
+    // Asked normally, 2's failure holds the verdict back (as before).
+    _ = f.fetchVerdict(&root, &cid, &holders, testing.allocator, idOf(1), &lost) catch {};
+    try testing.expect(!lost);
+    // Again at once: 1 is skipped for its miss, 2 is backing off and asked
+    // only as a probe. Its failure leaves the verdict as skipping it did.
+    try testing.expectError(error.HoldersUnreachable, f.fetchVerdict(&root, &cid, &holders, testing.allocator, idOf(1), &lost));
+    try testing.expect(lost);
+    try testing.expectEqual(@as(u64, 2), f.totals().failed);
+}
+
+test "fetcher: a dead holder the manager refuses at once doesn't use up the probe" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = "test_fetcher_probe_refused";
+    var store = try testStore(path);
+    defer {
+        store.deinit();
+        std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), path) catch {};
+    }
+    // 1 (the author, listed first) is dead and backed off in the manager;
+    // 2 (the backup) has the block. Both back off in the fetcher.
+    var peers = [_]FakeNet.Peer{ .{ .id = idOf(1), .refused = true }, .{ .id = idOf(2) }, .{ .id = idOf(3), .offline = true } };
+    var net: FakeNet = .{ .peers = &peers };
+    var cids: [1]Cid = undefined;
+    try addBlocks(&net, arena.allocator(), cids.len, 1024, &cids);
+    var f = Fetcher.init(&store, net.transport());
+    const root = [_]u8{9} ** 32;
+    f.markDown(idOf(1));
+    f.markDown(idOf(2));
+    testing.allocator.free(try f.fetch(&root, &cids[0], &.{ idOf(1), idOf(2) }, testing.allocator));
+    try testing.expectEqual(@as(u64, 1), f.totals().failed); // 1 was asked, and refused
+    try testing.expectEqual(@as(u32, 1), peers[1].served.load(.monotonic));
+    // A probe that cost a real dial attempt (3: every address failed) ends
+    // the probing: the next holder backing off is not asked in that fetch.
+    const missing = [_]u8{7} ** 32;
+    f.markDown(idOf(3));
+    f.markDown(idOf(2));
+    peers[1].has = false;
+    try testing.expectError(error.HoldersUnreachable, f.fetch(&root, &missing, &.{ idOf(3), idOf(2) }, testing.allocator));
+    try testing.expectEqual(@as(u64, 0), f.totals().not_found); // 2 never asked
+}
+
+test "fetcher: Tally.note, one rule per kind of failed attempt" {
+    const Case = struct { attempt: Fetcher.Attempt, probe: bool, any_failed: bool, all_unreachable: bool, only_refused: bool };
+    const cases = [_]Case{
+        // Refused at once by the manager's backoff: still out of reach, still free to probe.
+        .{ .attempt = .{ .failed = error.PeerUnreachable }, .probe = true, .any_failed = false, .all_unreachable = true, .only_refused = true },
+        // The same refusal asked normally holds the verdict back (the narrow set, as before).
+        .{ .attempt = .{ .failed = error.PeerUnreachable }, .probe = false, .any_failed = true, .all_unreachable = true, .only_refused = true },
+        // A dial that went out and failed: out of reach, but probing stops.
+        .{ .attempt = .{ .failed = error.ConnectionRefused }, .probe = false, .any_failed = false, .all_unreachable = true, .only_refused = false },
+        .{ .attempt = .{ .failed = error.AllAddressesFailed }, .probe = true, .any_failed = false, .all_unreachable = true, .only_refused = false },
+        // A reachable holder answering with an error.
+        .{ .attempt = .{ .failed = error.InvalidResponse }, .probe = false, .any_failed = true, .all_unreachable = false, .only_refused = false },
+        .{ .attempt = .{ .failed = error.InvalidResponse }, .probe = true, .any_failed = false, .all_unreachable = false, .only_refused = false },
+        .{ .attempt = .not_found, .probe = false, .any_failed = false, .all_unreachable = false, .only_refused = false },
+        .{ .attempt = .bad_answer, .probe = true, .any_failed = true, .all_unreachable = false, .only_refused = false },
+    };
+    for (cases) |c| {
+        var t: Fetcher.Tally = .{};
+        t.note(c.attempt, c.probe);
+        try testing.expectEqual(@as(usize, 1), t.failed_attempts);
+        try testing.expectEqual(c.any_failed, t.any_failed);
+        try testing.expectEqual(c.all_unreachable, t.all_unreachable);
+        try testing.expectEqual(c.only_refused, t.only_refused);
+    }
 }

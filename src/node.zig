@@ -966,6 +966,7 @@ pub const Node = struct {
                 self.redial.clearRetainingCapacity();
                 self.connection_manager.clearAllBackoff();
                 self.discovery_node.forgetRelayMisses();
+                if (self.block_manager.fetcher) |*f| f.clearAllBackoff();
             }
         }
     }

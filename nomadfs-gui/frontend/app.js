@@ -36,6 +36,20 @@ function formatSize(bytes) {
   return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
 }
 
+/** A read error as a sentence: the node reports Zig error names. */
+const READ_ERRORS = {
+  HoldersUnreachable: "the devices that keep it can't be reached right now. Try again on Wi-Fi or in a minute.",
+  AllAddressesFailed: "the device that has it can't be reached right now.",
+  PeerUnreachable: "the device that has it can't be reached right now.",
+  NoHolders: "no device is known to keep it yet.",
+  BlockNotFound: "none of the devices asked has it.",
+  NotRunning: "NomadFS isn't running.",
+};
+function errText(err) {
+  const name = String(err).replace(/^Error:\s*/, "");
+  return READ_ERRORS[name] || name;
+}
+
 function timeAgo(ms) {
   const s = Math.max(1, Math.round((Date.now() - ms) / 1000));
   if (s < 60) return "just now";
@@ -293,7 +307,7 @@ async function openInApp(source, e) {
     const url = await source.mediaUrl(e, true);
     await window.oriel.openExternal(url, { type: mimeFor(e.name) });
   } catch (err) {
-    snack(`Couldn't open it: ${err}`);
+    snack(`Couldn't open it: ${errText(err)}`);
   }
 }
 
@@ -2754,7 +2768,7 @@ async function openDetails(name, src) {
   try {
     d = await invoke("file_details", src);
   } catch (err) {
-    $("dt-meta").textContent = `Couldn't read the details: ${err}`;
+    $("dt-meta").textContent = `Couldn't read the details: ${errText(err)}`;
     return;
   }
   $("dt-meta").textContent = `${formatSize(d.size)} · ${d.chunks} chunk${d.chunks === 1 ? "" : "s"}`;

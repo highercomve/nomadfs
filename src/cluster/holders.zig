@@ -44,6 +44,11 @@ pub const Holders = struct {
         rolesFn: *const fn (ctx: *anyopaque, peer: NodeID) ?u8,
         /// Copies known peer IDs into `out`; returns how many.
         knownFn: *const fn (ctx: *anyopaque, out: []NodeID) usize,
+        /// Copies the IDs of peers with a live connection (direct or
+        /// relayed) into `out`; returns how many. Null: none known. A
+        /// device reached only through a relay is in no routing table, so
+        /// this is the only way it is listed.
+        connectedFn: ?*const fn (ctx: *anyopaque, out: []NodeID) usize = null,
     };
 
     /// `holder` keeps copies of `origin`'s folders (re-noting refreshes).
@@ -119,16 +124,36 @@ pub const Holders = struct {
     /// Likely holders of a swarm file: the author first, then the peers
     /// whose roles say they keep swarm backups, then the rest of the known
     /// peers, so no read ever has fewer sources than before the registry
-    /// existed. Within each group, peers on a metered network come last.
-    /// The result excludes this node, is bounded to `fetcher.max_holders`,
-    /// and lives in the caller's buffer.
+    /// existed. Within each group the peers connected right now come first
+    /// and peers on a metered network last, so a cap of
+    /// `fetcher.max_holders` drops stale peers, not the reachable backup.
+    /// Connected peers missing from the known list (reached through a
+    /// relay) count as known. The result excludes this node, is bounded to
+    /// `fetcher.max_holders`, and lives in the caller's buffer.
     pub fn forSwarm(self: *Holders, author: NodeID, out: *[fetcher.max_holders]NodeID) []NodeID {
         self.mutex.lock();
         defer self.mutex.unlock();
         const peers = self.peers orelse return self.swarmWithoutKnown(author, out);
 
+        // The connected peers first, so a full routing table can't crowd
+        // out a device reached only through a relay; then the table.
+        var connected: [max_known]NodeID = undefined;
+        const connected_count = if (peers.connectedFn) |f| f(peers.ctx, &connected) else 0;
+        const live = connected[0..connected_count];
         var known: [max_known]NodeID = undefined;
-        const count = peers.knownFn(peers.ctx, &known);
+        @memcpy(known[0..connected_count], live);
+        // The table after them, then compacted in place without the
+        // connected ones it lists too. With a table larger than what is
+        // left, a connected peer it also lists takes the slot of one more
+        // table entry (accepted: only past max_known peers, and the
+        // connected peers are the ones a read can use now).
+        const routing_count = peers.knownFn(peers.ctx, known[connected_count..]);
+        var count = connected_count;
+        for (connected_count..connected_count + routing_count) |i| {
+            if (contains(live, known[i])) continue;
+            known[count] = known[i];
+            count += 1;
+        }
 
         var n: usize = 0;
         if (!author.eql(self.self_id)) {
@@ -146,7 +171,7 @@ pub const Holders = struct {
                     m += 1;
                 }
             }
-            self.appendGroup(out, &n, backup[0..m]);
+            self.appendGroup(out, &n, backup[0..m], live);
             break :backuppeers;
         }
         // Everyone else: sources in reserve.
@@ -159,7 +184,7 @@ pub const Holders = struct {
                 m += 1;
             }
         }
-        self.appendGroup(out, &n, rest[0..m]);
+        self.appendGroup(out, &n, rest[0..m], live);
         return out[0..n];
     }
 
@@ -171,26 +196,23 @@ pub const Holders = struct {
     }
 
     /// Appends `group` to `out` (deduplicated against what is listed
-    /// already), the peers not on a metered network first.
-    fn appendGroup(self: *Holders, out: *[fetcher.max_holders]NodeID, n: *usize, group: []NodeID) void {
+    /// already), in four ranks, each in the group's order: connected and
+    /// not metered, not connected and not metered, connected and metered,
+    /// the rest. `live` lists the connected peers. Each peer's roles are
+    /// looked up once.
+    fn appendGroup(self: *Holders, out: *[fetcher.max_holders]NodeID, n: *usize, group: []const NodeID, live: []const NodeID) void {
+        std.debug.assert(group.len <= max_known);
         const peers = self.peers.?;
-        // Partition in place: non-metered first, metered behind.
-        var head: usize = 0;
-        var tail: usize = group.len;
-        while (head < tail) {
-            const roles = peers.rolesFn(peers.ctx, group[head]);
+        var ranks: [max_known]u2 = undefined;
+        for (group, ranks[0..group.len]) |peer, *r| {
+            const roles = peers.rolesFn(peers.ctx, peer);
             const metered = roles != null and roles.? & rpc.Roles.metered != 0;
-            if (metered) {
-                tail -= 1;
-                std.mem.swap(NodeID, &group[head], &group[tail]);
-            } else {
-                head += 1;
-            }
+            r.* = @as(u2, if (metered) 2 else 0) + @as(u2, if (contains(live, peer)) 0 else 1);
         }
-        for (0..2) |round| {
-            const part = if (round == 0) group[0..head] else group[head..];
-            for (part) |peer| {
+        for (0..4) |rank| {
+            for (group, ranks[0..group.len]) |peer, r| {
                 if (n.* >= out.len) return;
+                if (r != rank) continue;
                 if (peer.eql(self.self_id)) continue;
                 if (contains(out[0..n.*], peer)) continue;
                 out[n.*] = peer;
@@ -369,4 +391,57 @@ test "holders: forSwarm orders author, swarm backup peers, then the rest, metere
     const lone = t2.forSwarm(idOf(9), &out);
     try testing.expectEqualSlices(NodeID, &.{idOf(9)}, lone);
     try testing.expectEqual(@as(usize, 0), t2.forSwarm(idOf(0), &out).len);
+}
+
+/// A source with a full routing table of stale peers (ids 100..163, no
+/// roles), and connected peers the test sets.
+const FullTable = struct {
+    var connected: [4]NodeID = undefined;
+    var connected_count: usize = 0;
+    var backup: NodeID = undefined;
+
+    fn roles(_: *anyopaque, peer: NodeID) ?u8 {
+        return if (peer.eql(backup)) rpc.Roles.swarm_backup else null;
+    }
+    fn known(_: *anyopaque, out: []NodeID) usize {
+        const n = @min(out.len, max_known);
+        for (out[0..n], 0..) |*o, i| o.* = idOf(@intCast(100 + i));
+        return n;
+    }
+    fn live(_: *anyopaque, out: []NodeID) usize {
+        const n = @min(out.len, connected_count);
+        @memcpy(out[0..n], connected[0..n]);
+        return n;
+    }
+    fn source() Holders.Peers {
+        return .{ .ctx = undefined, .rolesFn = roles, .knownFn = known, .connectedFn = live };
+    }
+};
+
+test "holders: forSwarm lists a peer reached only through a relay, even with a full routing table" {
+    var t = table(idOf(0));
+    t.peers = FullTable.source();
+    var out: [fetcher.max_holders]NodeID = undefined;
+
+    // Not connected and not in the table: not listed; stale peers fill the cap.
+    FullTable.connected_count = 0;
+    FullTable.backup = idOf(7);
+    const before = t.forSwarm(idOf(9), &out);
+    try testing.expectEqual(@as(usize, fetcher.max_holders), before.len);
+    for (before) |p| try testing.expect(!p.eql(idOf(7)));
+
+    // Connected through a relay (so in no table): listed right after the
+    // author, ahead of the 64 stale peers, as a swarm backup.
+    FullTable.connected = .{ idOf(7), idOf(0), idOf(0), idOf(0) };
+    FullTable.connected_count = 1;
+    const after = t.forSwarm(idOf(9), &out);
+    try testing.expectEqual(idOf(9), after[0]);
+    try testing.expectEqual(idOf(7), after[1]);
+
+    // A connected peer without roles leads the rest, ahead of stale ones.
+    FullTable.backup = idOf(250);
+    FullTable.connected = .{ idOf(7), idOf(120), idOf(0), idOf(0) };
+    FullTable.connected_count = 2;
+    const ranked = t.forSwarm(idOf(9), &out);
+    try testing.expectEqualSlices(NodeID, &.{ idOf(9), idOf(7), idOf(120), idOf(100), idOf(101), idOf(102), idOf(103), idOf(104) }, ranked);
 }

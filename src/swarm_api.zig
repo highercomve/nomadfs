@@ -375,7 +375,7 @@ fn answerError(conn: *Conn, err: anyerror) !void {
         error.FileNotFound => .{ 404, "Not Found" },
         error.InvalidPath, error.IsDirectory => .{ 400, "Bad Request" },
         error.FileTooLarge, error.BodyTooLarge => .{ 413, "Content Too Large" },
-        error.Unavailable, error.BlockNotFound, error.NoHolders => .{ 503, "Unavailable" },
+        error.Unavailable, error.BlockNotFound, error.NoHolders, error.HoldersUnreachable, error.PeerUnreachable, error.AllAddressesFailed => .{ 503, "Unavailable" },
         else => .{ 500, "Internal Server Error" },
     };
     return conn.respond(code, text, &.{ .{ "Connection", "close" }, .{ "X-NomadFS-Error", @errorName(err) } }, "");

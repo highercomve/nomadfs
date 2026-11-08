@@ -433,6 +433,39 @@ pub const ConnectionManager = struct {
         return mc.conn;
     }
 
+    /// Whether a live connection to `peer` exists (direct or relayed).
+    /// Unlike existingConnection it doesn't count as using it, so asking
+    /// never keeps an idle connection from being closed.
+    pub fn isConnected(self: *ConnectionManager, peer: id.NodeID) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.connections.items) |mc| {
+            if (!mc.conn.isClosed() and mc.conn.getRemoteNodeID().eql(peer)) return true;
+        }
+        return false;
+    }
+
+    /// Copies the IDs of the devices with a live connection (direct or
+    /// relayed, each once) into `out`; returns how many. Allocates nothing
+    /// and doesn't count as using them.
+    pub fn copyConnectedIDs(self: *ConnectionManager, out: []id.NodeID) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var n: usize = 0;
+        for (self.connections.items) |mc| {
+            if (n >= out.len) break;
+            if (mc.conn.isClosed()) continue;
+            const peer = mc.conn.getRemoteNodeID();
+            for (out[0..n]) |known| {
+                if (known.eql(peer)) break;
+            } else {
+                out[n] = peer;
+                n += 1;
+            }
+        }
+        return n;
+    }
+
     /// Whether the only connection to `peer` runs through a relay.
     pub fn onlyRelayed(self: *ConnectionManager, peer: id.NodeID) bool {
         self.mutex.lock();
@@ -651,8 +684,10 @@ pub const ConnectionManager = struct {
         };
     }
 
-    /// Whether `peer` failed every address recently. Caller doesn't hold `mutex`.
-    fn dialBackedOff(self: *ConnectionManager, peer: id.NodeID) bool {
+    /// Whether `peer` failed every address recently (and its relay), so a
+    /// dial would fail at once with error.PeerUnreachable. Caller doesn't
+    /// hold `mutex`.
+    pub fn dialBackedOff(self: *ConnectionManager, peer: id.NodeID) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         const now = sync.monotonicMillis();

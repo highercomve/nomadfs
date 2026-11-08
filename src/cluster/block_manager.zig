@@ -49,10 +49,10 @@ pub const BlockManager = struct {
             .quorum = config.quorum,
         };
         if (config.storage) |s| {
-            self.fetcher = fetcher_mod.Fetcher.init(s, .{ .ctx = self, .getFn = getBlockFrom });
+            self.fetcher = fetcher_mod.Fetcher.init(s, .{ .ctx = self, .getFn = getBlockFrom, .connectedFn = isConnected });
             self.holders = .{
                 .self_id = config.dht.manager.node_id,
-                .peers = .{ .ctx = config.dht, .rolesFn = rolesOfPeered, .knownFn = knownIDsOf },
+                .peers = .{ .ctx = self, .rolesFn = rolesOfPeered, .knownFn = knownIDsOf, .connectedFn = connectedIDsOf },
             };
         }
         return self;
@@ -237,12 +237,14 @@ pub const BlockManager = struct {
 
     /// The fetcher's network side: one GET_BLOCK to `peer`. A holder not in
     /// the routing table yet (a node just started, the author not met) is
-    /// looked up once; if that fails, the fetcher's backoff keeps it from
-    /// being tried again for a while.
+    /// looked up through the DHT, but not while the connection manager
+    /// backs it off: a failed lookup ends in a failed dial, which starts
+    /// that backoff, so a device that can't be found costs one lookup per
+    /// backoff, even when the fetcher asks it anyway (a probe).
     fn getBlockFrom(ctx: *anyopaque, peer: NodeID, cid: *const fetcher_mod.Cid, allocator: std.mem.Allocator) anyerror!?[]u8 {
         const self: *BlockManager = @ptrCast(@alignCast(ctx));
         const conn = self.connectKnown(peer) catch |err| switch (err) {
-            error.ProviderUnreachable => try self.connectTo(peer),
+            error.ProviderUnreachable => if (self.net.dialBackedOff(peer)) return error.PeerUnreachable else try self.connectTo(peer),
             else => return err,
         };
         defer conn.deinit();
@@ -255,14 +257,28 @@ pub const BlockManager = struct {
 
     /// A peer's announced roles (PING/PONG), or null when unknown.
     fn rolesOfPeered(ctx: *anyopaque, peer: NodeID) ?u8 {
-        const node: *dht.Node = @ptrCast(@alignCast(ctx));
-        return node.peerRoles(peer);
+        const self: *BlockManager = @ptrCast(@alignCast(ctx));
+        return self.dht_node.peerRoles(peer);
     }
 
     /// Copies the routing table's peer IDs.
     fn knownIDsOf(ctx: *anyopaque, out: []NodeID) usize {
-        const node: *dht.Node = @ptrCast(@alignCast(ctx));
-        return node.copyPeerIDs(out);
+        const self: *BlockManager = @ptrCast(@alignCast(ctx));
+        return self.dht_node.copyPeerIDs(out);
+    }
+
+    /// Copies the IDs of the devices connected right now, relayed ones
+    /// included (they are in no routing table).
+    fn connectedIDsOf(ctx: *anyopaque, out: []NodeID) usize {
+        const self: *BlockManager = @ptrCast(@alignCast(ctx));
+        return self.net.copyConnectedIDs(out);
+    }
+
+    /// The fetcher's view of the connections: a device connected right now
+    /// is asked even while its fetch backoff runs.
+    fn isConnected(ctx: *anyopaque, peer: NodeID) bool {
+        const self: *BlockManager = @ptrCast(@alignCast(ctx));
+        return self.net.isConnected(peer);
     }
 
     fn findPeer(self: *BlockManager, peer_id: NodeID) !dht.kbucket.PeerInfo {
