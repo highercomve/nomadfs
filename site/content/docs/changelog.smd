@@ -7,6 +7,28 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.6.1 - 2026-11-08
+
+Devices on 0.4.0 and later work together. The fix is on the reading side: update the devices
+that open files from others, above all phones on mobile data.
+
+## Fixed
+
+- A phone on mobile data, reaching the swarm backup only through a relay, failed to open
+  backed-up files at once with "NoHolder", though the backup had them. After a few failed
+  attempts every device that could hold the file was waiting out its retry delay, so the read
+  asked nobody. Now a read always asks someone: the devices still waiting are tried in order
+  (the author, then the backups), and a device with a live connection, through a relay
+  included, is asked whatever its retry delay says. Coming back in touch with the relay
+  clears the delays.
+- The backup device could be left out of the devices a swarm file is read from: only eight are
+  asked, and one reached only through a relay (in no routing table) or not heard from since the
+  app started could fall behind devices long gone. Connected devices now come first.
+- A device that can't be found is looked up on the network once per retry delay, not on every
+  read.
+- Reads that fail now say why: "the devices that keep it can't be reached right now" or "no
+  device is known to keep it yet", in the app, the mobile API, WebDAV and the local swarm API.
+
 # 0.6.0 - 2026-11-03
 
 Devices on 0.4.0 and later work together. Only a device that runs a program using the swarm
