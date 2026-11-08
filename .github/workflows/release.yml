@@ -6,15 +6,21 @@
 #
 #   linux-app    nomadfs-gui .AppImage, .deb, .rpm (Arch: GNOME 50's GTK/WebKit)
 #   cross        command line (x86_64, aarch64 Linux; Windows), the Windows
-#                app (installer and update payload), the Android APK
+#                app (installer and update payload), the Android APK (the
+#                GitHub one: debug-signed, with its own update check)
+#   play         the Google Play .aab (-Dplay-store=true, upload key): an
+#                artifact of the run, uploaded to internal testing if set up
 #   publish      latest.json, latest-cli.json, SHA256SUMS; the release
 #   desktop      .github/workflows/desktop.yml (macOS, Windows test)
 #   site         .github/workflows/site.yml
 #
-# Secrets: NOMADFS_UPDATE_KEY (signs the manifests the apps check), and
-# NOMADFS_ANDROID_DEBUG_KEYSTORE_BASE64 (the keystore every published APK
-# was signed with: another key and Android refuses the update). Desktop's
-# macOS secrets and the site's Cloudflare ones as there.
+# Secrets: NOMADFS_UPDATE_KEY (signs the manifests the apps check),
+# NOMADFS_ANDROID_DEBUG_KEYSTORE_BASE64 (the keystore every GitHub APK was
+# signed with: another key and Android refuses the update),
+# NOMADFS_PLAY_UPLOAD_KEYSTORE_BASE64 and NOMADFS_PLAY_UPLOAD_PASSWORD (the
+# Play upload key, store/README.md), optionally PLAY_SERVICE_ACCOUNT_JSON (a
+# service account with release access in Play Console). Desktop's macOS
+# secrets and the site's Cloudflare ones as there.
 #
 # A release made with the workflow's token starts no other workflow, hence
 # Desktop and the site are called from here. Re-run a tag by hand with
@@ -174,6 +180,75 @@ jobs:
           name: cross
           path: dist/*
           if-no-files-found: error
+
+  # The Google Play build (store/README.md): -Dplay-store=true (Play updates
+  # it, so no update check or APK download), an .aab signed with the upload
+  # key. Kept as this run's artifact, never on the GitHub release; uploaded
+  # to the internal testing track when PLAY_SERVICE_ACCOUNT_JSON is set.
+  play:
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      V: ${{ needs.version.outputs.version }}
+      NDK_VERSION: 28.2.13676358
+      HAS_PLAY_ACCOUNT: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Android SDK (platform, build tools, NDK)
+        run: |
+          sdk="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-36" "build-tools;35.0.0" "ndk;$NDK_VERSION" >/dev/null
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$sdk/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+      - name: Upload key (nomadfs-upload)
+        env:
+          KEYSTORE: ${{ secrets.NOMADFS_PLAY_UPLOAD_KEYSTORE_BASE64 }}
+          PASSWORD: ${{ secrets.NOMADFS_PLAY_UPLOAD_PASSWORD }}
+        run: |
+          [ -n "$KEYSTORE" ] && [ -n "$PASSWORD" ] ||
+            { echo "::error::NOMADFS_PLAY_UPLOAD_KEYSTORE_BASE64 and NOMADFS_PLAY_UPLOAD_PASSWORD must be set"; exit 1; }
+          umask 077
+          printf '%s' "$KEYSTORE" | base64 --decode > "$RUNNER_TEMP/play-upload.p12"
+          {
+            echo "ORIEL_ANDROID_KEYSTORE=$RUNNER_TEMP/play-upload.p12"
+            echo "ORIEL_ANDROID_KEY_ALIAS=nomadfs-upload"
+            echo "ORIEL_ANDROID_KEYSTORE_PASSWORD=$PASSWORD"
+            echo "ORIEL_ANDROID_KEY_PASSWORD=$PASSWORD"
+          } >> "$GITHUB_ENV"
+      - name: App bundle (.aab)
+        working-directory: nomadfs-gui
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dplay-store=true -Dtarget=aarch64-linux-android
+          zig build -Doptimize=ReleaseSafe -Dplay-store=true -Dtarget=x86_64-linux-android -Dcpu=baseline
+          (cd android && ./gradlew --no-daemon bundleRelease)
+          rm -f "$RUNNER_TEMP/play-upload.p12"
+          mkdir -p ../play
+          cp android/app/build/outputs/bundle/release/app-release.aab "../play/nomadfs-$V-play.aab"
+          ls -la ../play
+      - uses: actions/upload-artifact@v4
+        with:
+          name: play-aab
+          path: play/*.aab
+          if-no-files-found: error
+      - name: Upload to Google Play (internal testing)
+        if: env.HAS_PLAY_ACCOUNT == 'true'
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.foreachdeveloper.nomadfs
+          releaseFiles: play/nomadfs-${{ env.V }}-play.aab
+          releaseName: ${{ env.V }}
+          track: internal
+          status: completed
 
   publish:
     needs: [version, linux-app, cross]
