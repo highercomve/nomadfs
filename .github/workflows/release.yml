@@ -1,27 +1,31 @@
-# NomadFS release assets from a tag: push vX.Y.Z (matching the version in
-# nomadfs-gui/build.zig) and this builds and signs every asset. Publishing
-# stays manual for now: download the run's `release` artifact and create the
-# release from it (the Desktop workflow then adds the macOS files, and the
-# site rebuilds after it).
+# A NomadFS release from a tag, like Ghostpen's and Oriel's: push vX.Y.Z
+# (matching the version in nomadfs-gui/build.zig) and every platform is built
+# in parallel, then one job signs the update manifests for all of them,
+# writes the checksums, publishes the GitHub release with its notes from
+# CHANGELOG.md, and the site is rebuilt so its download links list it.
 #
 #   linux-app    nomadfs-gui .AppImage, .deb, .rpm (Arch: GNOME 50's GTK/WebKit)
 #   cross        command line (x86_64, aarch64 Linux; Windows), the Windows
 #                app (installer and update payload), the Android APK (the
 #                GitHub one: debug-signed, with its own update check)
+#   macos        the macOS app (.dmg, and .app.tar.gz for the updater; signed
+#                with NomadFS's identity) and command line (Apple silicon)
 #   play         the Google Play .aab (-Dplay-store=true, upload key): an
 #                artifact of the run, uploaded to internal testing if set up
-#   assets       latest.json, latest-cli.json, SHA256SUMS, notes.md, title.txt: the
-#                `release` artifact, every file the GitHub release needs
-#
-#   gh run download <run id> -n release -D rel
-#   gh release create vX.Y.Z rel/assets/* --title "$(cat rel/title.txt)" --notes-file rel/notes.md
+#   release      latest.json, latest-cli.json, SHA256SUMS(-macos); publishes
+#   site         redeploys the site (site.yml), which reads the new release
 #
 # Secrets: NOMADFS_UPDATE_KEY (signs the manifests the apps check),
 # NOMADFS_ANDROID_DEBUG_KEYSTORE_BASE64 (the keystore every GitHub APK was
 # signed with: another key and Android refuses the update),
 # NOMADFS_PLAY_UPLOAD_KEYSTORE_BASE64 and NOMADFS_PLAY_UPLOAD_PASSWORD (the
-# Play upload key, store/README.md), optionally PLAY_SERVICE_ACCOUNT_JSON (a
-# service account with release access in Play Console).
+# Play upload key, store/README.md), NOMADFS_MACOS_CERT_P12_BASE64,
+# NOMADFS_MACOS_CERT_PASSWORD and NOMADFS_MACOS_SIGN_IDENTITY (the macOS
+# signing identity), optionally PLAY_SERVICE_ACCOUNT_JSON (a service account
+# with release access in Play Console).
+#
+# Re-run a tag with "Run workflow": a release that exists gets its files
+# replaced.
 name: Release
 
 on:
@@ -177,6 +181,76 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  macos:
+    needs: version
+    runs-on: macos-latest
+    env:
+      V: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Command line
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Smoke test
+        run: bash scripts/smoke.sh zig-out/bin/nomadfs
+      # The same identity every release, so macOS keeps the app's
+      # permissions across updates.
+      - name: Import signing identity
+        env:
+          CERT: ${{ secrets.NOMADFS_MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.NOMADFS_MACOS_CERT_PASSWORD }}
+        run: |
+          [ -n "$CERT" ] || { echo "::error::NOMADFS_MACOS_CERT_P12_BASE64 is not set"; exit 1; }
+          umask 077
+          printf '%s' "$CERT" | base64 --decode > "$RUNNER_TEMP/nomadfs.p12"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p ci "$keychain"
+          security set-keychain-settings "$keychain"
+          security unlock-keychain -p ci "$keychain"
+          security import "$RUNNER_TEMP/nomadfs.p12" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/nomadfs.p12"
+      - name: App
+        working-directory: nomadfs-gui
+        env:
+          ORIEL_MACOS_SIGN_IDENTITY: ${{ secrets.NOMADFS_MACOS_SIGN_IDENTITY }}
+        run: zig build package -Doptimize=ReleaseSafe
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+      - name: Check the app (signature; starts and stays up)
+        working-directory: nomadfs-gui
+        run: |
+          app=$(find zig-out/package -maxdepth 1 -name '*.app' | head -1)
+          codesign --verify --deep --strict "$app"
+          codesign -dvv "$app" 2>&1 | grep -E 'Authority|Identifier'
+          export HOME="$RUNNER_TEMP/apphome"; mkdir -p "$HOME"
+          "$app"/Contents/MacOS/* > "$RUNNER_TEMP/app.log" 2>&1 &
+          pid=$!
+          sleep 20
+          tail -30 "$RUNNER_TEMP/app.log"
+          kill -0 "$pid"
+          kill "$pid"
+      - name: Collect
+        run: |
+          mkdir dist
+          cp "$(find nomadfs-gui/zig-out/package -maxdepth 1 -name '*.dmg' | head -1)" "dist/nomadfs-gui-$V-macos-arm64.dmg"
+          cp zig-out/bin/nomadfs "dist/nomadfs-$V-aarch64-macos"
+          # The installed app's update payload: the signed bundle itself.
+          app=$(find nomadfs-gui/zig-out/package -maxdepth 1 -name '*.app' | head -1)
+          tar -C "$(dirname "$app")" -czf "dist/nomadfs-gui-$V-macos-arm64.app.tar.gz" "$(basename "$app")"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+          if-no-files-found: error
+
   # The Google Play build (store/README.md): -Dplay-store=true (Play updates
   # it, so no update check or APK download), an .aab signed with the upload
   # key. Kept as this run's artifact, never on the GitHub release; uploaded
@@ -246,11 +320,14 @@ jobs:
           track: internal
           status: completed
 
-  assets:
-    needs: [version, linux-app, cross]
+  release:
+    needs: [version, linux-app, cross, macos]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       V: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -269,7 +346,7 @@ jobs:
         run: |
           find artifacts -maxdepth 3 | sort
           mkdir -p assets
-          find artifacts/cross artifacts/linux-app -maxdepth 1 -type f -exec cp -t assets {} +
+          find artifacts/cross artifacts/linux-app artifacts/macos -maxdepth 1 -type f -exec cp -t assets {} +
           ls -la assets
       - name: Update manifests (latest.json, latest-cli.json)
         env:
@@ -290,29 +367,54 @@ jobs:
           # One APK for both ABIs. The app opens its download; Android installs it.
           sign "nomadfs-$V.apk" aarch64-android raw "" "$RUNNER_TEMP/m"
           sign "nomadfs-$V.apk" x86_64-android raw "" "$RUNNER_TEMP/m"
+          sign "nomadfs-gui-$V-macos-arm64.app.tar.gz" aarch64-macos app.tar.gz "" "$RUNNER_TEMP/m"
           # The command line node: its own app id, so the app's manifest
           # can't replace it with an AppImage (both are x86_64-linux).
           sign "nomadfs-$V-x86_64-linux" x86_64-linux raw .cli "$RUNNER_TEMP/mcli"
           sign "nomadfs-$V-aarch64-linux" aarch64-linux raw .cli "$RUNNER_TEMP/mcli"
           sign "nomadfs-$V-x86_64-windows.exe" x86_64-windows raw .cli "$RUNNER_TEMP/mcli"
+          sign "nomadfs-$V-aarch64-macos" aarch64-macos raw .cli "$RUNNER_TEMP/mcli"
           rm -f "$key"
           now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           (cd nomadfs-gui && zig build combine-manifests -- "$RUNNER_TEMP"/m/update-*.json --pub-date "$now" --out ../assets/latest.json)
           (cd nomadfs-gui && zig build combine-manifests -- "$RUNNER_TEMP"/mcli/update-*.json --pub-date "$now" --out ../assets/latest-cli.json)
           jq -r '.platforms | keys | join(", ")' assets/latest.json assets/latest-cli.json
+      # SHA256SUMS: every file. SHA256SUMS-macos: the macOS ones, which
+      # install.sh reads on a Mac.
       - name: Checksums
-        run: (cd assets && find . -maxdepth 1 -type f -printf '%f\n' | sort | xargs sha256sum --) > SHA256SUMS && mv SHA256SUMS assets/ && cat assets/SHA256SUMS
+        run: |
+          (cd assets && find . -maxdepth 1 -type f -printf '%f\n' | sort | xargs sha256sum --) > SHA256SUMS
+          (cd assets && sha256sum -- *-macos*) > SHA256SUMS-macos
+          mv SHA256SUMS SHA256SUMS-macos assets/
+          cat assets/SHA256SUMS
       - name: Release notes (CHANGELOG.md)
         run: |
           awk -v v="$V" '$0 ~ "^## "v" " {f=1; next} /^## / {f=0} f' CHANGELOG.md > notes.md
           [ -s notes.md ] || { echo "::error::no notes for $V in CHANGELOG.md"; exit 1; }
           title=$(git log -1 --format=%s HEAD | sed -n 's/^Release [0-9.]*: //p')
-          echo "NomadFS $V${title:+: $title}" > title.txt
-      - uses: actions/upload-artifact@v4
+          echo "TITLE=NomadFS $V${title:+: $title}" >> "$GITHUB_ENV"
+      - name: Publish
+        uses: softprops/action-gh-release@v2
         with:
-          name: release
-          path: |
-            assets/
-            notes.md
-            title.txt
-          if-no-files-found: error
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TITLE }}
+          body_path: notes.md
+          files: assets/*
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(env.TAG, '-') }}
+          generate_release_notes: false
+
+  # The site's download links come from the latest release: rebuild it. A
+  # release published with the workflow's token starts no other workflow,
+  # a workflow_dispatch does.
+  site:
+    needs: release
+    if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Rebuild the site
+        run: gh workflow run site.yml --repo "$GITHUB_REPOSITORY" --ref main

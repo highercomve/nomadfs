@@ -1,6 +1,7 @@
-# macOS and Windows: build and test on real machines, and attach the
-# macOS app and command line to a published release (release.yml builds the
-# Linux, Android and Windows assets from the tag, then calls this).
+# macOS and Windows: build and test on real machines. release.yml builds
+# and publishes every platform's files, macOS included; this attaches the
+# macOS ones only to a release published by hand (or for a tag given to
+# "Run workflow"), and tests the Windows installer of a release.
 #
 #   macOS:   the app (.dmg, signed with NomadFS's persistent self-signed
 #            identity so macOS keeps its permissions across updates) and the

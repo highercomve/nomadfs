@@ -13,8 +13,7 @@ on:
   workflow_run:
     workflows: [Desktop]
     types: [completed]
-  # From release.yml, after Desktop (a release it publishes starts no
-  # workflow_run here: its Desktop run is part of the Release run).
+  # From other workflows (a release they publish starts no workflow_run).
   workflow_call:
   workflow_dispatch:
 
