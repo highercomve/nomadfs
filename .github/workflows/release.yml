@@ -1,8 +1,8 @@
-# A NomadFS release from a tag: push vX.Y.Z (matching the version in
-# nomadfs-gui/build.zig) and this builds every asset, publishes the GitHub
-# release with its notes from CHANGELOG.md and the signed update manifests,
-# then runs Desktop (macOS assets and entries, the Windows install test) and
-# rebuilds the site so its download links list every platform.
+# NomadFS release assets from a tag: push vX.Y.Z (matching the version in
+# nomadfs-gui/build.zig) and this builds and signs every asset. Publishing
+# stays manual for now: download the run's `release` artifact and create the
+# release from it (the Desktop workflow then adds the macOS files, and the
+# site rebuilds after it).
 #
 #   linux-app    nomadfs-gui .AppImage, .deb, .rpm (Arch: GNOME 50's GTK/WebKit)
 #   cross        command line (x86_64, aarch64 Linux; Windows), the Windows
@@ -10,21 +10,18 @@
 #                GitHub one: debug-signed, with its own update check)
 #   play         the Google Play .aab (-Dplay-store=true, upload key): an
 #                artifact of the run, uploaded to internal testing if set up
-#   publish      latest.json, latest-cli.json, SHA256SUMS; the release
-#   desktop      .github/workflows/desktop.yml (macOS, Windows test)
-#   site         .github/workflows/site.yml
+#   assets       latest.json, latest-cli.json, SHA256SUMS, notes.md, title.txt: the
+#                `release` artifact, every file the GitHub release needs
+#
+#   gh run download <run id> -n release -D rel
+#   gh release create vX.Y.Z rel/assets/* --title "$(cat rel/title.txt)" --notes-file rel/notes.md
 #
 # Secrets: NOMADFS_UPDATE_KEY (signs the manifests the apps check),
 # NOMADFS_ANDROID_DEBUG_KEYSTORE_BASE64 (the keystore every GitHub APK was
 # signed with: another key and Android refuses the update),
 # NOMADFS_PLAY_UPLOAD_KEYSTORE_BASE64 and NOMADFS_PLAY_UPLOAD_PASSWORD (the
 # Play upload key, store/README.md), optionally PLAY_SERVICE_ACCOUNT_JSON (a
-# service account with release access in Play Console). Desktop's macOS
-# secrets and the site's Cloudflare ones as there.
-#
-# A release made with the workflow's token starts no other workflow, hence
-# Desktop and the site are called from here. Re-run a tag by hand with
-# "Run workflow" (it updates the release's assets if it exists).
+# service account with release access in Play Console).
 name: Release
 
 on:
@@ -37,8 +34,7 @@ on:
         required: true
 
 permissions:
-  contents: write
-  deployments: write
+  contents: read
 
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
@@ -250,12 +246,11 @@ jobs:
           track: internal
           status: completed
 
-  publish:
+  assets:
     needs: [version, linux-app, cross]
     runs-on: ubuntu-latest
     env:
       V: ${{ needs.version.outputs.version }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -306,34 +301,18 @@ jobs:
           (cd nomadfs-gui && zig build combine-manifests -- "$RUNNER_TEMP"/mcli/update-*.json --pub-date "$now" --out ../assets/latest-cli.json)
           jq -r '.platforms | keys | join(", ")' assets/latest.json assets/latest-cli.json
       - name: Checksums
-        run: cd assets && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort | xargs sha256sum -- > SHA256SUMS && cat SHA256SUMS
+        run: (cd assets && find . -maxdepth 1 -type f -printf '%f\n' | sort | xargs sha256sum --) > SHA256SUMS && mv SHA256SUMS assets/ && cat assets/SHA256SUMS
       - name: Release notes (CHANGELOG.md)
         run: |
           awk -v v="$V" '$0 ~ "^## "v" " {f=1; next} /^## / {f=0} f' CHANGELOG.md > notes.md
           [ -s notes.md ] || { echo "::error::no notes for $V in CHANGELOG.md"; exit 1; }
           title=$(git log -1 --format=%s HEAD | sed -n 's/^Release [0-9.]*: //p')
-          echo "TITLE=NomadFS $V${title:+: $title}" >> "$GITHUB_ENV"
-      - name: Publish
-        run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --title "$TITLE" --notes-file notes.md
-            gh release upload "$TAG" assets/* --clobber
-          else
-            gh release create "$TAG" assets/* --verify-tag --title "$TITLE" --notes-file notes.md
-          fi
-
-  desktop:
-    needs: publish
-    uses: ./.github/workflows/desktop.yml
-    with:
-      tag: ${{ github.event.inputs.tag || github.ref_name }}
-    secrets: inherit
-
-  # After Desktop (it adds the macOS files and entries), so the site's
-  # download links list every platform. Rebuilt even if Desktop failed:
-  # the release itself is out.
-  site:
-    needs: [publish, desktop]
-    if: ${{ !cancelled() && needs.publish.result == 'success' }}
-    uses: ./.github/workflows/site.yml
-    secrets: inherit
+          echo "NomadFS $V${title:+: $title}" > title.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: |
+            assets/
+            notes.md
+            title.txt
+          if-no-files-found: error
