@@ -47,6 +47,11 @@ concurrency:
 env:
   ZIG_VERSION: 0.16.0
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  # Public certificate fingerprints (SHA-256) the Android builds must carry:
+  # the GitHub APK's key (every published APK), and the Play upload key
+  # (Play Console > App integrity > App signing > Upload key).
+  APK_CERT_SHA256: FB635E48B9F289231F205BBDD89F6982F02689BA2100C67F5AF96CA3A80FF1F6
+  UPLOAD_CERT_SHA256: B5FD4CBE85C5E960D927CB6CA15CF302DDDBF5B6CD17B082F39D225673D08EE2
 
 jobs:
   version:
@@ -164,8 +169,13 @@ jobs:
           KEYSTORE: ${{ secrets.NOMADFS_ANDROID_DEBUG_KEYSTORE_BASE64 }}
         run: |
           [ -n "$KEYSTORE" ] || { echo "::error::NOMADFS_ANDROID_DEBUG_KEYSTORE_BASE64 is not set: an APK signed with another key can't update the installed app"; exit 1; }
-          mkdir -p ~/.android && umask 077
-          printf '%s' "$KEYSTORE" | base64 --decode > ~/.android/debug.keystore
+          # Where the Android Gradle plugin looks for the debug keystore:
+          # $ANDROID_USER_HOME first (the runner's ~/.android isn't it: an
+          # unset location gets a fresh key, which can't update the app).
+          dir="$RUNNER_TEMP/android-user"
+          mkdir -p "$dir" && umask 077
+          printf '%s' "$KEYSTORE" | base64 --decode > "$dir/debug.keystore"
+          echo "ANDROID_USER_HOME=$dir" >> "$GITHUB_ENV"
       - name: Android app
         working-directory: nomadfs-gui
         run: |
@@ -173,7 +183,14 @@ jobs:
           zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-android -Dcpu=baseline
           (cd android && ./gradlew --no-daemon assembleDebug)
           cp android/app/build/outputs/apk/debug/app-debug.apk "../dist/nomadfs-$V.apk"
-          rm -f ~/.android/debug.keystore
+          rm -f "$ANDROID_USER_HOME/debug.keystore"
+      - name: The APK carries the published key
+        run: |
+          got=$("$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "dist/nomadfs-$V.apk" |
+            sed -n 's/.*certificate SHA-256 digest: //p' | head -1 | tr -d ':' | tr 'a-f' 'A-F')
+          [ "$got" = "$APK_CERT_SHA256" ] ||
+            { echo "::error::the APK is signed with $got, not the published key $APK_CERT_SHA256: it couldn't update the installed app"; exit 1; }
+          echo "signed with the published key"
       - run: ls -la dist
       - uses: actions/upload-artifact@v4
         with:
@@ -304,6 +321,12 @@ jobs:
           mkdir -p ../play
           cp android/app/build/outputs/bundle/release/app-release.aab "../play/nomadfs-$V-play.aab"
           ls -la ../play
+      - name: The bundle carries the upload key Play knows
+        run: |
+          got=$(keytool -printcert -jarfile "play/nomadfs-$V-play.aab" | sed -n 's/.*SHA256: //p' | head -1 | tr -d ': ')
+          [ "$got" = "$UPLOAD_CERT_SHA256" ] ||
+            { echo "::error::the bundle is signed with $got, not the upload key $UPLOAD_CERT_SHA256: Play would refuse it"; exit 1; }
+          echo "signed with the upload key"
       - uses: actions/upload-artifact@v4
         with:
           name: play-aab
