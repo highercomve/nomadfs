@@ -360,6 +360,27 @@ pub const ConnectionManager = struct {
         };
     }
 
+    /// Closes every connection authenticated as `device` (its device
+    /// identity, not a transport ID); returns how many.
+    pub fn closeDevice(self: *ConnectionManager, device: id.DeviceID) usize {
+        var removed: [max_connections]ManagedConnection = undefined;
+        var count: usize = 0;
+        self.mutex.lock();
+        var i: usize = 0;
+        while (i < self.connections.items.len) {
+            const remote = self.connections.items[i].conn.getRemoteDeviceID();
+            if (remote != null and std.mem.eql(u8, &remote.?.bytes, &device.bytes)) {
+                removed[count] = self.connections.orderedRemove(i);
+                count += 1;
+            } else i += 1;
+        }
+        self.mutex.unlock();
+        // All signalled before any is waited for, as closePeer does.
+        for (removed[0..count]) |mc| mc.conn.close();
+        for (removed[0..count]) |mc| retireConnection(mc);
+        return count;
+    }
+
     pub fn closePeer(self: *ConnectionManager, peer: id.NodeID) usize {
         var removed: [max_connections]ManagedConnection = undefined;
         var count: usize = 0;
@@ -891,6 +912,23 @@ const TestConnection = struct {
         .isInUse = isInUse,
     };
 };
+
+test "closeDevice closes only the connections authenticated as that device" {
+    var manager = ConnectionManager.initExplicit(std.testing.allocator, .tcp, noise.KeyPair.generate());
+    defer manager.deinit();
+    const device_bytes = [_]u8{5} ** 32;
+    var authed = TestConnection{ .node = .{ .bytes = .{6} ** 32 }, .device = .{ .bytes = device_bytes } };
+    // A transport node whose ID happens to equal the device bytes: not it.
+    var lookalike = TestConnection{ .node = .{ .bytes = device_bytes } };
+    var other = TestConnection{ .node = .{ .bytes = .{7} ** 32 }, .device = .{ .bytes = .{8} ** 32 } };
+    try manager.addConnection(authed.connection());
+    try manager.addConnection(lookalike.connection());
+    try manager.addConnection(other.connection());
+    try std.testing.expectEqual(@as(usize, 1), manager.closeDevice(.{ .bytes = device_bytes }));
+    try std.testing.expect(authed.closed and !lookalike.closed and !other.closed);
+    try std.testing.expectEqual(@as(usize, 2), manager.getConnectionsCount());
+    manager.stop();
+}
 
 test "pool caps sessions and closes every matching device or node" {
     var manager = ConnectionManager.initExplicit(std.testing.allocator, .tcp, noise.KeyPair.generate());

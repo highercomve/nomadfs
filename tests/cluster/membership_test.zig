@@ -3,6 +3,7 @@ const nomadfs = @import("nomadfs");
 const TestPeer = @import("test_helpers").TestPeer;
 const DhtNode = nomadfs.net.discovery.Node;
 const Identity = nomadfs.device.identity.Identity;
+const DeviceID = nomadfs.net.id.DeviceID;
 const TrustStore = nomadfs.device.trust.Store;
 const Ticket = nomadfs.device.pairing.Ticket;
 
@@ -46,7 +47,7 @@ test "cluster: pairing with one member makes a device a member everywhere" {
     var store_b = try TrustStore.load(allocator, b_path, null);
     defer store_b.deinit();
     _ = try store_b.trustTicket(try ticketFor(admin, 0x24, "Admin"), 30);
-    _ = try store_b.revokeDevice(laptop.deviceId(), admin.deviceId(), 25);
+    _ = try store_b.revokeDevice(DeviceID.fromPublicKey(laptop.publicKey()), DeviceID.fromPublicKey(admin.publicKey()), 25);
 
     var peer_a = try TestPeer.init(allocator, 13190);
     defer peer_a.deinit();
@@ -76,12 +77,12 @@ test "cluster: pairing with one member makes a device a member everywhere" {
     // the laptop stays out (revoked after it was admitted); the joiner's own
     // record is ignored.
     _ = try dht_a.pushAdmissions(conn);
-    const got = store_b.lookup(phone.deviceId()) orelse return error.PhoneNotAdmitted;
+    const got = store_b.lookup(DeviceID.fromPublicKey(phone.publicKey())) orelse return error.PhoneNotAdmitted;
     try std.testing.expectEqualStrings("Phone", got.labelSlice());
     try std.testing.expectEqual([_]u8{0x21} ** 32, got.transport_key);
     try std.testing.expectEqual(@as(u64, 10), got.added_at);
-    try std.testing.expect(!store_b.isTrusted(laptop.deviceId()));
-    try std.testing.expect(!store_b.isTrusted(joiner.deviceId()));
+    try std.testing.expect(!store_b.isTrusted(DeviceID.fromPublicKey(laptop.publicKey())));
+    try std.testing.expect(!store_b.isTrusted(DeviceID.fromPublicKey(joiner.publicKey())));
     try std.testing.expectEqual(@as(usize, 2), store_b.count());
 
     // Vouches from a device the joiner doesn't trust change nothing.

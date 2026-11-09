@@ -39,6 +39,9 @@ fn mapError(err: anyerror) c_int {
         error.ProviderUnreachable,
         error.ConnectionRefused,
         error.ConnectionResetByPeer,
+        // A holder that didn't answer the dial in time (cluster's
+        // connectBlockPeer): the network, not this node, failed.
+        error.ConnectionTimedOut,
         error.NetworkUnreachable,
         error.NoBlockFound,
         error.QuorumNotReached,
@@ -498,6 +501,10 @@ test "mobile: two nodes put and retrieve a file through the C ABI" {
     try testing.expectEqual(nomadfs_ok, nomadfs_node_stop(node_b));
     try testing.expectEqual(nomadfs_ok, nomadfs_node_stop(node_a));
     try testing.expectEqual(unavailable, nomadfs_node_run(node_a));
+}
+
+test "mobile: a dial that timed out is reported as unavailable" {
+    try std.testing.expectEqual(unavailable, mapError(error.ConnectionTimedOut));
 }
 
 test "mobile: CID parsing requires exactly 64 hex characters" {

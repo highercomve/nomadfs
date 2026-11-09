@@ -1323,14 +1323,16 @@ pub const Node = struct {
         try response.send(self.allocator, stream);
     }
 
+    fn trustsDevice(self: *Node, authenticated_device: ?id.NodeID) bool {
+        const trust = self.trust_store orelse return false;
+        const device = authenticated_device orelse return false;
+        return trust.isTrusted(.{ .bytes = device.bytes });
+    }
+
     /// GET_NODE_INFO: only devices this one trusts learn about it; others
     /// get an empty reply.
     fn handleGetNodeInfo(self: *Node, stream: network.Stream, conn: network.Connection) !void {
-        const trusted = blk: {
-            const trust = self.trust_store orelse break :blk false;
-            const device = conn.getRemoteDeviceID() orelse break :blk false;
-            break :blk trust.isTrusted(device);
-        };
+        const trusted = self.trustsDevice(conn.getRemoteDeviceID());
         const info: []u8 = if (trusted) (if (self.info_source) |source| source.infoFn(source.ctx, self.allocator) catch |err| blk: {
             std.debug.print("NODE_INFO: unavailable: {any}\n", .{err});
             break :blk &.{};
@@ -1645,4 +1647,23 @@ test "announced roles not heard lately are not copied" {
     node.recordPeerRoles(fresh, rpc.Roles.swarm_backup, rpc.no_swarm);
     var out: [4]id.NodeID = undefined;
     try std.testing.expectEqualSlices(id.NodeID, &.{fresh}, out[0..node.copyPeersWithRole(rpc.Roles.swarm_backup, &out)]);
+}
+
+test "node info trust uses the authenticated device identity" {
+    const allocator = std.testing.allocator;
+    var manager = network.manager.ConnectionManager.initExplicit(allocator, .tcp, network.noise.KeyPair.generate());
+    defer manager.deinit();
+    var node = Node.init(allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    var trust = try @import("../../device/trust.zig").Store.load(allocator, "test_node_info_identity.store", null);
+    defer trust.deinit();
+    const identity = try @import("../../device/identity.zig").Identity.fromSeed([_]u8{0x63} ** 32);
+    _ = try trust.upsert(identity.publicKey(), manager.identity_key.public_key, "Member", 1);
+    node.trust_store = &trust;
+    try std.testing.expect(node.trustsDevice(identity.deviceId()));
+    try std.testing.expect(!node.trustsDevice(null));
+    const stranger = try @import("../../device/identity.zig").Identity.fromSeed([_]u8{0x70} ** 32);
+    try std.testing.expect(!node.trustsDevice(stranger.deviceId()));
+    try std.testing.expect(trust.revoke(id.DeviceID.fromPublicKey(identity.publicKey())));
+    try std.testing.expect(!node.trustsDevice(identity.deviceId()));
 }

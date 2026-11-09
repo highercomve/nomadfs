@@ -140,6 +140,32 @@ pub const Holders = struct {
 
     pub const SwarmHints = struct { ids: []NodeID, backups_end: usize };
 
+    /// The peers connected right now (direct or relayed), this node left
+    /// out, those not on a metered network first; in `out`, at most its
+    /// length. Taken from all connected peers, not from a list already cut
+    /// to size, so none that could serve is lost to the cap.
+    pub fn connectedPeers(self: *Holders, out: []NodeID) []NodeID {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const peers = self.peers orelse return out[0..0];
+        const f = peers.connectedFn orelse return out[0..0];
+        var live: [max_known]NodeID = undefined;
+        const count = f(peers.ctx, &live);
+        var n: usize = 0;
+        for (0..2) |round| {
+            for (live[0..count]) |peer| {
+                if (n >= out.len) return out[0..n];
+                if (peer.eql(self.self_id)) continue;
+                const roles = peers.rolesFn(peers.ctx, peer);
+                const metered = roles != null and roles.? & rpc.Roles.metered != 0;
+                if (@intFromBool(metered) != round) continue;
+                out[n] = peer;
+                n += 1;
+            }
+        }
+        return out[0..n];
+    }
+
     /// The boundary lets fs insert placement replicas after backups.
     pub fn forSwarmSplit(self: *Holders, author: NodeID, out: *[fetcher.max_holders]NodeID) SwarmHints {
         self.mutex.lock();

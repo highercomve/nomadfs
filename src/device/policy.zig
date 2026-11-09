@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const sync = @import("../sync.zig");
-const NodeID = @import("../net/id.zig").NodeID;
+const DeviceID = @import("../net/id.zig").DeviceID;
 const identity_mod = @import("identity.zig");
 const trust_mod = @import("trust.zig");
 
@@ -33,7 +33,7 @@ pub const Kind = enum(u8) { copies = 0, accepts = 1 };
 pub const Record = struct {
     kind: Kind,
     /// `accepts`: the device it is about (its signer); `copies`: zero.
-    subject: NodeID,
+    subject: DeviceID,
     value: u8,
     /// Unix seconds when it was set (signed).
     at: u64,
@@ -75,7 +75,7 @@ const message_len = domain.len + 1 + 32 + 1 + 8 + 32;
 
 /// Bytes a record's signature covers: the domain, kind, subject, value, when
 /// and who signed (binding the signer stops a signature being moved).
-pub fn message(kind: Kind, subject: NodeID, value: u8, at: u64, signer_id: NodeID) [message_len]u8 {
+pub fn message(kind: Kind, subject: DeviceID, value: u8, at: u64, signer_id: DeviceID) [message_len]u8 {
     var out: [message_len]u8 = undefined;
     @memcpy(out[0..domain.len], domain);
     var o: usize = domain.len;
@@ -91,14 +91,14 @@ pub fn message(kind: Kind, subject: NodeID, value: u8, at: u64, signer_id: NodeI
     return out;
 }
 
-pub fn sign(identity: identity_mod.Identity, kind: Kind, subject: NodeID, value: u8, at: u64) !Record {
+pub fn sign(identity: identity_mod.Identity, kind: Kind, subject: DeviceID, value: u8, at: u64) !Record {
     return .{
         .kind = kind,
         .subject = subject,
         .value = value,
         .at = at,
         .signer_key = identity.publicKey(),
-        .signature = try identity.sign(&message(kind, subject, value, at, identity.deviceId())),
+        .signature = try identity.sign(&message(kind, subject, value, at, DeviceID.fromPublicKey(identity.publicKey()))),
     };
 }
 
@@ -117,7 +117,7 @@ pub const Policy = struct {
     mutex: sync.Mutex = .{},
     copies_record: ?Record = null,
     /// By device ID.
-    accepts: std.AutoArrayHashMapUnmanaged(NodeID, Record) = .empty,
+    accepts: std.AutoArrayHashMapUnmanaged(DeviceID, Record) = .empty,
 
     /// Opens the records at `path`; a file that can't be read is moved
     /// aside and the policy starts empty (defaults), never failing the node.
@@ -154,14 +154,14 @@ pub const Policy = struct {
     }
 
     /// Whether `device` accepts copies of others' files (true unless it said no).
-    pub fn acceptsCopies(self: *Policy, device: NodeID) bool {
+    pub fn acceptsCopies(self: *Policy, device: DeviceID) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         const r = self.accepts.get(device) orelse return true;
         return r.value != 0;
     }
 
-    pub fn hasAccepts(self: *Policy, device: NodeID) bool {
+    pub fn hasAccepts(self: *Policy, device: DeviceID) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.accepts.contains(device);
@@ -172,7 +172,7 @@ pub const Policy = struct {
     pub fn setCopies(self: *Policy, identity: identity_mod.Identity, trust: *trust_mod.Store, n: u8, now: u64) !Outcome {
         if (n < 1 or n > max_copies) return error.InvalidCopies;
         const r = try sign(identity, .copies, .{ .bytes = [_]u8{0} ** 32 }, n, now);
-        const outcome = try self.apply(r, trust, identity.deviceId(), now);
+        const outcome = try self.apply(r, trust, DeviceID.fromPublicKey(identity.publicKey()), now);
         if (outcome == .applied) try self.save();
         return outcome;
     }
@@ -180,7 +180,7 @@ pub const Policy = struct {
     /// Signs whether this device accepts copies, when that changed (or was
     /// never said), applies it and saves it; the caller spreads it.
     pub fn setAccepts(self: *Policy, identity: identity_mod.Identity, trust: *trust_mod.Store, on: bool, now: u64) !Outcome {
-        const me = identity.deviceId();
+        const me = DeviceID.fromPublicKey(identity.publicKey());
         if (self.hasAccepts(me) and self.acceptsCopies(me) == on) return .duplicate;
         const r = try sign(identity, .accepts, me, @intFromBool(on), now);
         const outcome = try self.apply(r, trust, me, now);
@@ -190,8 +190,8 @@ pub const Policy = struct {
 
     /// Verifies and applies `r` (from a peer or this device). `trust` says
     /// who may sign; `self_device` is this device, always allowed.
-    pub fn apply(self: *Policy, r: Record, trust: *trust_mod.Store, self_device: NodeID, now: u64) !Outcome {
-        const signer_id = NodeID.fromPublicKey(r.signer_key);
+    pub fn apply(self: *Policy, r: Record, trust: *trust_mod.Store, self_device: DeviceID, now: u64) !Outcome {
+        const signer_id = DeviceID.fromPublicKey(r.signer_key);
         identity_mod.Identity.verify(r.signer_key, &message(r.kind, r.subject, r.value, r.at, signer_id), r.signature) catch return .rejected;
         if (r.at > now +| max_skew) return .rejected;
         if (!signer_id.eql(self_device) and !trust.isTrusted(signer_id)) return .rejected;
@@ -284,7 +284,7 @@ pub const Policy = struct {
         var i: usize = 0;
         while (i < bytes.len) : (i += Record.encoded_len) {
             const r = try Record.decode(bytes[i..][0..Record.encoded_len]);
-            const signer_id = NodeID.fromPublicKey(r.signer_key);
+            const signer_id = DeviceID.fromPublicKey(r.signer_key);
             try identity_mod.Identity.verify(r.signer_key, &message(r.kind, r.subject, r.value, r.at, signer_id), r.signature);
             switch (r.kind) {
                 .copies => self.copies_record = r,
@@ -319,32 +319,32 @@ test "policy: newest wins, older and equal are acknowledged, the future and stra
 
     const p = try Policy.load(testing.allocator, path);
     defer p.destroy();
-    const zero: NodeID = .{ .bytes = [_]u8{0} ** 32 };
+    const zero: DeviceID = .{ .bytes = [_]u8{0} ** 32 };
     try testing.expectEqual(default_copies, p.copies());
 
-    try testing.expectEqual(Outcome.applied, try p.apply(try sign(member, .copies, zero, 3, 100), &trust, me.deviceId(), 1000));
+    try testing.expectEqual(Outcome.applied, try p.apply(try sign(member, .copies, zero, 3, 100), &trust, DeviceID.fromPublicKey(me.publicKey()), 1000));
     try testing.expectEqual(@as(u8, 3), p.copies());
     // Older and equal: acknowledged, unchanged.
-    try testing.expectEqual(Outcome.duplicate, try p.apply(try sign(me, .copies, zero, 2, 90), &trust, me.deviceId(), 1000));
-    try testing.expectEqual(Outcome.duplicate, try p.apply(try sign(member, .copies, zero, 3, 100), &trust, me.deviceId(), 1000));
+    try testing.expectEqual(Outcome.duplicate, try p.apply(try sign(me, .copies, zero, 2, 90), &trust, DeviceID.fromPublicKey(me.publicKey()), 1000));
+    try testing.expectEqual(Outcome.duplicate, try p.apply(try sign(member, .copies, zero, 3, 100), &trust, DeviceID.fromPublicKey(me.publicKey()), 1000));
     try testing.expectEqual(@as(u8, 3), p.copies());
     // A stranger, the far future, and silly values are refused.
-    try testing.expectEqual(Outcome.rejected, try p.apply(try sign(stranger, .copies, zero, 5, 200), &trust, me.deviceId(), 1000));
-    try testing.expectEqual(Outcome.rejected, try p.apply(try sign(member, .copies, zero, 5, 1000 + max_skew + 1), &trust, me.deviceId(), 1000));
-    try testing.expectEqual(Outcome.rejected, try p.apply(try sign(member, .copies, zero, 0, 300), &trust, me.deviceId(), 1000));
+    try testing.expectEqual(Outcome.rejected, try p.apply(try sign(stranger, .copies, zero, 5, 200), &trust, DeviceID.fromPublicKey(me.publicKey()), 1000));
+    try testing.expectEqual(Outcome.rejected, try p.apply(try sign(member, .copies, zero, 5, 1000 + max_skew + 1), &trust, DeviceID.fromPublicKey(me.publicKey()), 1000));
+    try testing.expectEqual(Outcome.rejected, try p.apply(try sign(member, .copies, zero, 0, 300), &trust, DeviceID.fromPublicKey(me.publicKey()), 1000));
     // This device may always set it.
-    try testing.expectEqual(Outcome.applied, try p.apply(try sign(me, .copies, zero, 2, 400), &trust, me.deviceId(), 1000));
+    try testing.expectEqual(Outcome.applied, try p.apply(try sign(me, .copies, zero, 2, 400), &trust, DeviceID.fromPublicKey(me.publicKey()), 1000));
     try testing.expectEqual(@as(u8, 2), p.copies());
 
     // Accepts: only about oneself.
-    try testing.expect(p.acceptsCopies(member.deviceId()));
-    try testing.expectEqual(Outcome.applied, try p.apply(try sign(member, .accepts, member.deviceId(), 0, 500), &trust, me.deviceId(), 1000));
-    try testing.expect(!p.acceptsCopies(member.deviceId()));
-    try testing.expectEqual(Outcome.rejected, try p.apply(try sign(member, .accepts, me.deviceId(), 0, 600), &trust, me.deviceId(), 1000));
+    try testing.expect(p.acceptsCopies(DeviceID.fromPublicKey(member.publicKey())));
+    try testing.expectEqual(Outcome.applied, try p.apply(try sign(member, .accepts, DeviceID.fromPublicKey(member.publicKey()), 0, 500), &trust, DeviceID.fromPublicKey(me.publicKey()), 1000));
+    try testing.expect(!p.acceptsCopies(DeviceID.fromPublicKey(member.publicKey())));
+    try testing.expectEqual(Outcome.rejected, try p.apply(try sign(member, .accepts, DeviceID.fromPublicKey(me.publicKey()), 0, 600), &trust, DeviceID.fromPublicKey(me.publicKey()), 1000));
 
     // A revoked signer's accepted record stays.
-    _ = trust.revoke(member.deviceId());
-    try testing.expect(!p.acceptsCopies(member.deviceId()));
+    _ = trust.revoke(DeviceID.fromPublicKey(member.publicKey()));
+    try testing.expect(!p.acceptsCopies(DeviceID.fromPublicKey(member.publicKey())));
 
     // Saved and read back the same; a forged file is refused.
     const before = p.digest();
@@ -353,4 +353,21 @@ test "policy: newest wins, older and equal are acknowledged, the future and stra
     defer again.destroy();
     try testing.expectEqual(before, again.digest());
     try testing.expectEqual(@as(u8, 2), again.copies());
+}
+
+test "policy: subjects and copy acceptance require device identities" {
+    comptime {
+        if (@TypeOf(@as(Record, undefined).subject) != DeviceID)
+            @compileError("policy subjects must be device identities");
+        if (@typeInfo(@TypeOf(Policy.acceptsCopies)).@"fn".params[1].type.? != DeviceID)
+            @compileError("copy acceptance must require a device identity");
+    }
+    const identity = try identity_mod.Identity.fromSeed([_]u8{0x71} ** 32);
+    const subject = DeviceID.fromPublicKey(identity.publicKey());
+    const record = try sign(identity, .accepts, subject, 0, 10);
+    const encoded = record.encode();
+    try testing.expectEqualSlices(u8, &subject.bytes, encoded[1..33]);
+    const decoded = try Record.decode(&encoded);
+    try testing.expect(decoded.subject.eql(subject));
+    try identity_mod.Identity.verify(identity.publicKey(), &message(.accepts, subject, 0, 10, subject), decoded.signature);
 }

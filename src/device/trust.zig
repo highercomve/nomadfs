@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const pairing = @import("pairing.zig");
 const identity_mod = @import("identity.zig");
 const sync = @import("../sync.zig");
+const DeviceID = @import("../net/id.zig").DeviceID;
 const NodeID = @import("../net/id.zig").NodeID;
 
 pub const magic = "NMDFSTR2";
@@ -47,7 +48,7 @@ pub const Error = error{
 pub const no_transport_key: [32]u8 = [_]u8{0} ** 32;
 
 pub const Entry = struct {
-    device_id: NodeID,
+    device_id: DeviceID,
     public_key: [32]u8,
     /// The X25519 transport key the pair presented when it was admitted.
     transport_key: [32]u8 = no_transport_key,
@@ -85,13 +86,13 @@ fn normalizeHexQuery(query: []const u8, out: *[128]u8) ![]const u8 {
     return out[0..written];
 }
 
-const revocation_msg_len = revocation_domain.len + NodeID.len * 2 + 8;
+const revocation_msg_len = revocation_domain.len + DeviceID.len * 2 + 8;
 
 /// Bytes covered by a revocation signature: the domain, the revoked device,
 /// the signer's device ID and the original revocation time as a big-endian
 /// u64. Binding the signer stops a signature being moved to another revoker;
 /// binding `at` stops it being replayed with a fresher timestamp.
-pub fn revocationMessage(device_id: NodeID, signer_id: NodeID, at: u64) [revocation_msg_len]u8 {
+pub fn revocationMessage(device_id: DeviceID, signer_id: DeviceID, at: u64) [revocation_msg_len]u8 {
     var message: [revocation_msg_len]u8 = undefined;
     @memcpy(message[0..revocation_domain.len], revocation_domain);
     var offset = revocation_domain.len;
@@ -120,13 +121,13 @@ pub const RevocationOutcome = enum {
 /// a revocation that verifies but must not take effect is `.rejected`.
 pub fn applyRevocation(
     store: *Store,
-    device_id: NodeID,
+    device_id: DeviceID,
     signer_key: [32]u8,
     at: u64,
     signature: [64]u8,
     now: u64,
 ) !RevocationOutcome {
-    const signer_id = NodeID.fromPublicKey(signer_key);
+    const signer_id = DeviceID.fromPublicKey(signer_key);
     try identity_mod.Identity.verify(signer_key, &revocationMessage(device_id, signer_id, at), signature);
     if (signer_id.eql(device_id)) return Error.InvalidDeviceQuery;
     if (at > now +| max_revocation_skew) return .rejected;
@@ -151,12 +152,12 @@ pub fn applyRevocation(
 /// another device belongs to the swarm (applyAdmission).
 pub const admission_domain = "nomadfs-admit-v1";
 
-const admission_msg_len = admission_domain.len + 32 + 32 + 1 + max_label_len + 8 + NodeID.len;
+const admission_msg_len = admission_domain.len + 32 + 32 + 1 + max_label_len + 8 + DeviceID.len;
 
 /// Bytes covered by a membership signature: the domain, the member's
 /// identity and transport keys, its label (length-prefixed, zero-padded),
 /// when it was admitted and who vouches for it.
-pub fn admissionMessage(public_key: [32]u8, transport_key: [32]u8, label: []const u8, at: u64, signer_id: NodeID) [admission_msg_len]u8 {
+pub fn admissionMessage(public_key: [32]u8, transport_key: [32]u8, label: []const u8, at: u64, signer_id: DeviceID) [admission_msg_len]u8 {
     var message = [_]u8{0} ** admission_msg_len;
     var offset: usize = 0;
     @memcpy(message[0..admission_domain.len], admission_domain);
@@ -172,7 +173,7 @@ pub fn admissionMessage(public_key: [32]u8, transport_key: [32]u8, label: []cons
     offset += max_label_len;
     std.mem.writeInt(u64, message[offset..][0..8], at, .big);
     offset += 8;
-    @memcpy(message[offset..][0..NodeID.len], &signer_id.bytes);
+    @memcpy(message[offset..][0..DeviceID.len], &signer_id.bytes);
     return message;
 }
 
@@ -191,12 +192,12 @@ pub fn applyAdmission(
     at: u64,
     signer_key: [32]u8,
     signature: [64]u8,
-    self_id: NodeID,
+    self_id: DeviceID,
     now: u64,
 ) !RevocationOutcome {
-    const signer_id = NodeID.fromPublicKey(signer_key);
+    const signer_id = DeviceID.fromPublicKey(signer_key);
     try identity_mod.Identity.verify(signer_key, &admissionMessage(public_key, transport_key, label, at, signer_id), signature);
-    const device_id = NodeID.fromPublicKey(public_key);
+    const device_id = DeviceID.fromPublicKey(public_key);
     if (device_id.eql(self_id)) return .duplicate;
     if (device_id.eql(signer_id)) return .rejected;
     // A vouch dated ahead of this clock would outrank a later revocation
@@ -260,8 +261,8 @@ fn stripSignature(content: []const u8, signing_seed: [identity_mod.seed_len]u8) 
 /// the removal can be propagated again to peers that were not connected
 /// when it happened; re-pairing clears it.
 pub const Revocation = struct {
-    device_id: NodeID,
-    signer_id: NodeID,
+    device_id: DeviceID,
+    signer_id: DeviceID,
     /// When the revocation was made, as the original signer signed it.
     at: u64,
 };
@@ -272,12 +273,12 @@ pub const Revocation = struct {
 /// could save a file that its own load refuses.
 const base64_encoder = &std.base64.url_safe_no_pad.Encoder;
 const timestamp_digits = std.fmt.count("{d}", .{std.math.maxInt(u64)});
-const max_entry_line_len = NodeID.len * 2 + 1 +
+const max_entry_line_len = DeviceID.len * 2 + 1 +
     base64_encoder.calcSize(32) + 1 +
     timestamp_digits + 1 +
     base64_encoder.calcSize(max_label_len) + 1 +
     base64_encoder.calcSize(32) + 1 + timestamp_digits + 1;
-const max_tombstone_line_len = 1 + NodeID.len * 2 + 1 + NodeID.len * 2 + 1 + timestamp_digits + 1;
+const max_tombstone_line_len = 1 + DeviceID.len * 2 + 1 + DeviceID.len * 2 + 1 + timestamp_digits + 1;
 const max_header_line_len = magic.len + 1;
 const max_signature_line_len = "SIG ".len + 2 * signature_len + 1;
 
@@ -325,7 +326,7 @@ pub const Store = struct {
     /// `transport_key`: the device's pinned one, read before it was removed.
     pub const RevokedHook = struct {
         ctx: *anyopaque,
-        revokedFn: *const fn (ctx: *anyopaque, device_id: NodeID, transport_key: ?[32]u8) void,
+        revokedFn: *const fn (ctx: *anyopaque, device_id: DeviceID, transport_key: ?[32]u8) void,
     };
 
     /// Loads the store at `path`. A missing file is an empty store; a file
@@ -425,7 +426,7 @@ pub const Store = struct {
         return changed;
     }
 
-    const Gone = struct { device_id: NodeID, transport_key: ?[32]u8 };
+    const Gone = struct { device_id: DeviceID, transport_key: ?[32]u8 };
 
     /// Takes newer revocations and entries from `disk`. Caller holds `mutex`.
     fn mergeLocked(self: *Store, disk: *Store, gone: *std.ArrayList(Gone)) !bool {
@@ -477,13 +478,13 @@ pub const Store = struct {
     }
 
     /// Pointer into the store, valid until the next mutation.
-    pub fn find(self: *Store, device_id: NodeID) ?*Entry {
+    pub fn find(self: *Store, device_id: DeviceID) ?*Entry {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.findLocked(device_id);
     }
 
-    fn findLocked(self: *Store, device_id: NodeID) ?*Entry {
+    fn findLocked(self: *Store, device_id: DeviceID) ?*Entry {
         for (self.entries.items) |*entry| {
             if (entry.device_id.eql(device_id)) return entry;
         }
@@ -492,14 +493,14 @@ pub const Store = struct {
 
     /// Read-only lookup for verification paths that must not mutate. Copies
     /// the entry out, so the pointer into the store's array stays internal.
-    pub fn lookup(self: *Store, device_id: NodeID) ?Entry {
+    pub fn lookup(self: *Store, device_id: DeviceID) ?Entry {
         self.mutex.lock();
         defer self.mutex.unlock();
         const entry = self.findLocked(device_id) orelse return null;
         return entry.*;
     }
 
-    pub fn isTrusted(self: *Store, device_id: NodeID) bool {
+    pub fn isTrusted(self: *Store, device_id: DeviceID) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.isTrustedLocked(device_id);
@@ -518,7 +519,7 @@ pub const Store = struct {
         return false;
     }
 
-    fn isTrustedLocked(self: *Store, device_id: NodeID) bool {
+    fn isTrustedLocked(self: *Store, device_id: DeviceID) bool {
         return self.findLocked(device_id) != null;
     }
 
@@ -540,7 +541,7 @@ pub const Store = struct {
         try validateLabel(label);
         if (std.mem.eql(u8, &transport_key, &no_transport_key)) return pairing.Error.InvalidTicket;
 
-        const device_id = NodeID.fromPublicKey(public_key);
+        const device_id = DeviceID.fromPublicKey(public_key);
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -577,13 +578,13 @@ pub const Store = struct {
     }
 
     /// Removes a device. Returns whether it was present.
-    pub fn revoke(self: *Store, device_id: NodeID) bool {
+    pub fn revoke(self: *Store, device_id: DeviceID) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.revokeLocked(device_id);
     }
 
-    fn revokeLocked(self: *Store, device_id: NodeID) bool {
+    fn revokeLocked(self: *Store, device_id: DeviceID) bool {
         for (self.entries.items, 0..) |entry, index| {
             if (!entry.device_id.eql(device_id)) continue;
             _ = self.entries.orderedRemove(index);
@@ -592,7 +593,7 @@ pub const Store = struct {
         return false;
     }
 
-    pub fn isRevoked(self: *Store, device_id: NodeID) bool {
+    pub fn isRevoked(self: *Store, device_id: DeviceID) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.revocationLocked(device_id) != null;
@@ -622,10 +623,10 @@ pub const Store = struct {
     }
 
     /// Copy for out-of-lock use, e.g. pushing tombstones over the network.
-    pub fn copyRevocationIds(self: *Store, allocator: std.mem.Allocator) ![]NodeID {
+    pub fn copyRevocationIds(self: *Store, allocator: std.mem.Allocator) ![]DeviceID {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const ids = try allocator.alloc(NodeID, self.revocations.items.len);
+        const ids = try allocator.alloc(DeviceID, self.revocations.items.len);
         for (self.revocations.items, 0..) |r, i| ids[i] = r.device_id;
         return ids;
     }
@@ -634,13 +635,13 @@ pub const Store = struct {
     /// for devices without a local entry: peers propagate revocations for
     /// content not paired here yet, and the tombstone travels onward.
     /// `signer_id` must not equal `device_id`.
-    pub fn revokeDevice(self: *Store, device_id: NodeID, signer_id: NodeID, at: u64) !bool {
+    pub fn revokeDevice(self: *Store, device_id: DeviceID, signer_id: DeviceID, at: u64) !bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.revokeDeviceLocked(device_id, signer_id, at);
     }
 
-    fn revokeDeviceLocked(self: *Store, device_id: NodeID, signer_id: NodeID, at: u64) !bool {
+    fn revokeDeviceLocked(self: *Store, device_id: DeviceID, signer_id: DeviceID, at: u64) !bool {
         if (signer_id.eql(device_id)) return Error.InvalidDeviceQuery;
 
         // Tombstone first: if recording it fails, the device stays trusted.
@@ -648,7 +649,7 @@ pub const Store = struct {
         return self.revokeLocked(device_id);
     }
 
-    fn revocationLocked(self: *Store, device_id: NodeID) ?*Revocation {
+    fn revocationLocked(self: *Store, device_id: DeviceID) ?*Revocation {
         for (self.revocations.items) |*r| {
             if (r.device_id.eql(device_id)) return r;
         }
@@ -658,7 +659,7 @@ pub const Store = struct {
     /// Records a tombstone, or advances the existing one to a later `at`. At
     /// the cap the oldest tombstone (smallest `at`) makes room, so the newest
     /// revocation is always kept.
-    fn recordRevocationLocked(self: *Store, device_id: NodeID, signer_id: NodeID, at: u64) !void {
+    fn recordRevocationLocked(self: *Store, device_id: DeviceID, signer_id: DeviceID, at: u64) !void {
         if (self.revocationLocked(device_id)) |existing| {
             if (at > existing.at) {
                 existing.signer_id = signer_id;
@@ -684,7 +685,7 @@ pub const Store = struct {
 
     /// Re-pairing is an explicit human decision on a fresh ticket, so it
     /// overrides a propagated revocation instead of being blocked by one.
-    fn clearRevocationLocked(self: *Store, device_id: NodeID) void {
+    fn clearRevocationLocked(self: *Store, device_id: DeviceID) void {
         for (self.revocations.items, 0..) |r, index| {
             if (!r.device_id.eql(device_id)) continue;
             _ = self.revocations.orderedRemove(index);
@@ -695,14 +696,14 @@ pub const Store = struct {
     /// Resolves a device ID (64 hex chars) or fingerprint (16 hex chars) as
     /// typed by a human: case-insensitive, `0x` prefix and `-`, `:` or space
     /// separators allowed. Returns null when nothing matches.
-    pub fn resolve(self: *Store, query: []const u8) !?NodeID {
+    pub fn resolve(self: *Store, query: []const u8) !?DeviceID {
         var query_buf: [128]u8 = undefined;
         const normalized = try normalizeHexQuery(query, &query_buf);
         if (normalized.len == 0) return null;
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        var found: ?NodeID = null;
+        var found: ?DeviceID = null;
         for (self.entries.items) |entry| {
             var id_buf: [64]u8 = undefined;
             var fingerprint_buf: [identity_mod.Identity.fingerprint_len * 2]u8 = undefined;
@@ -850,7 +851,7 @@ fn parseEntry(line: []const u8) !Entry {
     decoder.decode(&entry.transport_key, transport_b64) catch return Error.CorruptTrustStore;
     entry.ticket_expiry = std.fmt.parseInt(u64, expiry_text, 10) catch return Error.CorruptTrustStore;
 
-    if (id_hex.len != NodeID.len * 2) return Error.CorruptTrustStore;
+    if (id_hex.len != DeviceID.len * 2) return Error.CorruptTrustStore;
     _ = std.fmt.hexToBytes(&entry.device_id.bytes, id_hex) catch return Error.CorruptTrustStore;
 
     const key_size = decoder.calcSizeForSlice(key_b64) catch return Error.CorruptTrustStore;
@@ -859,7 +860,7 @@ fn parseEntry(line: []const u8) !Entry {
 
     // The identifier must match the key; anything else means the file was
     // edited or written by an incompatible version.
-    if (!NodeID.fromPublicKey(entry.public_key).eql(entry.device_id)) return Error.CorruptTrustStore;
+    if (!DeviceID.fromPublicKey(entry.public_key).eql(entry.device_id)) return Error.CorruptTrustStore;
     entry.added_at = std.fmt.parseInt(u64, added_text, 10) catch return Error.CorruptTrustStore;
 
     const label_size = decoder.calcSizeForSlice(label_b64) catch return Error.CorruptTrustStore;
@@ -887,7 +888,7 @@ fn parseRevocation(rest: []const u8) !Revocation {
     if (fields.next() != null) return Error.CorruptTrustStore;
 
     var r: Revocation = .{ .device_id = undefined, .signer_id = undefined, .at = 0 };
-    if (device_hex.len != NodeID.len * 2 or signer_hex.len != NodeID.len * 2) return Error.CorruptTrustStore;
+    if (device_hex.len != DeviceID.len * 2 or signer_hex.len != DeviceID.len * 2) return Error.CorruptTrustStore;
     _ = std.fmt.hexToBytes(&r.device_id.bytes, device_hex) catch return Error.CorruptTrustStore;
     _ = std.fmt.hexToBytes(&r.signer_id.bytes, signer_hex) catch return Error.CorruptTrustStore;
     r.at = std.fmt.parseInt(u64, at_text, 10) catch return Error.CorruptTrustStore;
@@ -917,8 +918,8 @@ fn testTicket(seed_byte: u8, nickname: []const u8) !pairing.Ticket {
 }
 
 /// A device ID that is not backed by a local entry, for tombstone-only tests.
-fn syntheticId(index: usize) NodeID {
-    var id: NodeID = .{ .bytes = [_]u8{0} ** NodeID.len };
+fn syntheticId(index: usize) DeviceID {
+    var id: DeviceID = .{ .bytes = [_]u8{0} ** DeviceID.len };
     std.mem.writeInt(u64, id.bytes[0..8], @intCast(index + 1), .little);
     return id;
 }
@@ -943,9 +944,9 @@ test "trust: pairing a ticket records and updates one entry" {
     const ticket = try testTicket(0x21, "phone");
     try testing.expect(try store.trustTicket(ticket, 100));
     try testing.expectEqual(@as(usize, 1), store.count());
-    try testing.expect(store.isTrusted(ticket.deviceId()));
+    try testing.expect(store.isTrusted(@as(DeviceID, .{ .bytes = ticket.deviceId().bytes })));
 
-    const entry = store.find(ticket.deviceId()).?;
+    const entry = store.find(@as(DeviceID, .{ .bytes = ticket.deviceId().bytes })).?;
     try testing.expectEqualStrings("phone", entry.labelSlice());
     try testing.expectEqual(@as(u64, 100), entry.added_at);
 
@@ -953,8 +954,8 @@ test "trust: pairing a ticket records and updates one entry" {
     const renamed = try testTicket(0x21, "phone-2");
     try testing.expect(!try store.trustTicket(renamed, 200));
     try testing.expectEqual(@as(usize, 1), store.count());
-    try testing.expectEqual(@as(u64, 100), store.find(ticket.deviceId()).?.added_at);
-    try testing.expectEqualStrings("phone-2", store.find(ticket.deviceId()).?.labelSlice());
+    try testing.expectEqual(@as(u64, 100), store.find(@as(DeviceID, .{ .bytes = ticket.deviceId().bytes })).?.added_at);
+    try testing.expectEqualStrings("phone-2", store.find(@as(DeviceID, .{ .bytes = ticket.deviceId().bytes })).?.labelSlice());
 }
 
 test "trust: revoke removes only the requested device" {
@@ -970,11 +971,11 @@ test "trust: revoke removes only the requested device" {
     _ = try store.trustTicket(first, 1);
     _ = try store.trustTicket(second, 2);
 
-    try testing.expect(store.revoke(first.deviceId()));
-    try testing.expect(!store.revoke(first.deviceId()));
+    try testing.expect(store.revoke(@as(DeviceID, .{ .bytes = first.deviceId().bytes })));
+    try testing.expect(!store.revoke(@as(DeviceID, .{ .bytes = first.deviceId().bytes })));
     try testing.expectEqual(@as(usize, 1), store.count());
-    try testing.expect(!store.isTrusted(first.deviceId()));
-    try testing.expect(store.isTrusted(second.deviceId()));
+    try testing.expect(!store.isTrusted(@as(DeviceID, .{ .bytes = first.deviceId().bytes })));
+    try testing.expect(store.isTrusted(@as(DeviceID, .{ .bytes = second.deviceId().bytes })));
 }
 
 test "trust: resolve accepts ids, fingerprints and pasted decoration" {
@@ -991,16 +992,16 @@ test "trust: resolve accepts ids, fingerprints and pasted decoration" {
     _ = try store.trustTicket(phone, 2);
 
     var id_buf: [64]u8 = undefined;
-    const id_hex = std.fmt.bufPrint(&id_buf, "{x}", .{laptop.deviceId().bytes}) catch unreachable;
-    try testing.expect((try store.resolve(id_hex)).?.eql(laptop.deviceId()));
+    const id_hex = std.fmt.bufPrint(&id_buf, "{x}", .{@as(DeviceID, .{ .bytes = laptop.deviceId().bytes }).bytes}) catch unreachable;
+    try testing.expect((try store.resolve(id_hex)).?.eql(@as(DeviceID, .{ .bytes = laptop.deviceId().bytes })));
 
     // Uppercase, 0x prefix and the dashed fingerprint rendering all work.
     var fp_buf: [19]u8 = undefined;
     const fingerprint = identity_mod.Identity.formatFingerprint(phone.fingerprint(), &fp_buf);
-    try testing.expect((try store.resolve(fingerprint)).?.eql(phone.deviceId()));
+    try testing.expect((try store.resolve(fingerprint)).?.eql(@as(DeviceID, .{ .bytes = phone.deviceId().bytes })));
     var decorated_buf: [66]u8 = undefined;
     const decorated = std.fmt.bufPrint(&decorated_buf, "0x{s}", .{id_hex}) catch unreachable;
-    try testing.expect((try store.resolve(decorated)).?.eql(laptop.deviceId()));
+    try testing.expect((try store.resolve(decorated)).?.eql(@as(DeviceID, .{ .bytes = laptop.deviceId().bytes })));
 
     try testing.expect((try store.resolve("00112233445566778899aabbccddeeff")) == null);
     try testing.expectError(Error.InvalidDeviceQuery, store.resolve("not-a-device"));
@@ -1025,7 +1026,7 @@ test "trust: save and load round-trip with private permissions" {
     defer store.deinit();
     try testing.expectEqual(@as(usize, 2), store.count());
 
-    const alpha = store.find(alpha_ticket.deviceId()).?;
+    const alpha = store.find(@as(DeviceID, .{ .bytes = alpha_ticket.deviceId().bytes })).?;
     try testing.expectEqualStrings("alpha", alpha.labelSlice());
     try testing.expectEqual(@as(u64, 1000), alpha.added_at);
     try testing.expectEqualSlices(u8, &alpha_ticket.transport_public_key, &alpha.transport_key);
@@ -1074,7 +1075,7 @@ test "trust: a re-pairing rotates the pinned transport key" {
     try testing.expect(!try store.trustTicket(rotated, 2));
     try testing.expectEqual(@as(usize, 1), store.count());
 
-    const entry = store.find(fresh.deviceId()).?;
+    const entry = store.find(@as(DeviceID, .{ .bytes = fresh.deviceId().bytes })).?;
     try testing.expectEqual(@as(u64, 1), entry.added_at);
     try testing.expectEqualSlices(u8, &rotated.transport_public_key, &entry.transport_key);
 }
@@ -1136,7 +1137,7 @@ test "trust: a full store stays within max_file_bytes" {
             _ = try store.trustTicket(ticket, std.math.maxInt(u64));
         }
         for (0..max_revocations) |i| {
-            _ = try store.revokeDevice(syntheticId(i), admin.deviceId(), std.math.maxInt(u64));
+            _ = try store.revokeDevice(syntheticId(i), @as(DeviceID, .{ .bytes = admin.deviceId().bytes }), std.math.maxInt(u64));
         }
         try store.save();
     }
@@ -1162,13 +1163,13 @@ test "trust: a full tombstone list evicts its oldest revocation" {
 
     const admin = try identity_mod.Identity.fromSeed([_]u8{0x9c} ** identity_mod.seed_len);
     for (0..max_revocations) |i| {
-        _ = try store.revokeDevice(syntheticId(i), admin.deviceId(), 100 + @as(u64, @intCast(i)));
+        _ = try store.revokeDevice(syntheticId(i), @as(DeviceID, .{ .bytes = admin.deviceId().bytes }), 100 + @as(u64, @intCast(i)));
     }
     try testing.expectEqual(max_revocations, store.revocationCount());
 
     // At the cap, a newer revocation evicts the oldest one (at = 100).
     const newest = syntheticId(max_revocations);
-    _ = try store.revokeDevice(newest, admin.deviceId(), 1_000);
+    _ = try store.revokeDevice(newest, @as(DeviceID, .{ .bytes = admin.deviceId().bytes }), 1_000);
     try testing.expectEqual(max_revocations, store.revocationCount());
     try testing.expect(store.isRevoked(newest));
     try testing.expect(!store.isRevoked(syntheticId(0)));
@@ -1190,26 +1191,26 @@ test "trust: revocation tombstones persist and are overridden by re-pairing" {
         _ = try store.trustTicket(phone, 2);
 
         // Removing a locally known device records who ordered it.
-        try testing.expect(try store.revokeDevice(phone.deviceId(), operator.deviceId(), 1234));
-        try testing.expect(store.isRevoked(phone.deviceId()));
-        try testing.expect(!store.isTrusted(phone.deviceId()));
+        try testing.expect(try store.revokeDevice(@as(DeviceID, .{ .bytes = phone.deviceId().bytes }), @as(DeviceID, .{ .bytes = operator.deviceId().bytes }), 1234));
+        try testing.expect(store.isRevoked(@as(DeviceID, .{ .bytes = phone.deviceId().bytes })));
+        try testing.expect(!store.isTrusted(@as(DeviceID, .{ .bytes = phone.deviceId().bytes })));
         try testing.expectEqual(@as(usize, 1), store.revocationCount());
 
         // A signer is never its own subject.
-        try testing.expectError(Error.InvalidDeviceQuery, store.revokeDevice(operator.deviceId(), operator.deviceId(), 5));
+        try testing.expectError(Error.InvalidDeviceQuery, store.revokeDevice(@as(DeviceID, .{ .bytes = operator.deviceId().bytes }), @as(DeviceID, .{ .bytes = operator.deviceId().bytes }), 5));
 
         try store.save();
     }
 
     var reloaded = try Store.load(testing.allocator, path, null);
     defer reloaded.deinit();
-    try testing.expect(reloaded.isRevoked(phone.deviceId()));
+    try testing.expect(reloaded.isRevoked(@as(DeviceID, .{ .bytes = phone.deviceId().bytes })));
     try testing.expectEqual(@as(usize, 1), reloaded.revocationCount());
 
     // Pairing again with a fresh, human-scanned ticket clears the tombstone.
     _ = try reloaded.trustTicket(phone, 9999);
-    try testing.expect(!reloaded.isRevoked(phone.deviceId()));
-    try testing.expect(reloaded.isTrusted(phone.deviceId()));
+    try testing.expect(!reloaded.isRevoked(@as(DeviceID, .{ .bytes = phone.deviceId().bytes })));
+    try testing.expect(reloaded.isTrusted(@as(DeviceID, .{ .bytes = phone.deviceId().bytes })));
 }
 
 test "trust: applied revocations verify the signer and the signed time" {
@@ -1223,7 +1224,7 @@ test "trust: applied revocations verify the signer and the signed time" {
     const admin = try identity_mod.Identity.fromSeed([_]u8{0x73} ** identity_mod.seed_len);
     const admin_ticket = try testTicket(0x73, "admin");
     const phone_ticket = try testTicket(0x74, "phone");
-    const phone = phone_ticket.deviceId();
+    const phone = @as(DeviceID, .{ .bytes = phone_ticket.deviceId().bytes });
     const stranger = try identity_mod.Identity.fromSeed([_]u8{0x75} ** identity_mod.seed_len);
     _ = try store.trustTicket(admin_ticket, 1);
     _ = try store.trustTicket(phone_ticket, 2);
@@ -1231,12 +1232,12 @@ test "trust: applied revocations verify the signer and the signed time" {
 
     // An untrusted signer's revocation verifies cryptographically but is
     // never applied.
-    const stranger_sig = try stranger.sign(&revocationMessage(phone, stranger.deviceId(), 41));
+    const stranger_sig = try stranger.sign(&revocationMessage(phone, @as(DeviceID, .{ .bytes = stranger.deviceId().bytes }), 41));
     try testing.expectEqual(RevocationOutcome.rejected, try applyRevocation(&store, phone, stranger.publicKey(), 41, stranger_sig, now));
     try testing.expect(store.isTrusted(phone));
 
     // A trusted signer's revocation is applied and tombstoned.
-    const signature = try admin.sign(&revocationMessage(phone, admin.deviceId(), 42));
+    const signature = try admin.sign(&revocationMessage(phone, @as(DeviceID, .{ .bytes = admin.deviceId().bytes }), 42));
     try testing.expectEqual(RevocationOutcome.applied, try applyRevocation(&store, phone, admin.publicKey(), 42, signature, now));
     try testing.expect(store.isRevoked(phone));
     try testing.expect(!store.isTrusted(phone));
@@ -1271,34 +1272,34 @@ test "trust: revocation outcomes cover skew, re-pairing and replays" {
 
     const admin = try identity_mod.Identity.fromSeed([_]u8{0x7a} ** identity_mod.seed_len);
     const phone_ticket = try testTicket(0x7b, "phone");
-    const phone = phone_ticket.deviceId();
+    const phone = @as(DeviceID, .{ .bytes = phone_ticket.deviceId().bytes });
     _ = try store.trustTicket(try testTicket(0x7a, "admin"), 1);
     _ = try store.trustTicket(phone_ticket, 500);
     const now: u64 = 1_000;
 
     // Dated further ahead than the allowed skew: refused.
     const future = now + max_revocation_skew + 1;
-    const future_sig = try admin.sign(&revocationMessage(phone, admin.deviceId(), future));
+    const future_sig = try admin.sign(&revocationMessage(phone, @as(DeviceID, .{ .bytes = admin.deviceId().bytes }), future));
     try testing.expectEqual(RevocationOutcome.rejected, try applyRevocation(&store, phone, admin.publicKey(), future, future_sig, now));
     try testing.expect(store.isTrusted(phone));
 
     // Dated before the device was paired at 500: the pairing supersedes it.
-    const stale_sig = try admin.sign(&revocationMessage(phone, admin.deviceId(), 400));
+    const stale_sig = try admin.sign(&revocationMessage(phone, @as(DeviceID, .{ .bytes = admin.deviceId().bytes }), 400));
     try testing.expectEqual(RevocationOutcome.rejected, try applyRevocation(&store, phone, admin.publicKey(), 400, stale_sig, now));
     try testing.expect(store.isTrusted(phone));
 
-    const first_sig = try admin.sign(&revocationMessage(phone, admin.deviceId(), 600));
+    const first_sig = try admin.sign(&revocationMessage(phone, @as(DeviceID, .{ .bytes = admin.deviceId().bytes }), 600));
     try testing.expectEqual(RevocationOutcome.applied, try applyRevocation(&store, phone, admin.publicKey(), 600, first_sig, now));
     try testing.expect(!store.isTrusted(phone));
     try testing.expect(store.isRevoked(phone));
 
     // Replaying the same revocation, or an older one, changes nothing.
     try testing.expectEqual(RevocationOutcome.duplicate, try applyRevocation(&store, phone, admin.publicKey(), 600, first_sig, now));
-    const older_sig = try admin.sign(&revocationMessage(phone, admin.deviceId(), 550));
+    const older_sig = try admin.sign(&revocationMessage(phone, @as(DeviceID, .{ .bytes = admin.deviceId().bytes }), 550));
     try testing.expectEqual(RevocationOutcome.duplicate, try applyRevocation(&store, phone, admin.publicKey(), 550, older_sig, now));
 
     // A later revocation of the same device advances the tombstone.
-    const later_sig = try admin.sign(&revocationMessage(phone, admin.deviceId(), 700));
+    const later_sig = try admin.sign(&revocationMessage(phone, @as(DeviceID, .{ .bytes = admin.deviceId().bytes }), 700));
     try testing.expectEqual(RevocationOutcome.applied, try applyRevocation(&store, phone, admin.publicKey(), 700, later_sig, now));
     const tombstones = try store.copyRevocations(testing.allocator);
     defer testing.allocator.free(tombstones);
@@ -1327,7 +1328,7 @@ test "trust: a signed store rejects unauthorized edits" {
         // Round-trip keeps working; the signature is verified on load.
         var verify = try Store.load(testing.allocator, path, seed);
         defer verify.deinit();
-        try testing.expect(verify.isTrusted((try testTicket(0x92, "alpha")).deviceId()));
+        try testing.expect(verify.isTrusted(DeviceID{ .bytes = (try testTicket(0x92, "alpha")).deviceId().bytes }));
     }
 
     // A hand edit to one byte of the body makes the load fail outright.
@@ -1445,21 +1446,21 @@ test "trust: ticket expiry prevents rollback and persists" {
         var store = try Store.load(testing.allocator, path, null);
         defer store.deinit();
         _ = try store.upsert(identity.publicKey(), old.transport_public_key, "unsequenced", 10);
-        try testing.expectEqual(@as(u64, 0), store.lookup(identity.deviceId()).?.ticket_expiry);
+        try testing.expectEqual(@as(u64, 0), store.lookup(@as(DeviceID, .{ .bytes = identity.deviceId().bytes })).?.ticket_expiry);
         _ = try store.trustTicket(current, 20);
         try testing.expectError(Error.StaleTicket, store.trustTicket(old, 30));
-        try testing.expectEqualStrings("current", store.lookup(identity.deviceId()).?.labelSlice());
-        try testing.expectEqualSlices(u8, &current.transport_public_key, &store.lookup(identity.deviceId()).?.transport_key);
+        try testing.expectEqualStrings("current", store.lookup(@as(DeviceID, .{ .bytes = identity.deviceId().bytes })).?.labelSlice());
+        try testing.expectEqualSlices(u8, &current.transport_public_key, &store.lookup(@as(DeviceID, .{ .bytes = identity.deviceId().bytes })).?.transport_key);
         try testing.expect(!try store.trustTicket(current, 40));
         try testing.expect(!try store.trustTicket(newer, 50));
-        try testing.expectEqual(@as(u64, 10), store.lookup(identity.deviceId()).?.added_at);
+        try testing.expectEqual(@as(u64, 10), store.lookup(@as(DeviceID, .{ .bytes = identity.deviceId().bytes })).?.added_at);
         try store.save();
     }
     var reloaded = try Store.load(testing.allocator, path, null);
     defer reloaded.deinit();
-    try testing.expectEqual(@as(u64, 3000), reloaded.lookup(identity.deviceId()).?.ticket_expiry);
+    try testing.expectEqual(@as(u64, 3000), reloaded.lookup(@as(DeviceID, .{ .bytes = identity.deviceId().bytes })).?.ticket_expiry);
     try testing.expectError(Error.StaleTicket, reloaded.trustTicket(current, 60));
-    try testing.expectEqualSlices(u8, &newer.transport_public_key, &reloaded.lookup(identity.deviceId()).?.transport_key);
+    try testing.expectEqualSlices(u8, &newer.transport_public_key, &reloaded.lookup(@as(DeviceID, .{ .bytes = identity.deviceId().bytes })).?.transport_key);
 }
 
 test "trust: retired v1 is moved aside once without parsing or checking signature" {
@@ -1528,11 +1529,11 @@ test "trust: re-pairing with a newer ticket clears a revocation tombstone" {
     const old = try pairing.Ticket.init(identity, [_]u8{1} ** 32, "old", "127.0.0.1:1", 1000);
     const newer = try pairing.Ticket.init(identity, [_]u8{2} ** 32, "newer", "127.0.0.1:1", 2000);
     _ = try store.trustTicket(old, 10);
-    _ = try store.revokeDevice(identity.deviceId(), admin.deviceId(), 20);
-    try testing.expect(store.isRevoked(identity.deviceId()));
+    _ = try store.revokeDevice(@as(DeviceID, .{ .bytes = identity.deviceId().bytes }), @as(DeviceID, .{ .bytes = admin.deviceId().bytes }), 20);
+    try testing.expect(store.isRevoked(@as(DeviceID, .{ .bytes = identity.deviceId().bytes })));
     _ = try store.trustTicket(newer, 30);
-    try testing.expect(!store.isRevoked(identity.deviceId()));
-    try testing.expectEqual(@as(u64, 2000), store.lookup(identity.deviceId()).?.ticket_expiry);
+    try testing.expect(!store.isRevoked(@as(DeviceID, .{ .bytes = identity.deviceId().bytes })));
+    try testing.expectEqual(@as(u64, 2000), store.lookup(@as(DeviceID, .{ .bytes = identity.deviceId().bytes })).?.ticket_expiry);
 }
 
 test "trust: admissions add unknown members, respect tombstones and need a trusted signer" {
@@ -1551,37 +1552,37 @@ test "trust: admissions add unknown members, respect tombstones and need a trust
     const tk = [_]u8{0x42} ** 32;
     const sign = struct {
         fn by(signer: identity_mod.Identity, device: identity_mod.Identity, transport: [32]u8, at: u64) ![64]u8 {
-            return signer.sign(&admissionMessage(device.publicKey(), transport, "Phone", at, signer.deviceId()));
+            return signer.sign(&admissionMessage(device.publicKey(), transport, "Phone", at, @as(DeviceID, .{ .bytes = signer.deviceId().bytes })));
         }
     }.by;
 
     // A forged signature is an error; a device can't vouch for itself.
-    try testing.expectError(error.SignatureVerificationFailed, applyAdmission(&store, phone.publicKey(), tk, "Phone", 50, admin.publicKey(), [_]u8{0} ** 64, me.deviceId(), 1000));
-    try testing.expectEqual(RevocationOutcome.rejected, try applyAdmission(&store, phone.publicKey(), tk, "Phone", 50, phone.publicKey(), try sign(phone, phone, tk, 50), me.deviceId(), 1000));
+    try testing.expectError(error.SignatureVerificationFailed, applyAdmission(&store, phone.publicKey(), tk, "Phone", 50, admin.publicKey(), [_]u8{0} ** 64, @as(DeviceID, .{ .bytes = me.deviceId().bytes }), 1000));
+    try testing.expectEqual(RevocationOutcome.rejected, try applyAdmission(&store, phone.publicKey(), tk, "Phone", 50, phone.publicKey(), try sign(phone, phone, tk, 50), @as(DeviceID, .{ .bytes = me.deviceId().bytes }), 1000));
 
     // A tombstone made after the admission wins; a later admission re-admits.
-    _ = try store.revokeDevice(phone.deviceId(), admin.deviceId(), 60);
-    try testing.expectEqual(RevocationOutcome.rejected, try applyAdmission(&store, phone.publicKey(), tk, "Phone", 50, admin.publicKey(), try sign(admin, phone, tk, 50), me.deviceId(), 1000));
-    try testing.expectEqual(RevocationOutcome.applied, try applyAdmission(&store, phone.publicKey(), tk, "Phone", 70, admin.publicKey(), try sign(admin, phone, tk, 70), me.deviceId(), 1000));
-    try testing.expect(store.isTrusted(phone.deviceId()));
-    try testing.expect(!store.isRevoked(phone.deviceId()));
-    try testing.expectEqual(@as(u64, 70), store.lookup(phone.deviceId()).?.added_at);
+    _ = try store.revokeDevice(@as(DeviceID, .{ .bytes = phone.deviceId().bytes }), @as(DeviceID, .{ .bytes = admin.deviceId().bytes }), 60);
+    try testing.expectEqual(RevocationOutcome.rejected, try applyAdmission(&store, phone.publicKey(), tk, "Phone", 50, admin.publicKey(), try sign(admin, phone, tk, 50), @as(DeviceID, .{ .bytes = me.deviceId().bytes }), 1000));
+    try testing.expectEqual(RevocationOutcome.applied, try applyAdmission(&store, phone.publicKey(), tk, "Phone", 70, admin.publicKey(), try sign(admin, phone, tk, 70), @as(DeviceID, .{ .bytes = me.deviceId().bytes }), 1000));
+    try testing.expect(store.isTrusted(@as(DeviceID, .{ .bytes = phone.deviceId().bytes })));
+    try testing.expect(!store.isRevoked(@as(DeviceID, .{ .bytes = phone.deviceId().bytes })));
+    try testing.expectEqual(@as(u64, 70), store.lookup(@as(DeviceID, .{ .bytes = phone.deviceId().bytes })).?.added_at);
 
     // Known now: a vouch with another transport key changes nothing.
     const other = [_]u8{0x43} ** 32;
-    try testing.expectEqual(RevocationOutcome.duplicate, try applyAdmission(&store, phone.publicKey(), other, "Phone", 90, admin.publicKey(), try sign(admin, phone, other, 90), me.deviceId(), 1000));
-    try testing.expectEqual(tk, store.lookup(phone.deviceId()).?.transport_key);
+    try testing.expectEqual(RevocationOutcome.duplicate, try applyAdmission(&store, phone.publicKey(), other, "Phone", 90, admin.publicKey(), try sign(admin, phone, other, 90), @as(DeviceID, .{ .bytes = me.deviceId().bytes }), 1000));
+    try testing.expectEqual(tk, store.lookup(@as(DeviceID, .{ .bytes = phone.deviceId().bytes })).?.transport_key);
 
     // A vouch dated far ahead is refused; a little ahead is kept as now, so
     // a revocation made after now still wins over it.
     const tablet = try identity_mod.Identity.fromSeed([_]u8{0x34} ** identity_mod.seed_len);
     const tk2 = [_]u8{0x44} ** 32;
     const ahead = 1000 + max_admission_skew + 1;
-    try testing.expectEqual(RevocationOutcome.rejected, try applyAdmission(&store, tablet.publicKey(), tk2, "Phone", ahead, admin.publicKey(), try sign(admin, tablet, tk2, ahead), me.deviceId(), 1000));
-    try testing.expectEqual(RevocationOutcome.applied, try applyAdmission(&store, tablet.publicKey(), tk2, "Phone", 1300, admin.publicKey(), try sign(admin, tablet, tk2, 1300), me.deviceId(), 1000));
-    try testing.expectEqual(@as(u64, 1000), store.lookup(tablet.deviceId()).?.added_at);
-    try testing.expectEqual(RevocationOutcome.applied, try applyRevocation(&store, tablet.deviceId(), admin.publicKey(), 1001, try admin.sign(&revocationMessage(tablet.deviceId(), admin.deviceId(), 1001)), 1001));
-    try testing.expect(!store.isTrusted(tablet.deviceId()));
+    try testing.expectEqual(RevocationOutcome.rejected, try applyAdmission(&store, tablet.publicKey(), tk2, "Phone", ahead, admin.publicKey(), try sign(admin, tablet, tk2, ahead), @as(DeviceID, .{ .bytes = me.deviceId().bytes }), 1000));
+    try testing.expectEqual(RevocationOutcome.applied, try applyAdmission(&store, tablet.publicKey(), tk2, "Phone", 1300, admin.publicKey(), try sign(admin, tablet, tk2, 1300), @as(DeviceID, .{ .bytes = me.deviceId().bytes }), 1000));
+    try testing.expectEqual(@as(u64, 1000), store.lookup(@as(DeviceID, .{ .bytes = tablet.deviceId().bytes })).?.added_at);
+    try testing.expectEqual(RevocationOutcome.applied, try applyRevocation(&store, @as(DeviceID, .{ .bytes = tablet.deviceId().bytes }), admin.publicKey(), 1001, try admin.sign(&revocationMessage(@as(DeviceID, .{ .bytes = tablet.deviceId().bytes }), @as(DeviceID, .{ .bytes = admin.deviceId().bytes }), 1001)), 1001));
+    try testing.expect(!store.isTrusted(@as(DeviceID, .{ .bytes = tablet.deviceId().bytes })));
 }
 
 test "trust store: a running store merges what another process wrote, never overwrites it" {
@@ -1609,24 +1610,24 @@ test "trust store: a running store merges what another process wrote, never over
 
     // The node notices it, and its next save keeps it.
     try testing.expect(try node.syncFromDisk());
-    try testing.expect(node.isTrusted(b.deviceId()));
+    try testing.expect(node.isTrusted(@as(DeviceID, .{ .bytes = b.deviceId().bytes })));
     try testing.expect(!try node.syncFromDisk()); // unchanged now
     try node.save();
     var again = try Store.load(testing.allocator, path, seed);
     defer again.deinit();
-    try testing.expect(again.isTrusted(a.deviceId()) and again.isTrusted(b.deviceId()));
+    try testing.expect(again.isTrusted(@as(DeviceID, .{ .bytes = a.deviceId().bytes })) and again.isTrusted(@as(DeviceID, .{ .bytes = b.deviceId().bytes })));
 
     // A revocation written by the command line wins over the node's entry.
     {
         var cli = try Store.load(testing.allocator, path, seed);
         defer cli.deinit();
-        _ = try cli.revokeDevice(a.deviceId(), b.deviceId(), 30);
+        _ = try cli.revokeDevice(@as(DeviceID, .{ .bytes = a.deviceId().bytes }), @as(DeviceID, .{ .bytes = b.deviceId().bytes }), 30);
         try cli.save();
     }
     const Told = struct {
-        var device: ?NodeID = null;
+        var device: ?DeviceID = null;
         var transport: ?[32]u8 = null;
-        fn revoked(_: *anyopaque, device_id: NodeID, transport_key: ?[32]u8) void {
+        fn revoked(_: *anyopaque, device_id: DeviceID, transport_key: ?[32]u8) void {
             device = device_id;
             transport = transport_key;
         }
@@ -1634,9 +1635,9 @@ test "trust store: a running store merges what another process wrote, never over
     var ctx: u8 = 0;
     node.revoked_hook = .{ .ctx = &ctx, .revokedFn = Told.revoked };
     try node.save(); // merges before writing
-    try testing.expect(!node.isTrusted(a.deviceId()));
+    try testing.expect(!node.isTrusted(@as(DeviceID, .{ .bytes = a.deviceId().bytes })));
     // The node acts on it as on any revocation, with the key it had pinned.
-    try testing.expect(Told.device.?.eql(a.deviceId()));
+    try testing.expect(Told.device.?.eql(@as(DeviceID, .{ .bytes = a.deviceId().bytes })));
     try testing.expectEqual([_]u8{1} ** 32, Told.transport.?);
 
     // A --trust refresh written by the command line (a new ticket and transport key) wins
@@ -1648,5 +1649,35 @@ test "trust store: a running store merges what another process wrote, never over
         try cli.save();
     }
     try testing.expect(try node.syncFromDisk());
-    try testing.expectEqual([_]u8{3} ** 32, node.lookup(b.deviceId()).?.transport_key);
+    try testing.expectEqual([_]u8{3} ** 32, node.lookup(@as(DeviceID, .{ .bytes = b.deviceId().bytes })).?.transport_key);
+}
+
+test "trust: membership uses pinned transport IDs across key rotation" {
+    comptime {
+        if (@TypeOf(@as(Entry, undefined).device_id) != DeviceID)
+            @compileError("trust entries must use device identities");
+        if (@typeInfo(@TypeOf(Store.isTrusted)).@"fn".params[1].type.? != DeviceID)
+            @compileError("trust queries must require device identities");
+        if (@typeInfo(@TypeOf(Store.isMemberNode)).@"fn".params[1].type.? != NodeID)
+            @compileError("membership routing queries must require transport IDs");
+    }
+    const path = "test_trust_member_transport.store";
+    cleanup(path);
+    defer cleanup(path);
+    var store = try Store.load(testing.allocator, path, null);
+    defer store.deinit();
+    const identity_key = [_]u8{0x61} ** 32;
+    const old_transport = [_]u8{0x62} ** 32;
+    const new_transport = [_]u8{0x63} ** 32;
+    const device = DeviceID.fromPublicKey(identity_key);
+    _ = try store.upsert(identity_key, old_transport, "member", 1);
+    try testing.expect(store.isTrusted(device));
+    try testing.expect(store.isMemberNode(NodeID.fromPublicKey(old_transport)));
+    try testing.expect(!store.isMemberNode(NodeID.fromPublicKey(identity_key)));
+    _ = try store.upsert(identity_key, new_transport, "member", 2);
+    try testing.expect(store.isTrusted(device));
+    try testing.expect(!store.isMemberNode(NodeID.fromPublicKey(old_transport)));
+    try testing.expect(store.isMemberNode(NodeID.fromPublicKey(new_transport)));
+    try testing.expect(store.revoke(device));
+    try testing.expect(!store.isMemberNode(NodeID.fromPublicKey(new_transport)));
 }

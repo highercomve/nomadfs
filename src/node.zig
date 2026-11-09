@@ -254,7 +254,7 @@ pub const Node = struct {
         // Every revocation, from a peer, this device or another process on
         // this config (the disk merge), has the same effect: membershipRevoked.
         discovery_node.revocation_sink = .{ .ctx = block_manager, .revokedFn = membershipRevoked };
-        trust_store.revoked_hook = .{ .ctx = block_manager, .revokedFn = membershipRevoked };
+        trust_store.revoked_hook = .{ .ctx = block_manager, .revokedFn = trustMembershipRevoked };
 
         // Folder backups a backup device kept on its own before they went
         // into the swarm folder move there, once (fs/backup_import.zig).
@@ -279,7 +279,7 @@ pub const Node = struct {
             k.* = cluster.keeper.Keeper.init(allocator, &block_manager.fetcher.?, s);
             keeper = k;
             if (swarm) |folder| {
-                folder.placement = .{ .trust = trust_store, .policy = policy, .self_device = device_identity.deviceId() };
+                folder.placement = .{ .trust = trust_store, .policy = policy, .self_device = net.id.DeviceID.fromPublicKey(device_identity.publicKey()) };
                 folder.keeper = k;
                 try k.register(folder.keeperProvider());
             }
@@ -467,7 +467,7 @@ pub const Node = struct {
             for (out.items) |d| allocator.free(d.name);
             out.deinit(allocator);
         }
-        var reached: std.ArrayList(net.id.NodeID) = .empty;
+        var reached: std.ArrayList(net.id.DeviceID) = .empty;
         defer reached.deinit(allocator);
 
         const peers = try fs.remote.knownPeers(self.block_manager, allocator);
@@ -475,7 +475,8 @@ pub const Node = struct {
         for (peers) |peer| {
             const conn = self.block_manager.connectTo(peer) catch continue;
             defer conn.deinit();
-            const dev = conn.getRemoteDeviceID() orelse continue;
+            const legacy_device = conn.getRemoteDeviceID() orelse continue;
+            const dev = net.id.DeviceID{ .bytes = legacy_device.bytes };
             const entry = self.trust_store.lookup(dev);
             const trusted = entry != null and self.trust_store.isTrusted(dev);
             if (!trusted) {
@@ -497,7 +498,7 @@ pub const Node = struct {
         const entries = try self.trust_store.copyEntries(allocator);
         defer allocator.free(entries);
         for (entries) |e| {
-            const dev = net.id.NodeID.fromPublicKey(e.public_key);
+            const dev = net.id.DeviceID.fromPublicKey(e.public_key);
             if (!self.trust_store.isTrusted(dev)) continue;
             const seen = for (reached.items) |r| {
                 if (r.eql(dev)) break true;
@@ -1107,21 +1108,26 @@ pub const Node = struct {
 /// swarm on the next ping (its digest changed); nothing else to do here.
 fn membershipTrusted(_: *anyopaque, _: *const device.pairing.Ticket) void {}
 
-/// A device was revoked: its connections close and it stops being a holder
-/// of anything, under its device ID and its transport node ID.
+/// The trust hook carries a DeviceID; membership hooks still use identity bytes.
+fn trustMembershipRevoked(ctx: *anyopaque, device_id: net.id.DeviceID, transport_key: ?[32]u8) void {
+    membershipRevoked(ctx, .{ .bytes = device_id.bytes }, transport_key);
+}
+
+/// A device was revoked: the connections authenticated as it close, and
+/// its transport node ID (from its pinned transport key) stops being a
+/// holder of anything and is forgotten. `device_id` is identity bytes (the
+/// membership hooks' legacy type): only matched as a device, never used as
+/// a transport ID.
 fn membershipRevoked(ctx: *anyopaque, device_id: net.id.NodeID, transport_key: ?[32]u8) void {
     const bm: *cluster.BlockManager = @ptrCast(@alignCast(ctx));
-    _ = bm.net.closePeer(device_id);
+    _ = bm.net.closeDevice(.{ .bytes = device_id.bytes });
+    const tk = transport_key orelse return;
+    const node_id = net.id.NodeID.fromPublicKey(tk);
+    _ = bm.net.closePeer(node_id);
     // Forgotten from the devices this one remembers and redials too
     // (Node.rememberPeers drains this).
-    bm.dht_node.noteRevoked(device_id);
-    if (transport_key) |tk| bm.dht_node.noteRevoked(net.id.NodeID.fromPublicKey(tk));
-    if (bm.holders) |*h| h.forget(device_id);
-    if (transport_key) |tk| {
-        const node_id = net.id.NodeID.fromPublicKey(tk);
-        _ = bm.net.closePeer(node_id);
-        if (bm.holders) |*h| h.forget(node_id);
-    }
+    bm.dht_node.noteRevoked(node_id);
+    if (bm.holders) |*h| h.forget(node_id);
 }
 
 fn wakeKeeper(ctx: *anyopaque) void {
@@ -1221,4 +1227,20 @@ test "Node.pruneRedial keeps state only for remembered devices" {
 test "Node.rotateSwarmKey compiles" {
     std.testing.refAllDecls(Node);
     _ = &Node.rotateSwarmKey;
+}
+
+test "trust revocation queues only the pinned transport node" {
+    const allocator = std.testing.allocator;
+    var manager = ConnectionManager.initExplicit(allocator, .tcp, net.transport.noise.KeyPair.generate());
+    defer manager.deinit();
+    var dht = net.discovery.Node.init(allocator, &manager, "k" ** 32);
+    defer dht.deinit();
+    const bm = try cluster.BlockManager.init(allocator, .{ .network = &manager, .dht = &dht, .storage = null });
+    defer bm.deinit();
+    const identity = try device.identity.Identity.fromSeed([_]u8{0x68} ** 32);
+    const transport_key = [_]u8{0x69} ** 32;
+    trustMembershipRevoked(bm, net.id.DeviceID.fromPublicKey(identity.publicKey()), transport_key);
+    var revoked: [net.discovery.Node.max_revoked_queue]net.id.NodeID = undefined;
+    // The identity bytes match no transport ID: only the node is queued.
+    try std.testing.expectEqualSlices(net.id.NodeID, &.{net.id.NodeID.fromPublicKey(transport_key)}, revoked[0..dht.takeRevoked(&revoked)]);
 }

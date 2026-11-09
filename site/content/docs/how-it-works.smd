@@ -50,9 +50,10 @@ When you open a photo or play a video from the swarm folder:
 1. **Folders** knows the file and who added it, and works out which pieces cover
    what the player asks for next. While you watch, it asks for the next few
    seconds ahead of time.
-2. **Distribution** checks who holds the file: the device that added it, plus
-   any backup devices and placed replicas. It then picks, for each piece, the
-   device expected to answer first: `cost = (in_flight + 1) / rate`.
+2. **Distribution** checks who holds the file: the device that added it (if it
+   is still around), the backup devices, and any placed replicas, connected
+   ones first. It then picks, for each piece, the device expected to answer
+   first: `cost = (in_flight + 1) / rate`.
    With several devices holding the file, pieces come from all of them at once,
    most from the fastest. A device that turns out not to have the file is
    remembered, so it isn't asked again for every piece.

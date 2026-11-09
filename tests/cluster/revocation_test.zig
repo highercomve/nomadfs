@@ -3,6 +3,7 @@ const nomadfs = @import("nomadfs");
 const TestPeer = @import("test_helpers").TestPeer;
 const DhtNode = nomadfs.net.discovery.Node;
 const Identity = nomadfs.device.identity.Identity;
+const DeviceID = nomadfs.net.id.DeviceID;
 const TrustStore = nomadfs.device.trust.Store;
 const Ticket = nomadfs.device.pairing.Ticket;
 
@@ -32,7 +33,7 @@ test "cluster: revocations require a verified signature from a trusted device" {
     defer receiver_store.deinit();
     _ = try receiver_store.trustTicket(try ticketFor(admin, "admin"), 1);
     _ = try receiver_store.trustTicket(try ticketFor(phone, "phone"), 2);
-    try std.testing.expect(receiver_store.isTrusted(phone.deviceId()));
+    try std.testing.expect(receiver_store.isTrusted(DeviceID.fromPublicKey(phone.publicKey())));
 
     var peer_admin = try TestPeer.init(allocator, 13120);
     defer peer_admin.deinit();
@@ -66,8 +67,8 @@ test "cluster: revocations require a verified signature from a trusted device" {
 
         // A trusted device's signed revocation takes the entry out.
         try std.testing.expect(try dht_admin.sendRevoke(conn, phone.deviceId()));
-        try std.testing.expect(receiver_store.isRevoked(phone.deviceId()));
-        try std.testing.expect(!receiver_store.isTrusted(phone.deviceId()));
+        try std.testing.expect(receiver_store.isRevoked(DeviceID.fromPublicKey(phone.publicKey())));
+        try std.testing.expect(!receiver_store.isTrusted(DeviceID.fromPublicKey(phone.publicKey())));
 
         // Without a trust store on the receiving side, nothing is honored.
         dht_receiver.trust_store = null;
@@ -95,7 +96,7 @@ test "cluster: revocations require a verified signature from a trusted device" {
         dht_admin.device_identity = phone;
         try std.testing.expect(!try dht_admin.sendRevoke(conn, phone.deviceId()));
         try std.testing.expectEqual(entries_before, receiver_store.count());
-        try std.testing.expect(receiver_store.isRevoked(phone.deviceId()));
+        try std.testing.expect(receiver_store.isRevoked(DeviceID.fromPublicKey(phone.publicKey())));
     }
 }
 
@@ -122,7 +123,7 @@ test "cluster: the revocation sweep reaches peers that never dialed out" {
     // A holds a tombstone; B never met A and still holds the phone.
     _ = try store_b.trustTicket(try ticketFor(admin, "admin"), 1);
     _ = try store_b.trustTicket(try ticketFor(phone, "phone"), 2);
-    _ = try store_a.revokeDevice(phone.deviceId(), admin.deviceId(), 77);
+    _ = try store_a.revokeDevice(DeviceID.fromPublicKey(phone.publicKey()), DeviceID.fromPublicKey(admin.publicKey()), 77);
 
     var peer_a = try TestPeer.init(allocator, 13122);
     defer peer_a.deinit();
@@ -157,10 +158,10 @@ test "cluster: the revocation sweep reaches peers that never dialed out" {
     const accepted = try dht_a.sweepRevocations(4);
     try std.testing.expectEqual(@as(usize, 1), accepted);
 
-    try std.testing.expect(store_b.isRevoked(phone.deviceId()));
-    try std.testing.expect(!store_b.isTrusted(phone.deviceId()));
+    try std.testing.expect(store_b.isRevoked(DeviceID.fromPublicKey(phone.publicKey())));
+    try std.testing.expect(!store_b.isTrusted(DeviceID.fromPublicKey(phone.publicKey())));
     // The admin device itself stays trusted.
-    try std.testing.expect(store_b.isTrusted(admin.deviceId()));
+    try std.testing.expect(store_b.isTrusted(DeviceID.fromPublicKey(admin.publicKey())));
 
     // A second sweep is a no-op beyond reaching the peer again.
     const accepted_again = try dht_a.sweepRevocations(4);

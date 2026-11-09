@@ -13,6 +13,7 @@
 const std = @import("std");
 const identity_mod = @import("identity.zig");
 const trust_mod = @import("trust.zig");
+const DeviceID = @import("../net/id.zig").DeviceID;
 const NodeID = @import("../net/id.zig").NodeID;
 
 pub const version: u8 = 1;
@@ -71,7 +72,7 @@ pub const Authenticator = struct {
         @memcpy(message[domain.len..], &transcript);
         try identity_mod.Identity.verify(public_key, &message, signature);
 
-        const device_id = NodeID.fromPublicKey(public_key);
+        const device_id = DeviceID.fromPublicKey(public_key);
         if (self.trust) |store| {
             if (store.isRevoked(device_id)) return Error.UntrustedDevice;
             if (store.lookup(device_id)) |entry| {
@@ -86,7 +87,8 @@ pub const Authenticator = struct {
             const store = self.trust orelse return Error.UntrustedDevice;
             if (!store.isTrusted(device_id)) return Error.UntrustedDevice;
         }
-        return device_id;
+        // Keep the transport-facing API stable while its device IDs are migrated.
+        return .{ .bytes = device_id.bytes };
     }
 };
 
@@ -212,7 +214,7 @@ test "device auth: tombstones reject a device under either policy" {
     defer store.deinit();
     const remote = try identityWith(0x71);
     const local = try identityWith(0x72);
-    _ = try store.revokeDevice(remote.deviceId(), local.deviceId(), 10);
+    _ = try store.revokeDevice(DeviceID.fromPublicKey(remote.publicKey()), DeviceID.fromPublicKey(local.publicKey()), 10);
     const sender: Authenticator = .{ .identity = remote };
     const transcript = [_]u8{0x55} ** 32;
     const hello = try sender.createHello(transcript);

@@ -117,10 +117,15 @@ const RelayedConnectionImpl = struct {
 
     /// Signals shutdown: ends the stream through the relay, which wakes
     /// the Yamux reader. Safe while other threads use the connection.
+    /// Writes nothing: the stream's FIN is queued for the relay
+    /// connection's next flush, since this runs on the connection manager's
+    /// one maintenance thread when the session is dead, and the relay link
+    /// may be stalled even with its writer free.
     fn close(ctx: *anyopaque) void {
         const self: *RelayedConnectionImpl = @ptrCast(@alignCast(ctx));
         if (self.closed.swap(true, .acq_rel)) return;
-        self.base.shutdown();
+        // `base` is a Yamux stream of `via` (see `establish`).
+        if (self.base.ptr) |stream| YamuxSession.streamShutdownQueued(stream);
         self.yamux.close();
     }
 

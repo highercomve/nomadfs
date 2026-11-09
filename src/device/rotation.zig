@@ -11,6 +11,7 @@
 //! the new one: that is the point of rotating.
 
 const std = @import("std");
+const DeviceID = @import("../net/id.zig").DeviceID;
 const NodeID = @import("../net/id.zig").NodeID;
 const identity_mod = @import("identity.zig");
 const trust_mod = @import("trust.zig");
@@ -39,10 +40,11 @@ pub fn verify(
     new_key: [32]u8,
     current_epoch: u64,
 ) Rejection!void {
-    const signer = NodeID.fromPublicKey(signer_key);
+    const signer = DeviceID.fromPublicKey(signer_key);
     if (!trust.isTrusted(signer)) return error.UntrustedSigner;
     const peer = peer_device orelse return error.SignerNotPeer;
-    if (!peer.eql(signer)) return error.SignerNotPeer;
+    // The connection API still represents device identities with NodeID.
+    if (!std.mem.eql(u8, &peer.bytes, &signer.bytes)) return error.SignerNotPeer;
     const msg = message(epoch, new_key);
     identity_mod.Identity.verify(signer_key, &msg, signature) catch return error.BadSignature;
     if (epoch <= current_epoch) return error.StaleEpoch;

@@ -20,6 +20,7 @@
 //!   inviter -> joiner: [32 swarm key][u16 node port][u16 len][ticket uri]
 
 const std = @import("std");
+const DeviceID = @import("../net/id.zig").DeviceID;
 const sync = @import("../sync.zig");
 const pairing = @import("pairing.zig");
 const Identity = @import("identity.zig").Identity;
@@ -406,11 +407,11 @@ test "invite: possession enforced before consuming token, then matching identiti
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
     var store = try trust.Store.load(allocator, path, null);
     defer store.deinit();
-    _ = try store.revokeDevice(stranger.deviceId(), host_identity.deviceId(), nowSeconds());
+    _ = try store.revokeDevice(DeviceID.fromPublicKey(stranger.publicKey()), DeviceID.fromPublicKey(host_identity.publicKey()), nowSeconds());
     try std.testing.expectError(error.InviteRejected, joinExchange(allocator, code, stranger_uri, joiner));
     try std.testing.expectEqual(Host.State.waiting, host.status(nowSeconds()));
     try std.testing.expect((try host.joinedTicket(allocator)) == null);
-    try std.testing.expect(store.isRevoked(stranger.deviceId()));
+    try std.testing.expect(store.isRevoked(DeviceID.fromPublicKey(stranger.publicKey())));
 
     var wrong = try Code.parse(code);
     wrong.token[0] ^= 1;

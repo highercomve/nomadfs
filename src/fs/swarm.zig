@@ -1095,7 +1095,7 @@ pub const SwarmFolder = struct {
     pub const Placement = struct {
         trust: *device.trust.Store,
         policy: *device.policy.Policy,
-        self_device: NodeID,
+        self_device: @import("../net/id.zig").DeviceID,
     };
 
     /// Turns the backup on or off. On: every live file is kept on this
@@ -1505,6 +1505,9 @@ test "swarm: files keep their own modified time" {
 }
 
 const TestFolder = @import("test_fixture.zig").Fixture(SwarmFolder);
+/// This node's device identity in the placement tests: its own value, not
+/// derived from the transport self_id (the two spaces never mix).
+const test_device = @import("../net/id.zig").DeviceID{ .bytes = [_]u8{0xde} ** 32 };
 
 test "swarm: putBytes writes new content and replaces it only from its base" {
     var t: TestFolder = undefined;
@@ -1756,7 +1759,7 @@ test "swarm: a device that trusts no other device doesn't wait for a pull" {
     defer trust.deinit();
     var policy: device.policy.Policy = undefined; // not read by the edit gate
     const folder = t.folder;
-    folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = folder.self_id };
+    folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = test_device };
     defer folder.placement = null;
     folder.awaiting_pull = true;
     folder.awaiting_since_ms = sync.monotonicMillis();
@@ -2034,7 +2037,7 @@ test "swarm: backups precede placement replicas with eight copies" {
         .signer_key = [_]u8{0} ** 32,
         .signature = [_]u8{0} ** 64,
     } };
-    t.folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = t.folder.self_id };
+    t.folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = test_device };
     var bm: cluster.BlockManager = undefined;
     bm.holders = .{ .self_id = t.folder.self_id, .peers = .{
         .ctx = &bm,
@@ -2043,7 +2046,7 @@ test "swarm: backups precede placement replicas with eight copies" {
         .connectedFn = Fake.live,
     } };
     t.folder.block_manager = &bm;
-    const members = try cluster.placement.candidates(std.testing.allocator, &trust, &policy, t.folder.self_id, t.folder.self_id);
+    const members = try cluster.placement.candidates(std.testing.allocator, &trust, &policy, t.folder.self_id, test_device);
     defer std.testing.allocator.free(members);
     const author = NodeID.fromPublicKey([_]u8{21} ** 32);
     var root = [_]u8{0} ** 32;
@@ -2078,7 +2081,7 @@ test "swarm: only current transport authors are kept with trust membership" {
     var out: [cluster.fetcher.max_holders]NodeID = undefined;
     const root = [_]u8{9} ** 32;
     try std.testing.expectEqualSlices(NodeID, &.{author}, t.folder.holdersOf(allocator, &root, author, &out));
-    t.folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = t.folder.self_id };
+    t.folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = test_device };
     try std.testing.expectEqual(@as(usize, 0), t.folder.holdersOf(allocator, &root, author, &out).len);
     _ = try trust.upsert([_]u8{72} ** 32, key, "member", 1);
     try std.testing.expect(!NodeID.fromPublicKey([_]u8{72} ** 32).eql(author));
@@ -2112,7 +2115,7 @@ test "swarm: a connected author stays live without a trust entry; a remembered o
     var trust = try device.trust.Store.load(allocator, path, null);
     defer trust.deinit();
     var policy: device.policy.Policy = .{ .allocator = allocator, .path = &.{} };
-    t.folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = t.folder.self_id };
+    t.folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = test_device };
     var bm: cluster.BlockManager = undefined;
     bm.holders = .{ .self_id = t.folder.self_id, .peers = .{
         .ctx = &bm,
@@ -2143,7 +2146,7 @@ test "swarm: a read whose only holder is a gone author reports NoHolders" {
     var trust = try device.trust.Store.load(allocator, path, null);
     defer trust.deinit();
     var policy: device.policy.Policy = .{ .allocator = allocator, .path = &.{} };
-    t.folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = t.folder.self_id };
+    t.folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = test_device };
     // A node with nobody else around: the author (an ID from before a
     // re-join) is no member and not connected, so nobody is left to ask.
     var peers = [_]cluster.fetcher.FakeNet.Peer{};

@@ -8,6 +8,7 @@
 //! removing a member moves only the files it wins or held.
 
 const std = @import("std");
+const DeviceID = @import("../net/id.zig").DeviceID;
 const NodeID = @import("../net/id.zig").NodeID;
 const trust_mod = @import("../device/trust.zig");
 const policy_mod = @import("../device/policy.zig");
@@ -57,7 +58,7 @@ pub fn replicaHolders(root: *const Cid, author: NodeID, copies: u8, members: []c
 /// The members placement chooses from: this device (when it accepts copies)
 /// and every trusted member with a transport key that accepts copies, as
 /// transport node IDs. Caller frees.
-pub fn candidates(allocator: std.mem.Allocator, trust: *trust_mod.Store, policy: *policy_mod.Policy, self_node: NodeID, self_device: NodeID) ![]NodeID {
+pub fn candidates(allocator: std.mem.Allocator, trust: *trust_mod.Store, policy: *policy_mod.Policy, self_node: NodeID, self_device: DeviceID) ![]NodeID {
     const entries = try trust.copyEntries(allocator);
     defer allocator.free(entries);
     var out: std.ArrayList(NodeID) = .empty;
@@ -116,4 +117,36 @@ test "placement: a new member takes over only the files it wins" {
     }
     // About a quarter of the files (1 of 4 candidates besides the author).
     try testing.expect(moved > files / 8 and moved < files / 2);
+}
+
+test "placement: device policy selects pinned transport IDs" {
+    comptime {
+        if (@typeInfo(@TypeOf(candidates)).@"fn".params[4].type.? != DeviceID)
+            @compileError("placement self_device must require a device identity");
+    }
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "test_placement_device_identity.store";
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var trust = try trust_mod.Store.load(allocator, path, null);
+    defer trust.deinit();
+    const policy_path = "test_placement_device_identity.policy";
+    std.Io.Dir.cwd().deleteFile(io, policy_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, policy_path) catch {};
+    const policy = try policy_mod.Policy.load(allocator, policy_path);
+    defer policy.destroy();
+    const identity = try @import("../device/identity.zig").Identity.fromSeed([_]u8{7} ** 32);
+    const device = DeviceID.fromPublicKey(identity.publicKey());
+    const transport = [_]u8{8} ** 32;
+    _ = try trust.upsert(identity.publicKey(), transport, "member", 1);
+    const self_device = DeviceID.fromPublicKey([_]u8{9} ** 32);
+    const before = try candidates(allocator, &trust, policy, node(10), self_device);
+    defer allocator.free(before);
+    try testing.expectEqualSlices(NodeID, &.{ node(10), NodeID.fromPublicKey(transport) }, before);
+    const record = try policy_mod.sign(identity, .accepts, device, 0, 2);
+    try testing.expectEqual(policy_mod.Outcome.applied, try policy.apply(record, &trust, self_device, 2));
+    const after = try candidates(allocator, &trust, policy, node(10), self_device);
+    defer allocator.free(after);
+    try testing.expectEqualSlices(NodeID, &.{node(10)}, after);
 }

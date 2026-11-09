@@ -177,8 +177,12 @@ pub fn build(b: *std.Build) void {
         mod_tests.root_module.link_libc = true;
     }
 
-    // A run step that will run the test executable.
+    // A run step that will run the test executable. Each test run works in
+    // its own temporary directory (removed after a successful build): the
+    // tests' fixtures use paths relative to the working directory, and two
+    // runs at once in the same one would delete each other's files.
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    run_mod_tests.setCwd(b.tmpPath());
 
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
@@ -193,6 +197,7 @@ pub fn build(b: *std.Build) void {
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    run_exe_tests.setCwd(b.tmpPath());
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
@@ -219,6 +224,7 @@ pub fn build(b: *std.Build) void {
         integration_tests.root_module.link_libc = true;
     }
     const run_integration_tests = b.addRunArtifact(integration_tests);
+    run_integration_tests.setCwd(b.tmpPath());
 
     run_integration_tests.step.dependOn(&run_exe_tests.step);
 

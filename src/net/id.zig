@@ -1,5 +1,25 @@
 const std = @import("std");
 
+/// Hash of an Ed25519 identity key. Distinct from a transport node ID.
+pub const DeviceID = struct {
+    pub const len = 32;
+    bytes: [len]u8,
+
+    pub fn fromPublicKey(public_key: [32]u8) DeviceID {
+        var id: DeviceID = undefined;
+        std.crypto.hash.blake2.Blake2s256.hash(&public_key, &id.bytes, .{});
+        return id;
+    }
+
+    pub fn eql(self: DeviceID, other: DeviceID) bool {
+        return std.mem.eql(u8, &self.bytes, &other.bytes);
+    }
+
+    pub fn format(self: DeviceID, writer: anytype) !void {
+        try writer.print("{x}", .{self.bytes});
+    }
+};
+
 pub const NodeID = struct {
     pub const len = 32;
 
@@ -122,4 +142,26 @@ test "id: commonPrefixLen" {
     id2.bytes[0] = 0;
     id2.bytes[1] = 0x80;
     try std.testing.expectEqual(@as(u16, 8), id1.commonPrefixLen(id2));
+}
+
+test "id: device identities preserve the identity hash and remain a distinct type" {
+    comptime {
+        if (DeviceID == NodeID) @compileError("device and transport IDs must be distinct");
+        if (@typeInfo(@TypeOf(DeviceID.eql)).@"fn".params[1].type.? != DeviceID)
+            @compileError("device equality must require a device ID");
+    }
+    const key = [_]u8{0x42} ** 32;
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.blake2.Blake2s256.hash(&key, &expected, .{});
+    const device = DeviceID.fromPublicKey(key);
+    try std.testing.expectEqual(expected, device.bytes);
+    try std.testing.expect(device.eql(DeviceID.fromPublicKey(key)));
+    try std.testing.expect(!device.eql(DeviceID.fromPublicKey([_]u8{0x43} ** 32)));
+}
+
+test "id: transport nodes hash the pinned transport public key" {
+    const key = [_]u8{0x51} ** 32;
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.blake2.Blake2s256.hash(&key, &expected, .{});
+    try std.testing.expectEqual(expected, NodeID.fromPublicKey(key).bytes);
 }

@@ -127,9 +127,15 @@ pub const keepalive_idle_ms: i64 = 15 * std.time.ms_per_s;
 /// that dropped the mapping, a phone that slept), though no reset came.
 pub const keepalive_dead_ms: i64 = 45 * std.time.ms_per_s;
 
+/// Resets owed to the peer for reaped streams, at most: one per tracked
+/// stream, the most reapClosed can free in a round.
+pub const max_pending_resets = MaxStreams * 2;
+
 /// Lock order: Session.mutex before YamuxStream.mutex. Session.write_mutex is
-/// only ever taken with no other lock held, so a blocked transport write never
-/// stalls frame dispatch or stream bookkeeping.
+/// never waited for with another lock held, so a blocked transport write never
+/// stalls frame dispatch or stream bookkeeping. (flushResets takes
+/// Session.mutex briefly after a successful tryLock of write_mutex: nobody
+/// waits for write_mutex holding Session.mutex, so that can't deadlock.)
 pub const Session = struct {
     allocator: std.mem.Allocator,
     next_stream_id: u32,
@@ -151,6 +157,16 @@ pub const Session = struct {
     last_rx_ms: std.atomic.Value(i64) = .init(0),
     /// When keepAlive last sent a PING; only keepAlive's caller touches it.
     last_ping_ms: i64 = 0,
+    /// Reaped streams whose RST hasn't gone out yet: cleanup never waits
+    /// for another writer, so a busy session sends them on a later round
+    /// (guarded by mutex).
+    pending_resets: [max_pending_resets]u32 = undefined,
+    pending_reset_count: usize = 0,
+    /// Stream ends (FIN) that couldn't be written at once because another
+    /// writer held the lock: sent with the pending resets. Guarded by
+    /// `mutex`, bounded like them.
+    pending_fins: [max_pending_resets]u32 = undefined,
+    pending_fin_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, transport: network.Stream, is_server: bool) !*Session {
         const self = try allocator.create(Session);
@@ -242,13 +258,69 @@ pub const Session = struct {
         }
         for (ids[0..count]) |stream_id| {
             self.destroyStreamLocked(self.streams.get(stream_id).?);
+            // Full only if the peer never let a write through for many
+            // rounds: the session is as good as dead then, and its
+            // keepalive closes it.
+            if (self.pending_reset_count < self.pending_resets.len) {
+                self.pending_resets[self.pending_reset_count] = stream_id;
+                self.pending_reset_count += 1;
+            }
         }
-        const closed = self.closed;
         self.mutex.unlock();
-        if (closed) return;
+        self.flushResets();
+    }
+
+    /// Sends the pending resets, unless another frame is being written:
+    /// the connection manager's maintenance thread calls this, and a write
+    /// stuck on a dead path mustn't hold it. The resets wait for the next
+    /// round then.
+    fn flushResets(self: *Session) void {
+        if (!self.write_mutex.tryLock()) return;
+        defer self.write_mutex.unlock();
+        var ids: [max_pending_resets]u32 = undefined;
+        var fins: [max_pending_resets]u32 = undefined;
+        var fin_count: usize = 0;
+        const count = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const n = if (self.closed) 0 else self.pending_reset_count;
+            @memcpy(ids[0..n], self.pending_resets[0..n]);
+            self.pending_reset_count = 0;
+            fin_count = if (self.closed) 0 else self.pending_fin_count;
+            @memcpy(fins[0..fin_count], self.pending_fins[0..fin_count]);
+            self.pending_fin_count = 0;
+            break :blk n;
+        };
         for (ids[0..count]) |stream_id| {
-            self.writeFrame(.{ .type = .WINDOW_UPDATE, .flags = Flags.RST, .stream_id = stream_id, .length = 0 }, &.{}) catch {};
+            // A failed write means the transport is gone: the rest would
+            // fail too, and the session closes.
+            self.writeFrameLocked(.{ .type = .WINDOW_UPDATE, .flags = Flags.RST, .stream_id = stream_id, .length = 0 }, &.{}) catch return;
         }
+        for (fins[0..fin_count]) |stream_id| {
+            self.writeFrameLocked(.{ .type = .DATA, .flags = Flags.FIN, .stream_id = stream_id, .length = 0 }, &.{}) catch return;
+        }
+    }
+
+    /// Writes a stream's FIN if the writer is free, else keeps it for the
+    /// next flush: a shutdown never waits behind a write stuck on a stalled
+    /// link.
+    fn sendFin(self: *Session, stream_id: u32) void {
+        if (self.write_mutex.tryLock()) {
+            defer self.write_mutex.unlock();
+            self.writeFrameLocked(.{ .type = .DATA, .flags = Flags.FIN, .stream_id = stream_id, .length = 0 }, &.{}) catch {};
+            return;
+        }
+        self.queueFin(stream_id);
+    }
+
+    /// Keeps a stream's FIN for the next flush (`flushResets`, on this
+    /// session's own maintenance), writing nothing now.
+    fn queueFin(self: *Session, stream_id: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.closed or self.pending_fin_count == self.pending_fins.len) return;
+        self.pending_fins[self.pending_fin_count] = stream_id;
+        self.pending_fin_count += 1;
     }
 
     pub fn isClosed(self: *Session) bool {
@@ -534,12 +606,17 @@ pub const Session = struct {
     }
 
     fn writeFrame(self: *Session, header: Header, payload: []const u8) !void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        return self.writeFrameLocked(header, payload);
+    }
+
+    /// Caller holds write_mutex.
+    fn writeFrameLocked(self: *Session, header: Header, payload: []const u8) !void {
         std.debug.assert(payload.len == header.length or header.type != .DATA);
         var h_buf: [12]u8 = undefined;
         header.encode(&h_buf);
 
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
         // One transport write per frame: the header doesn't travel alone.
         defer if (self.write_buffer.capacity > 128 * 1024) self.write_buffer.clearAndFree(self.allocator);
         self.write_buffer.clearRetainingCapacity();
@@ -664,21 +741,31 @@ pub const Session = struct {
     /// so other threads may still be inside read or write.
     pub fn streamShutdown(ctx: *anyopaque) void {
         const stream: *YamuxStream = @ptrCast(@alignCast(ctx));
-        const session = stream.session;
-        {
-            stream.mutex.lock();
-            defer stream.mutex.unlock();
-            if (stream.reset or stream.local_closed) return;
-            stream.reset = true;
-            stream.cond.broadcast();
-            stream.write_cond.broadcast();
-        }
-        session.writeFrame(.{
-            .type = .DATA,
-            .flags = Flags.FIN,
-            .stream_id = stream.id,
-            .length = 0,
-        }, &.{}) catch {};
+        if (!markShutdown(stream)) return;
+        stream.session.sendFin(stream.id);
+    }
+
+    /// Like streamShutdown, but the FIN is only queued, never written here:
+    /// for a caller that must not wait on the transport at all (a relayed
+    /// session closed by the connection manager's one maintenance thread,
+    /// whose relay link may be stalled even with the writer free). It goes
+    /// out with this session's next flush.
+    pub fn streamShutdownQueued(ctx: *anyopaque) void {
+        const stream: *YamuxStream = @ptrCast(@alignCast(ctx));
+        if (!markShutdown(stream)) return;
+        stream.session.queueFin(stream.id);
+    }
+
+    /// Ends the stream locally and wakes its readers and writers; false if
+    /// it was ended already.
+    fn markShutdown(stream: *YamuxStream) bool {
+        stream.mutex.lock();
+        defer stream.mutex.unlock();
+        if (stream.reset or stream.local_closed) return false;
+        stream.reset = true;
+        stream.cond.broadcast();
+        stream.write_cond.broadcast();
+        return true;
     }
 
     /// Half-closes the stream and releases the caller's hold on it. The stream
@@ -821,6 +908,124 @@ test "locally closed streams release buffers and expire without peer FIN" {
     defer std.testing.allocator.free(large);
     try session.writeFrame(.{ .type = .DATA, .flags = 0, .stream_id = 7, .length = @intCast(large.len) }, large);
     try std.testing.expectEqual(@as(usize, 0), session.write_buffer.capacity);
+}
+
+test "reap: a busy writer doesn't block cleanup, and the reset goes out on a later round" {
+    const Sink = struct {
+        resets: usize = 0,
+        reset_id: u32 = 0,
+        fn read(_: *anyopaque, _: []u8) anyerror!usize {
+            return 0;
+        }
+        fn write(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const header = try Header.decode(bytes[0..12].*);
+            if (header.flags & Flags.RST != 0) {
+                self.resets += 1;
+                self.reset_id = header.stream_id;
+            }
+            return bytes.len;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable: network.Stream.StreamVTable = .{ .read = read, .write = write, .close = close };
+    };
+    var sink: Sink = .{};
+    const session = try Session.init(std.testing.allocator, network.Stream.init(&sink, &Sink.vtable), false);
+    defer session.deinit();
+    const stream = try session.newStream();
+    const id = stream.id;
+    Session.streamClose(stream);
+    const expired = stream.closed_at_ms + close_timeout_ms;
+
+    // Another writer is in the middle of a frame (a write stuck on a slow
+    // path, say): with a blocking lock this call would never return.
+    session.write_mutex.lock();
+    session.reapClosed(expired);
+    session.write_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), session.streams.count());
+    try std.testing.expectEqual(@as(usize, 0), sink.resets);
+    try std.testing.expectEqual(@as(usize, 1), session.pending_reset_count);
+
+    // The next round finds the writer gone and sends the reset it kept.
+    session.reapClosed(expired + 1);
+    try std.testing.expectEqual(@as(usize, 1), sink.resets);
+    try std.testing.expectEqual(id, sink.reset_id);
+    try std.testing.expectEqual(@as(usize, 0), session.pending_reset_count);
+    // Sent once only.
+    session.reapClosed(expired + 2);
+    try std.testing.expectEqual(@as(usize, 1), sink.resets);
+}
+
+test "shutdown: a busy writer doesn't block it, and the FIN goes out on the next flush" {
+    const Sink = struct {
+        fins: usize = 0,
+        fin_id: u32 = 0,
+        fn read(_: *anyopaque, _: []u8) anyerror!usize {
+            return 0;
+        }
+        fn write(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const header = try Header.decode(bytes[0..12].*);
+            if (header.type == .DATA and header.flags & Flags.FIN != 0) {
+                self.fins += 1;
+                self.fin_id = header.stream_id;
+            }
+            return bytes.len;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable: network.Stream.StreamVTable = .{ .read = read, .write = write, .close = close };
+    };
+    var sink: Sink = .{};
+    const session = try Session.init(std.testing.allocator, network.Stream.init(&sink, &Sink.vtable), false);
+    defer session.deinit();
+    const stream = try session.newStream();
+    // Another writer holds the lock (stuck on a stalled link, say): the
+    // shutdown (a dead relayed session closed by the maintenance thread)
+    // returns at once and keeps the FIN.
+    session.write_mutex.lock();
+    Session.streamShutdown(stream);
+    session.write_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), sink.fins);
+    try std.testing.expectEqual(@as(usize, 1), session.pending_fin_count);
+    // The next maintenance round sends it, once.
+    session.reapClosed(sync.monotonicMillis());
+    try std.testing.expectEqual(@as(usize, 1), sink.fins);
+    try std.testing.expectEqual(stream.id, sink.fin_id);
+    session.reapClosed(sync.monotonicMillis());
+    try std.testing.expectEqual(@as(usize, 1), sink.fins);
+    Session.streamClose(stream);
+}
+
+test "shutdown, queued: writes nothing even with the writer free; the FIN goes out on the next flush" {
+    const Sink = struct {
+        writes: usize = 0,
+        fins: usize = 0,
+        fn read(_: *anyopaque, _: []u8) anyerror!usize {
+            return 0;
+        }
+        fn write(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.writes += 1;
+            const header = try Header.decode(bytes[0..12].*);
+            if (header.type == .DATA and header.flags & Flags.FIN != 0) self.fins += 1;
+            return bytes.len;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable: network.Stream.StreamVTable = .{ .read = read, .write = write, .close = close };
+    };
+    var sink: Sink = .{};
+    const session = try Session.init(std.testing.allocator, network.Stream.init(&sink, &Sink.vtable), false);
+    defer session.deinit();
+    const stream = try session.newStream();
+    const before = sink.writes;
+    // The writer is free, but a stalled link would still block a write:
+    // nothing is written here.
+    Session.streamShutdownQueued(stream);
+    try std.testing.expectEqual(before, sink.writes);
+    try std.testing.expectEqual(@as(usize, 1), session.pending_fin_count);
+    session.reapClosed(sync.monotonicMillis());
+    try std.testing.expectEqual(@as(usize, 1), sink.fins);
+    Session.streamClose(stream);
 }
 
 test "keepalive: a ping after the idle time, dead after the limit" {

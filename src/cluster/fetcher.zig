@@ -40,6 +40,12 @@ const storage = @import("../storage/mod.zig");
 pub const Cid = [32]u8;
 /// Most holders one read considers.
 pub const max_holders = 8;
+/// Most holders one fetch may try for a block: more than a holder list
+/// (max_holders, what a swarm read hands over) for a caller that knows
+/// more candidates, like the whole-file get (connected peers, providers,
+/// the DHT's closest). Each is asked at most once per block, so a block is
+/// never given up while one of them, left out by a smaller cap, has it.
+pub const max_candidates = 32;
 /// First byte of a leaf block (storage/dag/codec.zig Tag.leaf).
 const leaf_tag: u8 = @intFromEnum(storage.dag.codec.Tag.leaf);
 
@@ -141,10 +147,10 @@ pub const Fetcher = struct {
             self.count(.local, 0);
             return @constCast(block.data);
         }
-        const list = holders[0..@min(holders.len, max_holders)];
+        const list = holders[0..@min(holders.len, max_candidates)];
         if (list.len == 0) return error.NoHolders;
-        var tried = [_]bool{false} ** max_holders;
-        var marks = [_]Mark{.untried} ** max_holders;
+        var tried = [_]bool{false} ** max_candidates;
+        var marks = [_]Mark{.untried} ** max_candidates;
         var tally: Tally = .{};
         var round: Round = .best;
         while (true) {
@@ -270,7 +276,7 @@ pub const Fetcher = struct {
 
     /// The author is among `holders` and said "not found": in this fetch, or
     /// a moment ago (skipped for it now).
-    fn authorMissed(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, tried: *const [max_holders]bool, marks: *const [max_holders]Mark, author: NodeID) bool {
+    fn authorMissed(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, tried: *const [max_candidates]bool, marks: *const [max_candidates]Mark, author: NodeID) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         const now = sync.monotonicMillis();
@@ -351,7 +357,7 @@ pub const Fetcher = struct {
     /// manager's own backoff keeps the backoff round from redialing a dead
     /// device for every block, and BlockManager skips the DHT lookup while
     /// it lasts.)
-    fn pick(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, tried: *const [max_holders]bool, round: Round) ?usize {
+    fn pick(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, tried: *const [max_candidates]bool, round: Round) ?usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         const now = sync.monotonicMillis();
@@ -365,7 +371,7 @@ pub const Fetcher = struct {
         return i;
     }
 
-    fn bestLocked(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, tried: *const [max_holders]bool, now: i64) ?usize {
+    fn bestLocked(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, tried: *const [max_candidates]bool, now: i64) ?usize {
         const fallback = self.bestRateLocked();
         var best: ?usize = null;
         var best_group: u1 = 1;
@@ -397,7 +403,7 @@ pub const Fetcher = struct {
 
     /// The first holder in the caller's order skipped only for the reason
     /// `round` stands for (and, for a miss, connected now).
-    fn firstSkippedLocked(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, tried: *const [max_holders]bool, round: Round, now: i64) ?usize {
+    fn firstSkippedLocked(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, tried: *const [max_candidates]bool, round: Round, now: i64) ?usize {
         for (holders, 0..) |peer, i| {
             if (tried[i]) continue;
             const connected = self.connectedLocked(peer);
@@ -431,9 +437,10 @@ pub const Fetcher = struct {
 
     /// One line for a fetch nobody served: the block, then each holder with
     /// what it did (not_found, the error, or why it was skipped), then the
-    /// error the read reports. Bounded by max_holders; no allocation.
-    fn logFailure(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, marks: *const [max_holders]Mark, verdict: anyerror) void {
-        var buf: [1024]u8 = undefined;
+    /// error the read reports. Bounded by max_candidates; no allocation.
+    fn logFailure(self: *Fetcher, root: *const Cid, cid: *const Cid, holders: []const NodeID, marks: *const [max_candidates]Mark, verdict: anyerror) void {
+        // max_candidates entries of a prefix and an outcome (an error name).
+        var buf: [4096]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         {
             self.mutex.lock();

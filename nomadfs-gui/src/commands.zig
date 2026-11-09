@@ -801,7 +801,7 @@ pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
             const handle = g_node.?;
             const policy = handle.node.policy;
             const reps = policy.copies();
-            const accept = policy.acceptsCopies(handle.node.device_identity.deviceId());
+            const accept = acceptsCopiesForIdentity(policy, handle.node.device_identity);
             if (!backup_supported) return .{ .supported = false, .enabled = false, .running = true, .copies = reps, .accept_copies = accept, .kept_copies = st.backed_up };
             return .{
                 .supported = true,
@@ -1830,4 +1830,23 @@ fn dirUsage(path: []const u8, size: *u64, files: *u64) void {
         size.* += st.size;
         files.* += 1;
     }
+}
+
+fn acceptsCopiesForIdentity(policy: *nomadfs.device.policy.Policy, identity: Identity) bool {
+    return policy.acceptsCopies(nomadfs.net.id.DeviceID.fromPublicKey(identity.publicKey()));
+}
+
+test "commands: backup acceptance follows this device identity" {
+    const allocator = std.testing.allocator;
+    const identity = try Identity.fromSeed([_]u8{0x6a} ** 32);
+    const other = try Identity.fromSeed([_]u8{0x6b} ** 32);
+    const policy = try nomadfs.device.policy.Policy.load(allocator, "test_gui_identity.policy");
+    defer policy.destroy();
+    var trust = try TrustStore.load(allocator, "test_gui_identity.trust", null);
+    defer trust.deinit();
+    const self_id = nomadfs.net.id.DeviceID.fromPublicKey(identity.publicKey());
+    const record = try nomadfs.device.policy.sign(identity, .accepts, self_id, 0, 1);
+    _ = try policy.apply(record, &trust, self_id, 1);
+    try std.testing.expect(!acceptsCopiesForIdentity(policy, identity));
+    try std.testing.expect(acceptsCopiesForIdentity(policy, other));
 }

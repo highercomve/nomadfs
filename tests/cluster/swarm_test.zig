@@ -176,7 +176,7 @@ test "swarm copies: placement gives a file to another device, whose keeper pulls
     const id_b = try nomadfs.device.identity.Identity.fromSeed([_]u8{0x77} ** nomadfs.device.identity.seed_len);
     const policy_b = try nomadfs.device.policy.Policy.load(allocator, "test_rep_b/swarm.policy");
     defer policy_b.destroy();
-    swarm_b.placement = .{ .trust = &trust_b, .policy = policy_b, .self_device = id_b.deviceId() };
+    swarm_b.placement = .{ .trust = &trust_b, .policy = policy_b, .self_device = nomadfs.net.id.DeviceID.fromPublicKey(id_b.publicKey()) };
 
     try swarm_a.addFile("", "doc.txt", "test_rep_src/doc.txt");
     const info = swarm_a.fileInfo("doc.txt") orelse return error.FileNotFound;
@@ -195,8 +195,8 @@ test "swarm copies: placement gives a file to another device, whose keeper pulls
     try std.testing.expectEqual(@as(usize, 1), swarm_b.backupStatus().backed_up);
 
     // A device that refuses copies keeps nothing new.
-    const r = try nomadfs.device.policy.sign(id_b, .accepts, id_b.deviceId(), 0, now + 1);
-    _ = try policy_b.apply(r, &trust_b, id_b.deviceId(), now + 1);
+    const r = try nomadfs.device.policy.sign(id_b, .accepts, nomadfs.net.id.DeviceID.fromPublicKey(id_b.publicKey()), 0, now + 1);
+    _ = try policy_b.apply(r, &trust_b, nomadfs.net.id.DeviceID.fromPublicKey(id_b.publicKey()), now + 1);
     try cwd.writeFile(io, .{ .sub_path = "test_rep_src/two.txt", .data = "a second file, not wanted on B" });
     try swarm_a.addFile("", "two.txt", "test_rep_src/two.txt");
     const two = swarm_a.fileInfo("two.txt") orelse return error.FileNotFound;

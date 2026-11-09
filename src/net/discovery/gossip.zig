@@ -11,6 +11,7 @@ const network = @import("../transport/mod.zig");
 const relay = network.relay;
 const device_trust = @import("../../device/trust.zig");
 const device_rotation = @import("../../device/rotation.zig");
+const Identity = @import("../../device/identity.zig").Identity;
 const policy_mod = @import("../../device/policy.zig");
 
 /// The membership-news part of the DHT node `Node` (discovery/node.zig).
@@ -48,26 +49,20 @@ pub fn Gossip(comptime Node: type) type {
                 const tombstones = try trust.copyRevocations(self.allocator);
                 defer self.allocator.free(tombstones);
                 for (tombstones) |r| {
-                    if (r.device_id.eql(device_id)) return sendRevokeAt(self, conn, device_id, r.at);
+                    if (r.device_id.eql(.{ .bytes = device_id.bytes })) return sendRevokeAt(self, conn, .{ .bytes = device_id.bytes }, r.at);
                 }
             }
             const now = std.math.cast(u64, sync.timestamp()) orelse return error.InvalidTimestamp;
-            return sendRevokeAt(self, conn, device_id, now);
+            return sendRevokeAt(self, conn, .{ .bytes = device_id.bytes }, now);
         }
 
-        pub fn sendRevokeAt(self: *Node, conn: network.Connection, device_id: id.NodeID, at: u64) !bool {
+        pub fn sendRevokeAt(self: *Node, conn: network.Connection, device_id: id.DeviceID, at: u64) !bool {
             const identity = self.device_identity orelse return error.NoDeviceIdentity;
-            const signed = device_trust.revocationMessage(device_id, identity.deviceId(), at);
+            const payload = try signedRevocation(identity, device_id, at);
             const stream = try conn.openStream();
             defer stream.close();
             stream.setTimeout(self.rpc_timeout_ms);
-
-            const signature = try identity.sign(&signed);
-
-            const msg = rpc.Message{
-                .sender_id = self.manager.node_id,
-                .payload = .{ .REVOKE = .{ .device_id = device_id, .signer_key = identity.publicKey(), .at = at, .signature = signature } },
-            };
+            const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = payload };
             try msg.send(self.allocator, stream);
 
             const response = try rpc.Message.deserialize(self.allocator, stream.reader());
@@ -146,7 +141,7 @@ pub fn Gossip(comptime Node: type) type {
             if (self.policy) |policy| if (self.trust_store) |trust| if (self.device_identity) |identity| {
                 if (policy_mod.Record.decode(&bytes)) |r| {
                     const now = std.math.cast(u64, sync.timestamp()) orelse 0;
-                    const outcome = policy.apply(r, trust, identity.deviceId(), now) catch .rejected;
+                    const outcome = policy.apply(r, trust, id.DeviceID.fromPublicKey(identity.publicKey()), now) catch .rejected;
                     stored = outcome != .rejected;
                     if (outcome == .applied) {
                         policy.save() catch |err| std.debug.print("policy: not saved: {any}\n", .{err});
@@ -163,7 +158,7 @@ pub fn Gossip(comptime Node: type) type {
         pub fn sendAdmit(self: *Node, conn: network.Connection, entry: device_trust.Entry) !bool {
             const identity = self.device_identity orelse return error.NoDeviceIdentity;
             const label = entry.labelSlice();
-            const signed = device_trust.admissionMessage(entry.public_key, entry.transport_key, label, entry.added_at, identity.deviceId());
+            const signed = device_trust.admissionMessage(entry.public_key, entry.transport_key, label, entry.added_at, id.DeviceID.fromPublicKey(identity.publicKey()));
             var admit: rpc.Admit = .{
                 .public_key = entry.public_key,
                 .transport_key = entry.transport_key,
@@ -215,7 +210,7 @@ pub fn Gossip(comptime Node: type) type {
             for (entries) |e| {
                 if (std.mem.eql(u8, &e.transport_key, &device_trust.no_transport_key)) continue;
                 // The peer itself needs no vouch for itself.
-                if (peer) |p| if (p.eql(e.device_id)) continue;
+                if (peer) |p| if (e.device_id.eql(.{ .bytes = p.bytes })) continue;
                 sent += 1;
                 const ok = sendAdmit(self, conn, e) catch |err| {
                     std.debug.print("Failed to vouch for {x}: {any}\n", .{ e.device_id.bytes[0..4], err });
@@ -341,11 +336,11 @@ pub fn Gossip(comptime Node: type) type {
             if (self.trust_store) |trust| {
                 const now = std.math.cast(u64, sync.timestamp()) orelse return error.InvalidTimestamp;
                 // The entry goes with the revocation: read its transport key first.
-                const transport_key: ?[32]u8 = if (trust.lookup(device_id)) |e| e.transport_key else null;
-                const outcome = device_trust.applyRevocation(trust, device_id, signer_key, at, signature, now) catch .rejected;
+                const transport_key: ?[32]u8 = if (trust.lookup(.{ .bytes = device_id.bytes })) |e| e.transport_key else null;
+                const outcome = device_trust.applyRevocation(trust, .{ .bytes = device_id.bytes }, signer_key, at, signature, now) catch .rejected;
                 honored = outcome != .rejected;
                 if (outcome == .applied) {
-                    _ = self.manager.closePeer(device_id);
+                    _ = self.manager.closeDevice(.{ .bytes = device_id.bytes });
                     // It stops being a holder too (cluster/holders.zig).
                     if (self.revocation_sink) |sink| sink.revokedFn(sink.ctx, device_id, transport_key);
                 }
@@ -367,7 +362,7 @@ pub fn Gossip(comptime Node: type) type {
         pub fn handleAdmit(self: *Node, stream: network.Stream, admit: rpc.Admit) !void {
             var taken = false;
             if (self.trust_store) |trust| {
-                const self_id = if (self.device_identity) |identity| identity.deviceId() else id.NodeID{ .bytes = [_]u8{0} ** 32 };
+                const self_id = if (self.device_identity) |identity| id.DeviceID.fromPublicKey(identity.publicKey()) else id.DeviceID{ .bytes = [_]u8{0} ** 32 };
                 const now = std.math.cast(u64, sync.timestamp()) orelse return error.InvalidTimestamp;
                 const outcome = device_trust.applyAdmission(trust, admit.public_key, admit.transport_key, admit.labelSlice(), admit.at, admit.signer_key, admit.signature, self_id, now) catch .rejected;
                 taken = outcome != .rejected;
@@ -379,4 +374,24 @@ pub fn Gossip(comptime Node: type) type {
             try response.send(self.allocator, stream);
         }
     };
+}
+
+fn signedRevocation(identity: Identity, device_id: id.DeviceID, at: u64) !rpc.MessagePayload {
+    const signed = device_trust.revocationMessage(device_id, id.DeviceID.fromPublicKey(identity.publicKey()), at);
+    return .{ .REVOKE = .{
+        .device_id = .{ .bytes = device_id.bytes },
+        .signer_key = identity.publicKey(),
+        .at = at,
+        .signature = try identity.sign(&signed),
+    } };
+}
+
+test "revocation signing preserves device identity bytes on the wire" {
+    const identity = try Identity.fromSeed([_]u8{0x61} ** 32);
+    const target = id.DeviceID.fromPublicKey([_]u8{0x62} ** 32);
+    const revoke = (try signedRevocation(identity, target, 42)).REVOKE;
+    try std.testing.expectEqual(target.bytes, revoke.device_id.bytes);
+    const message = device_trust.revocationMessage(.{ .bytes = revoke.device_id.bytes }, id.DeviceID.fromPublicKey(revoke.signer_key), revoke.at);
+    const key = try std.crypto.sign.Ed25519.PublicKey.fromBytes(revoke.signer_key);
+    try std.crypto.sign.Ed25519.Signature.fromBytes(revoke.signature).verify(&message, key);
 }

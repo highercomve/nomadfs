@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const sync = @import("../sync.zig");
+const DeviceID = @import("../net/id.zig").DeviceID;
 const NodeID = @import("../net/id.zig").NodeID;
 const identity_mod = @import("identity.zig");
 const pairing = @import("pairing.zig");
@@ -207,10 +208,11 @@ pub const Membership = struct {
     pub fn revoke(self: *Membership, query: []const u8, now: u64) !Revoked {
         const device = try self.trust.resolve(query) orelse return error.DeviceNotFound;
         const transport_key: ?[32]u8 = if (self.trust.lookup(device)) |e| e.transport_key else null;
-        const removed = try self.trust.revokeDevice(device, self.identity.deviceId(), now);
+        const removed = try self.trust.revokeDevice(device, DeviceID.fromPublicKey(self.identity.publicKey()), now);
         try self.trust.save();
-        if (self.hooks) |h| h.revokedFn(h.ctx, device, transport_key);
-        return .{ .device = device, .removed = removed };
+        // Front ends and node hooks still use the legacy device ID representation.
+        if (self.hooks) |h| h.revokedFn(h.ctx, .{ .bytes = device.bytes }, transport_key);
+        return .{ .device = .{ .bytes = device.bytes }, .removed = removed };
     }
 
     // ---- Invites ----
@@ -352,7 +354,7 @@ test "membership: trust a ticket, refuse an older one, revoke by fingerprint" {
     try testing.expectEqual(@as(usize, 1), seen.trusted);
     var reloaded = try trust_mod.Store.load(testing.allocator, path, me.seed());
     defer reloaded.deinit();
-    try testing.expect(reloaded.isTrusted(phone.deviceId()));
+    try testing.expect(reloaded.isTrusted(DeviceID.fromPublicKey(phone.publicKey())));
 
     // An older ticket of it is refused.
     const older = try Ticket.init(phone, [_]u8{3} ** 32, "Phone", "10.0.0.2:14700", 4000);
@@ -363,7 +365,7 @@ test "membership: trust a ticket, refuse an older one, revoke by fingerprint" {
     const fp = Identity.formatFingerprint(phone.fingerprint(), &fp_buf);
     const r = try m.revoke(fp, 2000);
     try testing.expect(r.removed and r.device.eql(phone.deviceId()));
-    try testing.expect(!store.isTrusted(phone.deviceId()));
+    try testing.expect(!store.isTrusted(DeviceID.fromPublicKey(phone.publicKey())));
     try testing.expectEqual(@as(usize, 1), seen.revoked);
     try testing.expectError(error.DeviceNotFound, m.revoke("ffffffff", 2001));
 

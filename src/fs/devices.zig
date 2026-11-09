@@ -361,15 +361,13 @@ pub const Directory = struct {
             online_indices[j] = i;
             const dev_id = d.device_id orelse d.remote.peer.bytes;
             var trusted_info: ?device_names.TrustedInfo = null;
-            if (trust_store) |ts| {
-                if (ts.lookup(NodeID{ .bytes = dev_id })) |te| {
-                    trust_entries.appendAssumeCapacity(te);
-                    const last_te = &trust_entries.items[trust_entries.items.len - 1];
-                    trusted_info = .{
-                        .label = last_te.labelSlice(),
-                        .added_at = last_te.added_at,
-                    };
-                }
+            if (remote_mod.lookupDevice(trust_store, d.device_id)) |te| {
+                trust_entries.appendAssumeCapacity(te);
+                const last_te = &trust_entries.items[trust_entries.items.len - 1];
+                trusted_info = .{
+                    .label = last_te.labelSlice(),
+                    .added_at = last_te.added_at,
+                };
             }
             entries[j] = .{
                 .device_id = dev_id,
@@ -395,3 +393,29 @@ pub const Directory = struct {
         }
     }
 };
+
+test "device names require an authenticated identity for a trusted label" {
+    const allocator = std.testing.allocator;
+    var trust = try device_trust.Store.load(allocator, "test_device_names_identity.store", null);
+    defer trust.deinit();
+    const identity = try @import("../device/identity.zig").Identity.fromSeed([_]u8{0x66} ** 32);
+    _ = try trust.upsert(identity.publicKey(), [_]u8{0x67} ** 32, "Member", 1);
+    var dht: @import("../net/discovery/node.zig").Node = undefined;
+    dht.trust_store = &trust;
+    var bm: cluster.BlockManager = undefined;
+    bm.dht_node = &dht;
+    var directory = Directory.init(allocator, &bm);
+    defer directory.deinit();
+    const remote = try allocator.create(Remote);
+    remote.* = .{ .block_manager = null, .peer = identity.deviceId() };
+    try directory.devices.append(allocator, .{
+        .name = try allocator.dupe(u8, "old"),
+        .remote = remote,
+        .online = true,
+    });
+    directory.recomputeNames();
+    try std.testing.expect(!std.mem.eql(u8, "Member", directory.devices.items[0].name));
+    directory.devices.items[0].device_id = identity.deviceId().bytes;
+    directory.recomputeNames();
+    try std.testing.expectEqualStrings("Member", directory.devices.items[0].name);
+}

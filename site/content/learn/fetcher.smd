@@ -17,8 +17,20 @@ from one source. It pulls pieces from all available holders concurrently.
 
 # [Picking a holder]($heading.id('picking'))
 
-Callers ask for a specific block CID and provide the candidate holders: the
-original author, swarm backup peers, and replica holders.
+Callers ask for a specific block CID and provide the candidate holders, at most
+eight, in this order:
+
+1. **The author**, the device that added the file, but only if it is still
+   around: connected right now, or a current member of the swarm. A device that
+   re-joined the swarm gets a new identity, and the files it added before still
+   name the old one; reads of those files go straight to the others instead of
+   trying a device that no longer exists.
+2. **Swarm backup devices**, which keep a copy of every file.
+3. **Replica holders**, when the swarm keeps several copies of each file.
+4. **Everyone else** the device knows, as sources in reserve.
+
+Within each group, devices connected right now come first. A backup reached only
+through a [relay]($link.page('learn/relay')) is listed too, between flaps.
 
 For each candidate device, the fetcher calculates:
 
@@ -32,11 +44,12 @@ The device with the lowest expected wait time is assigned the next chunk:
   historical, 1/4 new sample) of transfer speed, sampled only on leaf blocks of
   at least 16 KB (small index blocks measure round-trip latency, not sustained
   throughput).
-- **Untried devices** start with an optimistic rate equal to the fastest known
-  peer (or 4 MB/s default), ensuring new peers are immediately given a chance to
-  prove their link speed.
-- **Ties** preserve the original caller preference (such as trying the local LAN
-  server or author first).
+- **Connected devices** are always considered before the others.
+- **Untried devices** that are connected start with an optimistic rate equal to
+  the fastest known peer (or 4 MB/s default), so new peers get a chance to prove
+  their link speed. An untried device that isn't connected goes last: it is
+  likely a device that is gone, and it never goes before a backup that answers.
+- **Ties** preserve the caller's order (the author, then the backups).
 
 # [Parallel read-ahead across Yamux]($heading.id('parallel'))
 
@@ -75,12 +88,44 @@ the phone's bandwidth still contributes to completing the transfer faster.
 Because every block is addressed by its [SHA-256 hash]($link.page('learn/sha-256')),
 the receiving device verifies each chunk independently upon arrival before
 placing it in the local cache. It does not matter which device served a piece:
-data corruption or tampering is detected instantly.
+data corruption or tampering is detected instantly. A chunk that verifies but
+can't be kept in the cache (a full disk, say) is still handed to the read.
 
 If a device stalls or disconnects:
 - Its in-flight requests accumulate, driving up its cost so other devices take
   over upcoming blocks.
-- If a device fails to respond or reports "not found", the fetcher fails over to
-  the next holder for that specific block.
-- Failed devices back off exponentially (5 s to 60 s), and devices with 3
-  consecutive file misses are skipped for that file, avoiding wasted round trips.
+- A device that fails to connect backs off (5 s, doubling to 60 s). It is still
+  asked as soon as it is connected again, unless its link failed in the middle
+  of a request (a timeout, a broken stream): a session can look connected and
+  be silent, so it waits out its backoff until it serves again.
+- A device that answers "not found" is skipped for that block for 30 s, and for
+  the whole file after 3 misses in a row (60 s), avoiding wasted round trips.
+
+# [Who is asked]($heading.id('rounds'))
+
+Each block is fetched in up to three rounds, and a read never fails without
+asking anyone:
+
+1. **The best holders**, by the cost above, skipping those backing off or that
+   said "not found" a moment ago.
+2. **Every holder skipped only for its backoff**, once, in the caller's order.
+   Most answer at once (the connection layer remembers they are unreachable), so
+   this costs almost nothing.
+3. **Before failing**, the connected holders that said "not found" a moment
+   ago: a backup copies files as they arrive, so it may have the block by now.
+
+# [When a read fails]($heading.id('failure'))
+
+The error a failed read reports doesn't depend on the order the answers came in:
+
+- a real failure from a device that answered (a broken reply, say) comes first,
+  so it isn't hidden by another device's "not found";
+- **not found** only when every device asked said so;
+- **can't be reached** when a device that may have the block couldn't be
+  reached;
+- **asked a moment ago** when every holder said "not found" so recently that
+  none could be asked again yet.
+
+The apps show each case in plain words. Every failed read also logs which
+devices were asked and what each answered, and a swarm backup logs the blocks it
+was asked for and doesn't have, so a missing piece can be traced to its cause.

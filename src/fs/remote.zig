@@ -244,17 +244,13 @@ pub fn devices(
         const shares_val = probe.shares orelse continue;
         const dev_id_bytes = if (shares_val.device_id) |did| did.bytes else probe.peer.bytes;
         var trusted_info: ?device_names.TrustedInfo = null;
-        if (shares_val.device_id) |did| {
-            if (trust_store) |ts| {
-                if (ts.lookup(did)) |entry| {
-                    trust_entries[idx] = entry;
-                    has_trust[idx] = true;
-                    trusted_info = .{
-                        .label = trust_entries[idx].labelSlice(),
-                        .added_at = trust_entries[idx].added_at,
-                    };
-                }
-            }
+        if (lookupDevice(trust_store, if (shares_val.device_id) |did| did.bytes else null)) |entry| {
+            trust_entries[idx] = entry;
+            has_trust[idx] = true;
+            trusted_info = .{
+                .label = trust_entries[idx].labelSlice(),
+                .added_at = trust_entries[idx].added_at,
+            };
         }
         assign_entries[idx] = .{
             .device_id = dev_id_bytes,
@@ -309,4 +305,24 @@ pub fn devices(
     }
 
     return out;
+}
+
+/// Only authenticated identity bytes may enter the trust lookup.
+pub fn lookupDevice(trust_store: ?*device_trust.Store, device_id: ?[32]u8) ?device_trust.Entry {
+    const store = trust_store orelse return null;
+    const bytes = device_id orelse return null;
+    return store.lookup(.{ .bytes = bytes });
+}
+
+test "remote trust lookup preserves authenticated identity bytes" {
+    const allocator = std.testing.allocator;
+    var trust = try device_trust.Store.load(allocator, "test_remote_identity.store", null);
+    defer trust.deinit();
+    const identity = try @import("../device/identity.zig").Identity.fromSeed([_]u8{0x64} ** 32);
+    _ = try trust.upsert(identity.publicKey(), [_]u8{0x65} ** 32, "Member", 1);
+    const entry = lookupDevice(&trust, identity.deviceId().bytes) orelse return error.MissingDevice;
+    try std.testing.expectEqualStrings("Member", entry.labelSlice());
+    try std.testing.expectEqual(identity.deviceId().bytes, entry.device_id.bytes);
+    try std.testing.expect(lookupDevice(&trust, null) == null);
+    try std.testing.expect(lookupDevice(null, identity.deviceId().bytes) == null);
 }

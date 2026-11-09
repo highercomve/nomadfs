@@ -164,7 +164,7 @@ test "device names: loopback peer shares returns authenticated device_id and ass
     try std.testing.expectEqualStrings(expected_c_name, assigned[1]);
 
     // 10. Revoke A in B's store -> next assign names A "Alpha-<fp8(A)>"
-    try std.testing.expect(trust_b.revoke(expected_a_did));
+    try std.testing.expect(trust_b.revoke(nomadfs.net.id.DeviceID.fromPublicKey(id_a.publicKey())));
 
     const entry_a_revoked = device_names.Entry{
         .device_id = shares_a.device_id.?.bytes,
