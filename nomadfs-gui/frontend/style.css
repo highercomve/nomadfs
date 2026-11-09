@@ -637,8 +637,6 @@ main { padding-bottom: calc(104px + env(safe-area-inset-bottom)); }
 .pv-title { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 0 8px; }
 .pv-title .headline { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pv-title .meta { font-size: 12px; color: var(--md-on-surface-variant); }
-#pv-download span { display: none; }
-#pv-download { flex: none; width: 40px; padding: 0; justify-content: center; margin-right: 4px; }
 .icon-btn:disabled { opacity: .3; cursor: default; }
 .preview-body {
   flex: 1;
@@ -681,8 +679,6 @@ main { padding-bottom: calc(104px + env(safe-area-inset-bottom)); }
   .preview { padding: 4vh 4vw; }
   .preview-panel { border-radius: 28px; overflow: hidden; box-shadow: 0 12px 40px rgb(0 0 0 / .5); }
   .preview-bar { padding: 8px 12px; }
-  #pv-download span { display: inline; }
-  #pv-download { width: auto; padding: 0 20px 0 16px; }
 }
 
 /* ---- Invites ---- */

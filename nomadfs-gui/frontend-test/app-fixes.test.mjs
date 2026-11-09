@@ -1,9 +1,14 @@
-import {readFileSync} from 'node:fs';
+import {readdirSync, readFileSync} from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
-const source = readFileSync(new URL('../frontend/app.js', import.meta.url),'utf8');
-const fn = (start,end) => source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
+// The app is split into ES modules; the tested functions are extracted from
+// whichever module holds them, in alphabetical file order.
+const dir = new URL('../frontend/', import.meta.url);
+const source = readdirSync(dir).filter((f) => f.endsWith('.js')).sort().map((f) => readFileSync(new URL(f, dir), 'utf8')).join('\n');
+const raw = (start,end) => source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
+const fn = (start,end) => raw(start,end).replace(/^export /gm, '');
+// (modules' export keywords are stripped in the extracted VM slices)
 const deferred = () => {let resolve,reject; const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject}};
 const elements = new Map();
 const node = () => { const n = { style:{setProperty(){}}, dataset:{}, classList:{toggle(){},add(){},remove(){}}, hidden:false, closest:()=>({style:{setProperty(){}}}), append(){}, appendChild(){}, replaceChildren(){}, addEventListener(){}, setAttribute(){}, querySelector:()=>node(), querySelectorAll:()=>[], focus(){}, select(){}, title:'' }; return n; };
@@ -22,20 +27,20 @@ function $(id){return el(id)}
 {
  const a=deferred();let shown;
  const c=context({a,busy(){},snack(){},invoke:()=>a.promise,showLocation(){shown=vm.runInContext('path',c)}});
- vm.runInContext(`let browseNav=0;let path=[{name:'A',device:{peer:'A'}}];`+fn('async function refreshLocation(', '// ---- Swarm folder:')+`const pending=refreshLocation();path=[{name:'B',device:{peer:'B'}}];browseNav++;`,c);
+ vm.runInContext(`let browseNav=0;let path=[{name:'A',device:{peer:'A'}}];`+fn('async function refreshLocation(', '/** Wiring attaches once')+`const pending=refreshLocation();path=[{name:'B',device:{peer:'B'}}];browseNav++;`,c);
  a.resolve([{peer:'A',shares:[]}]);await vm.runInContext('pending',c);
  assert.equal(shown,undefined);
 }
 {
  elements.clear();const a=deferred(), b=deferred();
  const c=context({invoke:(cmd)=>cmd==='file_details'?a.promise:b.promise,errText:String});
- vm.runInContext('let detailsGeneration=0;'+fn('async function openDetails(', 'function drawChunkMap(')+fn('async function openDeviceInfo(', '$('+'"dt-close"'+')')+`const pending=openDetails('File A',{});openDeviceInfo('Device B','B');`,c);
+ vm.runInContext('let detailsGeneration=0;'+fn('async function openDetails(', 'function drawChunkMap(')+fn('async function openDeviceInfo(', '/** Wiring attaches once')+`const pending=openDetails('File A',{});openDeviceInfo('Device B','B');`,c);
  a.reject(new Error('old file request failed'));await vm.runInContext('pending',c);
  assert.equal(el('dt-name').textContent,'Device B');assert.equal(el('dt-meta').textContent,'Asking the device…');
 }
 {
  elements.clear();const dirs=[];
- const c=context({swarmCrumbs(){},running:true,listLoading(){},listLoaded(){},snack(){},swarmStatusText(){return 'ok'},swarmTable:{dir:null,show(){},render(){}},invoke:async(cmd,args)=>{dirs.push(args.dir);return {items:[]}}});
+ const c=context({swarmCrumbs(){},isRunning:()=>true,running:true,listLoading(){},listLoaded(){},snack(){},swarmStatusText(){return 'ok'},swarmTable:{dir:null,show(){},render(){}},invoke:async(cmd,args)=>{dirs.push(args.dir);return {items:[]}}});
  vm.runInContext(`let swarmDir='New folder',swarmNav=0;`+fn('async function loadSwarm(', 'const swarmTable =')+`const pending=loadSwarm();`,c);
  await vm.runInContext('pending',c);assert.deepEqual(dirs,['New folder']);assert.equal(vm.runInContext('swarmDir',c),'New folder');
 }
@@ -44,7 +49,7 @@ test('glm-3 askDialog queues shared handlers', async () => {
   elements.clear();
   for (const id of ['ask-ok','ask-input']) Object.assign(el(id), {focus(){},setSelectionRange(){},classList:{toggle(){}}});
   const c=context({});
-  vm.runInContext('let askQueue=Promise.resolve();'+fn('function askDialog(', 'async function swarmRenamePrompt(')+"const first=askDialog({title:'First'});const second=askDialog({title:'Second'});",c);
+  vm.runInContext('let askQueue=Promise.resolve();'+fn('function askDialog(', '/** All the document-level menu wiring')+"const first=askDialog({title:'First'});const second=askDialog({title:'Second'});",c);
   await new Promise(setImmediate);
   assert.equal(el('ask-title').textContent,'First');
   el('ask-form').onsubmit({preventDefault(){}});
@@ -58,7 +63,7 @@ test('glm-10 downloads errors preserve destination', async () => {
   el('downloads-where').textContent='Saved in here';
   const messages=[];
   const c=context({invoke:async()=>{throw 'failure'},snack:x=>messages.push(x),errText:x=>'formatted '+x,renderDownloads(){}});
-  vm.runInContext(fn('async function loadDownloads(', 'window.oriel.listen'),c);
+  vm.runInContext(fn('async function loadDownloads(', '/** The download progress events'),c);
   await vm.runInContext('loadDownloads()',c);
   assert.equal(el('downloads-where').textContent,'Saved in here');
   assert.deepEqual(messages,["Couldn't load downloads: formatted failure"]);

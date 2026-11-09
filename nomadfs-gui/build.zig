@@ -141,6 +141,10 @@ pub fn build(b: *std.Build) void {
     // what the notes list decides), in Node. Needs `node` (22 or newer).
     const frontend_test = b.addSystemCommand(&.{ "node", "--test", "frontend-test/markdown.test.mjs", "frontend-test/notes-model.test.mjs", "frontend-test/app-fixes.test.mjs" });
     frontend_test.setCwd(b.path("."));
+    // Plus the full-entry smoke: imports app.js with fake DOM/Oriel and bootes it.
+    const smoke_test = b.addSystemCommand(&.{ "node", "frontend-test/smoke-imports.mjs" });
+    smoke_test.setCwd(b.path("."));
+    frontend_test.step.dependOn(&smoke_test.step);
     const frontend_step = b.step("test-frontend", "Run the page's Node tests (Markdown renderer, notes list logic)");
     frontend_step.dependOn(&frontend_test.step);
 }
