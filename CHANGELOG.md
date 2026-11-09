@@ -3,6 +3,29 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.6.4 - 2026-11-09
+
+Devices on 0.4.0 and later work together. Update the desktop app, above all on computers with an
+NVIDIA graphics card.
+
+### Fixed
+
+- Desktop app with an NVIDIA graphics card: opening a video no longer freezes the window. The
+  page and the player stopped drawing while the app kept running, so closing the viewer or moving
+  to the next file seemed to do nothing. The app now draws with GTK's cairo renderer there (set
+  `GSK_RENDERER` to choose another).
+- The desktop app no longer crashes a few seconds after starting once a device is reached through
+  a relay: the thread that checks a relayed connection had too small a stack for the libraries
+  the app loads.
+- The app's config folder is now made private to your user, as its config file already was: the
+  step that tightened an old folder's permissions silently did nothing.
+- Moving quickly between files, folders and their details can no longer show an older one over
+  the one you opened last.
+- Downloading the same file twice gives one download, and only a running download shows a
+  progress bar.
+- PDF previews open in a sandboxed frame, and questions asked one after another wait their turn
+  instead of replacing each other.
+
 ## 0.6.3 - 2026-11-09
 
 Devices on 0.4.0 and later work together. Update the devices that open files from others (phones
