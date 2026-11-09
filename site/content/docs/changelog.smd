@@ -7,6 +7,22 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.6.5 - 2026-11-09
+
+Devices on 0.4.0 and later work together. Nothing changes in how devices talk to each other;
+update when convenient.
+
+## Fixed
+
+- Linux: the window the tray icon opens comes to the front on GNOME and KDE instead of staying
+  behind other windows.
+
+## Changed
+
+- Uses Oriel 0.20.15. Release builds are checked to carry none of its development-only control
+  code, and the Windows app's update download is now that checked executable, the same one the
+  installer carries.
+
 # 0.6.4 - 2026-11-09
 
 Devices on 0.4.0 and later work together. Update the desktop app, above all on computers with an
