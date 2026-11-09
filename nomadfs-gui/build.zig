@@ -73,12 +73,20 @@ pub fn build(b: *std.Build) void {
         .share_target = .{ .types = &.{ "text/plain", "text/markdown", "text/*" }, .label = "Save to NomadFS notes" },
         .url_schemes = &.{"nomadfs"},
         .frontend = .{
-            // A static page: embedded as-is, no npm and no dev server.
+            // A static page: embedded as-is in the app, no npm.
             .dir = "frontend",
             .dist = ".",
             .build_command = null,
             .install_command = null,
-            .dev = null,
+            // The development build (`zig build dev`, or `zig build
+            // build-dev` with the server started by hand) loads the page
+            // from this plain file server instead, so a page edit is a
+            // reload, and it answers `oriel agent` (Oriel's dev control
+            // socket: snapshot, click, eval, screenshots, logs).
+            .dev = .{
+                .url = "http://127.0.0.1:5180/",
+                .command = &.{ "python3", "-m", "http.server", "5180", "--bind", "127.0.0.1" },
+            },
             .types_path = null,
         },
         .package = .{

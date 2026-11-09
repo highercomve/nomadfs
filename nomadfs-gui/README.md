@@ -17,6 +17,30 @@ Each command is a thin wrapper around `zig build <step>` (run from anywhere
 inside the project; extra arguments are passed on), so plain `zig build ...`
 works as well. `oriel doctor` checks that the system has everything needed.
 
+### Development build and `oriel agent`
+
+```sh
+oriel dev        # zig build dev: serves frontend/ on 127.0.0.1:5180 and runs nomadfs-gui-dev
+```
+
+The development build loads the page from that file server (a page edit is a
+reload) and answers `oriel agent` on a control socket, so a script or a coding
+agent can check the app without the mouse or the desktop:
+
+```sh
+oriel agent snapshot --interactive         # the page as an outline with refs
+oriel agent click "text=Swarm folder"
+oriel agent eval "document.getElementById('pv-name').textContent"
+oriel agent screenshot                     # the web view (not native views over it)
+oriel agent logs                           # the page's console and the app's log
+```
+
+`claude mcp add oriel -- oriel agent mcp` offers the same commands as MCP
+tools. The native video player (GtkVideo) draws over the page, so a
+screenshot from the agent shows it black; capture the window itself to see
+it. Only one copy of the app runs per user: quit the installed one first.
+Packages never contain the agent (`oriel package` refuses a dev binary).
+
 ## Layout
 
 | Path | What |
