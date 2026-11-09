@@ -44,6 +44,7 @@ fn mapError(err: anyerror) c_int {
         error.QuorumNotReached,
         error.StoreFailed,
         error.NoHolders,
+        error.NoHolderAskable,
         error.HoldersUnreachable,
         error.PeerUnreachable,
         error.AllAddressesFailed,

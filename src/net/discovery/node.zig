@@ -113,6 +113,9 @@ pub const Node = struct {
     pub const max_handlers = 256;
     pub const max_recent_peers = @import("recent.zig").max_recent_peers;
     pub const max_anchors = 8;
+    /// How long a role announcement counts without being heard again
+    /// (peers ping every minute or so; a few missed rounds, not a re-join).
+    pub const role_fresh_ms: i64 = 15 * std.time.ms_per_min;
     pub const max_revoked_queue = 16;
 
     /// Queues `peer` (a revoked device's node or device ID) for the
@@ -231,10 +234,9 @@ pub const Node = struct {
         return self.local_roles.load(.monotonic);
     }
 
-    /// Records `roles` for an authenticated peer (PING or PONG heard).
     /// Records what an authenticated peer said about itself (PING or PONG
     /// heard): its roles and its swarm manifest digest.
-    fn recordPeerRoles(self: *Node, peer: id.NodeID, roles: u8, swarm: [32]u8) void {
+    pub fn recordPeerRoles(self: *Node, peer: id.NodeID, roles: u8, swarm: [32]u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.recordPeerRolesLocked(peer, roles, swarm, sync.monotonicMillis());
@@ -271,6 +273,24 @@ pub const Node = struct {
             if (e.id.eql(peer)) return e.roles;
         }
         return null;
+    }
+
+    /// Copies announced role holders, including peers reachable only by relay.
+    pub fn copyPeersWithRole(self: *Node, bit: u8, out: []id.NodeID) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now = sync.monotonicMillis();
+        var n: usize = 0;
+        for (self.peer_roles.entries[0..self.peer_roles.count]) |e| {
+            if (n == out.len) break;
+            if (e.roles & bit == 0) continue;
+            // Heard lately: a device that re-joined announces under its new
+            // ID, and its old one must stop being listed.
+            if (now - e.heard_ms > role_fresh_ms) continue;
+            out[n] = e.id;
+            n += 1;
+        }
+        return n;
     }
 
     /// The swarm manifest digest a peer last announced, or null when it
@@ -1159,7 +1179,7 @@ pub const Node = struct {
             .FIND_NODE => |p| try self.respondCloserPeers(stream, p.target, .find_node),
             .FIND_VALUE => |p| try self.handleFindValue(stream, p.key),
             .STORE => |p| try self.handleStore(stream, p.key, p.value),
-            .GET_BLOCK => |p| try self.handleGetBlock(stream, p.cid),
+            .GET_BLOCK => |p| try self.handleGetBlock(stream, conn, p.cid),
             .GET_SHARES => try self.handleGetShares(stream),
             .GET_SWARM => |p| try self.handleGetSwarm(stream, p.have),
             .GET_NODE_INFO => try self.handleGetNodeInfo(stream, conn),
@@ -1283,11 +1303,18 @@ pub const Node = struct {
         try response.send(self.allocator, stream);
     }
 
-    fn handleGetBlock(self: *Node, stream: network.Stream, cid: [32]u8) !void {
+    fn handleGetBlock(self: *Node, stream: network.Stream, conn: network.Connection, cid: [32]u8) !void {
         var data: ?[]const u8 = null;
         defer if (data) |d| self.allocator.free(d);
         if (self.block_store) |block_store| {
             if (try block_store.get(&cid, self.allocator)) |block| data = block.data;
+        }
+        // Logged on a swarm backup only: it is meant to hold every block, so
+        // a miss there is news. Other devices are asked for blocks they
+        // don't have all the time.
+        if (data == null and self.announcedRoles() & rpc.Roles.swarm_backup != 0) {
+            const requester = conn.getRemoteNodeID();
+            std.debug.print("GET_BLOCK miss {x} requester={x}\n", .{ cid[0..4], requester.bytes[0..4] });
         }
         const response = rpc.Message{
             .sender_id = self.manager.node_id,
@@ -1586,4 +1613,36 @@ test "lookup prioritizes known addresses and confines hearsay-only failure" {
     hearsay.addrs_count = 0;
     Node.lookupNodeWorker(&node, &state, hearsay, hearsay.id);
     try std.testing.expect(node.routing_table.contains(peer.id));
+}
+
+test "announced role copies include disconnected peers and obey the output bound" {
+    var manager = network.manager.ConnectionManager.initExplicit(std.testing.allocator, .tcp, network.noise.KeyPair.generate());
+    defer manager.deinit();
+    var node = Node.init(std.testing.allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    const backup = id.NodeID{ .bytes = [_]u8{7} ** 32 };
+    node.recordPeerRoles(backup, rpc.Roles.swarm_backup, rpc.no_swarm);
+    node.recordPeerRoles(.{ .bytes = [_]u8{8} ** 32 }, 0, rpc.no_swarm);
+    node.recordPeerRoles(.{ .bytes = [_]u8{9} ** 32 }, rpc.Roles.swarm_backup, rpc.no_swarm);
+    var out: [1]id.NodeID = undefined;
+    try std.testing.expectEqual(@as(usize, 1), node.copyPeersWithRole(rpc.Roles.swarm_backup, &out));
+    try std.testing.expectEqual(backup, out[0]);
+    try std.testing.expectEqual(@as(usize, 0), node.copyPeersWithRole(rpc.Roles.swarm_backup, out[0..0]));
+}
+
+test "announced roles not heard lately are not copied" {
+    var manager = network.manager.ConnectionManager.initExplicit(std.testing.allocator, .tcp, network.noise.KeyPair.generate());
+    defer manager.deinit();
+    var node = Node.init(std.testing.allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    const old = id.NodeID{ .bytes = [_]u8{7} ** 32 };
+    const fresh = id.NodeID{ .bytes = [_]u8{9} ** 32 };
+    const now = sync.monotonicMillis();
+    // A backup that re-joined: its old ID was last heard long ago.
+    node.mutex.lock();
+    node.recordPeerRolesLocked(old, rpc.Roles.swarm_backup, rpc.no_swarm, now - Node.role_fresh_ms - 1);
+    node.mutex.unlock();
+    node.recordPeerRoles(fresh, rpc.Roles.swarm_backup, rpc.no_swarm);
+    var out: [4]id.NodeID = undefined;
+    try std.testing.expectEqualSlices(id.NodeID, &.{fresh}, out[0..node.copyPeersWithRole(rpc.Roles.swarm_backup, &out)]);
 }

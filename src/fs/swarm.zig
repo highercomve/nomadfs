@@ -773,27 +773,53 @@ pub const SwarmFolder = struct {
         return tree.readAt(allocator, tree.Loader.local(self.store), cid, offset, dest);
     }
 
-    /// The devices likely to hold a swarm file, best first: its author, the
-    /// devices placement gives it (the swarm's `copies`), then the cluster's
-    /// list (swarm backup devices, everyone else).
+    /// Live author, swarm backups, placement replicas, then other peers.
     pub fn holdersOf(self: *SwarmFolder, allocator: std.mem.Allocator, cid: *const [32]u8, author: NodeID, out: *[cluster.fetcher.max_holders]NodeID) []NodeID {
-        var n: usize = 0;
-        addHint(out, &n, author, self.self_id);
+        var placed: [policy_max]NodeID = undefined;
+        var replicas: []const NodeID = &.{};
         if (self.placement) |p| {
             const copies = p.policy.copies();
             if (copies > 1) {
                 if (cluster.placement.candidates(allocator, p.trust, p.policy, self.self_id, p.self_device)) |members| {
                     defer allocator.free(members);
-                    var placed: [policy_max]NodeID = undefined;
-                    for (cluster.placement.replicaHolders(cid, author, copies, members, &placed)) |h| addHint(out, &n, h, self.self_id);
+                    replicas = cluster.placement.replicaHolders(cid, author, copies, members, &placed);
                 } else |_| {}
             }
         }
-        const bm = self.block_manager orelse return out[0..n];
-        if (bm.holders) |*holds| {
-            var more = remote_mod.holdersBuffer();
-            for (holds.forSwarm(author, &more)) |h| addHint(out, &n, h, self.self_id);
+        return self.holderHints(author, replicas, &.{}, out);
+    }
+
+    /// Manifest authors survive key rotation; only current IDs are dialed.
+    fn liveAuthor(self: *SwarmFolder, author: NodeID) bool {
+        const trust = if (self.placement) |p| p.trust else if (self.block_manager) |bm| bm.trustStore() else null;
+        const members = trust orelse return true;
+        // Connected right now, through the cluster layer's registry (fs/
+        // never asks the network directly; a remembered routing ID doesn't
+        // count); else the trust store decides.
+        if (self.block_manager) |bm| if (bm.holders) |*holds| if (holds.knowsPeer(author)) return true;
+        return members.isMemberNode(author);
+    }
+
+    /// Shared by reads and keeper wants so both use the same source order.
+    /// An author that is gone (not a current member, not connected) is left
+    /// out. The keeper's lost verdict needs the author's own "not found",
+    /// so such a file is never declared lost: the same as before, when the
+    /// gone author was listed but never answered.
+    fn holderHints(self: *SwarmFolder, author: NodeID, replicas: []const NodeID, known: []const NodeID, out: *[cluster.fetcher.max_holders]NodeID) []NodeID {
+        var n: usize = 0;
+        const live = self.liveAuthor(author);
+        if (live) addHint(out, &n, author, self.self_id);
+        var more = remote_mod.holdersBuffer();
+        var rest: []const NodeID = known;
+        if (self.block_manager) |bm| {
+            if (bm.holders) |*holds| {
+                const split = holds.forSwarmSplit(if (live) author else self.self_id, &more);
+                for (split.ids[0..split.backups_end]) |h| addHint(out, &n, h, self.self_id);
+                rest = split.ids[split.backups_end..];
+            }
         }
+        for (replicas) |h| addHint(out, &n, h, self.self_id);
+        for (rest) |h| addHint(out, &n, h, self.self_id);
         return out[0..n];
     }
 
@@ -1147,15 +1173,8 @@ pub const SwarmFolder = struct {
             const holders = cluster.placement.replicaHolders(&e.cid, author, copies, members, &placed);
             if (!backup and !contains(holders, self.self_id)) continue;
             var hints: [cluster.fetcher.max_holders]NodeID = undefined;
-            var n: usize = 0;
-            hints[0] = author;
-            n = 1;
-            for (holders) |h| addHint(&hints, &n, h, self.self_id);
-            if (bm.holders) |*holds| {
-                var more = remote_mod.holdersBuffer();
-                for (holds.forSwarm(author, &more)) |h| addHint(&hints, &n, h, self.self_id);
-            } else for (known) |h| addHint(&hints, &n, h, self.self_id);
-            var want = cluster.keeper.Want.init(e.cid, hints[0..n]);
+            const sources = self.holderHints(author, holders, known, &hints);
+            var want = cluster.keeper.Want.init(e.cid, sources);
             want.author = author;
             try out.append(allocator, want);
         }
@@ -1980,4 +1999,162 @@ test "swarm: same content under a new version restarts the count" {
     try mergeManifest(b, phone.folder);
     lostRound(b, put.cid, .lost);
     try std.testing.expect(liveAt(b, "Phone/Camera/a.jpg"));
+}
+
+test "swarm: backups precede placement replicas with eight copies" {
+    const Fake = struct {
+        fn roles(_: *anyopaque, _: NodeID) ?u8 {
+            return 1;
+        }
+        fn live(_: *anyopaque, out: []NodeID) usize {
+            if (out.len == 0) return 0;
+            out[0] = .{ .bytes = [_]u8{0xbb} ** 32 };
+            return 1;
+        }
+        fn known(_: *anyopaque, _: []NodeID) usize {
+            return 0;
+        }
+    };
+    var t: TestFolder = undefined;
+    try t.open(0xee, "reader");
+    defer t.close();
+    const path = try std.fs.path.join(std.testing.allocator, &.{ t.dir, "trust" });
+    defer std.testing.allocator.free(path);
+    var trust = try device.trust.Store.load(std.testing.allocator, path, null);
+    defer trust.deinit();
+    for (1..9) |i| {
+        const b: u8 = @intCast(i);
+        _ = try trust.upsert([_]u8{b} ** 32, [_]u8{b + 20} ** 32, "member", 1);
+    }
+    var policy: device.policy.Policy = .{ .allocator = std.testing.allocator, .path = &.{}, .copies_record = .{
+        .kind = .copies,
+        .subject = .{ .bytes = [_]u8{0} ** 32 },
+        .value = 8,
+        .at = 1,
+        .signer_key = [_]u8{0} ** 32,
+        .signature = [_]u8{0} ** 64,
+    } };
+    t.folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = t.folder.self_id };
+    var bm: cluster.BlockManager = undefined;
+    bm.holders = .{ .self_id = t.folder.self_id, .peers = .{
+        .ctx = &bm,
+        .rolesFn = Fake.roles,
+        .knownFn = Fake.known,
+        .connectedFn = Fake.live,
+    } };
+    t.folder.block_manager = &bm;
+    const members = try cluster.placement.candidates(std.testing.allocator, &trust, &policy, t.folder.self_id, t.folder.self_id);
+    defer std.testing.allocator.free(members);
+    const author = NodeID.fromPublicKey([_]u8{21} ** 32);
+    var root = [_]u8{0} ** 32;
+    var placed: [8]NodeID = undefined;
+    for (0..256) |i| {
+        root[0] = @intCast(i);
+        const replicas = cluster.placement.replicaHolders(&root, author, 8, members, &placed);
+        if (!SwarmFolder.contains(replicas, t.folder.self_id)) break;
+    } else return error.NoFixture;
+    var out: [8]NodeID = undefined;
+    const list = t.folder.holdersOf(std.testing.allocator, &root, author, &out);
+    try std.testing.expectEqual(author, list[0]);
+    try std.testing.expectEqual(NodeID{ .bytes = [_]u8{0xbb} ** 32 }, list[1]);
+    try std.testing.expectEqual(@as(usize, 8), list.len);
+    const hints = t.folder.holderHints(author, placed[0..7], &.{}, &out);
+    try std.testing.expectEqual(author, hints[0]);
+    try std.testing.expectEqual(NodeID{ .bytes = [_]u8{0xbb} ** 32 }, hints[1]);
+}
+
+test "swarm: only current transport authors are kept with trust membership" {
+    var t: TestFolder = undefined;
+    try t.open(0xef, "reader");
+    defer t.close();
+    const allocator = std.testing.allocator;
+    const path = try std.fs.path.join(allocator, &.{ t.dir, "trust" });
+    defer allocator.free(path);
+    var trust = try device.trust.Store.load(allocator, path, null);
+    defer trust.deinit();
+    var policy: device.policy.Policy = .{ .allocator = allocator, .path = &.{} };
+    const key = [_]u8{71} ** 32;
+    const author = NodeID.fromPublicKey(key);
+    var out: [cluster.fetcher.max_holders]NodeID = undefined;
+    const root = [_]u8{9} ** 32;
+    try std.testing.expectEqualSlices(NodeID, &.{author}, t.folder.holdersOf(allocator, &root, author, &out));
+    t.folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = t.folder.self_id };
+    try std.testing.expectEqual(@as(usize, 0), t.folder.holdersOf(allocator, &root, author, &out).len);
+    _ = try trust.upsert([_]u8{72} ** 32, key, "member", 1);
+    try std.testing.expect(!NodeID.fromPublicKey([_]u8{72} ** 32).eql(author));
+    try std.testing.expectEqualSlices(NodeID, &.{author}, t.folder.holdersOf(allocator, &root, author, &out));
+    const dead = NodeID{ .bytes = [_]u8{73} ** 32 };
+    try std.testing.expectEqual(@as(usize, 0), t.folder.holderHints(dead, &.{}, &.{}, &out).len);
+}
+
+test "swarm: a connected author stays live without a trust entry; a remembered one doesn't" {
+    const Peers = struct {
+        fn roles(_: *anyopaque, _: NodeID) ?u8 {
+            return null;
+        }
+        fn connected(_: *anyopaque, out: []NodeID) usize {
+            if (out.len == 0) return 0;
+            out[0] = .{ .bytes = [_]u8{51} ** 32 };
+            return 1;
+        }
+        fn known(_: *anyopaque, out: []NodeID) usize {
+            if (out.len == 0) return 0;
+            out[0] = .{ .bytes = [_]u8{52} ** 32 };
+            return 1;
+        }
+    };
+    var t: TestFolder = undefined;
+    try t.open(0xed, "reader");
+    defer t.close();
+    const allocator = std.testing.allocator;
+    const path = try std.fs.path.join(allocator, &.{ t.dir, "trust" });
+    defer allocator.free(path);
+    var trust = try device.trust.Store.load(allocator, path, null);
+    defer trust.deinit();
+    var policy: device.policy.Policy = .{ .allocator = allocator, .path = &.{} };
+    t.folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = t.folder.self_id };
+    var bm: cluster.BlockManager = undefined;
+    bm.holders = .{ .self_id = t.folder.self_id, .peers = .{
+        .ctx = &bm,
+        .rolesFn = Peers.roles,
+        .knownFn = Peers.known,
+        .connectedFn = Peers.connected,
+    } };
+    t.folder.block_manager = &bm;
+    const root = [_]u8{9} ** 32;
+    var out: [cluster.fetcher.max_holders]NodeID = undefined;
+    // 51 is connected: kept first.
+    const connected = NodeID{ .bytes = [_]u8{51} ** 32 };
+    try std.testing.expectEqual(connected, t.folder.holdersOf(allocator, &root, connected, &out)[0]);
+    // 52 is only in the routing table (an ID from before a re-join can
+    // linger there): not a member, not connected, so not listed first.
+    const remembered = NodeID{ .bytes = [_]u8{52} ** 32 };
+    const list = t.folder.holdersOf(allocator, &root, remembered, &out);
+    try std.testing.expect(list.len == 0 or !list[0].eql(remembered));
+}
+
+test "swarm: a read whose only holder is a gone author reports NoHolders" {
+    var t: TestFolder = undefined;
+    try t.open(0xec, "reader");
+    defer t.close();
+    const allocator = std.testing.allocator;
+    const path = try std.fs.path.join(allocator, &.{ t.dir, "trust" });
+    defer allocator.free(path);
+    var trust = try device.trust.Store.load(allocator, path, null);
+    defer trust.deinit();
+    var policy: device.policy.Policy = .{ .allocator = allocator, .path = &.{} };
+    t.folder.placement = .{ .trust = &trust, .policy = &policy, .self_device = t.folder.self_id };
+    // A node with nobody else around: the author (an ID from before a
+    // re-join) is no member and not connected, so nobody is left to ask.
+    var peers = [_]cluster.fetcher.FakeNet.Peer{};
+    var net: cluster.fetcher.FakeNet = .{ .peers = &peers };
+    var bm: cluster.BlockManager = undefined;
+    bm.fetcher = cluster.fetcher.Fetcher.init(&t.store, net.transport());
+    bm.holders = null;
+    t.folder.block_manager = &bm;
+    t.folder.read_ahead = null;
+    const gone = NodeID{ .bytes = [_]u8{0x73} ** 32 };
+    var dest: [16]u8 = undefined;
+    // The app shows NoHolders as "no device is known to keep it yet".
+    try std.testing.expectError(error.NoHolders, t.folder.readAt(allocator, [_]u8{0x44} ** 32, gone.bytes, 0, &dest));
 }

@@ -52,7 +52,7 @@ pub const BlockManager = struct {
             self.fetcher = fetcher_mod.Fetcher.init(s, .{ .ctx = self, .getFn = getBlockFrom, .connectedFn = isConnected });
             self.holders = .{
                 .self_id = config.dht.manager.node_id,
-                .peers = .{ .ctx = self, .rolesFn = rolesOfPeered, .knownFn = knownIDsOf, .connectedFn = connectedIDsOf },
+                .peers = .{ .ctx = self, .rolesFn = rolesOfPeered, .knownFn = knownIDsOf, .connectedFn = connectedIDsOf, .withRoleFn = roleIDsOf, .knowsFn = knowsID },
             };
         }
         return self;
@@ -235,7 +235,8 @@ pub const BlockManager = struct {
         return self.net.connectToPeerMulti(peer.addresses[0..peer.addrs_count], self.dht_node.swarm_key, peer_id);
     }
 
-    /// The fetcher's network side: one GET_BLOCK to `peer`. A holder not in
+    /// The fetcher's network side: GET_BLOCK to `peer`, retrying a failed
+    /// pooled session once. A holder not in
     /// the routing table yet (a node just started, the author not met) is
     /// looked up through the DHT, but not while the connection manager
     /// backs it off: a failed lookup ends in a failed dial, which starts
@@ -243,14 +244,40 @@ pub const BlockManager = struct {
     /// backoff, even when the fetcher asks it anyway (a probe).
     fn getBlockFrom(ctx: *anyopaque, peer: NodeID, cid: *const fetcher_mod.Cid, allocator: std.mem.Allocator) anyerror!?[]u8 {
         const self: *BlockManager = @ptrCast(@alignCast(ctx));
-        const conn = self.connectKnown(peer) catch |err| switch (err) {
-            error.ProviderUnreachable => if (self.net.dialBackedOff(peer)) return error.PeerUnreachable else try self.connectTo(peer),
-            else => return err,
-        };
+        const pooled = self.net.existingConnection(peer);
+        const conn = pooled orelse try self.connectBlockPeer(peer);
         defer conn.deinit();
-        const data = (try self.dht_node.fetchBlock(conn, cid.*)) orelse return null;
+        const data = (self.dht_node.fetchBlock(conn, cid.*) catch |err| retry: {
+            // Only a session that is gone (closed by its keepalive or the
+            // far end) is replaced. One request ending early (a timeout, a
+            // stream the server closed) says nothing about the session,
+            // which other requests may be using: report it.
+            if (pooled == null or !sessionGone(conn, err)) return err;
+            // Gone: closing it can't hurt anyone, and drops it from the
+            // pool so the retry dials a fresh one.
+            conn.close();
+            const fresh = try self.connectBlockPeer(peer);
+            defer fresh.deinit();
+            break :retry (try self.dht_node.fetchBlock(fresh, cid.*));
+        }) orelse return null;
         defer self.dht_node.allocator.free(data);
         return try allocator.dupe(u8, data);
+    }
+
+    /// A new connection to `peer`. A timeout here is the dial's (the
+    /// handshake, through a relay too): reported as ConnectionTimedOut, so
+    /// the fetcher doesn't take it for a live link failing under a request.
+    fn connectBlockPeer(self: *BlockManager, peer: NodeID) !network.Connection {
+        const conn = self.connectKnown(peer) catch |err| switch (err) {
+            error.ProviderUnreachable => if (self.net.dialBackedOff(peer)) error.PeerUnreachable else self.connectTo(peer),
+            else => err,
+        };
+        return conn catch |err| if (err == error.Timeout) error.ConnectionTimedOut else err;
+    }
+
+    /// The pooled session itself is gone, so a fresh one may work.
+    fn sessionGone(conn: network.Connection, err: anyerror) bool {
+        return conn.isClosed() or err == error.SessionClosed;
     }
 
     // ---- The holder registry's view of discovery ----
@@ -259,6 +286,30 @@ pub const BlockManager = struct {
     fn rolesOfPeered(ctx: *anyopaque, peer: NodeID) ?u8 {
         const self: *BlockManager = @ptrCast(@alignCast(ctx));
         return self.dht_node.peerRoles(peer);
+    }
+
+    /// Connected right now: the one sign a peer still exists that stale
+    /// state can't fake (other peers' lookup replies can put an ID from
+    /// before a re-join back into the routing table).
+    fn knowsID(ctx: *anyopaque, peer: NodeID) bool {
+        const self: *BlockManager = @ptrCast(@alignCast(ctx));
+        return self.net.isConnected(peer);
+    }
+
+    /// Peers that announced `bit` lately, kept only if connected or a
+    /// current member (a revoked device's announcement lingers for
+    /// role_fresh_ms; the same rule as a file's author).
+    fn roleIDsOf(ctx: *anyopaque, bit: u8, out: []NodeID) usize {
+        const self: *BlockManager = @ptrCast(@alignCast(ctx));
+        const n = self.dht_node.copyPeersWithRole(bit, out);
+        const trust = self.trustStore() orelse return n;
+        var kept: usize = 0;
+        for (out[0..n]) |peer| {
+            if (!self.net.isConnected(peer) and !trust.isMemberNode(peer)) continue;
+            out[kept] = peer;
+            kept += 1;
+        }
+        return kept;
     }
 
     /// Copies the routing table's peer IDs.
@@ -295,3 +346,188 @@ pub const BlockManager = struct {
         return peer;
     }
 };
+
+const TestConnection = struct {
+    node: NodeID,
+    device: ?NodeID = null,
+    closed: bool = false,
+    released: usize = 0,
+    failure: anyerror = error.SessionClosed,
+    reply: ?network.Stream = null,
+    opens: usize = 0,
+    fn stream(ctx: *anyopaque) anyerror!network.Stream {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.opens += 1;
+        if (self.reply) |reply| return reply;
+        return self.failure;
+    }
+    fn address(_: *anyopaque) network.Address {
+        return network.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+    }
+    fn nodeId(ctx: *anyopaque) NodeID {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.node;
+    }
+    fn deviceId(ctx: *anyopaque) ?NodeID {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.device;
+    }
+    fn close(ctx: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.closed = true;
+    }
+    fn retain(_: *anyopaque) void {}
+    fn deinit(ctx: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.released += 1;
+    }
+    fn isClosed(ctx: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.closed;
+    }
+    fn isInUse(_: *anyopaque) bool {
+        return false;
+    }
+    fn connection(self: *@This()) network.Connection {
+        return network.Connection.init(self, &vtable);
+    }
+    const vtable: network.Connection.ConnectionVTable = .{
+        .openStream = stream,
+        .acceptStream = stream,
+        .getPeerAddress = address,
+        .getRemoteNodeID = nodeId,
+        .getRemoteDeviceID = deviceId,
+        .close = close,
+        .retain = retain,
+        .deinit = deinit,
+        .isClosed = isClosed,
+        .isInUse = isInUse,
+    };
+};
+
+test "block manager: a pooled session that is gone is dropped and redialed once" {
+    var manager = network.manager.ConnectionManager.initExplicit(std.testing.allocator, .tcp, network.noise.KeyPair.generate());
+    var mock = TestConnection{ .node = .{ .bytes = [_]u8{7} ** 32 } };
+    defer manager.deinit();
+    var node = dht.Node.init(std.testing.allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    var bm: BlockManager = .{ .allocator = std.testing.allocator, .net = &manager, .dht_node = &node, .store = null, .quorum = .{} };
+    try manager.addConnection(mock.connection());
+    // No route or relay exists: the fresh attempt reports its own error.
+    try std.testing.expectError(error.ProviderUnreachable, BlockManager.getBlockFrom(&bm, mock.node, &([_]u8{1} ** 32), std.testing.allocator));
+    try std.testing.expect(mock.closed);
+    try std.testing.expectEqual(@as(usize, 1), mock.opens);
+    try std.testing.expectEqual(@as(usize, 1), mock.released);
+}
+
+test "block manager: one request's timeout leaves the pooled connection open" {
+    var manager = network.manager.ConnectionManager.initExplicit(std.testing.allocator, .tcp, network.noise.KeyPair.generate());
+    var mock = TestConnection{ .node = .{ .bytes = [_]u8{7} ** 32 }, .failure = error.Timeout };
+    defer manager.deinit();
+    var node = dht.Node.init(std.testing.allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    var bm: BlockManager = .{ .allocator = std.testing.allocator, .net = &manager, .dht_node = &node, .store = null, .quorum = .{} };
+    try manager.addConnection(mock.connection());
+    // Other requests (read-ahead workers) may be using the session: the
+    // timeout is reported, the connection kept, no redial.
+    try std.testing.expectError(error.Timeout, BlockManager.getBlockFrom(&bm, mock.node, &([_]u8{1} ** 32), std.testing.allocator));
+    try std.testing.expect(!mock.closed);
+    try std.testing.expectEqual(@as(usize, 1), mock.opens);
+}
+
+test "block manager: a request ending early leaves a healthy pooled session open" {
+    var manager = network.manager.ConnectionManager.initExplicit(std.testing.allocator, .tcp, network.noise.KeyPair.generate());
+    var mock = TestConnection{ .node = .{ .bytes = [_]u8{7} ** 32 }, .failure = error.EndOfStream };
+    defer manager.deinit();
+    var node = dht.Node.init(std.testing.allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    var bm: BlockManager = .{ .allocator = std.testing.allocator, .net = &manager, .dht_node = &node, .store = null, .quorum = .{} };
+    try manager.addConnection(mock.connection());
+    // The server closed that one stream; the session (and other requests
+    // on it) is fine: reported, not closed, no redial.
+    try std.testing.expectError(error.EndOfStream, BlockManager.getBlockFrom(&bm, mock.node, &([_]u8{1} ** 32), std.testing.allocator));
+    try std.testing.expect(!mock.closed);
+    try std.testing.expectEqual(@as(usize, 1), mock.opens);
+}
+
+test "block manager: local allocation failure leaves the pooled connection open" {
+    var manager = network.manager.ConnectionManager.initExplicit(std.testing.allocator, .tcp, network.noise.KeyPair.generate());
+    var mock = TestConnection{ .node = .{ .bytes = [_]u8{7} ** 32 }, .failure = error.OutOfMemory };
+    defer manager.deinit();
+    var node = dht.Node.init(std.testing.allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    var bm: BlockManager = .{ .allocator = std.testing.allocator, .net = &manager, .dht_node = &node, .store = null, .quorum = .{} };
+    try manager.addConnection(mock.connection());
+    try std.testing.expectError(error.OutOfMemory, BlockManager.getBlockFrom(&bm, mock.node, &([_]u8{1} ** 32), std.testing.allocator));
+    try std.testing.expect(!mock.closed);
+    try std.testing.expectEqual(@as(usize, 1), mock.opens);
+}
+
+test "block manager: a pooled block miss does not close or retry the connection" {
+    const Reply = struct {
+        bytes: [128]u8 = undefined,
+        len: usize = 0,
+        pos: usize = 0,
+        saving: bool = true,
+        fn read(ctx: *anyopaque, out: []u8) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const n = @min(out.len, self.len - self.pos);
+            @memcpy(out[0..n], self.bytes[self.pos..][0..n]);
+            self.pos += n;
+            return n;
+        }
+        fn write(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.saving) {
+                if (bytes.len > self.bytes.len - self.len) return error.NoSpaceLeft;
+                @memcpy(self.bytes[self.len..][0..bytes.len], bytes);
+                self.len += bytes.len;
+            }
+            return bytes.len;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable: network.Stream.StreamVTable = .{ .read = read, .write = write, .close = close };
+    };
+    var reply: Reply = .{};
+    const stream = network.Stream.init(&reply, &Reply.vtable);
+    const message = dht.rpc.Message{ .sender_id = .{ .bytes = [_]u8{7} ** 32 }, .payload = .{ .BLOCK = .{ .data = null } } };
+    try message.send(std.testing.allocator, stream);
+    reply.saving = false;
+    var manager = network.manager.ConnectionManager.initExplicit(std.testing.allocator, .tcp, network.noise.KeyPair.generate());
+    var mock = TestConnection{ .node = message.sender_id, .reply = stream };
+    defer manager.deinit();
+    var node = dht.Node.init(std.testing.allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    var bm: BlockManager = .{ .allocator = std.testing.allocator, .net = &manager, .dht_node = &node, .store = null, .quorum = .{} };
+    try manager.addConnection(mock.connection());
+    try std.testing.expectEqual(@as(?[]u8, null), try BlockManager.getBlockFrom(&bm, mock.node, &([_]u8{1} ** 32), std.testing.allocator));
+    try std.testing.expect(!mock.closed);
+    try std.testing.expectEqual(@as(usize, 1), mock.opens);
+}
+
+test "block manager: announced backups are kept only if connected or current members" {
+    var manager = network.manager.ConnectionManager.initExplicit(std.testing.allocator, .tcp, network.noise.KeyPair.generate());
+    defer manager.deinit();
+    var node = dht.Node.init(std.testing.allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "test_bm_role_trust.store";
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var trust = try @import("../device/trust.zig").Store.load(std.testing.allocator, path, null);
+    defer trust.deinit();
+    const member_key = [_]u8{41} ** 32;
+    _ = try trust.upsert([_]u8{40} ** 32, member_key, "backup", 1);
+    node.trust_store = &trust;
+    var bm: BlockManager = .{ .allocator = std.testing.allocator, .net = &manager, .dht_node = &node, .store = null, .quorum = .{} };
+    const member = NodeID.fromPublicKey(member_key);
+    const revoked = NodeID{ .bytes = [_]u8{42} ** 32 };
+    node.recordPeerRoles(member, rpc_roles.swarm_backup, rpc_no_swarm);
+    node.recordPeerRoles(revoked, rpc_roles.swarm_backup, rpc_no_swarm);
+    var out: [4]NodeID = undefined;
+    // The member is kept; the other (a revoked device, say) isn't.
+    try std.testing.expectEqualSlices(NodeID, &.{member}, out[0..BlockManager.roleIDsOf(&bm, rpc_roles.swarm_backup, &out)]);
+}
+
+const rpc_roles = @import("../net/discovery/rpc.zig").Roles;
+const rpc_no_swarm = @import("../net/discovery/rpc.zig").no_swarm;

@@ -26,6 +26,11 @@ const RelayedConnectionImpl = struct {
     yamux_thread: std.Thread,
     allocator: std.mem.Allocator,
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Maintenance writes are under way (on their own thread: see maintain).
+    maintaining: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// The last maintenance worker, joined before the next one starts and
+    /// in deinit (after close wakes it), so none outlives the session.
+    worker: ?std.Thread = null,
     refs: network.RefCount = .{},
 
     fn connection(self: *RelayedConnectionImpl) network.Connection {
@@ -63,9 +68,46 @@ const RelayedConnectionImpl = struct {
         return self.closed.load(.acquire) or self.yamux.isClosed() or self.via.isClosed();
     }
 
+    /// Like a TCP connection's: a session silent past the keepalive is
+    /// closed. A relayed one needs it more: the relay can keep the stream
+    /// open while the far leg is dead, and nothing else would notice.
+    /// Every write maintenance needs (resets for expired streams, the
+    /// keepalive ping) goes out on this session's own worker thread, one at
+    /// a time: written through the relay's stream, a write can wait on that
+    /// stream's window if the relay stops reading, and the caller here is
+    /// the connection manager's one maintenance thread. Here only the
+    /// state is checked, which writes nothing; a session silent past the
+    /// limit is closed, which writes nothing either and wakes a stuck
+    /// worker.
     fn maintain(ctx: *anyopaque) void {
         const self: *RelayedConnectionImpl = @ptrCast(@alignCast(ctx));
-        self.yamux.reapClosed(@import("../../sync.zig").monotonicMillis());
+        const now = @import("../../sync.zig").monotonicMillis();
+        const state = self.yamux.keepAliveState(now);
+        if (state == .dead) {
+            std.debug.print("relayed connection to {x}: no answer for {d} s, closing\n", .{ getRemoteNodeID(ctx).bytes[0..4], @divTrunc(@import("yamux.zig").keepalive_dead_ms, 1000) });
+            close(ctx);
+            return;
+        }
+        self.maintainAsync(now, state == .ping);
+    }
+
+    /// Only ever called from maintain (the manager's one maintenance
+    /// thread), which holds a reference meanwhile: deinit can't run.
+    fn maintainAsync(self: *RelayedConnectionImpl, now: i64, ping: bool) void {
+        if (self.maintaining.swap(true, .acq_rel)) return; // one still writing
+        // The previous one has finished (maintaining was false): instant.
+        if (self.worker) |t| t.join();
+        self.worker = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, maintainWorker, .{ self, now, ping }) catch {
+            self.worker = null;
+            self.maintaining.store(false, .release);
+            return;
+        };
+    }
+
+    fn maintainWorker(self: *RelayedConnectionImpl, now: i64, ping: bool) void {
+        self.yamux.reapClosed(now);
+        if (ping) self.yamux.sendPing(now);
+        self.maintaining.store(false, .release);
     }
 
     fn isInUse(ctx: *anyopaque) bool {
@@ -92,6 +134,8 @@ const RelayedConnectionImpl = struct {
         if (!self.refs.release()) return;
 
         close(ctx);
+        // close woke a worker stuck on the relay's window; it ends now.
+        if (self.worker) |t| t.join();
         self.yamux_thread.join();
         self.yamux.deinit();
         self.noise_stream.deinit(); // Closes `base`.
@@ -190,4 +234,81 @@ pub fn splice(a: network.Stream, b: network.Stream) void {
     other.join();
     a.close();
     b.close();
+}
+
+test "relay: maintenance never blocks on a stalled relay (ping and expired-stream resets go to the worker)" {
+    const sync = @import("../../sync.zig");
+    const yamux = @import("yamux.zig");
+    const Sink = struct {
+        fn read(_: *anyopaque, _: []u8) anyerror!usize {
+            return 0;
+        }
+        fn write(_: *anyopaque, bytes: []const u8) anyerror!usize {
+            return bytes.len;
+        }
+        fn close(_: *anyopaque) void {}
+        const vt: network.Stream.StreamVTable = .{ .read = read, .write = write, .close = close };
+    };
+    const Call = struct {
+        impl: *RelayedConnectionImpl,
+        finished: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            RelayedConnectionImpl.maintain(self.impl);
+            self.finished.store(true, .release);
+        }
+    };
+    // A relayed session: an inner Yamux session over Noise over a stream
+    // of the session to the relay (`outer`).
+    var sink: Sink = .{};
+    const outer = try YamuxSession.init(std.testing.allocator, network.Stream.init(&sink, &Sink.vt), false);
+    defer outer.deinit();
+    const base = try outer.newStream();
+    var packet: [65537]u8 = undefined;
+    var encrypted: noise.NoiseStream = undefined;
+    encrypted.inner = network.Stream.init(base, &stream_vtable);
+    encrypted.send_cipher = noise.CipherState.init();
+    encrypted.send_cipher.initializeKey([_]u8{1} ** 32);
+    encrypted.write_buffer = &packet;
+    const inner = try YamuxSession.init(std.testing.allocator, encrypted.stream(), false);
+    defer inner.deinit();
+    // A request stream released here whose peer never sent FIN.
+    const tombstone = try inner.newStream();
+    YamuxSession.streamClose(tombstone);
+    // The relay stops reading: no window left on its stream.
+    base.remote_window = 0;
+    inner.last_rx_ms.store(sync.monotonicMillis() - yamux.keepalive_idle_ms - 1, .monotonic);
+    var impl: RelayedConnectionImpl = undefined;
+    impl.yamux = inner;
+    impl.maintaining = .init(false);
+    impl.worker = null;
+    impl.refs = .{};
+    // First round: a ping is due; the worker writes it and gets stuck.
+    RelayedConnectionImpl.maintain(&impl);
+    var worker_stuck = false;
+    for (0..1000) |_| {
+        if (!inner.write_mutex.tryLock()) {
+            worker_stuck = true;
+            break;
+        }
+        inner.write_mutex.unlock();
+        sync.sleep(std.time.ns_per_ms);
+    }
+    // The tombstone expires; the next round must still return at once.
+    tombstone.mutex.lock();
+    tombstone.closed_at_ms = sync.monotonicMillis() - 60_000;
+    tombstone.mutex.unlock();
+    var call: Call = .{ .impl = &impl };
+    const thread = try std.Thread.spawn(.{}, Call.run, .{&call});
+    sync.sleep(100 * std.time.ns_per_ms);
+    const returned = call.finished.load(.acquire);
+    // Release the window and wait for everyone before freeing state.
+    base.mutex.lock();
+    base.remote_window = 4096;
+    base.write_cond.broadcast();
+    base.mutex.unlock();
+    thread.join();
+    while (impl.maintaining.load(.acquire)) sync.sleep(std.time.ns_per_ms);
+    if (impl.worker) |t| t.join();
+    try std.testing.expect(worker_stuck);
+    try std.testing.expect(returned);
 }

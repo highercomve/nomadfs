@@ -496,19 +496,41 @@ pub const Session = struct {
     /// arrived for keepalive_dead_ms (the caller closes the connection).
     /// Called every few seconds from one thread (the connection manager).
     pub fn keepAlive(self: *Session, now_ms: i64) bool {
+        switch (self.keepAliveState(now_ms)) {
+            .dead => return false,
+            .alive => return true,
+            .ping => {
+                self.sendPing(now_ms);
+                return true;
+            },
+        }
+    }
+
+    pub const KeepAlive = enum { alive, ping, dead };
+
+    /// What keepalive needs now, without writing anything: `dead` once
+    /// nothing arrived for keepalive_dead_ms, `ping` when idle long enough
+    /// and not pinged lately (marked as pinged now), else `alive`. For a
+    /// caller that must not block on the write (a relayed session's ping
+    /// can wait on the relay's stream window): it sends the ping elsewhere.
+    pub fn keepAliveState(self: *Session, now_ms: i64) KeepAlive {
         const idle = now_ms - self.last_rx_ms.load(.monotonic);
-        if (idle >= keepalive_dead_ms) return false;
-        if (idle < keepalive_idle_ms or now_ms - self.last_ping_ms < keepalive_idle_ms) return true;
+        if (idle >= keepalive_dead_ms) return .dead;
+        if (idle < keepalive_idle_ms or now_ms - self.last_ping_ms < keepalive_idle_ms) return .alive;
         self.last_ping_ms = now_ms;
-        // Not while another frame is being written: traffic is flowing
-        // then, and a write stuck on a dead path mustn't hold this caller.
-        if (!self.write_mutex.tryLock()) return true;
+        return .ping;
+    }
+
+    /// Writes one PING. Not while another frame is being written: traffic
+    /// is flowing then, and a write stuck on a dead path mustn't hold this
+    /// caller for it.
+    pub fn sendPing(self: *Session, now_ms: i64) void {
+        if (!self.write_mutex.tryLock()) return;
         defer self.write_mutex.unlock();
         var h_buf: [12]u8 = undefined;
         const ping = Header{ .type = .PING, .flags = Flags.SYN, .stream_id = 0, .length = @truncate(@as(u64, @bitCast(now_ms))) };
         ping.encode(&h_buf);
         compat.writeFull(self.transport, &h_buf) catch {};
-        return true;
     }
 
     fn writeFrame(self: *Session, header: Header, payload: []const u8) !void {
@@ -831,6 +853,35 @@ test "keepalive: a ping after the idle time, dead after the limit" {
     session.last_rx_ms.store(t0 + 30_000, .monotonic);
     try std.testing.expect(session.keepAlive(t0 + 30_000 + keepalive_dead_ms - 1));
     try std.testing.expect(!session.keepAlive(t0 + 30_000 + keepalive_dead_ms));
+}
+
+test "keepalive: the state check writes nothing (the ping is the caller's)" {
+    const Sink = struct {
+        writes: usize = 0,
+        fn read(_: *anyopaque, _: []u8) anyerror!usize {
+            return 0;
+        }
+        fn write(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.writes += 1;
+            return bytes.len;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable: network.Stream.StreamVTable = .{ .read = read, .write = write, .close = close };
+    };
+    var sink: Sink = .{};
+    const session = try Session.init(std.testing.allocator, network.Stream.init(&sink, &Sink.vtable), false);
+    defer session.deinit();
+    const t0 = session.last_rx_ms.load(.monotonic);
+    const before = sink.writes;
+    try std.testing.expectEqual(Session.KeepAlive.alive, session.keepAliveState(t0 + 1000));
+    try std.testing.expectEqual(Session.KeepAlive.ping, session.keepAliveState(t0 + keepalive_idle_ms));
+    // Marked as pinged: not asked again before another idle period.
+    try std.testing.expectEqual(Session.KeepAlive.alive, session.keepAliveState(t0 + keepalive_idle_ms + 1000));
+    try std.testing.expectEqual(Session.KeepAlive.dead, session.keepAliveState(t0 + keepalive_dead_ms));
+    try std.testing.expectEqual(before, sink.writes);
+    session.sendPing(t0 + keepalive_idle_ms);
+    try std.testing.expectEqual(before + 1, sink.writes);
 }
 
 test "keepalive: every chunk of a large frame counts as received" {

@@ -505,6 +505,19 @@ pub const Store = struct {
         return self.isTrustedLocked(device_id);
     }
 
+    /// Whether `node` is the transport node ID (the hash of the pinned
+    /// transport key) of a current member: the ID it dials from now. No
+    /// allocation (readers ask once per file, the keeper once per entry).
+    pub fn isMemberNode(self: *Store, node: NodeID) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.entries.items) |e| {
+            if (std.mem.eql(u8, &e.transport_key, &no_transport_key)) continue;
+            if (NodeID.fromPublicKey(e.transport_key).eql(node)) return true;
+        }
+        return false;
+    }
+
     fn isTrustedLocked(self: *Store, device_id: NodeID) bool {
         return self.findLocked(device_id) != null;
     }

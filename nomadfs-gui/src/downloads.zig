@@ -169,7 +169,9 @@ fn describe(err: anyerror) []const u8 {
     return switch (err) {
         error.Canceled => "Canceled",
         error.NotRunning => "NomadFS isn't running",
-        error.BlockNotFound, error.AllAddressesFailed, error.HoldersUnreachable, error.PeerUnreachable => "The device that has it is offline",
+        error.AllAddressesFailed, error.HoldersUnreachable, error.PeerUnreachable => "The device that has it is offline",
+        error.BlockNotFound => "None of the devices asked has it",
+        error.NoHolderAskable => "Its devices said no a moment ago; try again in a minute",
         error.NoHolders => "No device is known to keep it",
         error.NoSpaceLeft => "The disk is full",
         error.AccessDenied, error.PermissionDenied => "No permission to write to the Downloads folder",

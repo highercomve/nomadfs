@@ -386,3 +386,46 @@ test "ReadAhead prunes stale streams and drops cursors" {
     try std.testing.expect(!ra.streams.contains(root1));
     try std.testing.expect(ra.streams.contains(root2));
 }
+
+test "ReadAhead: a worker whose fetch fails leaves nothing in flight" {
+    const allocator = std.testing.allocator;
+    const fetcher_mod = cluster.fetcher;
+    const path = "test_readahead_fail";
+    var store = try fetcher_mod.testStore(path);
+    defer {
+        store.deinit();
+        std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), path) catch {};
+    }
+    // The only holder is offline: every fetch fails.
+    const holder = NodeID{ .bytes = [_]u8{3} ** 32 };
+    var peers = [_]fetcher_mod.FakeNet.Peer{.{ .id = holder, .offline = true }};
+    var net: fetcher_mod.FakeNet = .{ .peers = &peers };
+    var bm: cluster.BlockManager = undefined;
+    bm.fetcher = fetcher_mod.Fetcher.init(&store, net.transport());
+    const ra = try ReadAhead.create(allocator, &bm, &store);
+    defer ra.destroy();
+    // A read of the file started a cursor; the job reads ahead of it.
+    const root: Cid = [_]u8{1} ** 32;
+    const span = ra.track(root, 0, 1024);
+    var job = ReadAhead.Job{ .root = root, .cursor = span.cursor, .cid = [_]u8{2} ** 32, .peers = undefined, .peer_count = 1 };
+    job.peers[0] = holder;
+    {
+        ra.mutex.lock();
+        defer ra.mutex.unlock();
+        try ra.queue.append(allocator, job);
+        ra.work.signal();
+    }
+    // Wait (bounded) for a worker to take and finish it.
+    var waited: u32 = 0;
+    while (waited < 200) : (waited += 1) {
+        ra.mutex.lock();
+        const idle = ra.queue.items.len == 0 and ra.in_flight.count() == 0;
+        ra.mutex.unlock();
+        if (idle and bm.fetcher.?.totals().failed > 0) break;
+        sync.sleep(10 * std.time.ns_per_ms);
+    }
+    ra.mutex.lock();
+    defer ra.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), ra.in_flight.count());
+    try std.testing.expect(bm.fetcher.?.totals().failed > 0);
+}

@@ -42,6 +42,7 @@ const READ_ERRORS = {
   AllAddressesFailed: "the device that has it can't be reached right now.",
   PeerUnreachable: "the device that has it can't be reached right now.",
   NoHolders: "no device is known to keep it yet.",
+  NoHolderAskable: "the devices that keep it said no a moment ago and can't be asked again yet. Try again in a minute.",
   BlockNotFound: "none of the devices asked has it.",
   NotRunning: "NomadFS isn't running.",
 };
@@ -1121,7 +1122,7 @@ const nativeVideo = window.oriel.video?.available ? window.oriel.video : null;
 /** A read error as the user should see it: a file whose blocks no device
  * has (a photo deleted on the phone before any backup copied it). */
 function readFailure(err) {
-  return /BlockNotFound/.test(String(err)) ? "This file's data isn't on any device you can reach" : String(err);
+  return /BlockNotFound/.test(String(err)) ? "This file's data isn't on any device you can reach" : errText(err);
 }
 
 async function streamPreview(entry, kind, token) {

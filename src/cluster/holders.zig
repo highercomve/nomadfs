@@ -45,10 +45,13 @@ pub const Holders = struct {
         /// Copies known peer IDs into `out`; returns how many.
         knownFn: *const fn (ctx: *anyopaque, out: []NodeID) usize,
         /// Copies the IDs of peers with a live connection (direct or
-        /// relayed) into `out`; returns how many. Null: none known. A
-        /// device reached only through a relay is in no routing table, so
-        /// this is the only way it is listed.
+        /// relayed) into `out`; returns how many. Null: none known. This
+        /// includes relay peers absent from the routing table.
         connectedFn: ?*const fn (ctx: *anyopaque, out: []NodeID) usize = null,
+        /// Includes role announcements from peers currently disconnected.
+        withRoleFn: ?*const fn (ctx: *anyopaque, bit: u8, out: []NodeID) usize = null,
+        /// Whether `peer` is connected right now (not just remembered).
+        knowsFn: ?*const fn (ctx: *anyopaque, peer: NodeID) bool = null,
     };
 
     /// `holder` keeps copies of `origin`'s folders (re-noting refreshes).
@@ -128,12 +131,23 @@ pub const Holders = struct {
     /// and peers on a metered network last, so a cap of
     /// `fetcher.max_holders` drops stale peers, not the reachable backup.
     /// Connected peers missing from the known list (reached through a
-    /// relay) count as known. The result excludes this node, is bounded to
+    /// relay) and disconnected announced backups count as known.
+    /// The result excludes this node, is bounded to
     /// `fetcher.max_holders`, and lives in the caller's buffer.
     pub fn forSwarm(self: *Holders, author: NodeID, out: *[fetcher.max_holders]NodeID) []NodeID {
+        return self.forSwarmSplit(author, out).ids;
+    }
+
+    pub const SwarmHints = struct { ids: []NodeID, backups_end: usize };
+
+    /// The boundary lets fs insert placement replicas after backups.
+    pub fn forSwarmSplit(self: *Holders, author: NodeID, out: *[fetcher.max_holders]NodeID) SwarmHints {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const peers = self.peers orelse return self.swarmWithoutKnown(author, out);
+        const peers = self.peers orelse {
+            const ids = self.swarmWithoutKnown(author, out);
+            return .{ .ids = ids, .backups_end = ids.len };
+        };
 
         // The connected peers first, so a full routing table can't crowd
         // out a device reached only through a relay; then the table.
@@ -161,19 +175,8 @@ pub const Holders = struct {
             n = 1;
         }
         // Swarm backup devices: they keep every file.
-        backuppeers: {
-            var backup: [max_known]NodeID = undefined;
-            var m: usize = 0;
-            for (known[0..count]) |p| {
-                const roles = peers.rolesFn(peers.ctx, p) orelse continue;
-                if (roles & rpc.Roles.swarm_backup != 0) {
-                    backup[m] = p;
-                    m += 1;
-                }
-            }
-            self.appendGroup(out, &n, backup[0..m], live);
-            break :backuppeers;
-        }
+        self.appendBackups(out, &n, known[0..count], live);
+        const backups_end = n;
         // Everyone else: sources in reserve.
         var rest: [max_known]NodeID = undefined;
         var m: usize = 0;
@@ -185,7 +188,47 @@ pub const Holders = struct {
             }
         }
         self.appendGroup(out, &n, rest[0..m], live);
-        return out[0..n];
+        return .{ .ids = out[0..n], .backups_end = backups_end };
+    }
+
+    fn appendBackups(self: *Holders, out: *[fetcher.max_holders]NodeID, n: *usize, known: []const NodeID, live: []const NodeID) void {
+        const peers = self.peers.?;
+        var backup: [max_known]NodeID = undefined;
+        var count: usize = 0;
+        // Keep connected backups ahead of older role-only announcements
+        // even when the bounded role list fills up.
+        for (known) |peer| {
+            if (count == backup.len) break;
+            if (contains(backup[0..count], peer)) continue;
+            const roles = peers.rolesFn(peers.ctx, peer) orelse continue;
+            if (roles & rpc.Roles.swarm_backup == 0) continue;
+            backup[count] = peer;
+            count += 1;
+        }
+        if (peers.withRoleFn) |f| {
+            var announced: [max_known]NodeID = undefined;
+            const copied = f(peers.ctx, rpc.Roles.swarm_backup, &announced);
+            for (announced[0..copied]) |peer| {
+                if (count == backup.len) break;
+                if (contains(backup[0..count], peer)) continue;
+                backup[count] = peer;
+                count += 1;
+            }
+        }
+        self.appendGroup(out, n, backup[0..count], live);
+    }
+
+    /// Whether `peer` is connected right now, without looking it up or
+    /// dialing it. (Remembered IDs don't count: an ID from before a re-join
+    /// can linger in routing tables.)
+    pub fn knowsPeer(self: *Holders, peer: NodeID) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const peers = self.peers orelse return false;
+        if (peers.knowsFn) |f| return f(peers.ctx, peer);
+        var ids: [max_known]NodeID = undefined;
+        const f = peers.connectedFn orelse return false;
+        return contains(ids[0..f(peers.ctx, &ids)], peer);
     }
 
     /// forSwarm without a discovery source: the author alone.
@@ -444,4 +487,31 @@ test "holders: forSwarm lists a peer reached only through a relay, even with a f
     FullTable.connected_count = 2;
     const ranked = t.forSwarm(idOf(9), &out);
     try testing.expectEqualSlices(NodeID, &.{ idOf(9), idOf(7), idOf(120), idOf(100), idOf(101), idOf(102), idOf(103), idOf(104) }, ranked);
+}
+
+test "holders: announced relay backup stays listed while disconnected" {
+    const Roles = struct {
+        fn copy(_: *anyopaque, bit: u8, out: []NodeID) usize {
+            if (out.len == 0 or bit != rpc.Roles.swarm_backup) return 0;
+            out[0] = idOf(7);
+            return 1;
+        }
+    };
+    FullTable.connected_count = 0;
+    FullTable.backup = idOf(7);
+    var t = table(idOf(0));
+    var peers = FullTable.source();
+    peers.withRoleFn = Roles.copy;
+    t.peers = peers;
+    var out: [fetcher.max_holders]NodeID = undefined;
+    const split = t.forSwarmSplit(idOf(9), &out);
+    try testing.expectEqualSlices(NodeID, &.{ idOf(9), idOf(7) }, split.ids[0..split.backups_end]);
+    try testing.expectEqual(@as(usize, fetcher.max_holders), split.ids.len);
+    try testing.expect(!t.knowsPeer(idOf(7)));
+    // Remembered in the routing table but not connected: not "known".
+    try testing.expect(!t.knowsPeer(idOf(100)));
+    FullTable.connected = .{ idOf(100), idOf(0), idOf(0), idOf(0) };
+    FullTable.connected_count = 1;
+    try testing.expect(t.knowsPeer(idOf(100)));
+    FullTable.connected_count = 0;
 }

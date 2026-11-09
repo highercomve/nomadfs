@@ -784,7 +784,7 @@ fn statusOf(err: anyerror) Status {
         error.InvalidPath, error.InvalidName => .{ .code = 400, .text = "Bad Request" },
         error.IsDirectory, error.NotADirectory, error.DirNotEmpty => .{ .code = 409, .text = "Conflict" },
         error.BodyTooLarge => .{ .code = 413, .text = "Content Too Large" },
-        error.PeerDown, error.AllAddressesFailed, error.NotRunning, error.NoHolders, error.HoldersUnreachable, error.PeerUnreachable => .{ .code = 503, .text = "Service Unavailable" },
+        error.PeerDown, error.AllAddressesFailed, error.NotRunning, error.NoHolders, error.NoHolderAskable, error.HoldersUnreachable, error.PeerUnreachable => .{ .code = 503, .text = "Service Unavailable" },
         error.NoSpaceLeft => .{ .code = 507, .text = "Insufficient Storage" },
         else => .{ .code = 500, .text = "Internal Server Error" },
     };
