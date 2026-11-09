@@ -242,7 +242,9 @@ pub fn ensureConfig(gpa: std.mem.Allocator) !ConfigResult {
     var file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     try file.setPermissions(io, private_file_perms);
-    if (std.Io.Dir.cwd().openDir(io, dir, .{})) |d_val| {
+    // `.iterate`: a real descriptor (the default is O_PATH, which fchmod
+    // refuses with EBADF).
+    if (std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true })) |d_val| {
         var d = d_val;
         defer d.close(io);
         d.setPermissions(io, private_dir_perms) catch {};

@@ -509,7 +509,27 @@ fn openFolder(path: [:0]const u8) void {
     oriel.App.openPath(path, "inode/directory");
 }
 
+/// The native video player (GtkVideo) on NVIDIA's driver: Oriel picks
+/// GTK's GL renderer there (Vulkan runs out of device memory), but once
+/// GStreamer's frames share that GL context the window stops presenting
+/// frames: the page and the player freeze on screen while the app keeps
+/// running (closing the viewer does nothing visible). The cairo renderer
+/// plays the video and keeps the window drawing; the page arrives as shared
+/// memory buffers there anyway (WEBKIT_DMABUF_RENDERER_FORCE_SHM). Set
+/// before Oriel's own choice, which leaves a set GSK_RENDERER alone; the
+/// user's own setting stays too.
+fn nvidiaRenderer() void {
+    if (builtin.os.tag != .linux or builtin.abi.isAndroid()) return;
+    const c = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
+    };
+    const nvidia = c.access("/proc/driver/nvidia", 0) == 0 or c.access("/sys/module/nvidia", 0) == 0;
+    if (nvidia) _ = c.setenv("GSK_RENDERER", "cairo", 0);
+}
+
 pub fn main(init: std.process.Init) !u8 {
+    nvidiaRenderer();
     initDataDirs();
     commands.before_node_close = downloads.cancelAll;
     commands.after_node_open = notes_events.subscribe;

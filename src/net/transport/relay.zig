@@ -97,7 +97,11 @@ const RelayedConnectionImpl = struct {
         if (self.maintaining.swap(true, .acq_rel)) return; // one still writing
         // The previous one has finished (maintaining was false): instant.
         if (self.worker) |t| t.join();
-        self.worker = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, maintainWorker, .{ self, now, ping }) catch {
+        // The default stack: glibc's pthread_create takes the process's
+        // static TLS out of it and fails with EINVAL (a panic in
+        // std.Thread) when it doesn't fit, and the desktop app's GTK,
+        // WebKit, GStreamer and GPU libraries grow that past 64 KiB.
+        self.worker = std.Thread.spawn(.{}, maintainWorker, .{ self, now, ping }) catch {
             self.worker = null;
             self.maintaining.store(false, .release);
             return;
