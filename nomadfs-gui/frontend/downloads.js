@@ -32,7 +32,6 @@ function downloadFile(device, entry) {
   return startDownload("download", { peer: device.peer, cid: entry.cid, name: entry.name, size: entry.size });
 }
 
-// ---- Downloads: what was saved, where, and how far a copy has got ----
 
 const downloads = new Map(); // id → a download, as downloads_list gives it
 
@@ -61,7 +60,7 @@ async function loadDownloads() {
 
 /** The download progress events and the two Downloads buttons attach once,
  *  from app.js. */
-let ctx = null; // injected: installdo deps from the root
+let ctx = null; // injected deps from the root
 
 export function installDownloads({ setView, nodeState }) {
   ctx = { setView, nodeState };
@@ -174,7 +173,7 @@ function decorateDownloadRow(li, d) {
   const stillRunning = d.state === "running";
   const meta = li.querySelector(".meta");
   if (d.state === "failed") meta.classList.add("dl-failed");
-  if (isRunning()) {
+  if (stillRunning) {
     const bar = document.createElement("span");
     bar.className = "dl-progress";
     meta.after(bar);

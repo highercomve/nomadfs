@@ -37,7 +37,7 @@ async function loadMount() {
 
 /** Wiring attaches once, from app.js: visibility re-checks and the mount
  *  buttons. */
-let ctx = null; // injected: insta deps from the root
+let ctx = null; // injected deps from the root
 
 export function installMount({ setView, nodeState }) {
   ctx = { setView, nodeState };

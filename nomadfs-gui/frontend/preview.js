@@ -183,13 +183,13 @@ async function showPreview() {
 
   const limit = KINDS[kind].max;
   if (kind !== "text" && entry.size > limit) {
-    return previewMessage(kind === "image" ? "image" : "video", `Too large to preview here (${formatSize(entry.size)}). Download it or open it from the mount.`);
+    return previewMessage(kind === "image" ? "image" : "file", `Too large to preview here (${formatSize(entry.size)}). Download it or open it from the mount.`);
   }
 
   const total = kind === "text" ? Math.min(entry.size, limit) : entry.size;
   const bar = document.createElement("div");
   bar.className = "progress determinate";
-  const msg = previewMessage(kind === "image" ? "image" : kind === "video" ? "video" : "file", `Loading ${formatSize(total)}…`, bar);
+  const msg = previewMessage(kind === "image" ? "image" : "file", `Loading ${formatSize(total)}…`, bar);
   const bytes = kind !== "text" && entry.size > 0 ? new Uint8Array(entry.size) : null;
   const parts = [];
   let offset = 0;

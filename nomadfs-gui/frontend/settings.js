@@ -81,7 +81,9 @@ export function installSettings({ setView, nodeState }) {
     if (!document.hidden) invoke("keep_running_status", null).then(renderBackground).catch(() => {});
   });
 
-  loadBackground();  $("devices-refresh").addEventListener("click", async () => {
+  loadBackground();
+
+  $("devices-refresh").addEventListener("click", async () => {
     const list = $("devices-list");
     if (!list.children.length) listLoading(list, 3);
     try {

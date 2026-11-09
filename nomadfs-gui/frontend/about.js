@@ -369,7 +369,7 @@ async function openDeviceInfo(title, peer) {
 
 /** Wiring attaches once, from app.js: the About/cache/feedback controls and
  *  the shared details dialog; updates.js installs its own timers. */
-let ctx = null; // injected: insta deps from the root
+let ctx = null; // injected deps from the root
 
 export function installAbout({ setView, nodeState }) {
   ctx = { setView, nodeState };
