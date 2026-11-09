@@ -3,6 +3,25 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.6.3 - 2026-11-09
+
+Devices on 0.4.0 and later work together. Update the devices that open files from others (phones
+above all) and the swarm backup.
+
+### Fixed
+
+- Downloading or sharing a whole file from the phone now asks the connected devices and the swarm
+  backup first, before searching the network for other copies, and it falls back to that search
+  only if they can't serve the file. A file whose pieces are spread over many devices is no longer
+  cut short at eight of them: up to 32 devices are asked for each piece, each at most once.
+- When one transfer on a connection times out, the connection is kept: the other transfers on it
+  carry on instead of failing with it.
+- Closing streams and checking a relayed connection no longer wait on a slow link, so one stalled
+  device can't hold up the upkeep of the others.
+- A read that timed out now says the devices that keep the file can't be reached right now,
+  instead of reporting an internal error.
+- Removing a device from the swarm closes every connection it has, wherever it came from.
+
 ## 0.6.2 - 2026-11-09
 
 Devices on 0.4.0 and later work together. Update the devices that open files from others (phones
