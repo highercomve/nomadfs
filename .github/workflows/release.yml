@@ -147,13 +147,16 @@ jobs:
           echo "WebView2 $ver"
       - name: Windows app (installer and update payload)
         working-directory: nomadfs-gui
+        # Published files come from package/ only, never bin/: packaging
+        # checks the executable carries no dev agent and strips it.
         run: |
-          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu -Dcpu=baseline -p ../out/gui-windows
           zig build package -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu -Dcpu=baseline \
+            -Dwebview2-loader="$WEBVIEW2_LOADER" -p ../out/gui-windows
+          zig build package-executable -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu -Dcpu=baseline \
             -Dwebview2-loader="$WEBVIEW2_LOADER" -p ../out/gui-windows
           cp "../out/gui-windows/package/nomadfs-gui-$V-setup.exe" "../dist/nomadfs-gui-$V-windows-x86_64-setup.exe"
           # What an installed app downloads to update itself: the executable alone.
-          cp ../out/gui-windows/bin/nomadfs-gui.exe "../dist/nomadfs-gui-$V-x86_64-windows-update.exe"
+          cp "../out/gui-windows/package/nomadfs-gui-$V-x86_64-windows.exe" "../dist/nomadfs-gui-$V-x86_64-windows-update.exe"
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

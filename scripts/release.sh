@@ -87,12 +87,15 @@ step "Desktop app (Windows installer)"
 # The WebView2 loader ships next to the app (`oriel webview2` caches it).
 loader=$(ls -d "$HOME"/.oriel/webview2/*/x64/WebView2Loader.dll 2>/dev/null | sort -V | tail -1)
 [ -n "$loader" ] || { echo "No WebView2Loader.dll: run 'oriel webview2'" >&2; exit 1; }
-run gui-windows-exe zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu "${x86_cpu[@]}" -p "$out/build/gui-windows"
+# Published files come from package/ only, never bin/: packaging checks the
+# executable carries no dev agent and strips it.
 run gui-windows zig build package -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu "${x86_cpu[@]}" \
+  -Dwebview2-loader="$loader" -p "$out/build/gui-windows"
+run gui-windows-exe zig build package-executable -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu "${x86_cpu[@]}" \
   -Dwebview2-loader="$loader" -p "$out/build/gui-windows"
 cp "$out/build/gui-windows/package/nomadfs-gui-$version-setup.exe" "$assets/nomadfs-gui-$version-windows-x86_64-setup.exe"
 # What an installed app downloads to update itself: the executable alone.
-cp "$out/build/gui-windows/bin/nomadfs-gui.exe" "$assets/nomadfs-gui-$version-x86_64-windows-update.exe"
+cp "$out/build/gui-windows/package/nomadfs-gui-$version-x86_64-windows.exe" "$assets/nomadfs-gui-$version-x86_64-windows-update.exe"
 
 step "Android app"
 run android-aarch64 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-android
