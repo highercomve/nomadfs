@@ -735,7 +735,7 @@ class FileTable {
     if (!this.entries || !this.chipsBox) return;
     const counts = { all: this.entries.length };
     for (const e of this.entries) {
-      const t = e.dir ? "Folder" : fileType(e.name, false);
+      const t = e._type;
       counts[t] = (counts[t] || 0) + 1;
     }
     const categories = ["Photo", "Video", "Audio", "Document", "Archive", "Code", "Folder", "File"];
@@ -819,8 +819,8 @@ class FileTable {
       let x = a[key] ?? "";
       let y = b[key] ?? "";
       if (key === "type") {
-        x = a.dir ? "Folder" : fileType(a.name, false);
-        y = b.dir ? "Folder" : fileType(b.name, false);
+        x = a._type;
+        y = b._type;
       }
       c = typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y), undefined, { sensitivity: "base" });
     }
@@ -830,6 +830,7 @@ class FileTable {
 
   /** A new place: new entries, search cleared. */
   show(entries) {
+    for (const e of entries) e._type = e.dir ? "Folder" : fileType(e.name, false);
     this.entries = entries;
     this.input.value = "";
     this.filterType = "all";
@@ -851,7 +852,7 @@ class FileTable {
     const shown = this.entries
       .filter((e) => {
         if (filter !== "all") {
-          const t = e.dir ? "Folder" : fileType(e.name, false);
+          const t = e._type;
           if (t !== filter) return false;
         }
         return !query || e.name.toLocaleLowerCase().includes(query);
@@ -1005,7 +1006,7 @@ function goToDownloads() {
 
 /** Starts a download (it runs in the background; Downloads follows it). */
 async function startDownload(command, args) {
-  const running = [...downloads.values()].find((d) => d.state === "running" && d.cid === args.cid);
+  const running = [...downloads.values()].find((d) => d.state === "running" && d.source_id === (args.peer ?? args.author_id) && d.name === args.name);
   if (running) return snack(`${args.name} is already downloading`, 4000, goToDownloads);
   try {
     const d = await invoke(command, args);
@@ -1085,8 +1086,10 @@ function decodeBase64(b64) {
   return bytes;
 }
 
+let previewGeneration = 0;
+
 function openPreview(source, files, index) {
-  pv = { source, files, index, token: 0, url: null };
+  pv = { source, files, index, token: ++previewGeneration, url: null };
   $("preview").hidden = false;
   document.body.classList.add("pv-open");
   showPreview();
@@ -1126,16 +1129,17 @@ function readFailure(err) {
 }
 
 async function streamPreview(entry, kind, token) {
+  const session = pv;
   let url;
   try {
     // The native player gets an address other apps can open too, so its
     // "Open in another app" works (Android's in-app scheme is WebView-only).
-    url = await pv.source.mediaUrl(entry, kind === "video" && !!nativeVideo);
+    url = await session.source.mediaUrl(entry, kind === "video" && !!nativeVideo);
   } catch (err) {
-    if (pv && token === pv.token) previewMessage("file", `Preview failed: ${readFailure(err)}`);
+    if (pv === session && pv && token === pv.token) previewMessage("file", `Preview failed: ${readFailure(err)}`);
     return;
   }
-  if (!pv || token !== pv.token) return;
+  if (pv !== session || !pv || token !== pv.token) return;
   if (kind === "video" && nativeVideo) return playNative(entry, url, token);
   inPagePlayer(kind, url, token);
 }
@@ -1148,6 +1152,7 @@ let pvNative = null;
  * page's: name, previous and next, the ⋮ menu). Falls back to the page's
  * player if the native one fails. */
 async function playNative(entry, url, token) {
+  const session = pv;
   stopNative();
   const slot = document.createElement("div");
   slot.className = "pv-native";
@@ -1157,11 +1162,12 @@ async function playNative(entry, url, token) {
   pvNative = { slot, observer, entry, url, token };
   try {
     await nativeVideo.play({ url, title: entry.name, rect: rect() });
+    if (pv !== session || !pv || token !== pv.token) return;
     observer.observe(slot);
     syncVideoCover();
   } catch (err) {
     if (pvNative?.slot === slot) pvNative = null;
-    if (pv && token === pv.token) inPagePlayer("video", url, token);
+    if (pv === session && pv && token === pv.token) inPagePlayer("video", url, token);
   }
 }
 
@@ -1202,13 +1208,14 @@ window.oriel.listen?.("video:error", ({ message }) => {
 });
 
 function inPagePlayer(kind, url, token) {
+  const session = pv;
   const el = document.createElement(kind);
   el.controls = true;
   el.autoplay = true;
   el.preload = "auto";
   el.src = url;
   el.addEventListener("error", () => {
-    if (!pv || token !== pv.token) return;
+    if (pv !== session || !pv || token !== pv.token) return;
     previewMessage(kind === "video" ? "video" : "file",
       `This ${kind === "video" ? "video" : "audio file"} can't play here (its format may not be supported). Download it to open it in another app.`);
   });
@@ -1216,9 +1223,10 @@ function inPagePlayer(kind, url, token) {
 }
 
 async function showPreview() {
+  const session = pv;
   stopMedia();
   stopNative();
-  const token = ++pv.token;
+  const token = pv.token = ++previewGeneration;
   if (pv.url) { URL.revokeObjectURL(pv.url); pv.url = null; }
   const entry = pv.files[pv.index];
   $("pv-name").textContent = entry.name;
@@ -1241,22 +1249,24 @@ async function showPreview() {
   const bar = document.createElement("div");
   bar.className = "progress determinate";
   const msg = previewMessage(kind === "image" ? "image" : kind === "video" ? "video" : "file", `Loading ${formatSize(total)}…`, bar);
+  const bytes = kind !== "text" && entry.size > 0 ? new Uint8Array(entry.size) : null;
   const parts = [];
   let offset = 0;
   try {
     while (offset < total) {
       const len = Math.min(RANGE, total - offset);
-      const b64 = await pv.source.read(entry, offset, len);
-      if (!pv || token !== pv.token) return; // closed or moved on
-      const bytes = decodeBase64(b64);
-      if (bytes.length === 0) break;
-      parts.push(bytes);
-      offset += bytes.length;
+      const b64 = await session.source.read(entry, offset, len);
+      if (pv !== session || !pv || token !== pv.token) return; // closed or moved on
+      const chunk = decodeBase64(b64);
+      if (chunk.length === 0) break;
+      if (bytes) bytes.set(chunk, offset);
+      else parts.push(chunk);
+      offset += chunk.length;
       bar.style.setProperty("--p", `${Math.round((offset / Math.max(total, 1)) * 100)}%`);
       msg.querySelector("p").textContent = `Loading ${formatSize(offset)} of ${formatSize(total)}…`;
     }
   } catch (err) {
-    if (pv && token === pv.token) previewMessage("file", `Preview failed: ${readFailure(err)}`);
+    if (pv === session && pv && token === pv.token) previewMessage("file", `Preview failed: ${readFailure(err)}`);
     return;
   }
 
@@ -1268,15 +1278,15 @@ async function showPreview() {
     body.replaceChildren(pre);
     return;
   }
-  pv.url = URL.createObjectURL(new Blob(parts, { type: MIME[ext] || "application/octet-stream" }));
+  pv.url = URL.createObjectURL(new Blob(bytes ? [bytes.subarray(0, offset)] : parts, { type: MIME[ext] || "application/octet-stream" }));
   let el;
   if (kind === "image") { el = document.createElement("img"); el.alt = entry.name; }
   else if (kind === "video") { el = document.createElement("video"); el.controls = true; el.autoplay = true; }
   else if (kind === "audio") { el = document.createElement("audio"); el.controls = true; el.autoplay = true; }
-  else { el = document.createElement("iframe"); el.title = entry.name; }
+  else { el = document.createElement("iframe"); el.sandbox = ""; el.title = entry.name; }
   el.src = pv.url;
   el.addEventListener("error", () => {
-    if (!pv || token !== pv.token) return;
+    if (pv !== session || !pv || token !== pv.token) return;
     const what = kind === "video" ? "video" : kind === "audio" ? "audio file" : "file";
     previewMessage(kind === "video" ? "video" : "file",
       `This ${what} uses a format this device can't play here. Download it, or open it from the mount with your usual player.`);
@@ -1425,26 +1435,34 @@ $("remote-refresh").addEventListener("click", () => (path.length ? refreshLocati
  *  edit (and while a first scan fills it in), so the path is walked again
  *  by name from the device's current share list. */
 async function refreshLocation() {
-  const peer = path[0].device.peer;
+  const snapshot = [...path];
+  const nav = ++browseNav;
+  const peer = snapshot[0].device.peer;
   busy(true);
   try {
     const fresh = (await invoke("remote_devices", null)).find((d) => d.peer === peer);
+    if (nav !== browseNav) return;
     if (!fresh) throw new Error("the device isn't reachable");
-    const walked = [{ ...path[0], device: fresh }];
+    const walked = [{ ...snapshot[0], device: fresh }];
     let entries = fresh.shares.map((sh) => ({ ...sh, dir: true }));
-    for (const step of path.slice(1)) {
+    for (const step of snapshot.slice(1)) {
       const e = entries.find((x) => x.dir && x.name === step.name);
       if (!e) break; // gone: stop at the deepest folder still there
       walked.push({ name: e.name, cid: e.cid, pending: !e.mtime && !e.size });
-      if (walked.length < path.length) entries = await invoke("browse", { peer, cid: e.cid });
+      if (walked.length < snapshot.length) {
+        entries = await invoke("browse", { peer, cid: e.cid });
+        if (nav !== browseNav) return;
+      }
     }
+    if (path[0]?.device.peer !== peer) return;
     path = walked;
   } catch (err) {
+    if (nav !== browseNav) return;
     snack(`Couldn't refresh: ${err.message || err}`);
   } finally {
-    busy(false);
+    if (nav === browseNav) busy(false);
   }
-  showLocation();
+  if (nav === browseNav && path[0]?.device.peer === peer) showLocation();
 }
 
 // ---- Swarm folder: one folder all devices read and write ----
@@ -1497,12 +1515,9 @@ async function loadSwarm() {
   if (nav !== swarmNav) return;
   listLoaded(list);
   $("swarm-status").textContent = swarmStatusText(res);
-  if (!res.items.length && swarmDir) { // folder vanished (deleted elsewhere): go up
-    swarmDir = swarmDir.split("/").slice(0, -1).join("/");
-    return loadSwarm();
-  }
   // Same folder (a refresh): keep what is typed in the search.
   if (swarmTable.dir === swarmDir) {
+    for (const e of res.items) e._type = e.dir ? "Folder" : fileType(e.name, false);
     swarmTable.entries = res.items;
     swarmTable.render();
   } else {
@@ -1595,7 +1610,7 @@ async function loadDownloads() {
     downloadsFolder ||= await invoke("downloads_dir", null);
     $("downloads-where").textContent = `Saved in ${downloadsFolder}`;
   } catch (err) {
-    $("downloads-where").textContent = `${err}`;
+    snack(`Couldn't load downloads: ${errText(err)}`);
   }
   renderDownloads();
 }
@@ -1748,8 +1763,10 @@ $("downloads-clear").addEventListener("click", async () => {
 });
 
 /** A small dialog: ask for a name, or confirm. Resolves null on cancel. */
+let askQueue = Promise.resolve();
+
 function askDialog({ title, text = "", value = null, confirm = "OK", danger = false }) {
-  return new Promise((resolve) => {
+  const run = () => new Promise((resolve) => {
     const dlg = $("ask");
     $("ask-title").textContent = title;
     $("ask-text").textContent = text;
@@ -1776,6 +1793,7 @@ function askDialog({ title, text = "", value = null, confirm = "OK", danger = fa
     $("ask-form").onsubmit = (e) => { e.preventDefault(); done(value === null ? true : $("ask-input").value.trim()); };
     $("ask-cancel").onclick = () => done(null);
   });
+  return (askQueue = askQueue.then(run, run));
 }
 
 async function swarmRenamePrompt(it) {
@@ -2090,7 +2108,7 @@ let inviteTimer = null;
 
 function renderInvite(info) {
   const active = info.state !== "none";
-  $("invite-idle").hidden = active && info.state === "waiting";
+  $("invite-idle").hidden = active;
   $("invite-active").hidden = !active;
   if (!active) return;
   const status = $("invite-active").querySelector(".invite-status");
@@ -2759,7 +2777,10 @@ function cssVar(name) {
   return getComputedStyle(document.body).getPropertyValue(name).trim() || "#888";
 }
 
+let detailsGeneration = 0;
+
 async function openDetails(name, src) {
+  const gen = ++detailsGeneration;
   $("dt-name").textContent = name;
   $("dt-meta").textContent = "Reading the file's structure…";
   const body = $("dt-body");
@@ -2769,9 +2790,11 @@ async function openDetails(name, src) {
   try {
     d = await invoke("file_details", src);
   } catch (err) {
+    if (gen !== detailsGeneration) return;
     $("dt-meta").textContent = `Couldn't read the details: ${errText(err)}`;
     return;
   }
+  if (gen !== detailsGeneration) return;
   $("dt-meta").textContent = `${formatSize(d.size)} · ${d.chunks} chunk${d.chunks === 1 ? "" : "s"}`;
   const el = (tag, cls, text) => {
     const n = document.createElement(tag);
@@ -2826,7 +2849,7 @@ async function openDetails(name, src) {
   });
   section("Chunk map", canvas, legend,
     el("p", "", "Each segment is one chunk, as wide as its share of the file. Reading a range fetches only the chunks it covers; fetched chunks go to the read cache."));
-  requestAnimationFrame(() => drawChunkMap(canvas, d));
+  requestAnimationFrame(() => { if (gen === detailsGeneration) drawChunkMap(canvas, d); });
 
   // First chunks
   if (d.first.length) {
@@ -2882,7 +2905,6 @@ function drawChunkMap(canvas, d) {
 
 // ---- A device's About and health (device_info, asked on demand) ----
 
-let deviceInfoToken = 0;
 
 function formatUptime(s) {
   if (s < 60) return `${s} s`;
@@ -2933,7 +2955,7 @@ function deviceHealth(i) {
 }
 
 async function openDeviceInfo(title, peer) {
-  const token = ++deviceInfoToken;
+  const gen = ++detailsGeneration;
   $("dt-name").textContent = title;
   $("dt-meta").textContent = "Asking the device…";
   const body = $("dt-body");
@@ -2943,7 +2965,7 @@ async function openDeviceInfo(title, peer) {
   try {
     i = await invoke("device_info", peer ? { peer } : {});
   } catch (err) {
-    if (token !== deviceInfoToken) return;
+    if (gen !== detailsGeneration) return;
     const why = String(err);
     $("dt-meta").textContent = why.includes("NeedsUpdate")
       ? "This device runs an older NomadFS that can't answer: update it."
@@ -2952,7 +2974,7 @@ async function openDeviceInfo(title, peer) {
         : `Couldn't ask the device: ${err}`;
     return;
   }
-  if (token !== deviceInfoToken) return;
+  if (gen !== detailsGeneration) return;
   const el = (tag, cls, text) => {
     const n = document.createElement(tag);
     if (cls) n.className = cls;
@@ -3023,6 +3045,6 @@ async function openDeviceInfo(title, peer) {
   body.append(again);
 }
 
-$("dt-close").addEventListener("click", () => { $("details").hidden = true; });
-$("details").addEventListener("click", (e) => { if (e.target === $("details")) $("details").hidden = true; });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("details").hidden) $("details").hidden = true; });
+$("dt-close").addEventListener("click", () => { { detailsGeneration++; $("details").hidden = true; } });
+$("details").addEventListener("click", (e) => { if (e.target === $("details")) { detailsGeneration++; $("details").hidden = true; } });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("details").hidden) { detailsGeneration++; $("details").hidden = true; } });

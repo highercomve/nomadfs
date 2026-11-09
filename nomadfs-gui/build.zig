@@ -139,7 +139,7 @@ pub fn build(b: *std.Build) void {
 
     // zig build test-frontend: the page's own logic (the Markdown renderer,
     // what the notes list decides), in Node. Needs `node` (22 or newer).
-    const frontend_test = b.addSystemCommand(&.{ "node", "--test", "frontend-test/markdown.test.mjs", "frontend-test/notes-model.test.mjs" });
+    const frontend_test = b.addSystemCommand(&.{ "node", "--test", "frontend-test/markdown.test.mjs", "frontend-test/notes-model.test.mjs", "frontend-test/app-fixes.test.mjs" });
     frontend_test.setCwd(b.path("."));
     const frontend_step = b.step("test-frontend", "Run the page's Node tests (Markdown renderer, notes list logic)");
     frontend_step.dependOn(&frontend_test.step);
