@@ -80,26 +80,30 @@ async function loadSwarm() {
   }
 }
 
-const swarmTable = new FileTable({
-  view: "swarm",
-  tools: $("swarm-tools"),
-  head: $("swarm-head"),
-  list: $("swarm-list"),
-  columns: [
-    { key: "type", label: "Type", cls: "th-type" },
-    { key: "size", label: "Size", cls: "th-size" },
-    { key: "mtime", label: "Modified", cls: "th-date" },
-    { key: "author", label: "Added by", cls: "th-by" },
-  ],
-  storageKey: "swarmSort",
-  actions: 4,
-  setEmpty: (text) => {
-    $("swarm-empty").hidden = !text;
-    $("swarm-empty").textContent = text;
-  },
-  emptyText: () => "Empty. Add a file, or create a folder; every device sees it.",
-  renderRow: (it, files) => swarmRow(it, files),
-});
+let swarmTable = null; // built when the screen installs (the constructor wires the DOM)
+
+function buildSwarmTable() {
+  swarmTable = new FileTable({
+    view: "swarm",
+    tools: $("swarm-tools"),
+    head: $("swarm-head"),
+    list: $("swarm-list"),
+    columns: [
+      { key: "type", label: "Type", cls: "th-type" },
+      { key: "size", label: "Size", cls: "th-size" },
+      { key: "mtime", label: "Modified", cls: "th-date" },
+      { key: "author", label: "Added by", cls: "th-by" },
+    ],
+    storageKey: "swarmSort",
+    actions: 4,
+    setEmpty: (text) => {
+      $("swarm-empty").hidden = !text;
+      $("swarm-empty").textContent = text;
+    },
+    emptyText: () => "Empty. Add a file, or create a folder; every device sees it.",
+    renderRow: (it, files) => swarmRow(it, files),
+  });
+}
 
 function swarmRow(it, files) {
   const by = it.author || "";
@@ -197,6 +201,7 @@ export function openSwarmAt(dir) { swarmDir = dir; }
 /** Wiring attaches once, from app.js: the buttons, the open-view poll and
  *  Back's swarm provider (registered before Browse's). */
 export function installSwarm() {
+  buildSwarmTable();
   registerUp({
     depth: () => ((document.body.dataset.view || "browse") === "swarm" && swarmDir ? swarmDir.split("/").length : 0),
     up: () => { swarmDir = swarmDir.split("/").slice(0, -1).join("/"); loadSwarm(); },

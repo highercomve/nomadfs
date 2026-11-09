@@ -139,24 +139,29 @@ async function showDevices() {
 // level, whose entries are its shared folders).
 let browse = null;
 
-const browseTable = new FileTable({
-  view: "browse",
-  tools: $("browse-tools"),
-  head: $("remote-head"),
-  list: $("remote-list"),
-  columns: [
-    { key: "type", label: "Type", cls: "th-type" },
-    { key: "size", label: "Size", cls: "th-size" },
-    { key: "mtime", label: "Modified", cls: "th-date" },
-  ],
-  storageKey: "browseSort",
-  actions: 2,
-  setEmpty: (text) => setEmpty(text),
-  emptyText: () => browse?.shares ? "This device shares nothing yet."
-    : path.at(-1)?.pending ? "Not indexed yet: the device is still scanning this share. Check back soon."
-    : "Empty folder.",
-  renderRow: (e, files) => browseRow(e, files),
-});
+let browseTable = null; // built when the screen installs (the constructor wires the DOM)
+
+// The table itself and the two screen buttons attach once, in installBrowse.
+function buildBrowseTable() {
+  browseTable = new FileTable({
+    view: "browse",
+    tools: $("browse-tools"),
+    head: $("remote-head"),
+    list: $("remote-list"),
+    columns: [
+      { key: "type", label: "Type", cls: "th-type" },
+      { key: "size", label: "Size", cls: "th-size" },
+      { key: "mtime", label: "Modified", cls: "th-date" },
+    ],
+    storageKey: "browseSort",
+    actions: 2,
+    setEmpty: (text) => setEmpty(text),
+    emptyText: () => browse?.shares ? "This device shares nothing yet."
+      : path.at(-1)?.pending ? "Not indexed yet: the device is still scanning this share. Check back soon."
+      : "Empty folder.",
+    renderRow: (e, files) => browseRow(e, files),
+  });
+}
 
 function browseRow(e, files) {
   const { device, shares } = browse;
@@ -250,9 +255,6 @@ function deviceSource(device) {
 }
 /** ...or the swarm folder (the device that added it, then anyone). */
 
-$("device-about").addEventListener("click", () => { if (path.length) openDeviceInfo(path[0].name, path[0].device.peer); });
-$("remote-refresh").addEventListener("click", () => (path.length ? refreshLocation() : showDevices()));
-
 /** Reloads the open folder as it is now: a share's root changes with every
  *  edit (and while a first scan fills it in), so the path is walked again
  *  by name from the device's current share list. */
@@ -302,6 +304,9 @@ let ctx = null; // injected: instal deps from the root
 
 export function installBrowse({ setView, nodeState }) {
   ctx = { setView, nodeState };
+  buildBrowseTable();
+  $("device-about").addEventListener("click", () => { if (path.length) openDeviceInfo(path[0].name, path[0].device.peer); });
+  $("remote-refresh").addEventListener("click", () => (path.length ? refreshLocation() : showDevices()));
   registerUp({
     depth: () => (((document.body.dataset.view || "browse") !== "browse") ? 1 + path.length : path.length),
     up: () => {

@@ -11,7 +11,7 @@ const fn = (start,end) => raw(start,end).replace(/^export /gm, '');
 // (modules' export keywords are stripped in the extracted VM slices)
 const deferred = () => {let resolve,reject; const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject}};
 const elements = new Map();
-const node = () => { const n = { style:{setProperty(){}}, dataset:{}, classList:{toggle(){},add(){},remove(){}}, hidden:false, closest:()=>({style:{setProperty(){}}}), append(){}, appendChild(){}, replaceChildren(){}, addEventListener(){}, setAttribute(){}, querySelector:()=>node(), querySelectorAll:()=>[], focus(){}, select(){}, title:'' }; return n; };
+const node = () => { const n = { style:{setProperty(){}}, dataset:{}, classList:{toggle(){},add(){},remove(){}}, hidden:false, closest:()=>({style:{setProperty(){}}}), append(){}, appendChild(){}, replaceChildren(){}, addEventListener(){}, setAttribute(){}, removeAttribute(){}, after(){}, before(){}, insertBefore(){}, remove(){}, children:[], querySelector:()=>node(), querySelectorAll:()=>[], focus(){}, select(){}, title:'' }; return n; };
 const el = id => {if(!elements.has(id)) elements.set(id,node());return elements.get(id)};
 const context = extra => vm.createContext({console, $, ...extra});
 function $(id){return el(id)}
@@ -41,7 +41,7 @@ function $(id){return el(id)}
 {
  elements.clear();const dirs=[];
  const c=context({swarmCrumbs(){},isRunning:()=>true,running:true,listLoading(){},listLoaded(){},snack(){},swarmStatusText(){return 'ok'},swarmTable:{dir:null,show(){},render(){}},invoke:async(cmd,args)=>{dirs.push(args.dir);return {items:[]}}});
- vm.runInContext(`let swarmDir='New folder',swarmNav=0;`+fn('async function loadSwarm(', 'const swarmTable =')+`const pending=loadSwarm();`,c);
+ vm.runInContext(`let swarmDir='New folder',swarmNav=0;`+fn('async function loadSwarm(', 'let swarmTable = null;')+`const pending=loadSwarm();`,c);
  await vm.runInContext('pending',c);assert.deepEqual(dirs,['New folder']);assert.equal(vm.runInContext('swarmDir',c),'New folder');
 }
 
@@ -157,3 +157,23 @@ test('glm-4 fileType runs once per entry per place, not per keystroke', async ()
   assert.equal(calls[0], entries[0].name);
 });
 
+
+test('codex-r2-1 downloads rows: the bar follows the download state, not the node', () => {
+  const created = [];
+  let NODE_ON = true;
+  const c = context({
+    document: { createElement: () => { const n = node(); created.push(n); return n; } },
+    isRunning: () => NODE_ON,
+  });
+  // one slice of the two real functions from downloads.js (merged source header)
+  vm.runInContext(fn('function decorateDownloadRow(', 'function updateDownloadRow('), c);
+  for (const state of ['running', 'done', 'failed', 'canceled']) {
+    for (NODE_ON of [true, false]) {
+      created.length = 0;
+      const li = node(); li.querySelector = () => { const m = node(); created.push(m); return m; };
+      vm.runInContext('decorateDownloadRow(LI, D)', Object.assign(c, { LI: li, D: { name: 'f', size: 4, done: 2, state, exists: state === 'done', path: '/tmp/f' } }));
+      const bars = created.filter((n) => n.className === 'dl-progress');
+      assert.equal(bars.length, state === 'running' ? 1 : 0, `state=${state} nodeOn=${NODE_ON}`);
+    }
+  }
+});
