@@ -3,6 +3,31 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.6.2 - 2026-11-09
+
+Devices on 0.4.0 and later work together. Update the devices that open files from others (phones
+above all) and the swarm backup.
+
+### Fixed
+
+- A phone could fail to open backed-up files with "This file's data isn't on any device you can
+  reach" while the swarm backup had them and was connected. A read now always asks the connected
+  backup before failing: also after another device said "not found", after an offline device
+  failed, and after the backup itself said "not found" a moment earlier (it may have copied the
+  file since).
+- Files added by a device that later re-joined the swarm no longer start every read by trying
+  that device's old identity, which no longer exists: reads of those files go straight to the
+  backup.
+- A connection through a relay that went silent is now noticed and replaced, as direct ones
+  were. It no longer stalls reads for 10 seconds per block, and it can't hold up the upkeep of
+  other connections.
+- A block that arrives intact but can't be kept in the read cache (a full disk, say) is still
+  shown.
+- When a read fails, the message says why: none of the devices asked has it, the devices that
+  keep it can't be reached right now, or they said no a moment ago (try again in a minute).
+  Each failed read logs which devices were asked and what each answered, and the swarm backup
+  logs the blocks it was asked for and doesn't have.
+
 ## 0.6.1 - 2026-11-08
 
 Devices on 0.4.0 and later work together. The fix is on the reading side: update the devices
