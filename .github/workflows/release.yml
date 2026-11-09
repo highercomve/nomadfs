@@ -164,6 +164,22 @@ jobs:
           yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-36" "build-tools;35.0.0" "ndk;$NDK_VERSION" >/dev/null
           echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$sdk/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+      # Gradle itself, which the wrapper downloads (through GitHub's release
+      # servers): kept between runs, and retried, so a dropped download
+      # doesn't fail a release.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.gradle/wrapper/dists
+          key: gradle-wrapper-${{ hashFiles('nomadfs-gui/android/gradle/wrapper/gradle-wrapper.properties') }}
+      - name: Gradle (downloaded with retries)
+        working-directory: nomadfs-gui/android
+        run: |
+          for i in 1 2 3 4 5; do
+            ./gradlew --no-daemon --version >/dev/null && exit 0
+            echo "::warning::fetching Gradle failed (attempt $i), retrying"
+            sleep $((i * 20))
+          done
+          exit 1
       - name: Signing key (the one every published APK carries)
         env:
           KEYSTORE: ${{ secrets.NOMADFS_ANDROID_DEBUG_KEYSTORE_BASE64 }}
@@ -296,6 +312,22 @@ jobs:
           yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-36" "build-tools;35.0.0" "ndk;$NDK_VERSION" >/dev/null
           echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$sdk/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+      # Gradle itself, which the wrapper downloads (through GitHub's release
+      # servers): kept between runs, and retried, so a dropped download
+      # doesn't fail a release.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.gradle/wrapper/dists
+          key: gradle-wrapper-${{ hashFiles('nomadfs-gui/android/gradle/wrapper/gradle-wrapper.properties') }}
+      - name: Gradle (downloaded with retries)
+        working-directory: nomadfs-gui/android
+        run: |
+          for i in 1 2 3 4 5; do
+            ./gradlew --no-daemon --version >/dev/null && exit 0
+            echo "::warning::fetching Gradle failed (attempt $i), retrying"
+            sleep $((i * 20))
+          done
+          exit 1
       - name: Upload key (nomadfs-upload)
         env:
           KEYSTORE: ${{ secrets.NOMADFS_PLAY_UPLOAD_KEYSTORE_BASE64 }}
