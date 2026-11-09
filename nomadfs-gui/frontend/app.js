@@ -84,13 +84,13 @@ registerUp({
   depth: () => (notesApi?.editing() ? 1 : 0),
   up: () => notesApi.closeEditor(),
 });
-installAbout({ setView, nodeState });
+installAbout();
 installUpdates({ setView, nodeState });
 installSettings({ setView, nodeState });
-installShares({ setView, nodeState });
+installShares();
 installMount({ setView, nodeState });
 installConnect({ setView, nodeState });
-installSwarm({ setView, nodeState });
+installSwarm();
 installBrowse({ setView, nodeState });
 installDownloads({ setView, nodeState });
 

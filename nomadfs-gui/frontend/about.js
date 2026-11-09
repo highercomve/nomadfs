@@ -369,10 +369,7 @@ async function openDeviceInfo(title, peer) {
 
 /** Wiring attaches once, from app.js: the About/cache/feedback controls and
  *  the shared details dialog; updates.js installs its own timers. */
-let ctx = null; // injected deps from the root
-
-export function installAbout({ setView, nodeState }) {
-  ctx = { setView, nodeState };
+export function installAbout() {
   $("cache-clear").addEventListener("click", async (e) => {
     const btn = e.currentTarget;
     btn.disabled = true;
