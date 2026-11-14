@@ -10,6 +10,9 @@
 //!         --if-match <etag>   only over that version (what `ls` shows)
 //!         --create            only where nothing is yet
 //!     nomadfs swarm rm <path> [--if-match <etag>]
+//!     nomadfs swarm photos [--folder <dir>] [--limit <n>] [--videos | --photos]
+//!                                                pictures and films, newest first
+//!     nomadfs swarm thumb <path> > t.jpg         a small JPEG of a picture
 //! @atlas layer: frontend
 
 const std = @import("std");
@@ -80,6 +83,12 @@ pub const Response = struct {
 
 /// One request: `method` on `<base><path>` with `headers` and `body`.
 pub fn request(arena: std.mem.Allocator, ep: Endpoint, method: []const u8, path: []const u8, headers: []const [2][]const u8, body: []const u8) !Response {
+    return send(arena, ep, method, path, "", headers, body);
+}
+
+/// `request` with a query: `query` is what follows the `?`, its values
+/// already encoded (`writeEncoded`); "" for none.
+fn send(arena: std.mem.Allocator, ep: Endpoint, method: []const u8, path: []const u8, query: []const u8, headers: []const [2][]const u8, body: []const u8) !Response {
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", ep.port);
     const stream = compat.tcpConnectToAddress(.{ .ip = addr }) catch return error.NodeNotRunning;
     defer stream.close();
@@ -89,6 +98,7 @@ pub fn request(arena: std.mem.Allocator, ep: Endpoint, method: []const u8, path:
     const w = &head.writer;
     try w.print("{s} {s}", .{ method, ep.base });
     try writeEncoded(w, path);
+    if (query.len > 0) try w.print("?{s}", .{query});
     try w.print(" HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {d}\r\n", .{body.len});
     for (headers) |h| try w.print("{s}: {s}\r\n", .{ h[0], h[1] });
     try w.writeAll("\r\n");
@@ -153,9 +163,15 @@ pub fn run(io: std.Io, arena: std.mem.Allocator, args: []const []const u8, key_p
         const r = request(arena, ep, "GET", try std.fmt.allocPrint(arena, "list/{s}", .{dir}), &.{}, "") catch |err| return fail(err);
         return printBody(io, r, true);
     }
+    if (eql(u8, cmd, "photos")) return photos(io, arena, ep, args[1..]);
     if (args.len < 2) return usage();
     const path = args[1];
     const files = try std.fmt.allocPrint(arena, "files/{s}", .{path});
+    if (eql(u8, cmd, "thumb")) {
+        if (args.len != 2) return usage();
+        const r = request(arena, ep, "GET", try std.fmt.allocPrint(arena, "thumb/{s}", .{path}), &.{}, "") catch |err| return fail(err);
+        return printBody(io, r, false);
+    }
     if (eql(u8, cmd, "get")) {
         const r = request(arena, ep, "GET", files, &.{}, "") catch |err| return fail(err);
         return printBody(io, r, false);
@@ -183,6 +199,82 @@ pub fn run(io: std.Io, arena: std.mem.Allocator, args: []const []const u8, key_p
     return usage();
 }
 
+/// What `photos` reads of a page (the API's JSON, swarm_api.zig).
+const PhotosPage = struct {
+    generation: u64,
+    total: u32,
+    items: []const struct { path: []const u8, size: u64, mtime: u64, kind: []const u8 },
+};
+
+/// How many `photos` lists without `--limit`.
+const default_photos = 100;
+/// The pages one `photos` asks for at most (a million items).
+const max_photo_pages = 2000;
+
+/// `nomadfs swarm photos`: the timeline's first `--limit` items, one a
+/// line, asked for a page at a time as of the first page's generation.
+fn photos(io: std.Io, arena: std.mem.Allocator, ep: Endpoint, args: []const []const u8) !u8 {
+    const eql = std.mem.eql;
+    var folder: []const u8 = "";
+    var kinds: []const u8 = "all";
+    var limit: u32 = default_photos;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (eql(u8, args[i], "--folder") and i + 1 < args.len) {
+            i += 1;
+            folder = args[i];
+        } else if (eql(u8, args[i], "--limit") and i + 1 < args.len) {
+            i += 1;
+            limit = std.fmt.parseInt(u32, args[i], 10) catch return usage();
+        } else if (eql(u8, args[i], "--videos")) {
+            kinds = "videos";
+        } else if (eql(u8, args[i], "--photos")) {
+            kinds = "photos";
+        } else return usage();
+    }
+    var buf: [4096]u8 = undefined;
+    var out = std.Io.File.stdout().writerStreaming(io, &buf);
+    const w = &out.interface;
+    var generation: u64 = 0;
+    var listed: u32 = 0;
+    var pages: usize = 0;
+    while (listed < limit and pages < max_photo_pages) : (pages += 1) {
+        var query: std.Io.Writer.Allocating = .init(arena);
+        try query.writer.writeAll("folder=");
+        try writeEncoded(&query.writer, folder);
+        try query.writer.print("&kinds={s}&generation={d}&start={d}&count={d}", .{ kinds, generation, listed, limit - listed });
+        const r = send(arena, ep, "GET", "photos", query.written(), &.{}, "") catch |err| return fail(err);
+        if (r.code >= 300) {
+            w.flush() catch {};
+            return printBody(io, r, false);
+        }
+        const page = std.json.parseFromSliceLeaky(PhotosPage, arena, r.body, .{ .ignore_unknown_fields = true }) catch return fail(error.BadResponse);
+        generation = page.generation;
+        if (page.items.len == 0) break;
+        for (page.items) |item| {
+            var when: [16]u8 = undefined;
+            w.print("{s}  {s: <5}  {d: >12}  {s}\n", .{ minuteOf(&when, item.mtime), item.kind, item.size, item.path }) catch {};
+        }
+        listed += @intCast(page.items.len); // a page has at most `count` items
+    }
+    w.flush() catch {};
+    return 0;
+}
+
+/// `YYYY-MM-DD HH:MM` (UTC) of a time in seconds.
+fn minuteOf(buf: *[16]u8, seconds: u64) []const u8 {
+    // A time past the year 9999 (a damaged entry) has no such form.
+    if (seconds > 253_402_300_799) return "????-??-?? ??:??";
+    const es = std.time.epoch.EpochSeconds{ .secs = seconds };
+    const day = es.getEpochDay().calculateYearDay();
+    const month = day.calculateMonthDay();
+    const clock = es.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{
+        day.year,                month.month.numeric(),      @as(u8, month.day_index) + 1,
+        clock.getHoursIntoDay(), clock.getMinutesIntoHour(),
+    }) catch "????-??-?? ??:??";
+}
+
 fn readSource(io: std.Io, arena: std.mem.Allocator, source: ?[]const u8) ![]u8 {
     if (source) |p| return std.Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(swarm_api.max_file + 1));
     var buf: [4096]u8 = undefined;
@@ -206,11 +298,18 @@ fn printBody(io: std.Io, r: Response, newline: bool) u8 {
 }
 
 fn explain(r: Response) []const u8 {
+    const err = r.err orelse "";
     return switch (r.code) {
-        404 => "not found",
+        404 => if (std.mem.eql(u8, err, "NoThumbnail")) "no thumbnail can be made of this file (a format NomadFS doesn't decode, or a damaged picture)" else "not found",
+        409 => "the folder changed while it was listed: run it again",
         412 => "the file changed (or exists) since that version",
         413 => "too large (8 MiB at most)",
-        503 => if (r.err != null and std.mem.eql(u8, r.err.?, "NotSynced")) "the node hasn't synced the swarm folder yet: try again shortly" else "the file's data isn't reachable right now",
+        503 => if (std.mem.eql(u8, err, "NotSynced"))
+            "the node hasn't synced the swarm folder yet: try again shortly"
+        else if (std.mem.eql(u8, err, "Pending"))
+            "the thumbnail is being made: try again shortly"
+        else
+            "the file's data isn't reachable right now",
         else => r.err orelse "failed",
     };
 }
@@ -234,9 +333,19 @@ fn usage() u8 {
         \\  nomadfs swarm get <path>
         \\  nomadfs swarm put <path> [file] [--if-match <etag> | --create]
         \\  nomadfs swarm rm <path> [--if-match <etag>]
+        \\  nomadfs swarm photos [--folder <dir>] [--limit <n>] [--videos | --photos]
+        \\  nomadfs swarm thumb <path> > thumb.jpg
         \\
     , .{});
     return 2;
+}
+
+test explain {
+    try std.testing.expectEqualStrings("not found", explain(.{ .code = 404, .err = "FileNotFound" }));
+    try std.testing.expect(std.mem.startsWith(u8, explain(.{ .code = 404, .err = "NoThumbnail" }), "no thumbnail"));
+    try std.testing.expect(std.mem.startsWith(u8, explain(.{ .code = 503, .err = "Pending" }), "the thumbnail is being made"));
+    try std.testing.expect(std.mem.startsWith(u8, explain(.{ .code = 503 }), "the file's data"));
+    try std.testing.expectEqualStrings("Boom", explain(.{ .code = 500, .err = "Boom" }));
 }
 
 test "Endpoint.parse" {
@@ -246,6 +355,15 @@ test "Endpoint.parse" {
     try std.testing.expectError(error.BadApiFile, Endpoint.parse("http://example.com:1/x/"));
     try std.testing.expectError(error.BadApiFile, Endpoint.parse("http://127.0.0.1:1/x/v1/ HTTP/1.1\r\nX: y\r\n/"));
     try std.testing.expectError(error.BadApiFile, Endpoint.parse("http://127.0.0.1:1/x/v1"));
+}
+
+test minuteOf {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("1970-01-01 00:00", minuteOf(&buf, 0));
+    try std.testing.expectEqualStrings("2023-11-14 22:13", minuteOf(&buf, 1_700_000_000));
+    try std.testing.expectEqualStrings("2024-02-29 23:59", minuteOf(&buf, 1_709_251_199));
+    try std.testing.expectEqualStrings("9999-12-31 23:59", minuteOf(&buf, 253_402_300_799));
+    try std.testing.expectEqualStrings("????-??-?? ??:??", minuteOf(&buf, std.math.maxInt(u64)));
 }
 
 test parseResponse {

@@ -18,7 +18,7 @@ function $(id){return el(id)}
 // Source functions are evaluated unchanged; only DOM/IPC dependencies are fakes.
 {
  const a=deferred(),b=deferred(),paint=[];
- const c=context({document:{body:{classList:{add(){},remove(){}}}},syncBack(){},stopNative(){},nativeVideo:null,
+ const c=context({document:{body:{classList:{add(){},remove(){}}},dispatchEvent(){}},CustomEvent:class{},syncBack(){},stopNative(){},attachZoom(){},nativeVideo:null,
  previewMessage(){},readFailure:String,inPagePlayer:(kind,url)=>paint.push(url),a,b});
  vm.runInContext('let pv=null; let previewGeneration=0;'+fn('function openPreview(', '/** Stops a streaming player')+fn('function stopMedia(', '// The native player:')+fn('async function streamPreview(', '// The native player, embedded')+`function showPreview(){const token=++pv.token;streamPreview(pv.files[0],'audio',token)};openPreview({mediaUrl:()=>a.promise},[{name:'A'}],0);closePreview();openPreview({mediaUrl:()=>b.promise},[{name:'B'}],0);`,c);
  b.resolve('B-url');await new Promise(setImmediate);a.resolve('A-url');await new Promise(setImmediate);
@@ -95,7 +95,7 @@ test('glm-5 pdf iframe is sandboxed; glm-6 buffer holds the exact bytes without 
   const created = [];
   const makeNode = () => { const n = node(); created.push(n); return n; };
   const blobs = [];
-  const c = context({
+  const c = context({ attachZoom() {},
     document: { createElement: makeNode, body: { classList: { add(){}, remove(){} } } },
     stopMedia(){}, stopNative(){},
     formatSize: (n) => `${n}B`, formatDate: () => 'date',

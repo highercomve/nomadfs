@@ -13,6 +13,7 @@ import { loadMount, installMount } from "./mount.js";
 import { loadShares, loadBackup, storageSetup, installShares } from "./shares.js";
 import { installSettings } from "./settings.js";
 import { loadAbout, openDetails, installAbout } from "./about.js";
+import { loadPhotos, installPhotos } from "./photos.js";
 import { installUpdates } from "./updates.js";
 import { renderNavDevices, showDevices, installBrowse, browsePath, resetDeviceRetries } from "./browse.js";
 import { isRunning, setRunning, ensureConfig } from "./state.js";
@@ -47,11 +48,13 @@ export function setView(view) {
   for (const item of document.querySelectorAll(".nav-item[data-view], .bar-item[data-view]")) {
     item.classList.toggle("active", item.dataset.view === view);
   }
-  $("bar-more").classList.toggle("active", view === "notes" || view === "settings" || view === "about");
+  $("bar-more").classList.toggle("active", view === "notes" || view === "settings" || view === "about" || view === "connect");
   window.scrollTo(0, 0);
   try { localStorage.setItem("view", view); } catch {}
   if (view === "settings") { $("devices-refresh").click(); loadBackup(); }
   if (view === "swarm") { loadSwarm(); }
+  if (view === "photos") { loadPhotos(); }
+  if (view === "connect") { loadJoinInfo(); }
   if (view === "downloads") loadDownloads();
   if (view === "notes") notesApi?.show();
   else notesApi?.hide();
@@ -91,6 +94,7 @@ installShares();
 installMount({ setView, nodeState });
 installConnect({ setView, nodeState });
 installSwarm();
+installPhotos();
 installBrowse({ setView, nodeState });
 installDownloads({ setView, nodeState });
 

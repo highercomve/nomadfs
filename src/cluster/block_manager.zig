@@ -8,6 +8,7 @@ const keeper_mod = @import("keeper.zig");
 const fetcher_mod = @import("fetcher.zig");
 const holders_mod = @import("holders.zig");
 const walk = storage.dag.walk;
+const sync = @import("../sync.zig");
 
 /// Owns the fetcher and the holder registry, and dials holders for them.
 /// Also the mobile C API's file-level path: `put` stores a file locally and
@@ -29,6 +30,8 @@ pub const BlockManager = struct {
     /// Who probably holds what (holders.zig); null without a store, since
     /// only reads need it.
     holders: ?holders_mod.Holders = null,
+    /// `askDerived` calls running now: `max_derived_asks` at most.
+    derived_asks: std.atomic.Value(u8) = .init(0),
 
     pub const Config = struct {
         network: *network.manager.ConnectionManager,
@@ -353,10 +356,39 @@ pub const BlockManager = struct {
     /// backoff, even when the fetcher asks it anyway (a probe).
     fn getBlockFrom(ctx: *anyopaque, peer: NodeID, cid: *const fetcher_mod.Cid, allocator: std.mem.Allocator) anyerror!?[]u8 {
         const self: *BlockManager = @ptrCast(@alignCast(ctx));
+        const data = try self.onSession(peer, BlockRequest{ .cid = cid.* }) orelse return null;
+        defer self.dht_node.allocator.free(data);
+        return try allocator.dupe(u8, data);
+    }
+
+    /// GET_BLOCK on a session; the block is the DHT node's allocation.
+    const BlockRequest = struct {
+        cid: fetcher_mod.Cid,
+        const Reply = ?[]u8;
+        fn send(self: BlockRequest, node: *dht.Node, conn: network.Connection) anyerror!Reply {
+            return node.fetchBlock(conn, self.cid);
+        }
+    };
+
+    /// GET_DERIVED on a session; found bytes are allocated in `allocator`.
+    const DerivedRequest = struct {
+        cid: [32]u8,
+        kind: u8,
+        allocator: std.mem.Allocator,
+        const Reply = dht.Node.DerivedReply;
+        fn send(self: DerivedRequest, node: *dht.Node, conn: network.Connection) anyerror!Reply {
+            return node.fetchDerived(conn, self.cid, self.kind, self.allocator);
+        }
+    };
+
+    /// Sends `request` (a BlockRequest or a DerivedRequest) to `peer` on
+    /// its pooled session, or a new one, retrying a failed pooled session
+    /// once.
+    fn onSession(self: *BlockManager, peer: NodeID, request: anytype) anyerror!@TypeOf(request).Reply {
         const pooled = self.net.existingConnection(peer);
         const conn = pooled orelse try self.connectBlockPeer(peer);
         defer conn.deinit();
-        const data = (self.dht_node.fetchBlock(conn, cid.*) catch |err| retry: {
+        return request.send(self.dht_node, conn) catch |err| {
             // Only a session that is gone (closed by its keepalive or the
             // far end) is replaced. One request ending early (a timeout, a
             // stream the server closed) says nothing about the session,
@@ -367,10 +399,79 @@ pub const BlockManager = struct {
             conn.close();
             const fresh = try self.connectBlockPeer(peer);
             defer fresh.deinit();
-            break :retry (try self.dht_node.fetchBlock(fresh, cid.*));
-        }) orelse return null;
-        defer self.dht_node.allocator.free(data);
-        return try allocator.dupe(u8, data);
+            return request.send(self.dht_node, fresh);
+        };
+    }
+
+    /// What `askDerived` learned.
+    pub const Derived = union(enum) {
+        /// The derived bytes, caller-owned and unchecked.
+        found: []u8,
+        /// A device that has the file says nothing can be made of it, and
+        /// why (the asker's numbering).
+        none: u8,
+        /// A device is making it, or too many asks are out: ask again
+        /// shortly.
+        busy,
+        /// Nobody asked has the file.
+        unavailable,
+    };
+
+    pub const AskOptions = struct {
+        /// Devices that announced this role (rpc.Roles) are asked first;
+        /// 0: no preference.
+        prefer_role: u8 = 0,
+        /// Devices asked at most.
+        max_attempts: u8 = 3,
+        /// No further device is asked once this long has passed; 0: no
+        /// limit but `max_attempts` requests.
+        deadline_ms: u32 = 0,
+    };
+
+    /// GET_DERIVED asks out at once, whatever they are for: a page of
+    /// thumbnails must not take every stream of a session.
+    pub const max_derived_asks = 6;
+
+    /// Asks the likely holders `hints` of the file `cid` for what they
+    /// derive from it (`kind`: the asker's number, GET_DERIVED): those
+    /// connected first, down ones (fetcher) skipped, the next one when a
+    /// device does not have the file, does not know the kind or the
+    /// message (an older build closes the stream), or fails.
+    pub fn askDerived(self: *BlockManager, allocator: std.mem.Allocator, cid: [32]u8, kind: u8, hints: []const NodeID, opts: AskOptions) !Derived {
+        if (self.derived_asks.fetchAdd(1, .acq_rel) >= max_derived_asks) {
+            _ = self.derived_asks.fetchSub(1, .acq_rel);
+            return .busy;
+        }
+        defer _ = self.derived_asks.fetchSub(1, .acq_rel);
+
+        var buf: [holders_mod.max_known]NodeID = undefined;
+        const order = if (self.holders) |*h| h.orderForRequest(hints, opts.prefer_role, &buf) else blk: {
+            const n = @min(hints.len, buf.len);
+            @memcpy(buf[0..n], hints[0..n]);
+            break :blk buf[0..n];
+        };
+        const until = sync.monotonicMillis() +| opts.deadline_ms;
+        var attempts: u8 = 0;
+        for (order) |peer| {
+            if (attempts >= opts.max_attempts) break;
+            if (opts.deadline_ms != 0 and attempts > 0 and sync.monotonicMillis() >= until) break;
+            if (self.fetcher) |*f| if (f.isDown(peer) and !self.net.isConnected(peer)) continue;
+            attempts += 1;
+            const reply = self.onSession(peer, DerivedRequest{ .cid = cid, .kind = kind, .allocator = allocator }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // Not reachable, or a device that closed the stream on a
+                // message it does not know: the next one.
+                else => continue,
+            };
+            if (self.fetcher) |*f| f.markUp(peer);
+            switch (reply) {
+                .found => |bytes| return .{ .found = bytes },
+                .none => |reason| return .{ .none = reason },
+                .busy => return .busy,
+                .not_held, .unknown_kind => {},
+            }
+        }
+        return .unavailable;
     }
 
     /// A new connection to `peer`. A timeout here is the dial's (the
@@ -533,6 +634,40 @@ test "block manager: a pooled session that is gone is dropped and redialed once"
     try std.testing.expect(mock.closed);
     try std.testing.expectEqual(@as(usize, 1), mock.opens);
     try std.testing.expectEqual(@as(usize, 1), mock.released);
+}
+
+test "block manager: a device that closes the stream on GET_DERIVED is passed over, its session kept" {
+    var manager = network.manager.ConnectionManager.initExplicit(std.testing.allocator, .tcp, network.noise.KeyPair.generate());
+    // A build from before the message: the request ends without an answer.
+    var old = TestConnection{ .node = .{ .bytes = [_]u8{7} ** 32 }, .failure = error.EndOfStream };
+    var silent = TestConnection{ .node = .{ .bytes = [_]u8{8} ** 32 }, .failure = error.Timeout };
+    defer manager.deinit();
+    var node = dht.Node.init(std.testing.allocator, &manager, "k" ** 32);
+    defer node.deinit();
+    var bm: BlockManager = .{ .allocator = std.testing.allocator, .net = &manager, .dht_node = &node, .store = null, .quorum = .{} };
+    try manager.addConnection(old.connection());
+    try manager.addConnection(silent.connection());
+    const cid = [_]u8{1} ** 32;
+
+    // Both are asked, in the hints' order, and neither has it.
+    try std.testing.expect(try bm.askDerived(std.testing.allocator, cid, 1, &.{ old.node, silent.node }, .{}) == .unavailable);
+    try std.testing.expectEqual(@as(usize, 1), old.opens);
+    try std.testing.expectEqual(@as(usize, 1), silent.opens);
+    try std.testing.expect(!old.closed);
+    try std.testing.expect(!silent.closed);
+    // No more devices than `max_attempts`.
+    try std.testing.expect(try bm.askDerived(std.testing.allocator, cid, 1, &.{ old.node, silent.node }, .{ .max_attempts = 1 }) == .unavailable);
+    try std.testing.expectEqual(@as(usize, 2), old.opens);
+    try std.testing.expectEqual(@as(usize, 1), silent.opens);
+    try std.testing.expect(try bm.askDerived(std.testing.allocator, cid, 1, &.{}, .{}) == .unavailable);
+
+    // With `BlockManager.max_derived_asks` out, the next is told to come back, and
+    // nobody is asked.
+    bm.derived_asks.store(BlockManager.max_derived_asks, .release);
+    try std.testing.expect(try bm.askDerived(std.testing.allocator, cid, 1, &.{old.node}, .{}) == .busy);
+    try std.testing.expectEqual(@as(usize, 2), old.opens);
+    try std.testing.expectEqual(@as(u8, BlockManager.max_derived_asks), bm.derived_asks.load(.acquire));
+    bm.derived_asks.store(0, .release);
 }
 
 test "block manager: one request's timeout leaves the pooled connection open" {

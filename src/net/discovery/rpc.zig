@@ -81,6 +81,28 @@ pub const MessageType = enum(u8) {
     /// A signed swarm setting (device/policy.zig). Answered with STORE_ACK,
     /// `stored` also for one not newer than the receiver's.
     POLICY = 27,
+    /// Ask a device for something it derives from the file `cid` (a
+    /// thumbnail, say): `kind` says what, and means nothing to this layer.
+    /// Answered with DERIVED.
+    GET_DERIVED = 28,
+    /// Reply to GET_DERIVED: the bytes, or why there are none
+    /// (DerivedStatus).
+    DERIVED = 29,
+};
+
+/// What a DERIVED reply says.
+pub const DerivedStatus = enum(u8) {
+    /// The derived bytes follow (1..max_derived_len of them).
+    found = 0,
+    /// The device does not have the whole file: ask another.
+    not_held = 1,
+    /// The device has the file and nothing of this kind can be made of it;
+    /// `reason` says why (defined with the kind, above this layer).
+    none = 2,
+    /// The device is making it, or will: ask again later.
+    busy = 3,
+    /// The device knows no such `kind`.
+    unknown_kind = 4,
 };
 
 pub const FindValueResult = union(enum) {
@@ -112,6 +134,8 @@ pub const Roles = struct {
     pub const accepts_copies: u8 = 1 << 1;
     /// Transfers to it should wait or stay small (mobile data).
     pub const metered: u8 = 1 << 2;
+    /// The device can take a frame of a film (it makes video thumbnails).
+    pub const video_thumbs: u8 = 1 << 3;
 };
 
 pub const MessagePayload = union(MessageType) {
@@ -160,6 +184,10 @@ pub const MessagePayload = union(MessageType) {
     GET_NODE_INFO: void,
     NODE_INFO: struct { info: []const u8 },
     POLICY: struct { record: [policy_mod.Record.encoded_len]u8 },
+    GET_DERIVED: struct { cid: [32]u8, kind: u8 },
+    /// `data` is empty unless `status` is found; `reason` counts only with
+    /// none.
+    DERIVED: struct { status: DerivedStatus, reason: u8 = 0, data: []const u8 = &.{} },
 };
 
 /// A member's signed vouch for another device (ADMIT). The label is a fixed
@@ -301,6 +329,18 @@ pub const Message = struct {
                 try writer.writeInt(u32, try valueLen(p.info.len), .big);
                 try writer.writeAll(p.info);
             },
+            .GET_DERIVED => |p| {
+                try writer.writeAll(&p.cid);
+                try writer.writeByte(p.kind);
+            },
+            .DERIVED => |p| {
+                // What the receiver would reject is not sent.
+                if ((p.status == .found) != (p.data.len != 0)) return error.InvalidMessage;
+                try writer.writeByte(@intFromEnum(p.status));
+                try writer.writeByte(p.reason);
+                try writer.writeInt(u32, try valueLenMax(p.data.len, max_derived_len), .big);
+                try writer.writeAll(p.data);
+            },
         }
     }
 
@@ -419,6 +459,22 @@ pub const Message = struct {
                 break :blk MessagePayload{ .POLICY = .{ .record = record } };
             },
             .NODE_INFO => MessagePayload{ .NODE_INFO = .{ .info = try readValueMax(allocator, reader, max_node_info_len) } },
+            .GET_DERIVED => blk: {
+                var cid: [32]u8 = undefined;
+                try reader.readNoEof(&cid);
+                break :blk MessagePayload{ .GET_DERIVED = .{ .cid = cid, .kind = try reader.readByte() } };
+            },
+            .DERIVED => blk: {
+                const status = std.enums.fromInt(DerivedStatus, try reader.readByte()) orelse return error.InvalidMessage;
+                const reason = try reader.readByte();
+                const data = try readValueMax(allocator, reader, max_derived_len);
+                // Bytes come with found, and only with it.
+                if ((status == .found) != (data.len != 0)) {
+                    allocator.free(data);
+                    return error.InvalidMessage;
+                }
+                break :blk MessagePayload{ .DERIVED = .{ .status = status, .reason = reason, .data = data } };
+            },
             .ROTATE_KEY => blk: {
                 const epoch = try reader.readInt(u64, .big);
                 var new_key: [32]u8 = undefined;
@@ -563,6 +619,7 @@ pub const Message = struct {
             },
             .SWARM => |p| allocator.free(p.manifest),
             .NODE_INFO => |p| allocator.free(p.info),
+            .DERIVED => |p| allocator.free(p.data),
             else => {},
         }
     }
@@ -592,6 +649,9 @@ pub const no_swarm = [_]u8{0} ** 32;
 
 /// The largest NODE_INFO (node_info.zig encodes within it).
 pub const max_node_info_len = 1024;
+
+/// The largest DERIVED payload: a thumbnail is a few tens of KiB.
+pub const max_derived_len = 128 * 1024;
 
 /// Each message's values are bounded before they're read, so a peer can't
 /// make a handler buffer more than its type allows (256 handlers at the
@@ -900,9 +960,102 @@ test "rpc bounded random inputs do not panic" {
         var buf = TestBuffer{ .allocator = allocator };
         defer buf.list.deinit(allocator);
         try buf.list.appendSlice(allocator, bytes[0 .. iteration % bytes.len]);
+        // Every fourth input is a DERIVED or a GET_DERIVED, half of those
+        // with a status and a length that can be read.
+        if (iteration % 4 == 0 and buf.list.items.len > 39) {
+            buf.list.items[0] = @intFromEnum(if (iteration % 8 == 0) MessageType.DERIVED else MessageType.GET_DERIVED);
+            if (iteration % 16 == 0) {
+                buf.list.items[33] %= 6;
+                @memcpy(buf.list.items[35..38], &[_]u8{ 0, 0, 0 });
+            }
+        }
         const msg = Message.deserialize(allocator, buf.reader()) catch continue;
         msg.deinit(allocator);
     }
+}
+
+test "rpc: GET_DERIVED and every DERIVED status round trip" {
+    const allocator = std.testing.allocator;
+    const sender = id.NodeID{ .bytes = [_]u8{6} ** 32 };
+    var buf = TestBuffer{ .allocator = allocator };
+    defer buf.list.deinit(allocator);
+
+    try (Message{ .sender_id = sender, .payload = .{ .GET_DERIVED = .{ .cid = [_]u8{7} ** 32, .kind = 1 } } }).serialize(buf.writer());
+    // The frame the plan fixes: type, sender, CID, kind.
+    try std.testing.expectEqual(@as(usize, 1 + 32 + 32 + 1), buf.list.items.len);
+    try std.testing.expectEqual(@as(u8, 28), buf.list.items[0]);
+    const ask = try Message.deserialize(allocator, buf.reader());
+    defer ask.deinit(allocator);
+    try std.testing.expect(ask.sender_id.eql(sender));
+    try std.testing.expectEqual([_]u8{7} ** 32, ask.payload.GET_DERIVED.cid);
+    try std.testing.expectEqual(@as(u8, 1), ask.payload.GET_DERIVED.kind);
+
+    const largest = try allocator.alloc(u8, max_derived_len);
+    defer allocator.free(largest);
+    @memset(largest, 0x5a);
+    const replies = [_]@FieldType(MessagePayload, "DERIVED"){
+        .{ .status = .found, .data = "jpeg bytes" },
+        .{ .status = .found, .data = largest },
+        .{ .status = .not_held },
+        .{ .status = .none, .reason = 3 },
+        .{ .status = .busy },
+        .{ .status = .unknown_kind },
+    };
+    for (replies) |reply| {
+        buf.pos = 0;
+        buf.list.clearRetainingCapacity();
+        try (Message{ .sender_id = sender, .payload = .{ .DERIVED = reply } }).serialize(buf.writer());
+        try std.testing.expectEqual(@as(u8, 29), buf.list.items[0]);
+        try std.testing.expectEqual(1 + 32 + 1 + 1 + 4 + reply.data.len, buf.list.items.len);
+        const got = try Message.deserialize(allocator, buf.reader());
+        defer got.deinit(allocator);
+        try std.testing.expectEqual(reply.status, got.payload.DERIVED.status);
+        try std.testing.expectEqual(reply.reason, got.payload.DERIVED.reason);
+        try std.testing.expectEqualSlices(u8, reply.data, got.payload.DERIVED.data);
+    }
+}
+
+test "rpc: a DERIVED with an unknown status, too many bytes, or bytes it should not have is rejected" {
+    const allocator = std.testing.allocator;
+    const sender = id.NodeID{ .bytes = [_]u8{6} ** 32 };
+    var buf = TestBuffer{ .allocator = allocator };
+    defer buf.list.deinit(allocator);
+    try (Message{ .sender_id = sender, .payload = .{ .DERIVED = .{ .status = .found, .data = "abc" } } }).serialize(buf.writer());
+    const status_at = 33;
+    const len_at = 35;
+
+    // A status no build writes.
+    buf.list.items[status_at] = 5;
+    try std.testing.expectError(error.InvalidMessage, Message.deserialize(allocator, buf.reader()));
+    // Bytes with anything but found.
+    for ([_]DerivedStatus{ .not_held, .none, .busy, .unknown_kind }) |status| {
+        buf.pos = 0;
+        buf.list.items[status_at] = @intFromEnum(status);
+        try std.testing.expectError(error.InvalidMessage, Message.deserialize(allocator, buf.reader()));
+    }
+    // Found without bytes.
+    buf.pos = 0;
+    buf.list.items[status_at] = @intFromEnum(DerivedStatus.found);
+    std.mem.writeInt(u32, buf.list.items[len_at..][0..4], 0, .big);
+    try std.testing.expectError(error.InvalidMessage, Message.deserialize(allocator, buf.reader()));
+    // A length over the limit is refused before a byte of it is read.
+    buf.pos = 0;
+    std.mem.writeInt(u32, buf.list.items[len_at..][0..4], max_derived_len + 1, .big);
+    try std.testing.expectError(error.ValueTooLarge, Message.deserialize(allocator, buf.reader()));
+    // Cut off in the bytes: nothing leaks.
+    buf.pos = 0;
+    std.mem.writeInt(u32, buf.list.items[len_at..][0..4], 9, .big);
+    try std.testing.expectError(error.EndOfStream, Message.deserialize(allocator, buf.reader()));
+
+    // Neither is one sent.
+    var out = TestBuffer{ .allocator = allocator };
+    defer out.list.deinit(allocator);
+    const too_long = try allocator.alloc(u8, max_derived_len + 1);
+    defer allocator.free(too_long);
+    @memset(too_long, 1);
+    try std.testing.expectError(error.ValueTooLarge, (Message{ .sender_id = sender, .payload = .{ .DERIVED = .{ .status = .found, .data = too_long } } }).serialize(out.writer()));
+    try std.testing.expectError(error.InvalidMessage, (Message{ .sender_id = sender, .payload = .{ .DERIVED = .{ .status = .busy, .data = "x" } } }).serialize(out.writer()));
+    try std.testing.expectError(error.InvalidMessage, (Message{ .sender_id = sender, .payload = .{ .DERIVED = .{ .status = .found } } }).serialize(out.writer()));
 }
 
 test "rpc: ADMIT round trip keeps every field" {

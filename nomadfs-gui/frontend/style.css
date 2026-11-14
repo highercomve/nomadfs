@@ -290,6 +290,7 @@ details.card:not([open]) { gap: 0; }
   display: grid;
   place-items: center;
 }
+.icon-btn[hidden] { display: none; }
 .icon-btn svg { width: 24px; height: 24px; fill: currentColor; }
 .icon-btn:hover { background: color-mix(in srgb, var(--md-on-surface) 8%, transparent); }
 .icon-btn.spin svg { animation: spin 0.8s linear infinite; }
@@ -399,6 +400,7 @@ body[data-view="notes"] main > [data-view="notes"],
 body[data-view="settings"] main > [data-view="settings"],
 body[data-view="mount"] main > [data-view="mount"],
 body[data-view="downloads"] main > [data-view="downloads"],
+body[data-view="photos"] main > [data-view="photos"],
 body[data-view="about"] main > [data-view="about"] { display: flex; }
 body[data-view="settings"] main > footer { display: block; }
 
@@ -657,6 +659,10 @@ main { padding-bottom: calc(104px + env(safe-area-inset-bottom)); }
   object-fit: contain;
   display: block;
 }
+/* zoom.js: pinch and drag are the page's, not the browser's. */
+.preview-body img { touch-action: none; transform-origin: center; cursor: zoom-in; }
+.preview-body img.zoomed { cursor: grab; }
+.preview-body img.zoomed:active { cursor: grabbing; }
 .preview-body audio { width: min(520px, 90%); }
 .preview-body iframe { width: 100%; height: 100%; border: none; background: white; }
 .preview-body pre {
@@ -839,7 +845,10 @@ h2 { font-size: 19px; font-weight: 650; letter-spacing: -.25px; font-variation-s
   border-color: var(--rule-strong);
 }
 .chip[data-state="on"] { background: rgb(46 196 182 / .1); border-color: rgb(92 225 230 / .35); color: var(--oasis-hi); }
-.chip[data-state="on"] .dot { background: var(--oasis-hi); animation: signal 2.6s ease-out infinite; }
+.chip[data-state="on"] .dot { background: var(--oasis-hi); animation: signal 2.6s ease-out 3; }
+/* The pulse plays 3 times when something comes online, then rests: an
+   endless box-shadow animation repaints every frame and kept a phone's
+   WebView at ~80% CPU on every page. */
 @keyframes signal {
   0% { box-shadow: 0 0 0 0 rgb(92 225 230 / .55); }
   70%, 100% { box-shadow: 0 0 0 9px rgb(92 225 230 / 0); }
@@ -949,11 +958,11 @@ h2 { font-size: 19px; font-weight: 650; letter-spacing: -.25px; font-variation-s
   position: absolute;
   inset: -1px;
   border-radius: 50%;
-  animation: signal 3s ease-out infinite;
+  animation: signal 3s ease-out 3;
 }
 .crumbs { font-family: var(--mono); font-size: 11px; letter-spacing: .4px; }
 .crumbs button { font-family: var(--mono); font-size: 11.5px; color: var(--amber); }
-.mount-status[data-state="on"] .dot { background: var(--oasis-hi); animation: signal 2.6s ease-out infinite; }
+.mount-status[data-state="on"] .dot { background: var(--oasis-hi); animation: signal 2.6s ease-out 3; }
 .mount-status, .invite-status { font-family: var(--mono); font-size: 12px; letter-spacing: .3px; }
 
 /* ---- Reveal: one orchestrated entrance per section ---- */
@@ -1034,7 +1043,7 @@ body[data-view] main > [data-view] + [data-view] { animation-delay: .07s; }
     height: 7px;
     margin-top: -3.5px;
     border-radius: 50%;
-    animation: signal 2.8s ease-out infinite;
+    animation: signal 2.8s ease-out 3;
   }
   #nav-devices .nav-item.active::before { background: var(--oasis-hi); box-shadow: 0 0 0 4px rgb(92 225 230 / .18); }
   #nav-devices .nav-item.active { background: linear-gradient(90deg, rgb(46 196 182 / .14), transparent 85%); }
@@ -1148,8 +1157,10 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 #devices-list .row-text .meta + .meta { margin-top: 1px; }
 
 @media (min-width: 840px) {
-  body[data-view="swarm"] main { overflow: hidden; }
-  body[data-view="swarm"] #swarm-section { flex: 1; min-height: 0; max-width: none; }
+  body[data-view="swarm"] main,
+  body[data-view="photos"] main { overflow: hidden; }
+  body[data-view="swarm"] #swarm-section,
+  body[data-view="photos"] #photos-section { flex: 1; min-height: 0; max-width: none; }
   .list.rows li.has-cols .col-by { display: block; width: 96px; overflow: hidden; text-overflow: ellipsis; }
   .list.rows li.has-cols .row-actions { width: var(--act-w, 34px); justify-content: flex-end; opacity: 0; }
   .list.rows li.has-cols:hover .row-actions, .list.rows li.has-cols .row-actions:focus-within { opacity: 1; }
@@ -1457,6 +1468,222 @@ body[data-view="swarm"] main > [data-view="swarm"] { display: flex; }
 .dt-stat span { font-size: 12px; color: var(--md-on-surface-variant); }
 .dt-map { width: 100%; height: 56px; display: block; border-radius: 6px; background: var(--md-surface-container); border: 1px solid var(--md-outline-variant); }
 .dt-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12.5px; color: var(--md-on-surface-variant); }
+
+/* ---- Photos timeline view ---- */
+/* No `display` here: an ID rule would beat `main > [data-view]` and show
+   the section on every page; the view rules above show it. */
+#photos-section {
+  flex-direction: column;
+  position: relative;
+  overflow: hidden;
+}
+.photos-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 2px 0 10px;
+  flex-shrink: 0;
+}
+.photos-toolbar .chips-row {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+.photos-toolbar .chip {
+  cursor: pointer;
+  border-radius: 8px;
+  border: 1px solid var(--md-outline-variant, var(--rule));
+  background: transparent;
+  color: var(--md-on-surface-variant);
+  font: 500 12px var(--font);
+  padding: 0 12px;
+  height: 28px;
+  white-space: nowrap;
+  user-select: none;
+}
+.photos-toolbar .chip:hover {
+  background: color-mix(in srgb, var(--md-on-surface) 8%, transparent);
+}
+.photos-toolbar .chip.active {
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+  border-color: transparent;
+  font-weight: 600;
+}
+/* The grid's scroller with the year scrubber beside it (not inside: it
+   would scroll away). */
+.photos-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.photos-scroll {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 0 -8px;
+  padding: 0 8px;
+}
+.photos-sticky {
+  position: sticky;
+  top: 4px;
+  z-index: 10;
+  display: inline-block;
+  padding: 4px 10px;
+  background: color-mix(in srgb, var(--md-surface-container-high, #273042) 88%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  font: 600 12px var(--font);
+  color: var(--md-on-surface);
+  border-radius: 6px;
+  border: 1px solid var(--rule, rgb(255 255 255 / .08));
+  box-shadow: 0 2px 8px rgb(0 0 0 / .2);
+  margin-bottom: -28px;
+  pointer-events: none;
+}
+.photos-spacer {
+  position: relative;
+  width: 100%;
+  pointer-events: none;
+}
+.photos-window {
+  position: absolute;
+  top: 0;
+  left: 8px;
+  right: 8px;
+  pointer-events: auto;
+}
+.photos-day-head {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--md-on-surface);
+  letter-spacing: -.2px;
+  user-select: none;
+}
+.photos-tile-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+}
+.photo-tile {
+  position: relative;
+  flex-shrink: 0;
+  overflow: hidden;
+  border-radius: 4px;
+  background: var(--md-surface-container, var(--sand-subtle));
+  cursor: pointer;
+  user-select: none;
+  transform: translateZ(0);
+}
+.photo-tile img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity .15s;
+}
+.photo-tile img.ready { opacity: 1; }
+.photo-placeholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--md-surface-container-high, var(--oasis));
+  color: var(--md-on-surface-variant);
+  font: 600 11px var(--mono);
+  letter-spacing: .5px;
+}
+.photo-placeholder svg {
+  width: 28px;
+  height: 28px;
+  opacity: .4;
+  fill: currentColor;
+}
+.photo-badge {
+  position: absolute;
+  bottom: 6px;
+  left: 6px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgb(0 0 0 / .65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+.photo-tile img[hidden], .photo-placeholder[hidden], .photo-badge[hidden] { display: none; }
+.photo-badge svg {
+  width: 12px;
+  height: 12px;
+  fill: #fff;
+  margin-left: 1px;
+}
+.photos-scrubber {
+  position: absolute;
+  right: -4px;
+  top: 0;
+  bottom: 0;
+  width: 32px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: flex-end;
+  padding: 8px 0;
+  touch-action: none;
+  user-select: none;
+}
+.scrubber-mark {
+  font: 600 10px var(--mono);
+  color: var(--md-outline);
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+.scrubber-mark:hover {
+  color: var(--md-on-surface);
+  background: var(--md-surface-container-high);
+}
+.photos-scrubber-bubble {
+  position: absolute;
+  right: 44px;
+  transform: translateY(-50%);
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+  font: 700 12px var(--mono);
+  padding: 4px 8px;
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgb(0 0 0 / .3);
+  pointer-events: none;
+  z-index: 25;
+}
+/* Phones: the page doesn't scroll on Photos, the grid does. The body is
+   the screen's height, so the card ends above the navigation bar (main's
+   bottom padding) and the grid scrolls inside it. */
+@media (max-width: 839.98px) {
+  body[data-view="photos"] { height: 100dvh; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+  body[data-view="photos"] .layout { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  body[data-view="photos"] main { flex: 1; min-height: 0; overflow: hidden; }
+  body[data-view="photos"] #photos-section { flex: 1; min-height: 0; padding: 12px 12px 0; gap: 8px; }
+  #photos-section .card-head .supporting { display: none; }
+  .scrubber-mark { background: color-mix(in srgb, var(--md-surface-container) 80%, transparent); }
+}
 .dt-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
 .dt-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
 .dt-table th { text-align: left; font-weight: 500; color: var(--md-on-surface-variant); padding: 4px 8px 4px 0; border-bottom: 1px solid var(--md-outline-variant); }

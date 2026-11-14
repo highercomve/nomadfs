@@ -166,6 +166,45 @@ pub const Holders = struct {
         return out[0..n];
     }
 
+    /// `hints` (likely holders, most likely first) in the order to send
+    /// one request: the connected peers that announced `prefer_role`
+    /// (rpc.Roles; 0: no such preference), the other connected ones, the
+    /// rest; peers on a metered network after all of those, connected
+    /// first. Each rank keeps the order of `hints`. This node and repeats
+    /// are left out; in `out`, at most its length.
+    pub fn orderForRequest(self: *Holders, hints: []const NodeID, prefer_role: u8, out: []NodeID) []NodeID {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var live_buf: [max_known]NodeID = undefined;
+        var live: []const NodeID = live_buf[0..0];
+        if (self.peers) |peers| if (peers.connectedFn) |f| {
+            live = live_buf[0..f(peers.ctx, &live_buf)];
+        };
+        const considered = hints[0..@min(hints.len, max_known)];
+        var ranks: [max_known]u8 = undefined;
+        for (considered, ranks[0..considered.len]) |peer, *r| {
+            const roles: u8 = if (self.peers) |peers| peers.rolesFn(peers.ctx, peer) orelse 0 else 0;
+            const connected = contains(live, peer);
+            r.* = if (roles & rpc.Roles.metered != 0)
+                (if (connected) 3 else 4)
+            else if (!connected)
+                2
+            else if (roles & prefer_role != 0) 0 else 1;
+        }
+        var n: usize = 0;
+        for (0..5) |rank| {
+            for (considered, ranks[0..considered.len]) |peer, r| {
+                if (n >= out.len) return out[0..n];
+                if (r != rank) continue;
+                if (peer.eql(self.self_id)) continue;
+                if (contains(out[0..n], peer)) continue;
+                out[n] = peer;
+                n += 1;
+            }
+        }
+        return out[0..n];
+    }
+
     /// The boundary lets fs insert placement replicas after backups.
     pub fn forSwarmSplit(self: *Holders, author: NodeID, out: *[fetcher.max_holders]NodeID) SwarmHints {
         self.mutex.lock();
@@ -540,4 +579,57 @@ test "holders: announced relay backup stays listed while disconnected" {
     FullTable.connected_count = 1;
     try testing.expect(t.knowsPeer(idOf(100)));
     FullTable.connected_count = 0;
+}
+
+test "holders: orderForRequest asks connected peers with the wanted role first, metered ones last" {
+    const video = rpc.Roles.video_thumbs;
+    const Net = struct {
+        var connected: [5]NodeID = undefined;
+        var count: usize = 0;
+        fn roles(_: *anyopaque, peer: NodeID) ?u8 {
+            return switch (peer.bytes[0]) {
+                1 => rpc.Roles.swarm_backup, // connected
+                2 => rpc.Roles.swarm_backup | video, // connected
+                3 => video, // not connected
+                4 => rpc.Roles.metered | video, // connected phone
+                5 => rpc.Roles.metered, // phone, away
+                6 => 0, // connected
+                else => null,
+            };
+        }
+        fn known(_: *anyopaque, _: []NodeID) usize {
+            return 0;
+        }
+        fn live(_: *anyopaque, out: []NodeID) usize {
+            const n = @min(out.len, count);
+            @memcpy(out[0..n], connected[0..n]);
+            return n;
+        }
+    };
+    Net.connected = .{ idOf(6), idOf(4), idOf(2), idOf(1), idOf(0) };
+    Net.count = 5;
+    var t = table(idOf(0));
+    t.peers = .{ .ctx = undefined, .rolesFn = Net.roles, .knownFn = Net.known, .connectedFn = Net.live };
+    // The author (7, unknown and away), then as a read would list them;
+    // this node and a repeat among them.
+    const hints = [_]NodeID{ idOf(7), idOf(1), idOf(2), idOf(0), idOf(3), idOf(4), idOf(5), idOf(6), idOf(1) };
+    var out: [16]NodeID = undefined;
+
+    // A film: the connected device that takes frames, the other connected
+    // ones in the hints' order, those away, then the phones.
+    try testing.expectEqualSlices(NodeID, &.{ idOf(2), idOf(1), idOf(6), idOf(7), idOf(3), idOf(4), idOf(5) }, t.orderForRequest(&hints, video, &out));
+    // No preference: connected, away, metered; each as hinted.
+    try testing.expectEqualSlices(NodeID, &.{ idOf(1), idOf(2), idOf(6), idOf(7), idOf(3), idOf(4), idOf(5) }, t.orderForRequest(&hints, 0, &out));
+    // A short buffer takes the best of them.
+    try testing.expectEqualSlices(NodeID, &.{ idOf(2), idOf(1) }, t.orderForRequest(&hints, video, out[0..2]));
+    try testing.expectEqual(@as(usize, 0), t.orderForRequest(&.{}, video, &out).len);
+    try testing.expectEqual(@as(usize, 0), t.orderForRequest(&.{idOf(0)}, 0, &out).len);
+
+    // Nobody connected: the hints' order, metered last.
+    Net.count = 0;
+    try testing.expectEqualSlices(NodeID, &.{ idOf(7), idOf(1), idOf(2), idOf(3), idOf(6), idOf(4), idOf(5) }, t.orderForRequest(&hints, video, &out));
+
+    // Without a discovery source: the hints, without this node or repeats.
+    var bare = table(idOf(0));
+    try testing.expectEqualSlices(NodeID, &.{ idOf(7), idOf(1), idOf(2), idOf(3), idOf(4), idOf(5), idOf(6) }, bare.orderForRequest(&hints, video, &out));
 }

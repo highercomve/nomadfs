@@ -4,11 +4,13 @@ import { $, snack, svg, ICONS, decodeBase64 } from "./core.js";
 import { formatSize, formatDate, errText } from "./format.js";
 import { showMenu, setMenuCover, menuOpen } from "./overlays.js";
 import { syncBack, registerUp } from "./back.js";
+import { attachZoom, installZoom, zoomBy, resetZoom, onZoomChange, zoomed, pinching, STEP } from "./zoom.js";
 
 // ---- Preview ----
 
 const KINDS = {
   image: { ext: ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif", "heic"], max: 64 << 20 },
+  raw: { ext: ["dng", "nef", "arw", "cr2"], max: 256 << 20 },
   // Camcorder MPEG-TS (.mts/.m2ts), WMV, MXF and the rest play in the native
   // player (oriel.video), which takes what the system's media stack plays.
   video: { ext: ["mp4", "webm", "mov", "m4v", "mkv", "3gp", "mts", "m2ts", "avi", "wmv", "flv", "mpg", "mpeg", "mxf", "ogv", "vob"], max: 512 << 20 },
@@ -70,6 +72,9 @@ export function closePreview() {
   pv.token++;
   if (pv.url) URL.revokeObjectURL(pv.url);
   pv = null;
+  attachZoom(null);
+  // Pages showing thumbnails ask again (what was viewed is here now).
+  document.dispatchEvent(new CustomEvent("preview:closed"));
   $("pv-body").replaceChildren();
   $("preview").hidden = true;
   document.body.classList.remove("pv-open");
@@ -163,23 +168,75 @@ function inPagePlayer(kind, url, token) {
   $("pv-body").replaceChildren(el);
 }
 
+async function rawPreview(entry, token) {
+  const session = pv;
+  let url;
+  try {
+    if (session.source?.mediaUrl) {
+      url = await session.source.mediaUrl(entry);
+    } else {
+      const author = entry.author || entry.author_id || "";
+      url = await window.oriel.invoke("media_url", { kind: "raw", id: author, cid: entry.cid, size: entry.size || 0, name: entry.name });
+    }
+  } catch (err) {
+    if (pv !== session || !pv || token !== pv.token) return;
+    return previewMessage("image", `Preview failed: ${readFailure(err)}`);
+  }
+  if (pv !== session || !pv || token !== pv.token) return;
+  const el = document.createElement("img");
+  el.alt = entry.name;
+  el.src = url;
+  el.addEventListener("error", () => {
+    if (pv !== session || !pv || token !== pv.token) return;
+    previewMessage("image",
+      "This file uses a format this device can't play here. Download it, or open it from the mount with your usual player.");
+  });
+  $("pv-body").replaceChildren(el);
+  attachZoom(el);
+}
+
 async function showPreview() {
   const session = pv;
+  attachZoom(null);
   stopMedia();
   stopNative();
   const token = pv.token = ++previewGeneration;
   if (pv.url) { URL.revokeObjectURL(pv.url); pv.url = null; }
-  const entry = pv.files[pv.index];
+
+  const len = session.files.length;
+  $("pv-prev").disabled = session.index <= 0;
+  $("pv-next").disabled = session.index >= len - 1;
+
+  if (session.source?.load) {
+    const early = session.files.at ? session.files.at(session.index) : session.files[session.index];
+    if (!early) {
+      $("pv-name").textContent = "Loading…";
+      $("pv-meta").textContent = `… · ${session.index + 1} of ${len}`;
+      previewMessage("file", "Loading file…");
+    }
+    try {
+      await session.source.load(session.index);
+    } catch (err) {
+      if (pv !== session || !pv || token !== pv.token) return;
+      return previewMessage("file", `Preview failed: ${readFailure(err)}`);
+    }
+    if (pv !== session || !pv || token !== pv.token) return;
+  }
+
+  const entry = session.files.at ? session.files.at(session.index) : session.files[session.index];
+  if (!entry) return previewMessage("file", "This file is unavailable.");
+
   $("pv-name").textContent = entry.name;
-  $("pv-meta").textContent = `${formatSize(entry.size)} · ${formatDate(entry.mtime)} · ${pv.index + 1} of ${pv.files.length}`;
-  $("pv-prev").disabled = pv.index === 0;
-  $("pv-next").disabled = pv.index === pv.files.length - 1;
+  $("pv-meta").textContent = `${formatSize(entry.size)} · ${formatDate(entry.mtime)} · ${session.index + 1} of ${len}`;
+  $("pv-prev").disabled = session.index <= 0;
+  $("pv-next").disabled = session.index >= len - 1;
 
   const { kind, ext } = kindOf(entry.name);
   if (!kind) return previewMessage("file", "No preview for this kind of file.");
   // Video and audio stream: the player asks for byte ranges as it plays
   // and seeks, so it starts at once and size doesn't matter.
   if (kind === "video" || kind === "audio") return streamPreview(entry, kind, token);
+  if (kind === "raw") return rawPreview(entry, token);
 
   const limit = KINDS[kind].max;
   if (kind !== "text" && entry.size > limit) {
@@ -230,6 +287,7 @@ async function showPreview() {
       `This file uses a format this device can't play here. Download it, or open it from the mount with your usual player.`);
   });
   body.replaceChildren(el);
+  if (kind === "image") attachZoom(el);
 }
 
 function concat(parts) {
@@ -264,16 +322,27 @@ export function installPreview() {
   if (pv) snack(`This video can't play: ${message || "unsupported format"}. Download it to open it in another app.`, 6000);
   });
   $("pv-close").addEventListener("click", closePreview);
+  installZoom($("pv-body"));
+  $("pv-zoom-in").addEventListener("click", () => zoomBy(STEP));
+  $("pv-zoom-out").addEventListener("click", () => zoomBy(1 / STEP));
+  // The zoom buttons show for photos only; − is off at 1×.
+  onZoomChange((zoomable, isZoomed) => {
+    $("pv-zoom-in").hidden = !zoomable;
+    $("pv-zoom-out").hidden = !zoomable;
+    $("pv-zoom-out").disabled = !isZoomed;
+  });
   $("preview").addEventListener("click", (e) => { if (e.target === $("preview")) closePreview(); });
   $("pv-prev").addEventListener("click", () => { if (pv && pv.index > 0) { pv.index--; showPreview(); } });
   $("pv-next").addEventListener("click", () => { if (pv && pv.index < pv.files.length - 1) { pv.index++; showPreview(); } });
   // The open file's menu: what its row's right-click offers. An edit
   // (rename, move, delete) closes the viewer: the file it shows changed.
   $("pv-menu").addEventListener("click", () => {
-  if (!pv) return;
-  const r = $("pv-menu").getBoundingClientRect();
-  const items = pv.source.menu(pv.files[pv.index]).map((it) => it === "-" || !it.changes ? it : { ...it, run: () => { closePreview(); it.run(); } });
-  showMenu(r.right - 220, r.bottom + 4, items);
+    if (!pv) return;
+    const entry = pv.files.at ? pv.files.at(pv.index) : pv.files[pv.index];
+    if (!entry) return;
+    const r = $("pv-menu").getBoundingClientRect();
+    const items = pv.source.menu(entry).map((it) => it === "-" || !it.changes ? it : { ...it, run: () => { closePreview(); it.run(); } });
+    showMenu(r.right - 220, r.bottom + 4, items);
   });
 
   // Swipe left or right on a touch screen for the next or previous file. The
@@ -289,11 +358,14 @@ export function installPreview() {
     img.addEventListener("transitionend", () => { img.style.transition = ""; }, { once: true });
   };
   body.addEventListener("pointerdown", (e) => {
-    if (!pv || e.pointerType === "mouse" || e.target.closest("video, audio, pre")) return;
+    // Zoomed in, a drag moves around the photo (zoom.js) instead.
+    if (!pv || e.pointerType === "mouse" || zoomed() || e.target.closest("video, audio, pre")) return;
     swipe = { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now() };
   });
   body.addEventListener("pointermove", (e) => {
     if (!swipe || e.pointerId !== swipe.id) return;
+    // A second finger makes it a pinch: no swipe, no spring back.
+    if (pinching() || zoomed()) { swipe = null; return; }
     const dx = e.clientX - swipe.x;
     const img = body.querySelector("img");
     if (img && Math.abs(dx) > Math.abs(e.clientY - swipe.y)) img.style.transform = `translateX(${dx}px)`;
@@ -319,6 +391,9 @@ export function installPreview() {
   document.addEventListener("keydown", (e) => {
   if (!pv) return;
   if (e.key === "Escape") closePreview();
+  else if (e.key === "+" || e.key === "=") zoomBy(STEP);
+  else if (e.key === "-" || e.key === "_") zoomBy(1 / STEP);
+  else if (e.key === "0") resetZoom();
   else if (e.key === "ArrowLeft") $("pv-prev").click();
   else if (e.key === "ArrowRight") $("pv-next").click();
   });

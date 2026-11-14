@@ -14,6 +14,13 @@ pub const filestore = @import("filestore.zig");
 pub const manifest = @import("manifest.zig");
 pub const swarm = @import("swarm.zig");
 pub const notes = @import("notes.zig");
+/// What kind of picture or film a file is, and the timeline of them all.
+pub const media = @import("media.zig");
+pub const photos = @import("photos.zig");
+/// Thumbnails of those: where they are kept, and how one is come by.
+pub const thumb_store = @import("thumb_store.zig");
+pub const thumbs = @import("thumbs.zig");
+pub const raw_preview = @import("raw_preview.zig");
 pub const readahead = @import("readahead.zig");
 pub const device_names = @import("device_names.zig");
 pub const backup_import = @import("backup_import.zig");
@@ -26,6 +33,7 @@ pub const fuse = if (builtin.os.tag == .linux and !builtin.abi.isAndroid()) @imp
 pub const ShareIndex = shares.ShareIndex;
 pub const Remote = remote.Remote;
 pub const SwarmFolder = swarm.SwarmFolder;
+pub const Thumbs = thumbs.Thumbs;
 pub const ReadAhead = readahead.ReadAhead;
 pub const BackupImport = backup_import.BackupImport;
 
@@ -40,6 +48,11 @@ test {
     _ = manifest;
     _ = swarm;
     _ = notes;
+    _ = media;
+    _ = photos;
+    _ = thumb_store;
+    _ = thumbs;
+    _ = raw_preview;
     _ = backup_import;
     _ = device_names;
     _ = devices;

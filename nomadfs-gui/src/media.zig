@@ -11,6 +11,11 @@
 //! file instead: `<base><token>/l/<download id>/<size>/f.<ext>`. The random token makes the URLs
 //! unguessable to other programs on the machine; the extension gives the
 //! MIME type.
+//!
+//! The Photos page's thumbnails come the same way, with no size in the URL
+//! (the node says how long one is): `<base><token>/t/<author>/<cid>/t.jpg`,
+//! answered by the node's `thumbnail` (fs/thumbs.zig), or 404 while there
+//! is none to show.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -59,13 +64,9 @@ pub const UrlArgs = struct {
 };
 
 /// `invoke("media_url", { kind, id, cid, size, name })`: a URL the page's
-/// `<video>`/`<audio>` streams the file from.
+/// `<video>`/`<audio>` streams the file from, or a RAW file's embedded preview.
 pub fn url(alloc: std.mem.Allocator, args: UrlArgs) ![]const u8 {
     try ensureStarted();
-    const k: u8 = if (std.mem.eql(u8, args.kind, "swarm")) 's' else if (std.mem.eql(u8, args.kind, "device")) 'd' else if (std.mem.eql(u8, args.kind, "download")) 'l' else return error.InvalidArgument;
-    if (k == 'l') {
-        _ = std.fmt.parseInt(u32, args.id, 10) catch return error.InvalidArgument;
-    } else if (!isHex64(args.id) or !isHex64(args.cid)) return error.InvalidArgument;
     // Only the extension matters (the MIME type); keep it to [a-z0-9].
     var ext_buf: [8]u8 = undefined;
     var ext_len: usize = 0;
@@ -78,6 +79,20 @@ pub fn url(alloc: std.mem.Allocator, args: UrlArgs) ![]const u8 {
         ext_len += 1;
     };
     const ext = if (ext_len > 0) ext_buf[0..ext_len] else "bin";
+    const is_raw = std.mem.eql(u8, args.kind, "raw") or ((std.mem.eql(u8, args.kind, "swarm") or std.mem.eql(u8, args.kind, "device")) and isRawExt(ext));
+    const k: u8 = if (std.mem.eql(u8, args.kind, "swarm"))
+        (if (is_raw) 'p' else 's')
+    else if (std.mem.eql(u8, args.kind, "device"))
+        (if (is_raw) 'p' else 'd')
+    else if (std.mem.eql(u8, args.kind, "download"))
+        'l'
+    else if (is_raw)
+        'p'
+    else
+        return error.InvalidArgument;
+    if (k == 'l') {
+        _ = std.fmt.parseInt(u32, args.id, 10) catch return error.InvalidArgument;
+    } else if (!isHex64(args.id) or !isHex64(args.cid)) return error.InvalidArgument;
     var network_base_buf: [64]u8 = undefined;
     const base = if (std.mem.eql(u8, args.network, "lan"))
         try networkBase(&network_base_buf, .lan)
@@ -90,7 +105,25 @@ pub fn url(alloc: std.mem.Allocator, args: UrlArgs) ![]const u8 {
     else
         g_base;
     if (k == 'l') return std.fmt.allocPrint(alloc, "{s}{s}/l/{s}/{d}/f.{s}", .{ base, &g_token, args.id, args.size, ext });
+    if (k == 'p') return std.fmt.allocPrint(alloc, "{s}{s}/p/{s}/{s}/p.jpg", .{ base, &g_token, args.id, args.cid });
     return std.fmt.allocPrint(alloc, "{s}{s}/{c}/{s}/{s}/{d}/f.{s}", .{ base, &g_token, k, args.id, args.cid, args.size, ext });
+}
+
+fn isRawExt(ext: []const u8) bool {
+    const raw_exts = [_][]const u8{ "dng", "raw", "cr2", "nef", "arw" };
+    for (raw_exts) |e| if (std.mem.eql(u8, ext, e)) return true;
+    return false;
+}
+
+/// How long a thumbnail request waits for its decode before the page is
+/// told to ask again (404; it retries).
+const thumb_deadline_ms = 4000;
+
+/// Where the Photos page loads thumbnails from: `<base><token>/t/`, to
+/// which it appends `<author>/<cid>/t.jpg`. Caller-owned.
+pub fn thumbBase(alloc: std.mem.Allocator) ![]const u8 {
+    try ensureStarted();
+    return std.fmt.allocPrint(alloc, "{s}{s}/t/", .{ g_base, &g_token });
 }
 
 fn ensureStarted() !void {
@@ -184,15 +217,16 @@ fn startHttpLocked(io: std.Io) !void {
 
 const Target = struct { kind: u8, id: [32]u8, cid: [32]u8, size: u64, download: u32 = 0 };
 
-/// `<token>/<kind>/<id>/<cid>/<size>/<name>`, or `<token>/l/<download
-/// id>/<size>/<name>`; null for anything else.
+/// `<token>/<kind>/<id>/<cid>/<size>/<name>`, `<token>/l/<download
+/// id>/<size>/<name>`, or a thumbnail's `<token>/t/<author>/<cid>/<name>`
+/// (its `size` is 0: the node gives it); null for anything else.
 fn parse(path: []const u8) ?Target {
     var it = std.mem.splitScalar(u8, path, '/');
     const token = it.next() orelse return null;
     if (!g_started or token.len != g_token.len) return null;
     if (!std.crypto.timing_safe.eql([32]u8, token[0..32].*, g_token)) return null;
     const kind = it.next() orelse return null;
-    if (kind.len != 1 or (kind[0] != 'd' and kind[0] != 's' and kind[0] != 'l')) return null;
+    if (kind.len != 1 or std.mem.indexOfScalar(u8, "dsltp", kind[0]) == null) return null;
     var out: Target = .{ .kind = kind[0], .id = undefined, .cid = undefined, .size = 0 };
     if (kind[0] == 'l') {
         out.download = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
@@ -204,17 +238,129 @@ fn parse(path: []const u8) ?Target {
     _ = std.fmt.hexToBytes(&out.id, id) catch return null;
     _ = std.fmt.hexToBytes(&out.cid, cid) catch return null;
     if (id.len != 64 or cid.len != 64) return null;
+    if (kind[0] == 't' or kind[0] == 'p') return out;
     out.size = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
     return out;
 }
 
 fn sizeOf(_: *anyopaque, path: []const u8) ?u64 {
     const t = parse(path) orelse return null;
+    if (t.kind == 't') return thumbSize(t);
+    if (t.kind == 'p') return rawPreviewSize(t);
     return t.size;
+}
+
+/// The length of the thumbnail the node has (or makes now) for `t`; null
+/// (a 404) when none can be made, one is being made or the file isn't
+/// here: the page shows a placeholder, and asks again for the last two.
+fn thumbSize(t: Target) ?u64 {
+    const handle = commands.mediaAcquire() orelse return null;
+    defer commands.mediaRelease();
+    // No name in the URL: the file's first bytes say what it is.
+    const found = handle.node.thumbnail(gpa, t.cid, t.id, .other, thumb_deadline_ms) catch return null;
+    return switch (found) {
+        .jpeg_len => |len| len,
+        .none, .pending, .unavailable => null,
+    };
+}
+
+const RawCache = struct {
+    const Slot = struct {
+        cid: [32]u8,
+        jpeg: []u8,
+        mtime: i64,
+    };
+    const cap = 4;
+    slots: [cap]?Slot = @splat(null),
+    mutex: nomadfs.sync.Mutex = .{},
+
+    fn get(self: *RawCache, cid: *const [32]u8) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.slots) |*s| {
+            if (s.*) |*e| {
+                if (std.mem.eql(u8, &e.cid, cid)) {
+                    e.mtime = nomadfs.sync.timestamp();
+                    return e.jpeg;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn put(self: *RawCache, cid: [32]u8, jpeg: []u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.slots) |*s| {
+            if (s.*) |*e| {
+                if (std.mem.eql(u8, &e.cid, &cid)) {
+                    gpa.free(e.jpeg);
+                    e.jpeg = jpeg;
+                    e.mtime = nomadfs.sync.timestamp();
+                    return;
+                }
+            }
+        }
+        var oldest_idx: usize = 0;
+        var oldest_time: i64 = std.math.maxInt(i64);
+        for (self.slots, 0..) |s, i| {
+            if (s == null) {
+                oldest_idx = i;
+                break;
+            }
+            if (s.?.mtime < oldest_time) {
+                oldest_time = s.?.mtime;
+                oldest_idx = i;
+            }
+        }
+        if (self.slots[oldest_idx]) |old| {
+            gpa.free(old.jpeg);
+        }
+        self.slots[oldest_idx] = .{
+            .cid = cid,
+            .jpeg = jpeg,
+            .mtime = nomadfs.sync.timestamp(),
+        };
+    }
+};
+
+var g_raw_cache: RawCache = .{};
+
+fn rawPreviewSize(t: Target) ?u64 {
+    if (g_raw_cache.get(&t.cid)) |jpeg| {
+        return jpeg.len;
+    }
+    const handle = commands.mediaAcquire() orelse return null;
+    defer commands.mediaRelease();
+    const jpeg = handle.node.rawPreview(gpa, t.cid, t.id) catch return null;
+    const len = jpeg.len;
+    g_raw_cache.put(t.cid, jpeg);
+    return len;
+}
+
+fn rawPreviewRead(t: Target, offset: u64, dest: []u8) !usize {
+    var maybe_jpeg = g_raw_cache.get(&t.cid);
+    if (maybe_jpeg == null) {
+        _ = rawPreviewSize(t);
+        maybe_jpeg = g_raw_cache.get(&t.cid);
+    }
+    const jpeg = maybe_jpeg orelse return error.FileNotFound;
+    if (offset >= jpeg.len) return 0;
+    const want = @min(dest.len, jpeg.len - offset);
+    @memcpy(dest[0..want], jpeg[offset .. offset + want]);
+    return want;
 }
 
 fn readAt(_: *anyopaque, path: []const u8, offset: u64, dest: []u8) anyerror!usize {
     const t = parse(path) orelse return error.FileNotFound;
+    if (t.kind == 't') {
+        const handle = commands.mediaAcquire() orelse return error.NotRunning;
+        defer commands.mediaRelease();
+        return handle.node.thumbRead(t.cid, offset, dest);
+    }
+    if (t.kind == 'p') {
+        return rawPreviewRead(t, offset, dest);
+    }
     if (offset >= t.size) return 0;
     const want = dest[0..@intCast(@min(dest.len, t.size - offset))];
     if (t.kind == 'l') return downloads.readSaved(t.download, offset, want);

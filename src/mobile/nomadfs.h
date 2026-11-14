@@ -4,8 +4,8 @@
  * Rules:
  *  - Every export returns a numeric status (0 = ok) or a nullable handle /
  *    string; no Zig panics cross the boundary.
- *  - Strings are NUL-terminated; inputs are caller-owned, outputs from
- *    `nomadfs_put_file` must be released with `nomadfs_free`.
+ *  - Strings are NUL-terminated; inputs are caller-owned, returned
+ *    strings must be released with `nomadfs_free`.
  *  - Calls on one handle are serialized internally; different handles can
  *    run in parallel.
  *  - `nomadfs_node_run` spawns its own thread; stop it (or free the node)
@@ -85,7 +85,38 @@ int nomadfs_cache_clear(NomadNode *node, uint64_t *out_freed);
 /* Sets the running node's read cache limit in MiB; 0 removes the limit. */
 int nomadfs_cache_set_limit(NomadNode *node, uint64_t limit_mb);
 
-/* Releases a string returned by nomadfs_put_file. */
+/* The photos timeline: every picture and film in the swarm folder below
+ * `folder` (NULL or "": all of it), newest first, as JSON:
+ *   {"generation":N,"total":N,"photos":N,"videos":N,
+ *    "mtimes":[seconds,...],"folders":[{"path":"...","count":N},...]}
+ * `mtimes` has every item's modified time in the timeline's order;
+ * `folders` the folders they are in, two levels deep. NULL on failure.
+ * Free the string with nomadfs_free. */
+char *nomadfs_photos_index_json(NomadNode *node, const char *folder);
+
+/* `count` items (500 at most) of that timeline from `start`, as JSON:
+ *   {"generation":N,"total":N,"items":[{"index":N,"path":"...",
+ *    "name":"...","cid":"hex","author":"hex","size":N,"mtime":seconds,
+ *    "kind":"photo|video|heic|raw","thumb":"ready|none|unknown"}]}
+ * `generation` is the index's: once the folder changed since then the
+ * answer is {"error":"Stale"} and the index must be asked for again; 0
+ * takes the timeline as it is now. NULL on any other failure. Free the
+ * string with nomadfs_free. */
+char *nomadfs_photos_json(NomadNode *node, const char *folder, uint64_t generation, uint32_t start, uint32_t count);
+
+/* Writes the thumbnail (a small JPEG, 320 pixels on its long edge) of the
+ * swarm folder file with the 64-hex-character content ID `cid_hex` to
+ * `out_path`, created or truncated. `author_hex` is the item's "author"
+ * in the photos JSON (NULL when unknown). The thumbnail is made from the
+ * file when all of it is on this device, and kept; the file itself is
+ * never downloaded for it.
+ *   NOMADFS_OK           written
+ *   NOMADFS_NOT_FOUND    none can be made of this file (show a placeholder)
+ *   NOMADFS_UNAVAILABLE  being made, or the file isn't on this device:
+ *                        ask again later */
+int nomadfs_thumbnail(NomadNode *node, const char *cid_hex, const char *author_hex, const char *out_path);
+
+/* Releases a string returned by this API. */
 void nomadfs_free(void *ptr);
 
 #ifdef __cplusplus

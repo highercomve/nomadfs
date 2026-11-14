@@ -43,6 +43,8 @@ globalThis.window = {
     downloads_list: [ { id: 1, name: "f.png", cid: "c", size: 5, done: 5, state: "done", exists: true, path: "/tmp/f.png", source_id: "peer" } ],
     downloads_dir: "/tmp",
     shares_local: [],
+    photos_index: { generation: 1, total: 1, photos: 1, videos: 0, mtimes: [1700000000], folders: [{ path: "Camera", count: 1 }], thumb_base: "http://127.0.0.1:5180/token/t/" },
+    photos_page: { generation: 1, total: 1, items: [{ index: 0, path: "Camera/1.jpg", name: "1.jpg", cid: "c1", author: "a1", size: 1024, mtime: 1700000000, kind: "photo", thumb: "ready" }] },
   })[cmd] ?? {}, listen: () => null, extensions: null, openExternal: async () => ({}), platform: {}, share: { capabilities: async () => ({}), save: async () => {} },},
   addEventListener: () => {}, scrollTo: () => {}, open: () => null,
 };
@@ -69,6 +71,8 @@ try {
   root.setView('swarm');
   await new Promise((r) => setTimeout(r, 100));
   root.setView('downloads');
+  await new Promise((r) => setTimeout(r, 100));
+  root.setView('photos');
   await new Promise((r) => setTimeout(r, 100));
   console.log('SMOKE OK');
   if (rejects.length) {

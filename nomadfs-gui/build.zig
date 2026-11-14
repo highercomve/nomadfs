@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    addCodec(b, nomadfs_mod);
 
     const app = oriel.addApp(b, dep, .{
         .name = "nomadfs-gui",
@@ -131,7 +132,8 @@ pub fn build(b: *std.Build) void {
     if (play_store and target.result.abi.isAndroid()) app.exe.root_module.strip = false;
 
     // zig build test: runs the commands tests with the same imports the
-    // app exe gets (nomadfs core + oriel paths).
+    // app exe gets (nomadfs core + oriel paths). The core module brings its
+    // C code (addCodec) into this binary too.
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/commands.zig"),
         .target = target,
@@ -140,14 +142,20 @@ pub fn build(b: *std.Build) void {
             .{ .name = "nomadfs", .module = nomadfs_mod },
         },
     });
-    const app_test = b.addTest(.{ .root_module = test_mod });
+    const app_test = b.addTest(.{
+        .root_module = test_mod,
+        // The core links libc (its codec), and Zig's own linker can't read
+        // the start files of recent glibc builds (.sframe relocations in
+        // crt1.o): LLVM and LLD link the test binary, as they do the app.
+        .use_llvm = true,
+    });
     const run_test = b.addRunArtifact(app_test);
     const test_step = b.step("test", "Run the GUI command tests");
     test_step.dependOn(&run_test.step);
 
     // zig build test-frontend: the page's own logic (the Markdown renderer,
     // what the notes list decides), in Node. Needs `node` (22 or newer).
-    const frontend_test = b.addSystemCommand(&.{ "node", "--test", "frontend-test/markdown.test.mjs", "frontend-test/notes-model.test.mjs", "frontend-test/app-fixes.test.mjs" });
+    const frontend_test = b.addSystemCommand(&.{ "node", "--test", "frontend-test/markdown.test.mjs", "frontend-test/notes-model.test.mjs", "frontend-test/app-fixes.test.mjs", "frontend-test/photos-model.test.mjs", "frontend-test/zoom.test.mjs", "frontend-test/thumb-loader.test.mjs" });
     frontend_test.setCwd(b.path("."));
     // Plus the full-entry smoke: imports app.js with fake DOM/Oriel and bootes it.
     const smoke_test = b.addSystemCommand(&.{ "node", "frontend-test/smoke-imports.mjs" });
@@ -155,6 +163,18 @@ pub fn build(b: *std.Build) void {
     frontend_test.step.dependOn(&smoke_test.step);
     const frontend_step = b.step("test-frontend", "Run the page's Node tests (Markdown renderer, notes list logic)");
     frontend_step.dependOn(&frontend_test.step);
+}
+
+/// The core's codec layer needs its C side wherever the core is compiled:
+/// the vendored stb image headers, and libc. The same helper as in
+/// ../build.zig (keep the two alike); only the paths differ.
+fn addCodec(b: *std.Build, module: *std.Build.Module) void {
+    module.addCSourceFile(.{
+        .file = b.path("../src/codec/stb/stb_impl.c"),
+        .flags = &.{ "-O2", "-fno-sanitize=undefined", "-fvisibility=hidden" },
+    });
+    module.addIncludePath(b.path("../src/codec/stb"));
+    module.link_libc = true;
 }
 
 /// The `.version` in a dependency's build.zig.zon.

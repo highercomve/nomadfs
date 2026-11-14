@@ -41,6 +41,7 @@ fn validateSwarmKey(val: []const u8, allocator: std.mem.Allocator) ![]const u8 {
 }
 
 pub const Config = struct {
+    backup_s3: @import("backup/config.zig").Config = .{},
     node: NodeConfig,
     storage: StorageConfig,
     network: NetworkConfig,
@@ -97,6 +98,19 @@ pub const Config = struct {
         /// read may take; past it the least recently read are evicted.
         /// 0 is unlimited.
         cache_mb: u64 = 2048,
+        /// Most space, in MiB, thumbnails got from other devices may take
+        /// (`<storage_path>.thumbs/cache`); past it the least recently
+        /// shown are evicted. 0 is unlimited. Thumbnails made here are not
+        /// counted: there is one per picture in the swarm folder.
+        thumbs_cache_mb: u64 = if (builtin.abi.isAndroid()) 256 else 512,
+        /// Make a picture's thumbnail here when the picture is on this
+        /// device, before asking a device that may have made it already.
+        /// Phones ask first: a decode costs them more than a download.
+        thumbs_prefer_local: bool = !builtin.abi.isAndroid(),
+        /// The ffmpeg that takes frames of films for their thumbnails.
+        /// Empty: `ffmpeg` on PATH, else the copy a media server (Emby,
+        /// Jellyfin) brought. Owned when not empty.
+        ffmpeg_path: []const u8 = "",
     };
 
     pub const SecurityConfig = struct {
@@ -118,6 +132,7 @@ pub const Config = struct {
     };
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
+        self.backup_s3.deinit(allocator);
         if (self.node.nickname.len > 0) allocator.free(self.node.nickname);
         if (self.node.swarm_key.len > 0) {
             std.crypto.secureZero(u8, @constCast(self.node.swarm_key));
@@ -125,6 +140,7 @@ pub const Config = struct {
         }
         if (self.node.key_path) |p| allocator.free(p);
         if (self.storage.storage_path.len > 0) allocator.free(self.storage.storage_path);
+        if (self.storage.ffmpeg_path.len > 0) allocator.free(self.storage.ffmpeg_path);
         for (self.network.bootstrap_peers) |peer| {
             allocator.free(peer);
         }
@@ -216,16 +232,21 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
         bootstrap_list.deinit(allocator);
     }
 
+    var backup_section = false;
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
 
-        if (std.mem.startsWith(u8, trimmed, "[")) continue; // Skip section headers for now
+        if (trimmed[0] == '[') {
+            backup_section = std.mem.eql(u8, @import("backup/config.zig").stripComment(trimmed), "[backup.s3]");
+            continue;
+        }
 
         const equals = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
         const key = std.mem.trim(u8, trimmed[0..equals], " \t");
-        const val_raw = std.mem.trim(u8, trimmed[equals + 1 ..], " \t");
+        const raw_value = std.mem.trim(u8, trimmed[equals + 1 ..], " \t");
+        const val_raw = if (backup_section) @import("backup/config.zig").stripComment(raw_value) else raw_value;
 
         // Simple string unquoting
         const val = if (val_raw.len >= 2 and std.mem.startsWith(u8, val_raw, "\"") and std.mem.endsWith(u8, val_raw, "\""))
@@ -233,7 +254,9 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
         else
             val_raw;
 
-        try applyConfigEntry(allocator, &config, &bootstrap_list, key, val);
+        if (backup_section) {
+            try config.backup_s3.apply(allocator, key, val);
+        } else try applyConfigEntry(allocator, &config, &bootstrap_list, key, val);
     }
 
     // Ownership of the list moves into config; the list errdefer is now a no-op.
@@ -291,6 +314,15 @@ fn applyConfigEntry(
         const mb = try std.fmt.parseInt(u64, val, 10);
         _ = std.math.mul(u64, mb, 1024 * 1024) catch return error.QuotaOutOfRange;
         config.storage.cache_mb = mb;
+    } else if (std.mem.eql(u8, key, "thumbs_cache_mb")) {
+        const mb = try std.fmt.parseInt(u64, val, 10);
+        _ = std.math.mul(u64, mb, 1024 * 1024) catch return error.QuotaOutOfRange;
+        config.storage.thumbs_cache_mb = mb;
+    } else if (std.mem.eql(u8, key, "thumbs_prefer_local")) {
+        config.storage.thumbs_prefer_local = std.mem.eql(u8, val, "true");
+    } else if (std.mem.eql(u8, key, "ffmpeg_path")) {
+        // Empty is "look for it": nothing owned.
+        replaceString(allocator, &config.storage.ffmpeg_path, if (val.len > 0) try allocator.dupe(u8, val) else "");
     } else if (std.mem.eql(u8, key, "port")) {
         config.network.port = try std.fmt.parseInt(u16, val, 10);
     } else if (std.mem.eql(u8, key, "upnp_enabled")) {
@@ -393,6 +425,27 @@ test "config: accept_copies, and an old swarm_replicas line is ignored" {
     try std.testing.expect(!cfg.storage.accept_copies);
 }
 
+test "config: the thumbnail settings and their defaults" {
+    const a = std.testing.allocator;
+    const base = "nickname = alpha\nswarm_key = " ++ "ab" ** 32 ++ "\nstorage_path = /tmp/a\n";
+    var defaults = try parseConfigText(a, base);
+    defer defaults.deinit(a);
+    try std.testing.expectEqual(@as(u64, if (builtin.abi.isAndroid()) 256 else 512), defaults.storage.thumbs_cache_mb);
+    try std.testing.expectEqual(!builtin.abi.isAndroid(), defaults.storage.thumbs_prefer_local);
+    try std.testing.expectEqualStrings("", defaults.storage.ffmpeg_path);
+
+    var set = try parseConfigText(a, base ++ "[storage]\nthumbs_cache_mb = 64\nthumbs_prefer_local = false\nffmpeg_path = \"/opt/emby-server/bin/emby-ffmpeg\"\n");
+    defer set.deinit(a);
+    try std.testing.expectEqualStrings("/opt/emby-server/bin/emby-ffmpeg", set.storage.ffmpeg_path);
+    // Set twice, then back to looking for it.
+    var cleared = try parseConfigText(a, base ++ "ffmpeg_path = /usr/bin/ffmpeg\nffmpeg_path = /usr/local/bin/ffmpeg\nffmpeg_path = \"\"\n");
+    defer cleared.deinit(a);
+    try std.testing.expectEqualStrings("", cleared.storage.ffmpeg_path);
+    try std.testing.expectEqual(@as(u64, 64), set.storage.thumbs_cache_mb);
+    try std.testing.expect(!set.storage.thumbs_prefer_local);
+    try std.testing.expectError(error.QuotaOutOfRange, parseConfigText(a, base ++ "thumbs_cache_mb = 18446744073709551615\n"));
+}
+
 test "config: a quota that overflows bytes is refused" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.QuotaOutOfRange, parseConfigText(a, "nickname = alpha\nswarm_key = " ++ "ab" ** 32 ++ "\nstorage_path = /tmp/a\nquota_mb = 18446744073709551615\n"));
@@ -457,4 +510,20 @@ test "config: reject files larger than the input buffer" {
     defer file.close(io);
     try file.writePositionalAll(io, ("#" ** 16385), 0);
     try std.testing.expectError(error.ConfigTooLarge, parseConfig(std.testing.allocator, path));
+}
+
+test "config: S3 section is scoped, defaults retain forever, and credentials cannot be inline" {
+    const a = std.testing.allocator;
+    const base = "nickname = alpha\nswarm_key = " ++ "ab" ** 32 ++ "\nstorage_path = /tmp/a\n";
+    var cfg = try parseConfigText(a, base ++
+        "[backup.s3] # offsite\nendpoint = \"https://example.test\"\nregion = \"auto\"\nbucket = \"bucket\"\nprefix = \"\" # optional\ncredentials = \"~/.nomadfs/s3.credentials\" # private file\nencrypt = true\nupload_limit_kbps = 10\npack_mb = 16\n[node]\nnickname = beta\n");
+    defer cfg.deinit(a);
+    try std.testing.expectEqualStrings("beta", cfg.node.nickname);
+    try std.testing.expectEqualStrings("https://example.test", cfg.backup_s3.endpoint);
+    try std.testing.expectEqualStrings("~/.nomadfs/s3.credentials", cfg.backup_s3.credentials);
+    try std.testing.expectEqual(@as(u32, 30), cfg.backup_s3.retain_daily);
+    try std.testing.expectEqual(@as(u32, 0), cfg.backup_s3.retain_monthly);
+    try std.testing.expectEqual(@as(u32, 16), cfg.backup_s3.pack_mb);
+    try std.testing.expectError(error.UnknownBackupSetting, parseConfigText(a, base ++ "[backup.s3]\nsecret_access_key = inline\n"));
+    try std.testing.expectError(error.InvalidPackSize, parseConfigText(a, base ++ "[backup.s3]\npack_mb = 0\n"));
 }

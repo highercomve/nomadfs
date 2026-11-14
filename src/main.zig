@@ -42,6 +42,10 @@ pub fn main(init: std.process.Init) !void {
     const allocator = if (@import("builtin").mode == .Debug) init.gpa else std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "backup")) {
+        std.process.exit(try @import("backup_cli.zig").run(init.io, allocator, args[2..]));
+    }
+
     // `nomadfs swarm ...`: a client of the running node's local API.
     if (args.len >= 2 and std.mem.eql(u8, args[1], "swarm")) {
         const arena = init.arena.allocator();
@@ -234,6 +238,7 @@ fn printHelp() void {
         \\
         \\Usage:
         \\  nomadfs [options] [config_path]
+        \\  nomadfs backup s3 status|run|verify|restore|recovery-key|forget [options]
         \\  nomadfs --pair [--address host:port] [config_path]
         \\  nomadfs --trust <nomadfs://pair?...> [config_path]
         \\  nomadfs --devices [config_path]
@@ -244,7 +249,7 @@ fn printHelp() void {
         \\  nomadfs --cache | --clear-cache [config_path]
         \\  nomadfs --bench-read <swarm path> [--bench-wait SECONDS] [--bench-cold] [config_path]
         \\  nomadfs --bench-idle SECONDS [config_path]
-        \\  nomadfs swarm status | ls [dir] | get <path> | put <path> [file] | rm <path>
+        \\  nomadfs swarm status | ls [dir] | get <path> | put <path> [file] | rm <path> | photos
         \\                     the swarm folder through the running node, no mount
         \\  nomadfs --upgrade [--check] [--yes]
         \\  nomadfs --version
@@ -877,5 +882,10 @@ fn benchIdleCommand(allocator: std.mem.Allocator, config: config_mod.Config, sec
 }
 
 test {
+    _ = @import("backup_cli.zig");
     _ = swarm_cli; // nomadfs swarm: its parsing tests
+    // The test binary links the core's C code (the codec's stb), which
+    // calls allocator functions the core exports: compile the core in even
+    // when no test here uses it.
+    _ = nomadfs.codec.budget;
 }

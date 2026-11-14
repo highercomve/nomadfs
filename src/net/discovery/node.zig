@@ -52,6 +52,9 @@ pub const Node = struct {
     share_source: ?ShareSource = null,
     /// Answers GET_NODE_INFO; set by the node (root.zig).
     info_source: ?InfoSource = null,
+    /// Answers GET_DERIVED. Null: this device derives nothing, and says it
+    /// does not hold the file, so the asker goes on to another.
+    derived_source: ?DerivedSource = null,
     /// Answers GET_SWARM with the swarm folder's manifest. Null: an empty
     /// manifest.
     swarm_source: ?ShareSource = null,
@@ -199,6 +202,34 @@ pub const Node = struct {
         infoFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
     };
 
+    /// Answers GET_DERIVED: what this device makes of the file `cid` for
+    /// `kind` (a number the layer above defines). `trusted`: the asker is
+    /// a device this one trusts, so work may be done for it. Type-erased
+    /// like ShareSource.
+    pub const DerivedSource = struct {
+        ctx: *anyopaque,
+        answerFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, trusted: bool, cid: [32]u8, kind: u8) anyerror!DerivedAnswer,
+    };
+
+    /// What a device says to GET_DERIVED (rpc.DerivedStatus).
+    pub const DerivedAnswer = union(enum) {
+        /// The derived bytes, 1..rpc.max_derived_len of them, owned by
+        /// whoever receives the answer (the allocator it passed).
+        found: []u8,
+        not_held,
+        /// Nothing can be made; the reason, as the layer above numbers it.
+        none: u8,
+        busy,
+        unknown_kind,
+    };
+
+    /// A peer's DERIVED, as `fetchDerived` returns it.
+    pub const DerivedReply = DerivedAnswer;
+
+    /// `none` when the source fails: 3 is "it could not be read" in the
+    /// one numbering there is (fs/thumb_store.zig Reason.decode_failed).
+    const derived_failed: u8 = 3;
+
     pub const RotationSink = struct {
         ctx: *anyopaque,
         /// Persist and adopt the new key (restarting the node). Called
@@ -226,8 +257,9 @@ pub const Node = struct {
     /// Turns one announced role bit (rpc.Roles) on or off. The next PING
     /// or PONG tells peers.
     pub fn setRole(self: *Node, bit: u8, on: bool) void {
-        const old = self.local_roles.load(.acquire);
-        self.local_roles.store(if (on) old | bit else old & ~bit, .release);
+        // One step: roles are set from several threads (the node's start,
+        // the network watcher).
+        _ = if (on) self.local_roles.fetchOr(bit, .acq_rel) else self.local_roles.fetchAnd(~bit, .acq_rel);
     }
 
     fn announcedRoles(self: *Node) u8 {
@@ -1183,6 +1215,7 @@ pub const Node = struct {
             .GET_SHARES => try self.handleGetShares(stream),
             .GET_SWARM => |p| try self.handleGetSwarm(stream, p.have),
             .GET_NODE_INFO => try self.handleGetNodeInfo(stream, conn),
+            .GET_DERIVED => |p| try self.handleGetDerived(stream, conn, p.cid, p.kind),
             .ROTATE_KEY => |p| try gossip.handleRotateKey(self, stream, conn, p.epoch, p.new_key, p.signer_key, p.signature),
             .REVOKE => |p| try gossip.handleRevoke(self, stream, p.device_id, p.signer_key, p.at, p.signature),
             .ADMIT => |p| try gossip.handleAdmit(self, stream, p),
@@ -1356,6 +1389,55 @@ pub const Node = struct {
             .NODE_INFO => |p| {
                 if (p.info.len == 0) return error.NotTrusted;
                 return allocator.dupe(u8, p.info);
+            },
+            else => return error.InvalidResponse,
+        }
+    }
+
+    /// GET_DERIVED: what the source says. Any peer of the swarm may ask;
+    /// the source is told whether it is a trusted device, and does no work
+    /// for one that is not.
+    fn handleGetDerived(self: *Node, stream: network.Stream, conn: network.Connection, cid: [32]u8, kind: u8) !void {
+        const answer: DerivedAnswer = if (self.derived_source) |source|
+            source.answerFn(source.ctx, self.allocator, self.trustsDevice(conn.getRemoteDeviceID()), cid, kind) catch |err| blk: {
+                std.debug.print("DERIVED: unavailable: {any}\n", .{err});
+                break :blk .{ .none = derived_failed };
+            }
+        else
+            .not_held;
+        defer if (answer == .found) self.allocator.free(answer.found);
+        const payload: @FieldType(rpc.MessagePayload, "DERIVED") = switch (answer) {
+            // A source's answer outside the message's bounds is its
+            // failure, not a reason to drop the stream.
+            .found => |data| if (data.len == 0 or data.len > rpc.max_derived_len) .{ .status = .none, .reason = derived_failed } else .{ .status = .found, .data = data },
+            .not_held => .{ .status = .not_held },
+            .none => |reason| .{ .status = .none, .reason = reason },
+            .busy => .{ .status = .busy },
+            .unknown_kind => .{ .status = .unknown_kind },
+        };
+        const response = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .DERIVED = payload } };
+        try response.send(self.allocator, stream);
+    }
+
+    /// Asks `conn`'s device for what it derives from the file `cid` for
+    /// `kind` (GET_DERIVED). The bytes of `.found` are caller-owned
+    /// (allocated with `allocator`) and unchecked. A device from before
+    /// this message closes the stream: error.EndOfStream.
+    pub fn fetchDerived(self: *Node, conn: network.Connection, cid: [32]u8, kind: u8, allocator: std.mem.Allocator) !DerivedReply {
+        const stream = try conn.openStream();
+        defer stream.close();
+        stream.setTimeout(self.rpc_timeout_ms);
+        const msg = rpc.Message{ .sender_id = self.manager.node_id, .payload = .{ .GET_DERIVED = .{ .cid = cid, .kind = kind } } };
+        try msg.send(self.allocator, stream);
+        const response = try rpc.Message.deserialize(self.allocator, stream.reader());
+        defer response.deinit(self.allocator);
+        switch (response.payload) {
+            .DERIVED => |p| return switch (p.status) {
+                .found => .{ .found = try allocator.dupe(u8, p.data) },
+                .not_held => .not_held,
+                .none => .{ .none = p.reason },
+                .busy => .busy,
+                .unknown_kind => .unknown_kind,
             },
             else => return error.InvalidResponse,
         }

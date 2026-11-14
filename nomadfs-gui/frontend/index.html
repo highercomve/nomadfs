@@ -34,6 +34,10 @@
         <svg viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-1 5.83V10H7.83A3 3 0 1 0 6 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 0 0 9.83 12h4.34A3 3 0 0 0 16 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 1 0 16.17 10H13V7.83A3 3 0 0 0 12 2z"/></svg>
         <span>Swarm folder</span>
       </button>
+      <button class="nav-item" data-view="photos">
+        <svg viewBox="0 0 24 24"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>
+        <span>Photos</span>
+      </button>
       <button class="nav-item" data-view="downloads">
         <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
         <span>Downloads</span>
@@ -189,6 +193,32 @@
         <div class="table-scroll" id="swarm-scroll">
           <div id="swarm-head" class="table-head"></div>
           <ul id="swarm-list" class="list rows"></ul>
+        </div>
+      </section>
+
+      <!-- Photos: timeline of photos and videos in the swarm folder -->
+      <section class="card photos-view" id="photos-section" data-view="photos">
+        <div class="card-head">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>
+          <div class="grow">
+            <h2>Photos</h2>
+            <p class="supporting">Photos and videos across your devices, ordered by day. Tap any photo to browse full-screen.</p>
+          </div>
+        </div>
+        <div class="photos-toolbar">
+          <div id="photos-chips" class="chips-row"></div>
+        </div>
+        <p id="photos-empty" class="empty-state" hidden></p>
+        <p id="photos-error" class="empty-state error-msg" hidden></p>
+        <div id="photos-loading" class="progress indeterminate" hidden></div>
+        <div class="photos-body">
+          <div class="photos-scroll" id="photos-scroll">
+            <div id="photos-sticky" class="photos-sticky" hidden></div>
+            <div id="photos-spacer" class="photos-spacer"></div>
+            <div id="photos-window" class="photos-window"></div>
+          </div>
+          <div id="photos-scrubber" class="photos-scrubber" hidden></div>
+          <div id="photos-scrubber-bubble" class="photos-scrubber-bubble" hidden></div>
         </div>
       </section>
 
@@ -468,7 +498,7 @@
     <nav class="nav-bar" aria-label="Sections">
       <button class="bar-item" data-view="browse"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg></span><span>Browse</span></button>
       <button class="bar-item" data-view="shares"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-5 3c1.1 0 2 .9 2 2s-.9 2-2 2-2-.9-2-2 .9-2 2-2zm4 8h-8v-1c0-1.33 2.67-2 4-2s4 .67 4 2v1z"/></svg></span><span>Shared</span></button>
-      <button class="bar-item" data-view="connect"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg></span><span>Connect</span></button>
+      <button class="bar-item" data-view="photos"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg></span><span>Photos</span></button>
       <button class="bar-item" data-view="swarm"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-1 5.83V10H7.83A3 3 0 1 0 6 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 0 0 9.83 12h4.34A3 3 0 0 0 16 12.83V15a3 3 0 1 0 2 0v-2.17A3 3 0 1 0 16.17 10H13V7.83A3 3 0 0 0 12 2z"/></svg></span><span>Swarm</span></button>
       <button class="bar-item" data-view="downloads"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg><span class="bar-badge" data-downloads-badge hidden></span></span><span>Downloads</span></button>
       <button class="bar-item" id="bar-more" type="button"><span class="bar-pill"><svg viewBox="0 0 24 24"><path d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></span><span>More</span></button>
@@ -485,6 +515,12 @@
             <span id="pv-name" class="headline"></span>
             <span id="pv-meta" class="meta"></span>
           </div>
+          <button id="pv-zoom-out" class="icon-btn" title="Zoom out (−, Ctrl+scroll)" aria-label="Zoom out" hidden>
+            <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14zM7 9h5v1H7z"/></svg>
+          </button>
+          <button id="pv-zoom-in" class="icon-btn" title="Zoom in (+, Ctrl+scroll)" aria-label="Zoom in" hidden>
+            <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14zm.5-7H9v2H7v1h2v2h1v-2h2V9h-2z"/></svg>
+          </button>
           <button id="pv-prev" class="icon-btn" title="Previous (←)" aria-label="Previous">
             <svg viewBox="0 0 24 24"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
           </button>
@@ -547,6 +583,10 @@
     <div id="more-sheet" class="sheet" hidden>
       <div class="sheet-panel" role="menu" aria-label="More">
         <div class="sheet-grip"></div>
+        <button class="sheet-item" data-view="connect" role="menuitem">
+          <svg viewBox="0 0 24 24"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>
+          <span><strong>Connect devices</strong><small>Add devices, invite links, and pairing</small></span>
+        </button>
         <button class="sheet-item" data-view="notes" role="menuitem">
           <svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
           <span><strong>Notes</strong><small>Write and edit notes across your devices</small></span>

@@ -1,6 +1,10 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
 
+pub const backup = @import("backup/mod.zig");
+pub const offsite = @import("cluster/offsite.zig");
+pub const backup_service = @import("backup/service.zig");
+pub const backup_source = @import("fs/offsite.zig");
 pub const config = @import("config.zig");
 pub const config_file = @import("config_file.zig");
 pub const settings = @import("settings.zig");
@@ -9,6 +13,8 @@ pub const net = @import("net/mod.zig");
 pub const storage = @import("storage/mod.zig");
 pub const device = @import("device/mod.zig");
 pub const fs = @import("fs/mod.zig");
+/// Pictures to thumbnails (std and the vendored stb; knows no folders).
+pub const codec = @import("codec/mod.zig");
 /// The mount where there is no FUSE: WebDAV on 127.0.0.1, and mounting it.
 pub const webdav = @import("webdav.zig");
 pub const webdav_mount = @import("webdav_mount.zig");
@@ -31,6 +37,9 @@ pub const nowSeconds = sync.nowSeconds;
 // library keeps its exports even though nothing below references it.
 comptime {
     _ = mobile_api;
+    // The vendored stb C code is linked into every artifact and calls the
+    // allocator functions this file exports, used or not.
+    _ = codec.budget;
 }
 pub const cluster = @import("cluster/mod.zig");
 pub const sync = @import("sync.zig");
@@ -58,6 +67,14 @@ test {
         @import("cluster/quorum.zig"),
         @import("cluster/ring.zig"),
         @import("cluster/vectors.zig"),
+        @import("codec/budget.zig"),
+        @import("codec/exif.zig"),
+        @import("codec/image.zig"),
+        @import("codec/raw.zig"),
+        @import("backup/mod.zig"),
+        @import("net/s3/mod.zig"),
+        @import("cluster/offsite.zig"),
+        @import("fs/offsite.zig"),
         @import("config.zig"),
         @import("config_file.zig"),
         @import("settings.zig"),
@@ -82,6 +99,10 @@ test {
         @import("fs/backup_import.zig"),
         @import("fs/inspect.zig"),
         @import("fs/manifest.zig"),
+        @import("fs/media.zig"),
+        @import("fs/photos.zig"),
+        @import("fs/thumb_store.zig"),
+        @import("fs/thumbs.zig"),
         @import("fs/swarm.zig"),
         @import("fs/remote.zig"),
         @import("fs/scan.zig"),

@@ -12,6 +12,7 @@ const net = @import("net/mod.zig");
 const storage = @import("storage/mod.zig");
 const device = @import("device/mod.zig");
 const fs = @import("fs/mod.zig");
+const codec = @import("codec/mod.zig");
 
 // A manifest the folder keeps must fit in a SWARM reply.
 comptime {
@@ -28,6 +29,7 @@ const DiscoveryNode = net.discovery.Node;
 const HashRing = cluster.ring.HashRing;
 
 pub const Node = struct {
+    offsite: ?*@import("cluster/offsite_worker.zig").Worker = null,
     allocator: std.mem.Allocator,
     connection_manager: *ConnectionManager,
     store: ?*storage.engine.StorageEngine,
@@ -58,6 +60,14 @@ pub const Node = struct {
     /// uses. Its pins are this device's (`<storage_path>.notes-pinned`).
     /// Null with the swarm folder.
     notes: ?*fs.notes.Notes,
+    /// The photos timeline over the swarm folder: the one every front end
+    /// shows (`photosIndex`, `photosPage`). Null with the swarm folder.
+    photos: ?*fs.photos.Timeline,
+    /// Thumbnails of the swarm folder's pictures (`thumbnail`,
+    /// `thumbRead`), kept in `<storage_path>.thumbs`. Null with the swarm
+    /// folder, or when that folder couldn't be opened (the node runs
+    /// without thumbnails).
+    thumbs: ?*fs.Thumbs,
     /// The local swarm API other programs of this user use (Locket,
     /// `nomadfs swarm`): swarm_api.zig. Null without the swarm folder, or
     /// when it couldn't start (the node runs without it).
@@ -220,6 +230,36 @@ pub const Node = struct {
             swarm = folder;
         }
         errdefer if (swarm) |f| f.destroy();
+        // After the folder it reads: freed before it.
+        const photos: ?*fs.photos.Timeline = if (swarm) |folder| try fs.photos.Timeline.create(allocator, folder) else null;
+        errdefer if (photos) |p| p.destroy();
+        // Thumbnails of the folder's pictures: read by the timeline (what
+        // it knows of each item's), so freed after it and before the folder.
+        var thumbs: ?*fs.Thumbs = null;
+        if (swarm) |folder| {
+            const thumbs_path = try std.fmt.allocPrint(allocator, "{s}.thumbs", .{cfg.storage.storage_path});
+            defer allocator.free(thumbs_path);
+            thumbs = fs.Thumbs.create(allocator, std.Io.Threaded.global_single_threaded.io(), store.?, folder, thumbs_path, .{
+                .cache_limit = cfg.storage.thumbs_cache_mb *| (1024 * 1024),
+                .prefer_local = cfg.storage.thumbs_prefer_local,
+            }) catch |err| blk: {
+                std.debug.print("thumbnails: not available: {any}\n", .{err});
+                break :blk null;
+            };
+            if (thumbs) |t| {
+                photos.?.thumb_hints = t.hints();
+                // Other devices are asked through the folder's block
+                // manager, and ask this one through the discovery node
+                // (GET_DERIVED): its handlers are drained before `t` is
+                // freed.
+                t.remote = t.clusterRemote();
+                discovery_node.derived_source = t.source();
+            }
+        }
+        errdefer if (thumbs) |t| {
+            discovery_node.derived_source = null;
+            t.destroy();
+        };
 
         const ring = try allocator.create(HashRing);
         ring.* = HashRing.init(allocator);
@@ -354,11 +394,20 @@ pub const Node = struct {
         var api: ?*swarm_api.Server = null;
         if (swarm) |folder| {
             const dir = std.fs.path.dirname(device_paths.identity) orelse ".";
-            api = swarm_api.Server.start(allocator, folder, dir) catch |err| blk: {
+            api = swarm_api.Server.start(allocator, folder, photos, thumbs, dir) catch |err| blk: {
                 std.debug.print("swarm api: not started: {any}\n", .{err});
                 break :blk null;
             };
         }
+        // Frames of films, for their thumbnails: ffmpeg reads a film from
+        // the local API, so only with both does this device take them, and
+        // say so to the others (they ask it first for a film's). Looking
+        // for ffmpeg runs it once: a moment, here at the start.
+        if (thumbs) |t| if (api) |server| {
+            codec.video.configure(cfg.storage.ffmpeg_path);
+            t.setVideoInput(server.videoInput());
+            discovery_node.setRole(net.discovery.rpc.Roles.video_thumbs, t.canTakeFrames());
+        };
 
         return Node{
             .swarm_api = api,
@@ -376,6 +425,8 @@ pub const Node = struct {
             .shares = shares,
             .swarm = swarm,
             .notes = notes,
+            .photos = photos,
+            .thumbs = thumbs,
             .read_ahead = read_ahead,
             .policy = policy,
             .membership = membership,
@@ -389,6 +440,8 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        if (self.offsite) |worker| worker.destroy();
+        self.offsite = null;
         self.stopCacheThread();
         self.bootstrap_running.store(false, .release);
         if (self.bootstrap_thread) |t| {
@@ -400,6 +453,9 @@ pub const Node = struct {
         // on detached threads. Everything freed below is reachable from them,
         // so nothing is freed before this returns.
         // First: its requests read and write the swarm folder.
+        // The thumbnails stop reading films through it before it goes:
+        // requests of other devices may still be answered (drained below).
+        if (self.thumbs) |t| t.setVideoInput(null);
         if (self.swarm_api) |api| api.stop();
         self.swarm_api = null;
         self.connection_manager.stop();
@@ -413,6 +469,11 @@ pub const Node = struct {
         if (self.keeper) |k| k.stop();
         if (self.read_ahead) |ra| ra.destroy(); // joins its workers
         // Then freed, users before what they use.
+        if (self.photos) |p| p.destroy(); // its readers (the API, the handlers) are gone
+        // After the timeline that asks it and the handlers that answer
+        // other devices from it (drained above), before the folder and the
+        // store it reads.
+        if (self.thumbs) |t| t.destroy();
         if (self.swarm) |folder| folder.destroy();
         if (self.notes) |n| { // its hooks ran on the folder's thread, now gone
             n.deinit();
@@ -537,6 +598,50 @@ pub const Node = struct {
             .swarm => |f| (self.swarm orelse return error.StorageDisabled).readAt(allocator, f.cid, f.author, offset, dest),
             .share => |f| fs.remote.readShareAt(allocator, self.block_manager, self.read_ahead, f.peer, f.cid, offset, dest),
         };
+    }
+
+    // ---- Photos ----
+
+    /// The photos timeline `filter` leaves: how many pictures and films,
+    /// their times and folders (fs/photos.zig). Allocated in `arena`.
+    pub fn photosIndex(self: *Node, arena: std.mem.Allocator, filter: fs.photos.Filter) !fs.photos.Index {
+        return (self.photos orelse return error.StorageDisabled).index(arena, filter);
+    }
+
+    /// `count` items of that timeline from `start` (500 at most), as of
+    /// the index's `generation`: error.Stale once the folder changed
+    /// (0: as it is now). Allocated in `arena`.
+    pub fn photosPage(self: *Node, arena: std.mem.Allocator, generation: u64, filter: fs.photos.Filter, start: u32, count: u32) !fs.photos.Page {
+        return (self.photos orelse return error.StorageDisabled).page(arena, generation, filter, start, count);
+    }
+
+    /// The thumbnail of the swarm folder file `cid` (a small JPEG), which
+    /// `author` wrote and whose name says it is a `kind` (`.other` when
+    /// the caller has no name): its length, to read with `thumbRead`; or
+    /// that none can be made, that one is being made, or that it can't be
+    /// had now (fs/thumbs.zig). Waits `deadline_ms` at most. A file's
+    /// blocks are never fetched for it.
+    pub fn thumbnail(self: *Node, allocator: std.mem.Allocator, cid: [32]u8, author: [32]u8, kind: fs.media.Kind, deadline_ms: u32) !fs.thumbs.Result {
+        return (self.thumbs orelse return error.StorageDisabled).get(allocator, cid, author, kind, deadline_ms);
+    }
+
+    /// Copies that thumbnail's bytes from `offset` into `dest`; how many
+    /// (less than `dest.len` only at its end). error.FileNotFound when
+    /// `thumbnail` didn't answer a length for it.
+    pub fn thumbRead(self: *Node, cid: [32]u8, offset: u64, dest: []u8) !usize {
+        return (self.thumbs orelse return error.StorageDisabled).read(cid, offset, dest);
+    }
+
+    /// The whole thumbnail `thumbnail` said has `len` bytes. Caller-owned.
+    pub fn thumbBytes(self: *Node, allocator: std.mem.Allocator, cid: [32]u8, len: u32) ![]u8 {
+        return (self.thumbs orelse return error.StorageDisabled).readAll(allocator, cid, len);
+    }
+
+    /// The embedded preview JPEG of a RAW photo in the swarm folder (`cid`,
+    /// `author`). Caller-owned. Bounded to files <= 256 MiB.
+    pub fn rawPreview(self: *Node, allocator: std.mem.Allocator, cid: [32]u8, author: [32]u8) ![]u8 {
+        const swarm = self.swarm orelse return error.StorageDisabled;
+        return fs.raw_preview.preview(allocator, swarm, cid, author);
     }
 
     /// A file's DAG and chunks (File Details), its blocks fetched from the
@@ -698,6 +803,17 @@ pub const Node = struct {
         try store.setCacheLimit(if (mb == 0) null else bytes);
     }
 
+    /// Shared offsite status for settings/mobile; null when not configured on
+    /// this keeper. Detailed bucket/snapshot queries use backup_service.
+    pub fn offsiteStatus(self: *Node) ?@import("cluster/offsite_worker.zig").Status {
+        return if (self.offsite) |worker| worker.status() else null;
+    }
+
+    pub fn runOffsite(self: *Node) !void {
+        const worker = self.offsite orelse return error.BackupNotConfigured;
+        try worker.round();
+    }
+
     /// Binds the listener and returns. The accept and
     /// maintenance threads run on their own. `running` must stay alive until
     /// stopListener() returns: the accept loop polls it.
@@ -705,6 +821,14 @@ pub const Node = struct {
         try self.connection_manager.start();
         try self.connection_manager.listen(cfg, running);
         if (self.keeper) |k| k.start() catch |err| std.debug.print("keeper: thread not started: {any}\n", .{err});
+        if (cfg.storage.swarm_backup and cfg.backup_s3.endpoint.len > 0 and self.offsite == null) {
+            if (self.swarm) |folder| if (self.store) |store| {
+                const host = try @import("cluster/offsite_worker.zig").Worker.create(self.allocator, cfg.backup_s3, self.device_identity, self.trust_store, .{ .folder = folder, .store = store });
+                errdefer host.destroy();
+                try host.start();
+                self.offsite = host;
+            };
+        }
         if (self.store != null and self.cache_thread == null) {
             self.cache_running.store(true, .release);
             self.cache_thread = std.Thread.spawn(.{}, runCacheSort, .{self}) catch null;
@@ -788,6 +912,7 @@ pub const Node = struct {
     /// them. Stopping is not undone here: a later listen() fails with
     /// ManagerStopping until the connection manager can restart.
     pub fn stopListener(self: *Node) void {
+        if (self.offsite) |worker| worker.stop();
         self.stopCacheThread();
         if (self.keeper) |k| k.stop();
         self.bootstrap_running.store(false, .release);

@@ -124,8 +124,20 @@ pub fn addStoredReachable(allocator: std.mem.Allocator, store: *StorageEngine, r
     }
 }
 
+/// Bounds and payload policy for a local DAG enumeration.
+pub const CollectOptions = struct {
+    max_blocks: usize = default_max_blocks,
+    /// A leaf already held in the verified store has no children. Offsite
+    /// enumeration needs its CID without reading/hashing its payload again.
+    read_leaves: bool = true,
+};
+
 /// Collects every CID reachable from `root` (inclusive). Caller deinits.
 pub fn collectReachable(allocator: std.mem.Allocator, store: *StorageEngine, root: []const u8) !CidSet {
+    return collectReachableWithOptions(allocator, store, root, .{});
+}
+
+pub fn collectReachableWithOptions(allocator: std.mem.Allocator, store: *StorageEngine, root: []const u8, options: CollectOptions) !CidSet {
     var stack: std.ArrayList(Cid) = .empty;
     defer stack.deinit(allocator);
     var reached: CidSet = .empty;
@@ -134,6 +146,8 @@ pub fn collectReachable(allocator: std.mem.Allocator, store: *StorageEngine, roo
 
     while (stack.pop()) |cid| {
         if ((try reached.getOrPut(allocator, cid)).found_existing) continue;
+        if (reached.count() > options.max_blocks) return error.DagTooLarge;
+        if (!options.read_leaves and store.heldLeaf(&cid)) continue;
         const block = (try store.get(&cid, allocator)) orelse return error.BlockNotFound;
         defer allocator.free(block.data);
         switch (try codec.decode(block.data)) {

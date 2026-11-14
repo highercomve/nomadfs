@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const zigatlas = @import("zigatlas");
 
 // Although this function looks imperative, it does not perform the build
@@ -12,7 +13,12 @@ pub fn build(b: *std.Build) void {
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
-    const target = b.standardTargetOptions(.{});
+    // The codec layer's C code needs a libc. On Linux the default is musl, so
+    // a plain `zig build` gives the same static binary as the release
+    // targets instead of one tied to the build machine's glibc.
+    const target = b.standardTargetOptions(.{
+        .default_target = if (builtin.os.tag == .linux) .{ .abi = .musl } else .{},
+    });
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
@@ -42,8 +48,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    addCodec(b, mod);
+
     if (target.result.os.tag == .windows) {
-        mod.link_libc = true;
         // GetAdaptersAddresses: this device's addresses (net/local_addrs.zig).
         mod.linkSystemLibrary("iphlpapi", .{});
     }
@@ -119,6 +126,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    addCodec(b, lib_mod);
     const lib = b.addLibrary(.{
         .name = "nomadfs",
         .root_module = lib_mod,
@@ -230,6 +238,13 @@ pub fn build(b: *std.Build) void {
 
     test_step.dependOn(&run_integration_tests.step);
 
+    // Offsite core + its fake S3 bucket and scoped config tests.
+    const backup_tests = b.addTest(.{ .root_module = mod, .filters = &.{ "offsite:", "config: S3", "backup credentials:" } });
+    const run_backup_tests = b.addRunArtifact(backup_tests);
+    run_backup_tests.setCwd(b.tmpPath());
+    const backup_step = b.step("test-backup", "Run offsite backup and S3 config tests");
+    backup_step.dependOn(&run_backup_tests.step);
+
     const test_mod_step = b.step("test-mod", "Run module tests");
     test_mod_step.dependOn(&run_mod_tests.step);
 
@@ -247,6 +262,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "frontend", .paths = &.{ "src/main.zig", "src/swarm_cli.zig", "src/mobile", "nomadfs-gui/src" }, .thin = true },
             .{ .name = "node", .paths = &.{ "src/root.zig", "src/node.zig", "src/settings.zig", "src/key_rotation.zig", "src/node_info.zig", "src/webdav.zig", "src/webdav", "src/webdav_mount.zig", "src/swarm_api.zig" } },
             .{ .name = "fs", .paths = &.{"src/fs"} },
+            // Pictures to thumbnails: std and the vendored stb only.
+            .{ .name = "codec", .paths = &.{"src/codec"} },
             .{ .name = "cluster", .paths = &.{"src/cluster"} },
             // Pairing flows that talk to peers sit above net; identity, trust
             // and auth (used by the transport handshake) sit below it.
@@ -258,6 +275,25 @@ pub fn build(b: *std.Build) void {
         },
         .forbid = &.{
             .{ .from = "fs", .to = "net", .reason = "fs reaches the network through cluster" },
+            .{ .from = "codec", .to = "fs", .reason = "codec is bytes in, bytes out: it knows no folders" },
+            .{ .from = "codec", .to = "cluster", .reason = "codec is bytes in, bytes out: it knows no holders" },
+            .{ .from = "codec", .to = "net", .reason = "codec is bytes in, bytes out: it knows no peers" },
         },
     });
+}
+
+/// The codec layer's C side (src/codec): the vendored stb image headers,
+/// compiled once into every module rooted at src/root.zig. They need libc
+/// (malloc, memcpy, math), so the module links it; musl targets stay static.
+/// nomadfs-gui/build.zig has the same helper for its copy of the core.
+fn addCodec(b: *std.Build, module: *std.Build.Module) void {
+    module.addCSourceFile(.{
+        .file = b.path("src/codec/stb/stb_impl.c"),
+        // Optimised in Debug builds too (decoding is the hot loop), and
+        // without UBSan: stb's decoders shift and wrap on purpose.
+        // stb's functions stay out of the mobile library's exports.
+        .flags = &.{ "-O2", "-fno-sanitize=undefined", "-fvisibility=hidden" },
+    });
+    module.addIncludePath(b.path("src/codec/stb"));
+    module.link_libc = true;
 }

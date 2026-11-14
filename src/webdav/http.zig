@@ -24,6 +24,8 @@ pub const Request = struct {
     method: []const u8,
     /// Decoded path segments (no empty ones).
     segments: []const []const u8,
+    /// What follows the path's `?`, as sent ("" without one): see `param`.
+    query: []const u8 = "",
     head: []const u8,
     content_length: ?u64 = null,
     chunked: bool = false,
@@ -37,6 +39,7 @@ pub const Request = struct {
         var req = Request{
             .method = try arena.dupe(u8, method),
             .segments = try splitPath(arena, targetPath(target)) orelse return error.BadRequest,
+            .query = try arena.dupe(u8, targetQuery(target)),
             // A copy: reading a chunked body reuses the connection's buffer.
             .head = try arena.dupe(u8, head),
         };
@@ -44,6 +47,31 @@ pub const Request = struct {
         if (req.header("transfer-encoding")) |v| req.chunked = std.ascii.indexOfIgnoreCase(v, "chunked") != null;
         if (!req.chunked and (req.content_length orelse 0) == 0) req.body_done = true;
         return req;
+    }
+
+    /// A query parameter's value, decoded (`%xx`, `+` for a space), or null
+    /// when it isn't there; the first one of that name. error.BadRequest
+    /// for a bad escape. Allocated in `arena`.
+    pub fn param(self: *const Request, arena: std.mem.Allocator, name: []const u8) !?[]const u8 {
+        var pairs = std.mem.splitScalar(u8, self.query, '&');
+        while (pairs.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+            if (!eql(pair[0..eq], name)) continue;
+            const raw = pair[@min(eq + 1, pair.len)..];
+            const out = try arena.alloc(u8, raw.len);
+            var n: usize = 0;
+            var i: usize = 0;
+            while (i < raw.len) : (i += 1) {
+                if (raw[i] == '%') {
+                    if (i + 2 >= raw.len) return error.BadRequest;
+                    out[n] = std.fmt.parseInt(u8, raw[i + 1 .. i + 3], 16) catch return error.BadRequest;
+                    i += 2;
+                } else out[n] = if (raw[i] == '+') ' ' else raw[i];
+                n += 1;
+            }
+            return out[0..n];
+        }
+        return null;
     }
 
     /// A header's value (case-insensitive name), trimmed.
@@ -68,6 +96,12 @@ pub fn targetPath(target: []const u8) []const u8 {
     }
     if (std.mem.indexOfScalar(u8, t, '?')) |q| t = t[0..q];
     return t;
+}
+
+/// A request target's query: what follows the first `?`, or "".
+pub fn targetQuery(target: []const u8) []const u8 {
+    const q = std.mem.indexOfScalar(u8, target, '?') orelse return "";
+    return target[q + 1 ..];
 }
 
 /// Decoded, non-empty segments; null for `.`/`..` or a bad escape.
@@ -271,6 +305,24 @@ test parseRange {
     try std.testing.expectEqual([2]u64{ 50, 100 }, parseRange("bytes=50-500", 100).?);
     try std.testing.expect(parseRange("bytes=100-", 100) == null);
     try std.testing.expect(parseRange("bytes=0-1,5-6", 100) == null);
+}
+
+test "Request.param" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const req = try Request.parse(arena, "GET /t/v1/photos?folder=Pixel%208/My+Camera&start=20&empty=&flag HTTP/1.1\r\nHost: x\r\n\r\n");
+    try std.testing.expectEqual(@as(usize, 3), req.segments.len);
+    try std.testing.expectEqualStrings("photos", req.segments[2]);
+    try std.testing.expectEqualStrings("Pixel 8/My Camera", (try req.param(arena, "folder")).?);
+    try std.testing.expectEqualStrings("20", (try req.param(arena, "start")).?);
+    try std.testing.expectEqualStrings("", (try req.param(arena, "empty")).?);
+    try std.testing.expectEqualStrings("", (try req.param(arena, "flag")).?);
+    try std.testing.expect(try req.param(arena, "count") == null);
+    const bad = try Request.parse(arena, "GET /t?folder=%zz&cut=%4 HTTP/1.1\r\n\r\n");
+    try std.testing.expectError(error.BadRequest, bad.param(arena, "folder"));
+    try std.testing.expectError(error.BadRequest, bad.param(arena, "cut"));
+    try std.testing.expectEqualStrings("", (try Request.parse(arena, "GET /t HTTP/1.1\r\n\r\n")).query);
 }
 
 test splitPath {

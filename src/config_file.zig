@@ -1,6 +1,6 @@
 //! Changing `nomadfs.conf` in place: the one editor the app and the command
-//! line use. The file is flat `key = value` lines (config.zig ignores the
-//! section headers), so an edit drops the lines it replaces and appends the
+//! line use. Legacy settings are flat `key = value` lines; [backup.s3]
+//! is scoped and preserved. An edit drops the lines it replaces and appends the
 //! new ones, keeping comments and every other setting as they are. Writes
 //! are atomic (temp file, fsync, rename) and owner-only: the file holds the
 //! swarm key.
@@ -47,13 +47,18 @@ pub fn edit(allocator: std.mem.Allocator, path: []const u8, change: Edit) !void 
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
+    var backup_section = false;
     var lines = std.mem.splitScalar(u8, old, '\n');
     while (lines.next()) |line| {
         if (lines.index == null and line.len == 0) break; // trailing newline
-        if (dropped(line, change)) continue;
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "[")) backup_section = std.mem.eql(u8, @import("backup/config.zig").stripComment(trimmed), "[backup.s3]");
+        if (!backup_section and dropped(line, change)) continue;
         try out.appendSlice(allocator, line);
         try out.append(allocator, '\n');
     }
+    // The legacy editor appends node settings; leave the scoped backup section.
+    if (backup_section and change.append.len > 0) try out.appendSlice(allocator, "[node]\n");
     for (change.append) |line| {
         try out.appendSlice(allocator, line);
         try out.append(allocator, '\n');
@@ -105,6 +110,15 @@ pub fn setBool(allocator: std.mem.Allocator, path: []const u8, key: []const u8, 
 pub fn setInt(allocator: std.mem.Allocator, path: []const u8, key: []const u8, value: u64) !void {
     var buf: [64]u8 = undefined;
     const line = try std.fmt.bufPrint(&buf, "{s} = {d}", .{ key, value });
+    try edit(allocator, path, .{ .drop_keys = &.{key}, .append = &.{line} });
+}
+
+/// A quoted string setting ("" clears it). error.InvalidValue for text
+/// the file cannot hold (a quote, a line break).
+pub fn setString(allocator: std.mem.Allocator, path: []const u8, key: []const u8, value: []const u8) !void {
+    if (std.mem.indexOfAny(u8, value, "\"\r\n") != null) return error.InvalidValue;
+    const line = try std.fmt.allocPrint(allocator, "{s} = \"{s}\"", .{ key, value });
+    defer allocator.free(line);
     try edit(allocator, path, .{ .drop_keys = &.{key}, .append = &.{line} });
 }
 
@@ -189,6 +203,13 @@ test "config file: edits are atomic, private, and keep the rest" {
 
     try setNickname(testing.allocator, path, "beta");
     try setBool(testing.allocator, path, "accept_copies", false);
+    // The thumbnail settings are plain keys like the rest.
+    try setInt(testing.allocator, path, "thumbs_cache_mb", 128);
+    try setInt(testing.allocator, path, "thumbs_cache_mb", 64);
+    try setBool(testing.allocator, path, "thumbs_prefer_local", false);
+    try setString(testing.allocator, path, "ffmpeg_path", "/usr/bin/ffmpeg");
+    try setString(testing.allocator, path, "ffmpeg_path", "/opt/emby-server/bin/emby-ffmpeg");
+    try testing.expectError(error.InvalidValue, setString(testing.allocator, path, "ffmpeg_path", "a\"b"));
     try addBootstrapPeers(testing.allocator, path, &.{ "tcp://10.0.0.2:14700", "tcp://10.0.0.2:14700" });
     try removeShare(testing.allocator, path, "Photos");
     try testing.expectError(error.InvalidNickname, setNickname(testing.allocator, path, "a\"b"));
@@ -202,6 +223,13 @@ test "config file: edits are atomic, private, and keep the rest" {
     try testing.expect(std.mem.indexOf(u8, text, "nickname = \"beta\"") != null);
     try testing.expect(std.mem.indexOf(u8, text, "alpha") == null);
     try testing.expect(std.mem.indexOf(u8, text, "accept_copies = false") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "thumbs_cache_mb"));
+    var parsed = try config_mod.parseConfigText(testing.allocator, text);
+    defer parsed.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 64), parsed.storage.thumbs_cache_mb);
+    try testing.expect(!parsed.storage.thumbs_prefer_local);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "ffmpeg_path"));
+    try testing.expectEqualStrings("/opt/emby-server/bin/emby-ffmpeg", parsed.storage.ffmpeg_path);
     // Added once, after whatever the parser defaults to.
     try testing.expect(std.mem.indexOf(u8, text, "bootstrap_peers = [") != null);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\"tcp://10.0.0.2:14700\""));
@@ -212,4 +240,21 @@ test "config file: edits are atomic, private, and keep the rest" {
         const st = try std.Io.Dir.cwd().statFile(io, path, .{});
         try testing.expectEqual(@as(u32, 0o600), @as(u32, @intFromEnum(st.permissions)) & 0o777);
     }
+}
+
+test "config: S3 section survives edits of node settings" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config", .data = "nickname = alpha\nswarm_key = " ++ "ab" ** 32 ++ "\nstorage_path = /tmp/a\n[backup.s3]\nendpoint = \"https://example.test\"\nbucket = bucket\ncredentials = /tmp/credentials\n" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    const path = try std.fs.path.join(a, &.{ dir, "config" });
+    defer a.free(path);
+    try setNickname(a, path, "beta");
+    var cfg = try config_mod.parseConfig(a, path);
+    defer cfg.deinit(a);
+    try std.testing.expectEqualStrings("beta", cfg.node.nickname);
+    try std.testing.expectEqualStrings("https://example.test", cfg.backup_s3.endpoint);
 }

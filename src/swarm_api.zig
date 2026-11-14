@@ -10,6 +10,31 @@
 //!   GET    /<token>/v1/files/<path>    the file; ETag: "<content id>"
 //!   PUT    /<token>/v1/files/<path>    the body becomes the file (8 MiB at most)
 //!   DELETE /<token>/v1/files/<path>
+//!   GET    /<token>/v1/photos/index    the photos timeline: how many, their times, folders
+//!   GET    /<token>/v1/photos          a page of its items
+//!   GET    /<token>/v1/thumb/<path>    a small JPEG of the picture at <path>
+//!   GET    /<token>/v1/content/<cid>   a file's bytes by content ID, with Range
+//!
+//! The photos timeline (fs/photos.zig) is every picture and film in the
+//! folder, newest first. Both requests take `folder=` (only below it),
+//! `kinds=all|photos|videos` and `dedupe=0` (show the same content at each
+//! of its paths); a page takes `start=`, `count=` (500 at most) and the
+//! index's `generation=`, and answers 409 once the folder changed since
+//! (ask for the index again). Without `generation` it is the page as of now.
+//!
+//! A thumbnail (fs/thumbs.zig) is made from the file when all of it is on
+//! this device, and kept. 404 with `X-NomadFS-Error: NoThumbnail` when none
+//! can be made of the file (a format no decoder here reads, a damaged
+//! picture), 503 when one is being made (`Pending`: ask again shortly) or
+//! the file isn't here (`Unavailable`).
+//!
+//! `content` is what ffmpeg reads a film through to take its frame
+//! (`videoInput`): only files whose blocks are all on this device (404
+//! `NotLocal` otherwise; nothing is ever fetched for it), `Range` honoured
+//! (206, or 416) since a phone's films keep their index at the end. ffmpeg
+//! gets the URL as an argument, which other accounts can read from the
+//! process list, so that URL is under a second token that opens `content`
+//! and nothing else.
 //!
 //! A PUT with `If-Match: "<etag>"` writes only while the file is still that
 //! version, and with `If-None-Match: *` only while nothing is there (412
@@ -29,6 +54,9 @@ const builtin = @import("builtin");
 const compat = @import("net/compat.zig");
 const sync = @import("sync.zig");
 const swarm_mod = @import("fs/swarm.zig");
+const photos_mod = @import("fs/photos.zig");
+const thumbs_mod = @import("fs/thumbs.zig");
+const media = @import("fs/media.zig");
 const http = @import("webdav/http.zig");
 const peer = @import("webdav/peer.zig");
 
@@ -43,6 +71,10 @@ const max_connections = 16;
 const idle_timeout_ms = 30_000;
 /// A listing answers at most this many entries.
 const max_list = 10_000;
+/// How long a thumbnail request waits for its decode.
+const thumb_deadline_ms = 20_000;
+/// How much of a file `content` reads and sends at a time.
+const content_chunk = 256 * 1024;
 
 /// What `api.json` holds.
 pub const Info = struct {
@@ -55,9 +87,17 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     folder: *SwarmFolder,
+    /// The node's photos timeline (what its `photosIndex` and `photosPage`
+    /// answer from); it outlives the server. Null: no photos routes.
+    photos: ?*photos_mod.Timeline,
+    /// The node's thumbnails (what its `thumbnail` answers from); they
+    /// outlive the server. Null: no thumbnails.
+    thumbs: ?*thumbs_mod.Thumbs,
     /// The file the URL is published in; removed by `stop`.
     info_path: []u8,
     token: [64]u8 = undefined,
+    /// Opens `content` only: the token in the URL ffmpeg is given.
+    content_token: [64]u8 = undefined,
     port: u16 = 0,
     listener: ?compat.Server = null,
     running: std.atomic.Value(bool) = .init(false),
@@ -70,8 +110,9 @@ pub const Server = struct {
         active: usize = 0,
     } = .{},
 
-    /// Serves `folder` and publishes the URL in `<device_dir>/api.json`.
-    pub fn start(allocator: std.mem.Allocator, folder: *SwarmFolder, device_dir: []const u8) !*Server {
+    /// Serves `folder`, its `photos` timeline and its `thumbs`, and
+    /// publishes the URL in `<device_dir>/api.json`.
+    pub fn start(allocator: std.mem.Allocator, folder: *SwarmFolder, photos: ?*photos_mod.Timeline, thumbs: ?*thumbs_mod.Thumbs, device_dir: []const u8) !*Server {
         const io = std.Io.Threaded.global_single_threaded.io();
         const self = try allocator.create(Server);
         errdefer allocator.destroy(self);
@@ -79,12 +120,16 @@ pub const Server = struct {
             .allocator = allocator,
             .io = io,
             .folder = folder,
+            .photos = photos,
+            .thumbs = thumbs,
             .info_path = try std.fs.path.join(allocator, &.{ device_dir, api_file }),
         };
         errdefer allocator.free(self.info_path);
         var secret: [32]u8 = undefined;
         try io.randomSecure(&secret);
         self.token = std.fmt.bytesToHex(secret, .lower);
+        try io.randomSecure(&secret);
+        self.content_token = std.fmt.bytesToHex(secret, .lower);
         std.crypto.secureZero(u8, &secret);
 
         var listener = try compat.listenLoopback(0);
@@ -115,12 +160,28 @@ pub const Server = struct {
         self.conns.list.deinit(self.allocator);
         self.allocator.free(self.info_path);
         std.crypto.secureZero(u8, &self.token);
+        std.crypto.secureZero(u8, &self.content_token);
         self.allocator.destroy(self);
     }
 
     /// `http://127.0.0.1:<port>/<token>/v1/` into `buf`.
     pub fn url(self: *const Server, buf: []u8) ![]const u8 {
         return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}/{s}/v1/", .{ self.port, &self.token });
+    }
+
+    /// Where ffmpeg reads a film from: what the node gives the thumbnails
+    /// (`Thumbs.setVideoInput`), and takes back before `stop`.
+    pub fn videoInput(self: *Server) thumbs_mod.VideoInput {
+        return .{ .ctx = self, .urlFn = contentUrl };
+    }
+
+    /// `http://127.0.0.1:<port>/<content token>/v1/content/<cidhex>` into
+    /// `buf`; null once the server is stopping.
+    fn contentUrl(ctx: *anyopaque, cid: *const [32]u8, buf: []u8) ?[]const u8 {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        if (!self.running.load(.acquire)) return null;
+        const hex = std.fmt.bytesToHex(cid.*, .lower);
+        return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}/{s}/v1/content/{s}", .{ self.port, &self.content_token, &hex }) catch null;
     }
 
     /// api.json, owner-only, through a temp file and a rename.
@@ -229,14 +290,22 @@ pub const Server = struct {
         // A web page can't reach the API through DNS rebinding.
         if (!http.localHost(req.header("host"))) return conn.respond(403, "Forbidden", &close, "");
         const segments = req.segments; // decoded and checked (no "..") by Request.parse
-        if (segments.len < 3 or !tokenMatches(segments[0], &self.token) or !std.mem.eql(u8, segments[1], "v1")) {
-            return conn.respond(404, "Not Found", &close, "");
-        }
+        if (segments.len < 3 or !std.mem.eql(u8, segments[1], "v1")) return conn.respond(404, "Not Found", &close, "");
         const what = segments[2];
         const rest = segments[3..];
         const method = req.method;
+        const full = tokenMatches(segments[0], &self.token);
+        if ((full or tokenMatches(segments[0], &self.content_token)) and std.mem.eql(u8, what, "content") and rest.len == 1 and eql(method, "GET")) {
+            return self.content(arena, conn, &req, rest[0]);
+        }
+        if (!full) return conn.respond(404, "Not Found", &close, "");
         if (std.mem.eql(u8, what, "status") and rest.len == 0 and eql(method, "GET")) return self.status(arena, conn);
         if (std.mem.eql(u8, what, "list") and eql(method, "GET")) return self.list(arena, conn, try joinPath(arena, rest));
+        if (std.mem.eql(u8, what, "photos") and eql(method, "GET")) {
+            if (rest.len == 0) return self.photosPage(arena, conn, &req);
+            if (rest.len == 1 and eql(rest[0], "index")) return self.photosIndex(arena, conn, &req);
+        }
+        if (std.mem.eql(u8, what, "thumb") and rest.len > 0 and eql(method, "GET")) return self.thumb(arena, conn, try joinPath(arena, rest));
         if (std.mem.eql(u8, what, "files") and rest.len > 0) {
             const path = try joinPath(arena, rest);
             if (eql(method, "GET")) return self.get(arena, conn, path);
@@ -268,6 +337,86 @@ pub const Server = struct {
             e.* = .{ .name = it.name, .dir = it.dir, .size = it.size, .mtime = it.mtime, .etag = if (it.cid) |c| try arena.dupe(u8, &std.fmt.bytesToHex(c, .lower)) else null };
         }
         return conn.respond(200, "OK", &json_close, try std.json.Stringify.valueAlloc(arena, out, .{}));
+    }
+
+    fn photosIndex(self: *Server, arena: std.mem.Allocator, conn: *Conn, req: *const Request) !void {
+        const timeline = self.photos orelse return conn.respond(404, "Not Found", &close, "");
+        const filter = photosFilter(arena, req) catch return conn.respond(400, "Bad Request", &close, "");
+        const index = try timeline.index(arena, filter);
+        return conn.respond(200, "OK", &json_close, try photos_mod.indexJson(arena, index));
+    }
+
+    fn photosPage(self: *Server, arena: std.mem.Allocator, conn: *Conn, req: *const Request) !void {
+        const timeline = self.photos orelse return conn.respond(404, "Not Found", &close, "");
+        const filter = photosFilter(arena, req) catch return conn.respond(400, "Bad Request", &close, "");
+        const generation = numberParam(u64, arena, req, "generation", 0) catch return conn.respond(400, "Bad Request", &close, "");
+        const from = numberParam(u32, arena, req, "start", 0) catch return conn.respond(400, "Bad Request", &close, "");
+        const count = numberParam(u32, arena, req, "count", photos_mod.max_page) catch return conn.respond(400, "Bad Request", &close, "");
+        const page = timeline.page(arena, generation, filter, from, count) catch |err| return answerError(conn, err);
+        return conn.respond(200, "OK", &json_close, try photos_mod.pageJson(arena, page));
+    }
+
+    /// The thumbnail of the file at `path`, as the node's `thumbnail`
+    /// answers it.
+    fn thumb(self: *Server, arena: std.mem.Allocator, conn: *Conn, path: []const u8) !void {
+        const thumbs = self.thumbs orelse return conn.respond(404, "Not Found", &close, "");
+        const info = self.folder.fileInfo(path) orelse return answerError(conn, error.FileNotFound);
+        const found = try thumbs.get(arena, info.cid, info.author, media.kindOfName(path), thumb_deadline_ms);
+        switch (found) {
+            .jpeg_len => |len| {
+                // Evicted between the two: as if it weren't here.
+                const jpeg = thumbs.readAll(arena, info.cid, len) catch |err| switch (err) {
+                    error.FileNotFound => return answerError(conn, error.Unavailable),
+                    else => return err,
+                };
+                return conn.respond(200, "OK", &.{ .{ "Content-Type", "image/jpeg" }, .{ "ETag", try etagOf(arena, info.cid) }, .{ "Connection", "close" } }, jpeg);
+            },
+            .none => return conn.respond(404, "Not Found", &.{ .{ "Connection", "close" }, .{ "X-NomadFS-Error", "NoThumbnail" } }, ""),
+            .pending => return conn.respond(503, "Unavailable", &.{ .{ "Connection", "close" }, .{ "X-NomadFS-Error", "Pending" }, .{ "Retry-After", "2" } }, ""),
+            .unavailable => return answerError(conn, error.Unavailable),
+        }
+    }
+
+    /// The bytes of the file `hex` names, from this device's blocks only:
+    /// all of it, or the `Range` asked for.
+    fn content(self: *Server, arena: std.mem.Allocator, conn: *Conn, req: *const Request, hex: []const u8) !void {
+        const thumbs = self.thumbs orelse return conn.respond(404, "Not Found", &close, "");
+        var cid: [32]u8 = undefined;
+        if (hex.len != 64) return conn.respond(400, "Bad Request", &close, "");
+        _ = std.fmt.hexToBytes(&cid, hex) catch return conn.respond(400, "Bad Request", &close, "");
+        // A block missing (or no such file): not this endpoint's to fetch.
+        const size = thumbs.localSize(&cid) orelse return conn.respond(404, "Not Found", &.{ .{ "Connection", "close" }, .{ "X-NomadFS-Error", "NotLocal" } }, "");
+        var first: u64 = 0;
+        var end: u64 = size; // exclusive
+        var cr_buf: [80]u8 = undefined;
+        const partial = if (req.header("range")) |r| blk: {
+            const range = http.parseRange(r, size) orelse {
+                return conn.respond(416, "Range Not Satisfiable", &.{ .{ "Connection", "close" }, .{ "Content-Range", try std.fmt.bufPrint(&cr_buf, "bytes */{d}", .{size}) } }, "");
+            };
+            first, end = range;
+            break :blk true;
+        } else false;
+        var len_buf: [24]u8 = undefined;
+        var headers: [5][2][]const u8 = undefined;
+        headers[0..4].* = .{
+            .{ "Content-Type", "application/octet-stream" },
+            .{ "Content-Length", try std.fmt.bufPrint(&len_buf, "{d}", .{end - first}) },
+            .{ "Accept-Ranges", "bytes" },
+            .{ "Connection", "close" },
+        };
+        if (partial) headers[4] = .{ "Content-Range", try std.fmt.bufPrint(&cr_buf, "bytes {d}-{d}/{d}", .{ first, end - 1, size }) }; // end > first
+        try conn.writeHead(if (partial) 206 else 200, if (partial) "Partial Content" else "OK", headers[0..if (partial) 5 else 4]);
+        const buf = try arena.alloc(u8, content_chunk);
+        var at = first;
+        // Each round sends at least a byte: bounded by the range.
+        while (at < end) {
+            const want = buf[0..@intCast(@min(buf.len, end - at))];
+            const got = try self.folder.readLocal(self.allocator, cid, at, want);
+            // A block evicted since the walk: the answer is cut short.
+            if (got == 0) return error.EndOfStream;
+            try conn.stream.writeAll(want[0..got]);
+            at += got;
+        }
     }
 
     fn get(self: *Server, arena: std.mem.Allocator, conn: *Conn, path: []const u8) !void {
@@ -333,6 +482,27 @@ fn tokenMatches(given: []const u8, token: *const [64]u8) bool {
     return std.crypto.timing_safe.eql([64]u8, given[0..64].*, token.*);
 }
 
+/// The photos filter a request's query asks for (`folder`, `kinds`,
+/// `dedupe`); error.BadRequest for a value that isn't one.
+fn photosFilter(arena: std.mem.Allocator, req: *const Request) !photos_mod.Filter {
+    var filter: photos_mod.Filter = .{};
+    if (try req.param(arena, "folder")) |folder| filter.folder = folder;
+    if (try req.param(arena, "kinds")) |kinds| filter.kinds = photos_mod.KindSet.parse(kinds) orelse return error.BadRequest;
+    if (try req.param(arena, "dedupe")) |v| {
+        if (!eql(v, "0") and !eql(v, "1")) return error.BadRequest;
+        filter.dedupe = eql(v, "1");
+    }
+    return filter;
+}
+
+/// A decimal query parameter, or `default` when it isn't there (or is
+/// empty); error.BadRequest when it isn't a number of that size.
+fn numberParam(comptime T: type, arena: std.mem.Allocator, req: *const Request, name: []const u8, default: T) !T {
+    const text = try req.param(arena, name) orelse return default;
+    if (text.len == 0) return default;
+    return std.fmt.parseInt(T, text, 10) catch error.BadRequest;
+}
+
 /// "a/b/c" from the URL's segments (each already checked by splitPath).
 fn joinPath(arena: std.mem.Allocator, segments: []const []const u8) ![]const u8 {
     return std.mem.join(arena, "/", segments);
@@ -371,6 +541,7 @@ fn baseOf(req: *const Request, folder: *SwarmFolder, path: []const u8) !?[32]u8 
 fn answerError(conn: *Conn, err: anyerror) !void {
     const code: u16, const text: []const u8 = switch (err) {
         error.Changed => .{ 412, "Precondition Failed" },
+        error.Stale => .{ 409, "Conflict" },
         error.NotSynced => .{ 503, "Not Synced Yet" },
         error.FileNotFound => .{ 404, "Not Found" },
         error.InvalidPath, error.IsDirectory => .{ 400, "Bad Request" },
@@ -379,6 +550,244 @@ fn answerError(conn: *Conn, err: anyerror) !void {
         else => .{ 500, "Internal Server Error" },
     };
     return conn.respond(code, text, &.{ .{ "Connection", "close" }, .{ "X-NomadFS-Error", @errorName(err) } }, "");
+}
+
+const TestFolder = @import("fs/test_fixture.zig").Fixture(SwarmFolder);
+
+/// One GET of `target` (after `/<token>/v1/`) on a test server: the status
+/// code, the head and the body, in `arena`.
+fn testGet(arena: std.mem.Allocator, server: *Server, target: []const u8) !TestAnswer {
+    return testGetWith(arena, server, &server.token, target, "");
+}
+
+const TestAnswer = struct { code: u16, head: []const u8, body: []const u8 };
+
+/// `testGet` under `token`, with `headers` (whole lines, each ending in
+/// CRLF) added to the request.
+fn testGetWith(arena: std.mem.Allocator, server: *Server, token: []const u8, target: []const u8, headers: []const u8) !TestAnswer {
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", server.port);
+    const stream = try compat.tcpConnectToAddress(.{ .ip = addr });
+    defer stream.close();
+    try stream.setTimeout(10_000);
+    try stream.writeAll(try std.fmt.allocPrint(arena, "GET /{s}/v1/{s} HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}Connection: close\r\n\r\n", .{ token, target, headers }));
+    var raw: std.ArrayList(u8) = .empty;
+    var buf: [4096]u8 = undefined;
+    while (raw.items.len < 8 << 20) {
+        const n = try stream.read(&buf);
+        if (n == 0) break;
+        try raw.appendSlice(arena, buf[0..n]);
+    }
+    const end = std.mem.indexOf(u8, raw.items, "\r\n\r\n") orelse return error.BadResponse;
+    if (end < 12) return error.BadResponse;
+    return .{ .code = try std.fmt.parseInt(u16, raw.items[9..12], 10), .head = raw.items[0..end], .body = raw.items[end + 4 ..] };
+}
+
+test "swarm api: the photos index and pages, and 409 once the folder changed" {
+    const testing = std.testing;
+    var t: TestFolder = undefined;
+    try t.open(0x61, "Desk");
+    defer t.close();
+    _ = try t.folder.putBytes("Pixel 8/Camera/a.jpg", "a", null);
+    try t.folder.setMtime("Pixel 8/Camera/a.jpg", 200);
+    _ = try t.folder.putBytes("Pixel 8/Camera/clip.mp4", "clip", null);
+    try t.folder.setMtime("Pixel 8/Camera/clip.mp4", 300);
+    _ = try t.folder.putBytes("notes.md", "text", null);
+    const timeline = try photos_mod.Timeline.create(testing.allocator, t.folder);
+    defer timeline.destroy();
+    const server = try Server.start(testing.allocator, t.folder, timeline, null, t.dir);
+    defer server.stop();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Index = struct { generation: u64, total: u32, photos: u32, videos: u32, mtimes: []const u64, folders: []const struct { path: []const u8, count: u32 } };
+    const index_answer = try testGet(arena, server, "photos/index?folder=Pixel%208");
+    try testing.expectEqual(@as(u16, 200), index_answer.code);
+    const index = try std.json.parseFromSliceLeaky(Index, arena, index_answer.body, .{});
+    try testing.expectEqual(@as(u32, 2), index.total);
+    try testing.expectEqual(@as(u32, 1), index.photos);
+    try testing.expectEqual(@as(u32, 1), index.videos);
+    try testing.expectEqualSlices(u64, &.{ 300, 200 }, index.mtimes);
+    try testing.expectEqualStrings("Pixel 8/Camera", index.folders[1].path);
+
+    const Page = struct { generation: u64, total: u32, items: []const struct { index: u32, path: []const u8, name: []const u8, cid: []const u8, author: []const u8, size: u64, mtime: u64, kind: []const u8, thumb: []const u8 } };
+    const page_answer = try testGet(arena, server, try std.fmt.allocPrint(arena, "photos?folder=Pixel+8&generation={d}&start=1&count=5", .{index.generation}));
+    try testing.expectEqual(@as(u16, 200), page_answer.code);
+    const page = try std.json.parseFromSliceLeaky(Page, arena, page_answer.body, .{});
+    try testing.expectEqual(index.generation, page.generation);
+    try testing.expectEqual(@as(u32, 2), page.total);
+    try testing.expectEqual(@as(usize, 1), page.items.len);
+    try testing.expectEqual(@as(u32, 1), page.items[0].index);
+    try testing.expectEqualStrings("Pixel 8/Camera/a.jpg", page.items[0].path);
+    try testing.expectEqualStrings("a.jpg", page.items[0].name);
+    try testing.expectEqualStrings("photo", page.items[0].kind);
+    try testing.expectEqualStrings("unknown", page.items[0].thumb);
+    try testing.expectEqualStrings(&std.fmt.bytesToHex(t.folder.fileInfo("Pixel 8/Camera/a.jpg").?.cid, .lower), page.items[0].cid);
+    try testing.expectEqualStrings("61" ** 32, page.items[0].author);
+
+    // Only films; no generation: the page as of now.
+    const films = try std.json.parseFromSliceLeaky(Page, arena, (try testGet(arena, server, "photos?kinds=videos")).body, .{});
+    try testing.expectEqual(@as(usize, 1), films.items.len);
+    try testing.expectEqualStrings("video", films.items[0].kind);
+
+    try testing.expectEqual(@as(u16, 400), (try testGet(arena, server, "photos?start=x")).code);
+    try testing.expectEqual(@as(u16, 400), (try testGet(arena, server, "photos/index?kinds=films")).code);
+    try testing.expectEqual(@as(u16, 404), (try testGet(arena, server, "photos/other")).code);
+    // This server has no thumbnails.
+    try testing.expectEqual(@as(u16, 404), (try testGet(arena, server, "thumb/Pixel%208/Camera/a.jpg")).code);
+
+    // The folder changed: a page of the old index is refused.
+    _ = try t.folder.putBytes("new.png", "new", null);
+    try testing.expectEqual(@as(u16, 409), (try testGet(arena, server, try std.fmt.allocPrint(arena, "photos?generation={d}", .{index.generation}))).code);
+}
+
+test "swarm api: a thumbnail, none for a format no decoder reads, 404 for no file" {
+    const testing = std.testing;
+    const image = @import("codec/mod.zig").image;
+    var t: TestFolder = undefined;
+    try t.open(0x62, "Desk");
+    defer t.close();
+    const picture = try image.testing.gradientJpeg(testing.allocator, 800, 400, 1);
+    defer testing.allocator.free(picture);
+    _ = try t.folder.putBytes("Pixel 8/Camera/a.jpg", picture, null);
+    _ = try t.folder.putBytes("Pixel 8/Camera/b.heic", "\x00\x00\x00\x18ftypheic\x00\x00\x00\x00", null);
+    const thumbs_dir = try std.fs.path.join(testing.allocator, &.{ t.dir, "blocks.thumbs" });
+    defer testing.allocator.free(thumbs_dir);
+    const thumbs = try thumbs_mod.Thumbs.create(testing.allocator, testing.io, &t.store, t.folder, thumbs_dir, .{});
+    defer thumbs.destroy();
+    const server = try Server.start(testing.allocator, t.folder, null, thumbs, t.dir);
+    defer server.stop();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const made = try testGet(arena, server, "thumb/Pixel%208/Camera/a.jpg");
+    try testing.expectEqual(@as(u16, 200), made.code);
+    try testing.expect(std.mem.indexOf(u8, made.head, "Content-Type: image/jpeg") != null);
+    const dims = try image.info(made.body);
+    try testing.expectEqual(@as(u32, 320), dims.width);
+    try testing.expectEqual(@as(u32, 160), dims.height);
+    // The same bytes again, from the store.
+    try testing.expectEqualSlices(u8, made.body, (try testGet(arena, server, "thumb/Pixel%208/Camera/a.jpg")).body);
+    try testing.expectEqual(@as(u64, 1), thumbs.generated.load(.monotonic));
+
+    const none = try testGet(arena, server, "thumb/Pixel%208/Camera/b.heic");
+    try testing.expectEqual(@as(u16, 404), none.code);
+    try testing.expect(std.mem.indexOf(u8, none.head, "X-NomadFS-Error: NoThumbnail") != null);
+    const missing = try testGet(arena, server, "thumb/Pixel%208/Camera/nope.jpg");
+    try testing.expectEqual(@as(u16, 404), missing.code);
+    try testing.expect(std.mem.indexOf(u8, missing.head, "X-NomadFS-Error: FileNotFound") != null);
+    try testing.expectEqual(@as(u16, 404), (try testGet(arena, server, "thumb")).code);
+}
+
+test "swarm api: a file's bytes by content ID, in ranges, only when all of it is here" {
+    const testing = std.testing;
+    var t: TestFolder = undefined;
+    try t.open(0x63, "Desk");
+    defer t.close();
+    // Several blocks, so a range crosses them.
+    const bytes = try testing.allocator.alloc(u8, 3 * 1024 * 1024 + 123);
+    defer testing.allocator.free(bytes);
+    var prng = std.Random.DefaultPrng.init(63);
+    prng.random().bytes(bytes);
+    const cid = (try t.folder.putBytes("Camera/clip.mp4", bytes, null)).cid;
+    const far_bytes = try testing.allocator.dupe(u8, bytes[1..]);
+    defer testing.allocator.free(far_bytes);
+    const far = (try t.folder.putBytes("Camera/far.mp4", far_bytes, null)).cid;
+    const thumbs_dir = try std.fs.path.join(testing.allocator, &.{ t.dir, "blocks.thumbs" });
+    defer testing.allocator.free(thumbs_dir);
+    const thumbs = try thumbs_mod.Thumbs.create(testing.allocator, testing.io, &t.store, t.folder, thumbs_dir, .{});
+    defer thumbs.destroy();
+    const server = try Server.start(testing.allocator, t.folder, null, thumbs, t.dir);
+    defer server.stop();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const target = try std.fmt.allocPrint(arena, "content/{s}", .{&std.fmt.bytesToHex(cid, .lower)});
+
+    const whole = try testGet(arena, server, target);
+    try testing.expectEqual(@as(u16, 200), whole.code);
+    try testing.expect(std.mem.indexOf(u8, whole.head, "Accept-Ranges: bytes") != null);
+    try testing.expectEqualSlices(u8, bytes, whole.body);
+
+    const first = try testGetWith(arena, server, &server.token, target, "Range: bytes=0-99\r\n");
+    try testing.expectEqual(@as(u16, 206), first.code);
+    try testing.expect(std.mem.indexOf(u8, first.head, try std.fmt.allocPrint(arena, "Content-Range: bytes 0-99/{d}", .{bytes.len})) != null);
+    try testing.expect(std.mem.indexOf(u8, first.head, "Content-Length: 100\r\n") != null);
+    try testing.expectEqualSlices(u8, bytes[0..100], first.body);
+
+    const rest = try testGetWith(arena, server, &server.token, target, "Range: bytes=100-\r\n");
+    try testing.expectEqual(@as(u16, 206), rest.code);
+    try testing.expect(std.mem.indexOf(u8, rest.head, try std.fmt.allocPrint(arena, "Content-Range: bytes 100-{d}/{d}", .{ bytes.len - 1, bytes.len })) != null);
+    try testing.expectEqualSlices(u8, bytes[100..], rest.body);
+
+    // Across a block's end, and the last bytes (where a film's index is).
+    const middle = try testGetWith(arena, server, &server.token, target, "Range: bytes=1048000-1049999\r\n");
+    try testing.expectEqualSlices(u8, bytes[1048000..1050000], middle.body);
+    const tail = try testGetWith(arena, server, &server.token, target, "Range: bytes=-16\r\n");
+    try testing.expectEqual(@as(u16, 206), tail.code);
+    try testing.expectEqualSlices(u8, bytes[bytes.len - 16 ..], tail.body);
+
+    const past = try testGetWith(arena, server, &server.token, target, try std.fmt.allocPrint(arena, "Range: bytes={d}-\r\n", .{bytes.len}));
+    try testing.expectEqual(@as(u16, 416), past.code);
+    try testing.expect(std.mem.indexOf(u8, past.head, try std.fmt.allocPrint(arena, "Content-Range: bytes */{d}", .{bytes.len})) != null);
+
+    // The token ffmpeg's URL carries opens this and nothing else.
+    var url_buf: [thumbs_mod.max_input_url]u8 = undefined;
+    const input = server.videoInput();
+    const url = input.urlFn(input.ctx, &cid, &url_buf).?;
+    try testing.expect(std.mem.indexOf(u8, url, &server.token) == null);
+    try testing.expect(std.mem.endsWith(u8, url, target));
+    const by_url = try testGetWith(arena, server, &server.content_token, target, "Range: bytes=0-9\r\n");
+    try testing.expectEqualSlices(u8, bytes[0..10], by_url.body);
+    try testing.expectEqual(@as(u16, 404), (try testGetWith(arena, server, &server.content_token, "status", "")).code);
+    try testing.expectEqual(@as(u16, 404), (try testGetWith(arena, server, &server.content_token, "files/Camera/clip.mp4", "")).code);
+    try testing.expectEqual(@as(u16, 404), (try testGetWith(arena, server, "0" ** 64, target, "")).code);
+
+    // A block of it missing: not served, and nothing is fetched for it.
+    var leaves: std.ArrayList([32]u8) = .empty;
+    defer leaves.deinit(testing.allocator);
+    const tree = @import("fs/tree.zig");
+    try tree.leavesIn(testing.allocator, tree.Loader.local(&t.store), far, 0, 0, far_bytes.len, &leaves, 64);
+    try t.tmp.dir.deleteFile(testing.io, "blocks/" ++ std.fmt.bytesToHex(leaves.items[leaves.items.len - 1], .lower));
+    const missing = try testGet(arena, server, try std.fmt.allocPrint(arena, "content/{s}", .{&std.fmt.bytesToHex(far, .lower)}));
+    try testing.expectEqual(@as(u16, 404), missing.code);
+    try testing.expect(std.mem.indexOf(u8, missing.head, "X-NomadFS-Error: NotLocal") != null);
+    // A content ID nothing here has, and what is no content ID.
+    try testing.expectEqual(@as(u16, 404), (try testGet(arena, server, "content/" ++ "ee" ** 32)).code);
+    try testing.expectEqual(@as(u16, 400), (try testGet(arena, server, "content/abc")).code);
+}
+
+test "swarm api: ffmpeg takes a film's frame through the content endpoint" {
+    const testing = std.testing;
+    const codec = @import("codec/mod.zig");
+    var t: TestFolder = undefined;
+    try t.open(0x64, "Desk");
+    defer t.close();
+    // Skips without ffmpeg.
+    const path = try codec.video.testing.clip(testing.allocator, t.tmp.dir, "clip.mp4", "2");
+    defer testing.allocator.free(path);
+    const film = try t.tmp.dir.readFileAlloc(testing.io, "clip.mp4", testing.allocator, .limited(4 * 1024 * 1024));
+    defer testing.allocator.free(film);
+    _ = try t.folder.putBytes("Pixel 8/Camera/clip.mp4", film, null);
+    const thumbs_dir = try std.fs.path.join(testing.allocator, &.{ t.dir, "blocks.thumbs" });
+    defer testing.allocator.free(thumbs_dir);
+    const thumbs = try thumbs_mod.Thumbs.create(testing.allocator, testing.io, &t.store, t.folder, thumbs_dir, .{});
+    defer thumbs.destroy();
+    const server = try Server.start(testing.allocator, t.folder, null, thumbs, t.dir);
+    defer server.stop();
+    thumbs.setVideoInput(server.videoInput());
+    defer thumbs.setVideoInput(null);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const made = try testGet(arena, server, "thumb/Pixel%208/Camera/clip.mp4");
+    try testing.expectEqual(@as(u16, 200), made.code);
+    const dims = try codec.image.info(made.body);
+    try testing.expectEqual(@as(u32, 320), dims.width);
+    try testing.expectEqual(@as(u32, 180), dims.height);
+    try testing.expectEqual(@as(u64, 1), thumbs.generated.load(.monotonic));
 }
 
 test tokenMatches {

@@ -368,6 +368,87 @@ pub export fn nomadfs_cache_set_limit(node: ?*NodeHandle, limit_mb: u64) c_int {
     return nomadfs_ok;
 }
 
+/// The photos timeline below `folder` (NULL or "": the whole swarm folder)
+/// as JSON: `{"generation","total","photos","videos","mtimes":[…],
+/// "folders":[{"path","count"}]}` (fs/photos.zig, the same every front end
+/// gets). NULL on failure; callers free it with `nomadfs_free`.
+pub export fn nomadfs_photos_index_json(node: ?*NodeHandle, folder: ?[*:0]const u8) ?[*:0]u8 {
+    const self = acquireHandle(node) orelse return null;
+    defer releaseHandle(self);
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const index = self.node.photosIndex(arena, .{ .folder = spanSlice(folder) orelse "" }) catch return null;
+    const json = photos.indexJson(arena, index) catch return null;
+    return allocator.dupeZ(u8, json) catch null;
+}
+
+/// `count` items (500 at most) of that timeline from `start`, as JSON:
+/// `{"generation","total","items":[{"index","path","name","cid","author",
+/// "size","mtime","kind","thumb"}]}`. `generation` is the index's: once
+/// the folder changed since, the answer is `{"error":"Stale"}` (ask for
+/// the index again); 0 takes the timeline as it is now. NULL on any other
+/// failure; callers free it with `nomadfs_free`.
+pub export fn nomadfs_photos_json(node: ?*NodeHandle, folder: ?[*:0]const u8, generation: u64, start: u32, count: u32) ?[*:0]u8 {
+    const self = acquireHandle(node) orelse return null;
+    defer releaseHandle(self);
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const page = self.node.photosPage(arena, generation, .{ .folder = spanSlice(folder) orelse "" }, start, count) catch |err| switch (err) {
+        error.Stale => return allocator.dupeZ(u8, stale_json) catch null,
+        else => return null,
+    };
+    const json = photos.pageJson(arena, page) catch return null;
+    return allocator.dupeZ(u8, json) catch null;
+}
+
+const photos = nomadfs.fs.photos;
+/// What `nomadfs_photos_json` answers for a generation that has passed.
+const stale_json = "{\"error\":\"Stale\"}";
+
+/// How long `nomadfs_thumbnail` waits for a decode.
+const thumb_deadline_ms = 4000;
+
+/// Writes the thumbnail (a small JPEG) of the swarm folder file with the
+/// hex content ID `cid_hex` to `out_path`, created or truncated.
+/// `author_hex` is the device that wrote the file, as the photos JSON
+/// gives it (NULL: unknown). `nomadfs_ok` when written; `not_found` when
+/// none can be made of this file (the app shows a placeholder);
+/// `unavailable` when one is being made or the file isn't here (ask
+/// again later). The same service as every front end: the node's
+/// `thumbnail`.
+pub export fn nomadfs_thumbnail(node: ?*NodeHandle, cid_hex: ?[*:0]const u8, author_hex: ?[*:0]const u8, out_path: ?[*:0]const u8) c_int {
+    const self = acquireHandle(node) orelse return invalid_argument;
+    defer releaseHandle(self);
+    const cid = parseCid(spanSlice(cid_hex) orelse return invalid_argument) catch return invalid_argument;
+    const author: [32]u8 = if (spanSlice(author_hex)) |hex| parseCid(hex) catch return invalid_argument else @splat(0);
+    const path = spanSlice(out_path) orelse return invalid_argument;
+
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    // No name here: the file's first bytes say what it is.
+    const found = self.node.thumbnail(allocator, cid, author, .other, thumb_deadline_ms) catch |err| return mapError(err);
+    const len = switch (found) {
+        .jpeg_len => |n| n,
+        .none => return not_found,
+        .pending, .unavailable => return unavailable,
+    };
+    // Evicted between the two: as if it weren't here.
+    const jpeg = self.node.thumbBytes(allocator, cid, len) catch |err| return if (err == error.FileNotFound) unavailable else mapError(err);
+    defer allocator.free(jpeg);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = jpeg }) catch {
+        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        return internal_error;
+    };
+    return nomadfs_ok;
+}
+
 /// Releases a string returned by this API.
 pub export fn nomadfs_free(ptr: ?*anyopaque) void {
     const p = ptr orelse return;
@@ -501,6 +582,81 @@ test "mobile: two nodes put and retrieve a file through the C ABI" {
     try testing.expectEqual(nomadfs_ok, nomadfs_node_stop(node_b));
     try testing.expectEqual(nomadfs_ok, nomadfs_node_stop(node_a));
     try testing.expectEqual(unavailable, nomadfs_node_run(node_a));
+}
+
+test "mobile: the photos timeline as JSON, and a stale page" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = "test_mobile_photos";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const path = "test_mobile_photos.conf";
+    defer cleanupFiles(io, &.{path});
+    try writeConfig(path, "photos", 13203, dir ++ "/data", dir);
+    const handle = nomadfs_node_new(path.ptr) orelse return error.NodeNotCreated;
+    defer nomadfs_node_free(handle);
+    _ = try handle.node.swarm.?.putBytes("Camera/a.jpg", "a", null);
+    try handle.node.swarm.?.setMtime("Camera/a.jpg", 1_700_000_000);
+
+    const index = nomadfs_photos_index_json(handle, null) orelse return error.NoIndex;
+    defer nomadfs_free(@ptrCast(index));
+    const Index = struct { generation: u64, total: u32, mtimes: []const u64 };
+    const parsed = try std.json.parseFromSlice(Index, testing.allocator, std.mem.span(index), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expectEqual(@as(u32, 1), parsed.value.total);
+    try testing.expectEqualSlices(u64, &.{1_700_000_000}, parsed.value.mtimes);
+
+    const page = nomadfs_photos_json(handle, "Camera", parsed.value.generation, 0, 10) orelse return error.NoPage;
+    defer nomadfs_free(@ptrCast(page));
+    try testing.expect(std.mem.indexOf(u8, std.mem.span(page), "\"path\":\"Camera/a.jpg\"") != null);
+    try testing.expect(std.mem.indexOf(u8, std.mem.span(page), "\"thumb\":\"unknown\"") != null);
+
+    const stale = nomadfs_photos_json(handle, "", parsed.value.generation + 1, 0, 10) orelse return error.NoPage;
+    defer nomadfs_free(@ptrCast(stale));
+    try testing.expectEqualStrings(stale_json, std.mem.span(stale));
+    try testing.expect(nomadfs_photos_index_json(null, null) == null);
+}
+
+test "mobile: a thumbnail written to a file, none for a format no decoder reads" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = "test_mobile_thumbs";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const path = "test_mobile_thumbs.conf";
+    defer cleanupFiles(io, &.{path});
+    try writeConfig(path, "thumbs", 13204, dir ++ "/data", dir);
+    const handle = nomadfs_node_new(path.ptr) orelse return error.NodeNotCreated;
+    defer nomadfs_node_free(handle);
+    const image = nomadfs.codec.image;
+    const picture = try image.testing.gradientJpeg(testing.allocator, 640, 480, 2);
+    defer testing.allocator.free(picture);
+    const made = (try handle.node.swarm.?.putBytes("Camera/a.jpg", picture, null)).cid;
+    const heic = (try handle.node.swarm.?.putBytes("Camera/b.heic", "\x00\x00\x00\x18ftypheic\x00\x00\x00\x00", null)).cid;
+    const made_hex = try hexCid(made);
+    defer nomadfs_free(@ptrCast(made_hex));
+    const heic_hex = try hexCid(heic);
+    defer nomadfs_free(@ptrCast(heic_hex));
+
+    const out = dir ++ "/t.jpg";
+    try testing.expectEqual(nomadfs_ok, nomadfs_thumbnail(handle, made_hex, null, out.ptr));
+    const jpeg = try std.Io.Dir.cwd().readFileAlloc(io, out, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(jpeg);
+    const dims = try image.info(jpeg);
+    try testing.expectEqual(@as(u32, 320), dims.width);
+    try testing.expectEqual(@as(u32, 240), dims.height);
+    // The page says so from now on.
+    const page = nomadfs_photos_json(handle, "", 0, 0, 10) orelse return error.NoPage;
+    defer nomadfs_free(@ptrCast(page));
+    try testing.expect(std.mem.indexOf(u8, std.mem.span(page), "\"thumb\":\"ready\"") != null);
+
+    try testing.expectEqual(not_found, nomadfs_thumbnail(handle, heic_hex, made_hex, out.ptr));
+    // A file this device doesn't have.
+    try testing.expectEqual(unavailable, nomadfs_thumbnail(handle, "ee" ** 32, null, out.ptr));
+    try testing.expectEqual(invalid_argument, nomadfs_thumbnail(handle, "zz", null, out.ptr));
+    try testing.expectEqual(invalid_argument, nomadfs_thumbnail(handle, made_hex, "abc", out.ptr));
+    try testing.expectEqual(invalid_argument, nomadfs_thumbnail(handle, made_hex, null, null));
+    try testing.expectEqual(invalid_argument, nomadfs_thumbnail(null, made_hex, null, out.ptr));
 }
 
 test "mobile: a dial that timed out is reported as unavailable" {
