@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const nomadfs = @import("nomadfs");
+const offsite_worker = nomadfs.offsite_worker;
 const config_mod = nomadfs.config;
 
 const device = nomadfs.device;
@@ -28,6 +29,8 @@ const Options = struct {
     copies: ?u8 = null,
     /// --swarm-backup: keep a copy of the whole swarm folder.
     swarm_backup: bool = false,
+    /// --deep-backup: send the swarm backup to the archive target.
+    deep_backup: bool = false,
     bench_read_path: ?[]const u8 = null,
     bench_wait_seconds: u32 = 30,
     bench_cold: bool = false,
@@ -101,7 +104,8 @@ fn applyOptions(allocator: std.mem.Allocator, config: *config_mod.Config, option
         };
         try config.addShare(allocator, share.name, share.path);
     }
-    if (options.swarm_backup) config.storage.swarm_backup = true;
+    if (options.swarm_backup or options.deep_backup) config.storage.swarm_backup = true;
+    if (options.deep_backup) config.storage.deep_backup = true;
     if (options.copies) |n| config.storage.set_copies = n;
 }
 
@@ -211,6 +215,8 @@ fn switchFlag(arg: []const u8, options: *Options) bool {
         options.bench_cold = true;
     } else if (eql(u8, arg, "--swarm-backup")) {
         options.swarm_backup = true;
+    } else if (eql(u8, arg, "--deep-backup")) {
+        options.deep_backup = true;
     } else return false;
     return true;
 }
@@ -269,6 +275,10 @@ fn printHelp() void {
         \\                     so the folder stays readable while the device that
         \\                     added a file is offline (also `swarm_backup = true`
         \\                     under [storage])
+        \\  --deep-backup      Send everything this device keeps as swarm backup to
+        \\                     the archive target (a [backup.<name>] section with
+        \\                     storage_class GLACIER or DEEP_ARCHIVE). Turns on
+        \\                     --swarm-backup (also `deep_backup = true`)
         \\  --copies <N>       Keep each swarm folder file on N devices (1-8): the
         \\                     author and N-1 devices chosen for each file among
         \\                     those that accept copies (`accept_copies = false`
@@ -360,6 +370,7 @@ fn runOnce(allocator: std.mem.Allocator, config: config_mod.Config, config_path:
     std.debug.print("NomadFS Node: {s} (Storage: {any})\n", .{ config.node.nickname, config.storage.enabled });
     std.debug.print("Listening on port: {d}\n", .{config.network.port});
     if (config.storage.swarm_backup) std.debug.print("Backing up the swarm folder on this device\n", .{});
+    if (config.storage.deep_backup) std.debug.print("Deep backup: {s}\n", .{if (offsite_worker.hasArchive(config.backup_targets)) "the swarm backup goes to the archive target" else offsite_worker.no_archive});
 
     var node = try startNode(allocator, config);
     defer node.deinit();

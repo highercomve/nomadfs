@@ -19,6 +19,7 @@ comptime {
     std.debug.assert(fs.manifest.max_bytes <= net.discovery.rpc.max_swarm_len);
 }
 const cluster = @import("cluster/mod.zig");
+const offsite_worker = @import("cluster/offsite_worker.zig");
 const sync = @import("sync.zig");
 const node_info = @import("node_info.zig");
 const version = node_info.version;
@@ -29,7 +30,10 @@ const DiscoveryNode = net.discovery.Node;
 const HashRing = cluster.ring.HashRing;
 
 pub const Node = struct {
-    offsite: ?*@import("cluster/offsite_worker.zig").Worker = null,
+    offsite: ?*offsite_worker.Worker = null,
+    /// Swarm backup is on (settings change it while the node runs); deep
+    /// backup is kept by `info_provider`, which reports it.
+    swarm_backup: std.atomic.Value(bool) = .init(false),
     allocator: std.mem.Allocator,
     connection_manager: *ConnectionManager,
     store: ?*storage.engine.StorageEngine,
@@ -134,6 +138,7 @@ pub const Node = struct {
         discovery_node.swarm_epoch = cfg.node.swarm_epoch;
         // What every PING and PONG says about this device (rpc.Roles).
         discovery_node.setRole(net.discovery.rpc.Roles.swarm_backup, cfg.storage.swarm_backup);
+        discovery_node.setRole(net.discovery.rpc.Roles.deep_backup, cfg.storage.deep_backup);
         discovery_node.setRole(net.discovery.rpc.Roles.metered, !net.local_addrs.onUnmeteredNetwork());
         discovery_node.setRole(net.discovery.rpc.Roles.accepts_copies, cfg.storage.accept_copies);
 
@@ -365,6 +370,7 @@ pub const Node = struct {
             .manager = connection_manager,
             .block_manager = block_manager,
             .started_at = node_info.nowSeconds(),
+            .deep_backup = .init(cfg.storage.deep_backup),
         };
         info_provider.storage_path = try allocator.dupe(u8, cfg.storage.storage_path);
         errdefer allocator.free(info_provider.storage_path);
@@ -410,6 +416,7 @@ pub const Node = struct {
         };
 
         return Node{
+            .swarm_backup = .init(cfg.storage.swarm_backup),
             .swarm_api = api,
             .allocator = allocator,
             .connection_manager = connection_manager,
@@ -721,10 +728,34 @@ pub const Node = struct {
     // ---- Settings applied to the running node (settings.zig saves them) ----
 
     /// Keep a copy of every swarm folder file here, or not; peers learn it
-    /// from the roles in pings.
+    /// from the roles in pings. Turning it off turns deep backup off: there
+    /// is no whole backup left to send.
     pub fn setSwarmBackup(self: *Node, on: bool) !void {
         if (self.swarm) |folder| try folder.setBackup(on);
-        self.discovery_node.setRole(net.discovery.rpc.Roles.swarm_backup, on);
+        self.swarm_backup.store(on, .release);
+        if (!on) self.info_provider.deep_backup.store(false, .release);
+        self.announceBackupRoles();
+    }
+
+    /// Send the whole swarm backup to the cold offsite targets, or stop.
+    /// Turning it on turns swarm backup on: the device must hold every
+    /// block to upload it. Applied at once (cluster/offsite_worker.zig).
+    pub fn setDeepBackup(self: *Node, on: bool) !void {
+        if (on and !self.swarm_backup.load(.acquire)) try self.setSwarmBackup(true);
+        self.info_provider.deep_backup.store(on, .release);
+        self.announceBackupRoles();
+    }
+
+    fn backupRoles(self: *Node) offsite_worker.Roles {
+        return .{ .swarm_backup = self.swarm_backup.load(.acquire), .deep_backup = self.info_provider.deep_backup.load(.acquire) };
+    }
+
+    /// Tells the peers (pings) and the offsite worker the backup roles.
+    fn announceBackupRoles(self: *Node) void {
+        const roles = self.backupRoles();
+        self.discovery_node.setRole(net.discovery.rpc.Roles.swarm_backup, roles.swarm_backup);
+        self.discovery_node.setRole(net.discovery.rpc.Roles.deep_backup, roles.deep_backup);
+        if (self.offsite) |worker| worker.setRoles(roles);
     }
 
     /// Whether this device keeps copies of other devices' swarm files:
@@ -805,8 +836,18 @@ pub const Node = struct {
 
     /// Shared offsite status for settings/mobile; null when not configured on
     /// this keeper. Detailed bucket/snapshot queries use backup_service.
-    pub fn offsiteStatus(self: *Node) ?@import("cluster/offsite_worker.zig").Status {
+    pub fn offsiteStatus(self: *Node) ?offsite_worker.Status {
         return if (self.offsite) |worker| worker.status() else null;
+    }
+
+    pub fn deepBackup(self: *Node) bool {
+        return self.info_provider.deep_backup.load(.acquire);
+    }
+
+    /// The archive (cold) target's state; null when none is configured: a
+    /// deep backup device then has nowhere to send its backup.
+    pub fn archiveStatus(self: *Node) ?offsite_worker.Status {
+        return if (self.offsite) |worker| worker.archiveStatus() else null;
     }
 
     pub fn runOffsite(self: *Node) !void {
@@ -821,10 +862,13 @@ pub const Node = struct {
         try self.connection_manager.start();
         try self.connection_manager.listen(cfg, running);
         if (self.keeper) |k| k.start() catch |err| std.debug.print("keeper: thread not started: {any}\n", .{err});
-        if (cfg.storage.swarm_backup and cfg.backupTarget(null) != null and self.offsite == null) {
+        // Every node with a target hosts the worker; which targets upload
+        // is its policy, from the backup roles (changed while running).
+        if (cfg.backupTarget(null) != null and self.offsite == null) {
             if (self.swarm) |folder| if (self.store) |store| {
-                const host = try @import("cluster/offsite_worker.zig").Worker.create(self.allocator, cfg.backup_targets, self.device_identity, self.trust_store, .{ .folder = folder, .store = store });
+                const host = try offsite_worker.Worker.create(self.allocator, cfg.backup_targets, self.device_identity, self.trust_store, .{ .folder = folder, .store = store });
                 errdefer host.destroy();
+                host.setRoles(self.backupRoles());
                 try host.start();
                 self.offsite = host;
             };
@@ -1270,6 +1314,8 @@ pub const InfoProvider = struct {
     manager: *ConnectionManager,
     block_manager: *cluster.BlockManager,
     started_at: u64,
+    /// This device sends its swarm backup to the archive target.
+    deep_backup: std.atomic.Value(bool) = .init(false),
 
     pub fn info(self: *InfoProvider, allocator: std.mem.Allocator) !node_info.Info {
         const traffic = self.manager.trafficTotals();
@@ -1316,6 +1362,7 @@ pub const InfoProvider = struct {
             out.swarm_last_sync = st.last_sync;
             const b = folder.backupStatus();
             out.swarm_backup = b.enabled;
+            out.deep_backup = b.enabled and self.deep_backup.load(.acquire);
             out.swarm_backed_up = std.math.lossyCast(u32, b.backed_up);
             out.swarm_unreachable = std.math.lossyCast(u32, b.unreachable_files);
         }

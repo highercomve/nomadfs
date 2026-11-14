@@ -81,6 +81,7 @@ The format looks like TOML but the parser is much simpler:
 | `accept_copies` | bool | `true` | Keep copies of other devices' swarm folder files when placement gives this device some (the swarm's `copies`). The app writes `false` on phones. Signed into the swarm's policy at start ([4.3](../cluster/placement.md)). |
 | `write_quorum` | u8 | `1` | Provider-record acknowledgements (`ADD_PROVIDER`) `BlockManager.put` needs. `0` skips the announcement, so a device with no peers can store. With `1` and no peers, `put` returns `QuorumNotReached` (blocks stay local). |
 | `swarm_backup` | bool | `false` | Copy every swarm folder file into this device's store ([The Swarm Folder](../fs/swarm.md)). Same as `--swarm-backup`. |
+| `deep_backup` | bool | `false` | Send everything this device keeps as swarm backup to the cold offsite targets (`[backup.<name>]` with `storage_class` GLACIER or DEEP_ARCHIVE); those targets upload only from a deep backup device. Turns `swarm_backup` on. Same as `--deep-backup`. |
 | `share` | `"Name:/path"` | none | A shared folder; repeatable. Split at the first `:`. Same as `--share`. |
 
 ### Network

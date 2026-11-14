@@ -9,6 +9,8 @@ const Node = @import("../node.zig").Node;
 pub const Action = enum { status, run, verify, restore, @"recovery-key", forget };
 /// How fast a cold target thaws packs: bulk is cheapest and slowest.
 pub const Tier = offsite.Tier;
+pub const Gate = worker.Gate;
+pub const no_archive = worker.no_archive;
 pub const Request = struct {
     action: Action,
     /// A `[backup.<name>]` section; null (or "s3" with no such section) is the first.
@@ -30,6 +32,10 @@ pub const Result = struct {
     check: ?offsite.Check = null,
     count: usize = 0,
     recovery_phrase: ?[]const u8 = null,
+    /// Whether this device uploads to the target (its backup roles).
+    gate: worker.Gate = .uploading,
+    /// Deep backup is on and no target is cold: nothing goes to an archive.
+    archive_missing: bool = false,
 };
 /// Returned strings and lists are copied into the caller's allocator.
 pub fn execute(a: std.mem.Allocator, io: std.Io, request: Request) !Result {
@@ -39,6 +45,11 @@ pub fn execute(a: std.mem.Allocator, io: std.Io, request: Request) !Result {
     defer cfg.deinit(a);
     if (cfg.backup_targets.len == 0) return error.BackupNotConfigured;
     const target = cfg.backupTarget(request.target) orelse return error.UnknownBackupTarget;
+    const roles: worker.Roles = .{ .swarm_backup = cfg.storage.swarm_backup, .deep_backup = cfg.storage.deep_backup };
+    const allowed = worker.gate(target.*, roles);
+    // An archive takes the whole swarm backup or nothing: only a deep
+    // backup device writes to it, also when asked by hand.
+    if (request.action == .run and allowed == .needs_deep_backup) return error.DeepBackupOff;
     var paths = try device.paths.Paths.resolve(a, cfg.node.key_path);
     defer paths.deinit(a);
     const identity = try device.identity.Identity.loadOrCreate(paths.identity);
@@ -63,7 +74,7 @@ pub fn execute(a: std.mem.Allocator, io: std.Io, request: Request) !Result {
                 initialized += 1;
             }
             status.snapshots = names;
-            return .{ .status = status };
+            return .{ .status = status, .gate = allowed, .archive_missing = roles.deep_backup and !worker.hasArchive(cfg.backup_targets) };
         },
         .verify => {
             const check = try core.check(request.snapshot, request.download, request.tier);

@@ -317,6 +317,12 @@ pub const Commands = struct {
         return commands.swarmBackupSet(gpa, args);
     }
 
+    /// `invoke("deep_backup_set", { config_path, on })`: send the whole
+    /// swarm backup to the archive (Glacier) target.
+    pub fn deep_backup_set(gpa: std.mem.Allocator, args: commands.BackupArgs) !commands.BackupInfo {
+        return commands.deepBackupSet(gpa, args);
+    }
+
     /// `invoke("device_info", { peer? })`: a device's About and health,
     /// asked on demand.
     pub fn device_info(gpa: std.mem.Allocator, args: commands.DeviceInfoArgs) !commands.DeviceInfo {

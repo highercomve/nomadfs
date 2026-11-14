@@ -784,6 +784,16 @@ pub const BackupInfo = struct {
     accept_copies: bool = true,
     /// Files it keeps for others (backup or placement).
     kept_copies: usize = 0,
+    /// Deep backup: the swarm backup goes to the archive (cold) target.
+    deep_backup: bool = false,
+    /// A cold target (GLACIER, DEEP_ARCHIVE) is configured on this device.
+    archive_target: bool = false,
+    /// The archive target's last upload in this run of the node (Unix
+    /// seconds; 0: none yet), the files it left out waiting for blocks,
+    /// and whether its last try failed.
+    archive_last_upload: u64 = 0,
+    archive_waiting: usize = 0,
+    archive_failed: bool = false,
 };
 
 pub const SwarmCopiesArgs = struct { config_path: []const u8, copies: u8 };
@@ -805,7 +815,13 @@ pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
             const reps = policy.copies();
             const accept = acceptsCopiesForIdentity(policy, handle.node.device_identity);
             if (!backup_supported) return .{ .supported = false, .enabled = false, .running = true, .copies = reps, .accept_copies = accept, .kept_copies = st.backed_up };
+            const archive = handle.node.archiveStatus();
             return .{
+                .deep_backup = handle.node.deepBackup(),
+                .archive_target = archive != null,
+                .archive_last_upload = if (archive) |s| s.last_upload else 0,
+                .archive_waiting = if (archive) |s| s.waiting_files else 0,
+                .archive_failed = if (archive) |s| s.failure != null else false,
                 .supported = true,
                 .accept_copies = accept,
                 .kept_copies = st.backed_up,
@@ -822,7 +838,14 @@ pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
     }
     var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
     defer config.deinit(gpa);
-    return .{ .supported = backup_supported, .enabled = config.storage.swarm_backup, .running = false, .accept_copies = config.storage.accept_copies };
+    return .{
+        .supported = backup_supported,
+        .enabled = config.storage.swarm_backup,
+        .running = false,
+        .accept_copies = config.storage.accept_copies,
+        .deep_backup = config.storage.deep_backup,
+        .archive_target = nomadfs.offsite_worker.hasArchive(config.backup_targets),
+    };
 }
 
 /// `swarm_backup_set { config_path, on }`: saved in the config
@@ -833,6 +856,19 @@ pub fn swarmBackupSet(gpa: std.mem.Allocator, args: BackupArgs) !BackupInfo {
         g_mutex.lock();
         defer g_mutex.unlock();
         try nomadfs.settings.swarmBackup(gpa, args.config_path, runningNode(), args.on);
+    }
+    return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
+}
+
+/// `deep_backup_set { config_path, on }`: send the whole swarm backup to
+/// the archive target. Saved in the config (`deep_backup`) and applied to
+/// the running node at once; turning it on turns swarm backup on.
+pub fn deepBackupSet(gpa: std.mem.Allocator, args: BackupArgs) !BackupInfo {
+    if (!backup_supported) return error.Unsupported;
+    {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        try nomadfs.settings.deepBackup(gpa, args.config_path, runningNode(), args.on);
     }
     return swarmBackupStatus(gpa, .{ .config_path = args.config_path });
 }
@@ -1041,6 +1077,7 @@ pub const DeviceInfo = struct {
     unmetered: bool,
     bytes_sent: u64,
     bytes_received: u64,
+    deep_backup: bool,
 };
 
 /// `invoke("device_info", { peer? })`: what a device reports about itself

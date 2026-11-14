@@ -2,6 +2,7 @@
 
 import { $, snack, svg, ICONS, listLoading, listLoaded } from "./core.js";
 import { formatSize } from "./format.js";
+import { deepBackupView } from "./backup-model.js";
 import { row } from "./overlays.js";
 import { isRunning, ensureConfig } from "./state.js";
 
@@ -148,6 +149,10 @@ function renderBackup(st) {
     if (st.unreachable_files) text += ` ${st.unreachable_files} waiting for the device that added them to come online.`;
   }
   $("backup-state").textContent = text;
+  const deep = deepBackupView(st);
+  $("deep-backup").checked = deep.checked;
+  $("deep-backup").disabled = deep.disabled;
+  $("deep-backup-state").textContent = deep.text;
 }
 
 async function loadBackup() {
@@ -233,7 +238,18 @@ export function installShares() {
     const on = e.target.checked;
     try {
       renderBackup(await invoke("swarm_backup_set", { config_path: await ensureConfig(), on }));
-      snack(on ? "This device now backs up the swarm folder" : "Swarm backup turned off; copies already made stay");
+      snack(on ? "This device now backs up the swarm folder" : "Swarm backup turned off (and deep backup with it); copies already made stay");
+    } catch (err) {
+      e.target.checked = !on;
+      snack(`Couldn't change it: ${err}`);
+    }
+  });
+
+  $("deep-backup").addEventListener("change", async (e) => {
+    const on = e.target.checked;
+    try {
+      renderBackup(await invoke("deep_backup_set", { config_path: await ensureConfig(), on }));
+      snack(on ? "This device now sends its swarm backup to the archive" : "Deep backup turned off; what the archive holds stays");
     } catch (err) {
       e.target.checked = !on;
       snack(`Couldn't change it: ${err}`);

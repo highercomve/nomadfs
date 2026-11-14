@@ -104,6 +104,12 @@
             <input type="checkbox" id="swarm-backup" role="switch">
           </label>
           <p id="backup-state" class="supporting small"></p>
+          <label class="toggle-row" style="margin-top: 12px;">
+            <span>Deep backup (Glacier)</span>
+            <input type="checkbox" id="deep-backup" role="switch" aria-describedby="deep-backup-help deep-backup-state">
+          </label>
+          <p id="deep-backup-help" class="supporting small">Sends everything this device keeps as swarm backup to the archive bucket. Turns on swarm backup.</p>
+          <p id="deep-backup-state" class="supporting small"></p>
         </div>
         <div class="toggle-row" style="margin-top: 12px;">
           <span>Keep each swarm file on</span>

@@ -26,9 +26,13 @@ const job_name = ".nomadfs-restore.json";
 pub const Tier = s3.RestoreTier;
 pub const File = struct { path: []const u8, cid: Cid, size: u64, mtime: u64 = 0, blocks: []const Cid, directory: bool = false };
 pub const Snapshot = struct { time: u64, files: []const File };
+/// What the source can describe now. `waiting`: files left out because
+/// their blocks are not all in the local store yet (the keeper is still
+/// fetching them); a later run takes them.
+pub const Listing = struct { files: []const File, waiting: usize = 0 };
 pub const Source = struct {
     ctx: *anyopaque,
-    filesFn: *const fn (*anyopaque, Allocator) anyerror![]const File,
+    filesFn: *const fn (*anyopaque, Allocator) anyerror!Listing,
 };
 pub const Device = struct { id: Cid, secret: Key, public: Key };
 pub const Report = struct {
@@ -38,6 +42,8 @@ pub const Report = struct {
     recovery_phrase: ?[]const u8 = null,
     /// The new target took another target's key: the words are the same.
     reused_key: bool = false,
+    /// Files not in this snapshot: their blocks are not all here yet.
+    waiting_files: usize = 0,
 };
 pub const Status = struct {
     snapshots: []const []const u8,
@@ -457,7 +463,8 @@ pub const Service = struct {
         try self.setup();
         if (self.config.encrypt != self.encrypted) return error.EncryptionModeMismatch;
         try self.applyPurges();
-        const files = try source.filesFn(source.ctx, self.a());
+        const listing = try source.filesFn(source.ctx, self.a());
+        const files = listing.files;
         if (files.len > manifest.max_entries) return error.TooManyFiles;
         const purges = try self.purgePaths();
         var live: std.ArrayList(File) = .empty;
@@ -466,7 +473,7 @@ pub const Service = struct {
         var writer = try backup.pack.Writer.init(self.allocator, .{ .key = self.cryptoKey(), .target_size = @as(usize, self.config.pack_mb) * 1024 * 1024 });
         defer writer.deinit();
         var id = try backup.index.generatePackId();
-        var report: Report = .{};
+        var report: Report = .{ .waiting_files = listing.waiting };
         var pending: std.AutoHashMap(Cid, void) = .init(self.allocator);
         defer pending.deinit();
         for (files) |file| {

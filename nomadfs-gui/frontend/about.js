@@ -356,6 +356,7 @@ async function openDeviceInfo(title, peer) {
   netStat(String(i.shares), "shared folders");
   netStat(String(i.swarm_files), "swarm folder files");
   netStat(i.swarm_backup ? "On" : "Off", "swarm backup");
+  netStat(i.deep_backup ? "On" : "Off", "deep backup");
   netStat(i.unmetered ? "Yes" : "No", "on Wi-Fi or wired");
   netStat(formatSize(i.bytes_sent), "sent");
   netStat(formatSize(i.bytes_received), "received");

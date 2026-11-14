@@ -251,9 +251,9 @@ const Fixture = struct {
         f.tmp.cleanup();
         a.destroy(f);
     }
-    fn filesFn(ctx: *anyopaque, _: std.mem.Allocator) ![]const core.File {
+    fn filesFn(ctx: *anyopaque, _: std.mem.Allocator) !core.Listing {
         const f: *Fixture = @ptrCast(@alignCast(ctx));
-        return f.files.items;
+        return .{ .files = f.files.items };
     }
     fn source(f: *Fixture) core.Source {
         return .{ .ctx = f, .filesFn = filesFn };
@@ -887,4 +887,120 @@ test "offsite: the periodic uploader is due by the target's schedule" {
     try std.testing.expect(!(try f.service.due()));
     f.service.config.schedule = .daily;
     try std.testing.expect(try f.service.due());
+}
+
+test "offsite: a file with a missing block is left out and counted, then uploaded once the block is here" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path[0..try f.tmp.dir.realPath(io, &path)];
+    const manifest_path = try std.fs.path.join(a, &.{ root, "manifest.json" });
+    defer a.free(manifest_path);
+    const folder = try @import("../fs/swarm.zig").SwarmFolder.create(a, io, &f.store, .{ .bytes = [_]u8{7} ** 32 }, "test", manifest_path);
+    defer folder.destroy();
+    const whole = try f.add("whole.txt", "all here");
+    // A two-chunk file whose second chunk the keeper has not fetched yet.
+    const here = try f.add("unused", "first chunk");
+    const late = storage.block.Block.new(&([_]u8{0} ++ "second chunk".*));
+    const links = [_]storage.dag.node.DagLink{ .{ .name = "", .cid = &here, .size = 11 }, .{ .name = "", .cid = &late.cid, .size = 12 } };
+    const parent = storage.block.Block.new(try storage.dag.codec.encodeParent(f.arena.allocator(), &links));
+    try f.store.put(parent);
+    _ = try folder.importFiles(&.{ .{ .path = "whole.txt", .cid = whole, .size = 8, .mtime = 1 }, .{ .path = "Phone/Camera/partial.bin", .cid = parent.cid, .size = 23, .mtime = 1 } });
+    var source: @import("../fs/offsite.zig").Source = .{ .folder = folder, .store = &f.store };
+
+    const first = try f.service.run(source.source(), &f.store);
+    try std.testing.expectEqual(@as(usize, 1), first.waiting_files);
+    const partial = try f.service.snapshot(first.snapshot);
+    try std.testing.expectEqual(@as(usize, 1), partial.files.len);
+    try std.testing.expectEqualStrings("whole.txt", partial.files[0].path);
+    // Nothing of the half-present file went up, not even the chunk that is here.
+    try std.testing.expectEqual(@as(usize, 1), first.uploaded_blocks);
+
+    try f.store.put(late);
+    f.fake.time += 1;
+    const second = try f.service.run(source.source(), &f.store);
+    try std.testing.expectEqual(@as(usize, 0), second.waiting_files);
+    try std.testing.expectEqual(@as(usize, 3), second.uploaded_blocks);
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    try std.testing.expectEqual(@as(usize, 2), try f.service.restore(io, second.snapshot, null, target.dir));
+    const bytes = try target.dir.readFileAlloc(io, "Phone/Camera/partial.bin", a, .limited(100));
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("first chunksecond chunk", bytes);
+}
+
+const worker_mod = @import("offsite_worker.zig");
+const TargetConfig = @import("../backup/config.zig").Config;
+const Uploads = struct {
+    var names: [8][]const u8 = undefined;
+    var count: usize = 0;
+    fn record(_: *worker_mod.Worker, config: TargetConfig, _: usize, _: bool) anyerror!void {
+        names[count] = config.name;
+        count += 1;
+    }
+    fn took(name: []const u8) bool {
+        for (names[0..count]) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
+    }
+};
+
+test "offsite: the worker uploads to cold targets only on a deep backup device, warm ones on a swarm backup device" {
+    const Config = TargetConfig;
+    const warm: Config = .{ .name = "s3", .endpoint = "https://warm", .bucket = "b", .credentials = "/none" };
+    const cold: Config = .{ .name = "archive", .endpoint = "https://cold", .bucket = "b", .credentials = "/none", .storage_class = .DEEP_ARCHIVE };
+    const glacier: Config = .{ .name = "glacier", .endpoint = "https://cold", .bucket = "g", .credentials = "/none", .storage_class = .GLACIER };
+
+    // The policy itself.
+    try std.testing.expectEqual(worker_mod.Gate.needs_swarm_backup, worker_mod.gate(warm, .{}));
+    try std.testing.expectEqual(worker_mod.Gate.uploading, worker_mod.gate(warm, .{ .swarm_backup = true }));
+    try std.testing.expectEqual(worker_mod.Gate.needs_deep_backup, worker_mod.gate(cold, .{ .swarm_backup = true }));
+    try std.testing.expectEqual(worker_mod.Gate.needs_deep_backup, worker_mod.gate(glacier, .{ .swarm_backup = true }));
+    try std.testing.expectEqual(worker_mod.Gate.uploading, worker_mod.gate(cold, .{ .swarm_backup = true, .deep_backup = true }));
+    try std.testing.expect(worker_mod.hasArchive(&.{ warm, cold }) and !worker_mod.hasArchive(&.{warm}));
+    try std.testing.expect(!worker_mod.hasArchive(&.{.{ .name = "half", .storage_class = .GLACIER }}));
+
+    const identity = try @import("../device/mod.zig").identity.Identity.fromSeed([_]u8{3} ** 32);
+    const w = try worker_mod.Worker.create(a, &.{ warm, cold, glacier }, identity, undefined, .{ .folder = undefined, .store = undefined });
+    defer w.destroy();
+    w.uploadFn = Uploads.record;
+
+    // Neither role: nothing uploads, and each status says why.
+    Uploads.count = 0;
+    try w.round(true);
+    try std.testing.expectEqual(@as(usize, 0), Uploads.count);
+    try std.testing.expectEqual(worker_mod.Gate.needs_swarm_backup, w.statusOf("s3").?.gate);
+    try std.testing.expectEqual(worker_mod.Gate.needs_deep_backup, w.archiveStatus().?.gate);
+
+    // Swarm backup: the warm target only, also when asked to run now.
+    w.setRoles(.{ .swarm_backup = true });
+    try w.round(true);
+    try std.testing.expectEqual(@as(usize, 1), Uploads.count);
+    try std.testing.expect(Uploads.took("s3"));
+    try std.testing.expectEqual(worker_mod.Gate.uploading, w.statusOf("s3").?.gate);
+    try std.testing.expectEqual(worker_mod.Gate.needs_deep_backup, w.statusOf("archive").?.gate);
+    try std.testing.expect(w.statusOf("archive").?.gate.text().len > 0);
+    try std.testing.expect(!w.archiveMissing());
+
+    // Deep backup: every target, applied without a restart.
+    Uploads.count = 0;
+    w.setRoles(.{ .swarm_backup = true, .deep_backup = true });
+    try std.testing.expectEqual(worker_mod.Gate.uploading, w.statusOf("glacier").?.gate);
+    try w.round(false);
+    try std.testing.expectEqual(@as(usize, 3), Uploads.count);
+    try std.testing.expect(Uploads.took("archive") and Uploads.took("glacier") and Uploads.took("s3"));
+
+    // Turned off again: the cold targets stop.
+    Uploads.count = 0;
+    w.setRoles(.{ .swarm_backup = true });
+    try w.round(false);
+    try std.testing.expectEqual(@as(usize, 1), Uploads.count);
+    try std.testing.expect(!Uploads.took("archive"));
+
+    // A deep backup device with warm targets only has no archive to fill.
+    const lone = try worker_mod.Worker.create(a, &.{warm}, identity, undefined, .{ .folder = undefined, .store = undefined });
+    defer lone.destroy();
+    lone.setRoles(.{ .swarm_backup = true, .deep_backup = true });
+    try std.testing.expect(lone.archiveMissing());
+    try std.testing.expect(lone.archiveStatus() == null);
+    try std.testing.expectEqualStrings("no archive target configured", worker_mod.no_archive);
 }

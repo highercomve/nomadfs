@@ -3,6 +3,7 @@ const std = @import("std");
 
 pub const backup = @import("backup/mod.zig");
 pub const offsite = @import("cluster/offsite.zig");
+pub const offsite_worker = @import("cluster/offsite_worker.zig");
 pub const backup_service = @import("backup/service.zig");
 pub const backup_source = @import("fs/offsite.zig");
 pub const config = @import("config.zig");

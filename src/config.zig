@@ -85,6 +85,10 @@ pub const Config = struct {
         /// folder stays readable while the device that added a file is
         /// offline (an always-on desktop or server).
         swarm_backup: bool = false,
+        /// Send everything this device keeps as swarm backup to the cold
+        /// offsite targets (GLACIER, DEEP_ARCHIVE). Implies `swarm_backup`:
+        /// the device must hold every block to upload it.
+        deep_backup: bool = false,
         /// Whether this device keeps copies of other devices' swarm folder
         /// files when placement gives it some (the swarm's `copies`,
         /// device/policy.zig). Phones say no by default.
@@ -292,6 +296,9 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
     // Ownership of the list moves into config; the list errdefer is now a no-op.
     config.network.bootstrap_peers = try bootstrap_list.toOwnedSlice(allocator);
 
+    // Deep backup needs every block here: it turns swarm backup on.
+    if (config.storage.deep_backup) config.storage.swarm_backup = true;
+
     if (config.node.nickname.len == 0) return error.MissingRequiredField;
     if (config.node.swarm_key.len != 32) return error.MissingRequiredField;
     if (config.storage.storage_path.len == 0) return error.MissingRequiredField;
@@ -334,6 +341,8 @@ fn applyConfigEntry(
         config.storage.write_quorum = try std.fmt.parseInt(u8, val, 10);
     } else if (std.mem.eql(u8, key, "swarm_backup")) {
         config.storage.swarm_backup = std.mem.eql(u8, val, "true");
+    } else if (std.mem.eql(u8, key, "deep_backup")) {
+        config.storage.deep_backup = std.mem.eql(u8, val, "true");
     } else if (std.mem.eql(u8, key, "accept_copies")) {
         config.storage.accept_copies = std.mem.eql(u8, val, "true");
     } else if (std.mem.eql(u8, key, "quota_mb")) {
@@ -446,6 +455,23 @@ test "parseConfigText parses all fields" {
     try std.testing.expectEqual(@as(usize, 2), cfg.network.bootstrap_peers.len);
     try std.testing.expect(cfg.security.require_trusted_devices);
     try std.testing.expectEqual(@as(u64, 512), cfg.storage.quota_mb);
+}
+
+test "config: deep_backup turns swarm_backup on, whatever the file says about it" {
+    const a = std.testing.allocator;
+    const base = "nickname = alpha\nswarm_key = " ++ "ab" ** 32 ++ "\nstorage_path = /tmp/a\n";
+    var plain = try parseConfigText(a, base ++ "swarm_backup = true\n");
+    defer plain.deinit(a);
+    try std.testing.expect(plain.storage.swarm_backup and !plain.storage.deep_backup);
+    var deep = try parseConfigText(a, base ++ "deep_backup = true\n");
+    defer deep.deinit(a);
+    try std.testing.expect(deep.storage.swarm_backup and deep.storage.deep_backup);
+    var both = try parseConfigText(a, base ++ "deep_backup = true\nswarm_backup = false\n");
+    defer both.deinit(a);
+    try std.testing.expect(both.storage.swarm_backup and both.storage.deep_backup);
+    var off = try parseConfigText(a, base ++ "swarm_backup = true\ndeep_backup = false\n");
+    defer off.deinit(a);
+    try std.testing.expect(off.storage.swarm_backup and !off.storage.deep_backup);
 }
 
 test "config: accept_copies, and an old swarm_replicas line is ignored" {

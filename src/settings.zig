@@ -7,9 +7,19 @@ const config_file = @import("config_file.zig");
 const Node = @import("node.zig").Node;
 const codec = @import("storage/dag/codec.zig");
 
+/// Swarm backup; turning it off turns deep backup off too.
 pub fn swarmBackup(allocator: std.mem.Allocator, config_path: []const u8, node: ?*Node, on: bool) !void {
     try config_file.setBool(allocator, config_path, "swarm_backup", on);
+    if (!on) try config_file.setBool(allocator, config_path, "deep_backup", false);
     if (node) |n| try n.setSwarmBackup(on);
+}
+
+/// Deep backup: the whole swarm backup goes to the cold offsite targets
+/// (cluster/offsite_worker.zig). Turning it on turns swarm backup on.
+pub fn deepBackup(allocator: std.mem.Allocator, config_path: []const u8, node: ?*Node, on: bool) !void {
+    if (on) try config_file.setBool(allocator, config_path, "swarm_backup", true);
+    try config_file.setBool(allocator, config_path, "deep_backup", on);
+    if (node) |n| try n.setDeepBackup(on);
 }
 
 pub fn acceptCopies(allocator: std.mem.Allocator, config_path: []const u8, node: ?*Node, on: bool) !void {
@@ -126,4 +136,32 @@ pub fn cacheClear(allocator: std.mem.Allocator, config: config_mod.Config, node:
 fn openStore(allocator: std.mem.Allocator, config: config_mod.Config) !StorageEngine {
     if (!config.storage.enabled) return error.StorageDisabled;
     return StorageEngine.init(allocator, config.storage.storage_path);
+}
+
+test "settings: deep backup turns swarm backup on; swarm backup off turns deep backup off" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = "nickname = alpha\nswarm_key = " ++ "ab" ** 32 ++ "\nstorage_path = /tmp/a\n" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    const path = try std.fs.path.join(a, &.{ dir, "config.toml" });
+    defer a.free(path);
+
+    try deepBackup(a, path, null, true);
+    var on = try config_mod.parseConfig(a, path);
+    defer on.deinit(a);
+    try std.testing.expect(on.storage.swarm_backup and on.storage.deep_backup);
+
+    try deepBackup(a, path, null, false);
+    var kept = try config_mod.parseConfig(a, path);
+    defer kept.deinit(a);
+    try std.testing.expect(kept.storage.swarm_backup and !kept.storage.deep_backup);
+
+    try deepBackup(a, path, null, true);
+    try swarmBackup(a, path, null, false);
+    var off = try config_mod.parseConfig(a, path);
+    defer off.deinit(a);
+    try std.testing.expect(!off.storage.swarm_backup and !off.storage.deep_backup);
 }

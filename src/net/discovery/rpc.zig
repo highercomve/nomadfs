@@ -136,6 +136,8 @@ pub const Roles = struct {
     pub const metered: u8 = 1 << 2;
     /// The device can take a frame of a film (it makes video thumbnails).
     pub const video_thumbs: u8 = 1 << 3;
+    /// The device sends its whole swarm backup to a cold archive bucket.
+    pub const deep_backup: u8 = 1 << 4;
 };
 
 pub const MessagePayload = union(MessageType) {
@@ -832,12 +834,13 @@ test "rpc: PONG carries the listening port, and reads without it from older node
 
     var buf = TestBuffer{ .allocator = allocator };
     defer buf.list.deinit(allocator);
-    try (Message{ .sender_id = sender, .payload = .{ .PONG = .{ .announced = announced, .port = 7865, .roles = Roles.swarm_backup | Roles.metered, .swarm = [_]u8{9} ** 32 } } }).serialize(buf.writer());
+    try (Message{ .sender_id = sender, .payload = .{ .PONG = .{ .announced = announced, .port = 7865, .roles = Roles.swarm_backup | Roles.metered | Roles.deep_backup, .swarm = [_]u8{9} ** 32 } } }).serialize(buf.writer());
     const pong = try Message.deserialize(allocator, buf.reader());
     defer pong.deinit(allocator);
     try std.testing.expectEqual(@as(?u16, 7865), pong.payload.PONG.port);
     try std.testing.expectEqual(@as(u8, 1), pong.payload.PONG.announced.count);
-    try std.testing.expectEqual(Roles.swarm_backup | Roles.metered, pong.payload.PONG.roles);
+    try std.testing.expectEqual(Roles.swarm_backup | Roles.metered | Roles.deep_backup, pong.payload.PONG.roles);
+    try std.testing.expect(pong.payload.PONG.roles & Roles.deep_backup != 0 and pong.payload.PONG.roles & Roles.accepts_copies == 0);
     try std.testing.expectEqual([_]u8{9} ** 32, pong.payload.PONG.swarm);
 
     // 0.3.2 and older: the addresses, then the stream ends.

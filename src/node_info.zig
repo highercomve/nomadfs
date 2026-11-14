@@ -53,6 +53,8 @@ pub const Info = struct {
     unmetered: bool = true,
     bytes_sent: u64 = 0,
     bytes_received: u64 = 0,
+    /// The device sends its swarm backup to a cold archive bucket.
+    deep_backup: bool = false,
 
     pub const Text = struct {
         buf: [max_text]u8 = undefined,
@@ -212,7 +214,7 @@ pub const nowSeconds = sync.nowSeconds;
 
 test "node info: round trip, and an older device's shorter info" {
     const a = std.testing.allocator;
-    var info: Info = .{ .uptime_s = 42, .disk_total = 1 << 40, .disk_free = 1 << 30, .peers = 3, .swarm_backup = true, .unmetered = false, .bytes_sent = 123456, .bytes_received = 654321 };
+    var info: Info = .{ .uptime_s = 42, .disk_total = 1 << 40, .disk_free = 1 << 30, .peers = 3, .swarm_backup = true, .unmetered = false, .bytes_sent = 123456, .bytes_received = 654321, .deep_backup = true };
     info.version = Info.Text.init("0.2.5");
     info.platform = Info.Text.init(platform());
     const bytes = try encode(a, info);
@@ -220,13 +222,15 @@ test "node info: round trip, and an older device's shorter info" {
     const got = try decode(bytes);
     try std.testing.expectEqualStrings("0.2.5", got.version.slice());
     try std.testing.expectEqual(info.disk_free, got.disk_free);
-    try std.testing.expect(got.swarm_backup and !got.unmetered);
+    try std.testing.expect(got.swarm_backup and !got.unmetered and got.deep_backup);
     try std.testing.expectEqual(@as(u64, 123456), got.bytes_sent);
     try std.testing.expectEqual(@as(u64, 654321), got.bytes_received);
 
-    // Cut before the new traffic fields: an older device keeps defaults.
-    const older_len = bytes.len - 16;
+    // Cut before the traffic fields and the deep backup flag: an older
+    // device keeps defaults.
+    const older_len = bytes.len - 17;
     const older = try decode(bytes[0..older_len]);
+    try std.testing.expect(!older.deep_backup);
     try std.testing.expectEqual(info.disk_free, older.disk_free);
     try std.testing.expectEqual(@as(u64, 0), older.bytes_sent);
     try std.testing.expectEqual(@as(u64, 0), older.bytes_received);

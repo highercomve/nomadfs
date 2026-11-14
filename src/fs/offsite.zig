@@ -1,5 +1,7 @@
 //! Snapshot source: fs decides what the swarm folder contains. The cluster
 //! target receives only immutable file descriptions and reachable local CIDs.
+//! A file whose blocks are not all in the local store (the keeper is still
+//! fetching it) is left out and counted: a snapshot never holds half a file.
 const std = @import("std");
 const offsite = @import("../cluster/offsite.zig");
 const storage = @import("../storage/mod.zig");
@@ -10,7 +12,7 @@ pub const Source = struct {
     pub fn source(self: *Source) offsite.Source {
         return .{ .ctx = self, .filesFn = files };
     }
-    fn files(ctx: *anyopaque, a: std.mem.Allocator) ![]const offsite.File {
+    fn files(ctx: *anyopaque, a: std.mem.Allocator) !offsite.Listing {
         const self: *Source = @ptrCast(@alignCast(ctx));
         // Public manifest export takes one immutable view under the folder
         // lock, including empty directories. Never inspect folder internals.
@@ -20,6 +22,7 @@ pub const Source = struct {
         var parsed = try @import("manifest.zig").Manifest.parse(a, bytes);
         defer parsed.deinit();
         var out: std.ArrayList(offsite.File) = .empty;
+        var waiting: usize = 0;
         for (parsed.wire) |entry| {
             if (entry.x) continue;
             if (!@import("manifest.zig").validPath(entry.p)) return error.InvalidPath;
@@ -31,7 +34,13 @@ pub const Source = struct {
             if (entry.k != 0 or entry.h.len != 64) return error.InvalidManifest;
             var root: [32]u8 = undefined;
             _ = try std.fmt.hexToBytes(&root, entry.h);
-            var reached = try storage.dag.walk.collectReachableWithOptions(a, self.store, &root, .{ .read_leaves = false });
+            var reached = storage.dag.walk.collectReachableWithOptions(a, self.store, &root, .{ .read_leaves = false }) catch |err| switch (err) {
+                error.BlockNotFound => {
+                    waiting += 1;
+                    continue;
+                },
+                else => return err,
+            };
             defer reached.deinit(a);
             if (reached.count() > 1 << 20) return error.DagTooLarge;
             const cids = try a.alloc([32]u8, reached.count());
@@ -40,6 +49,6 @@ pub const Source = struct {
             while (it.next()) |cid| : (i += 1) cids[i] = cid.*;
             try out.append(a, .{ .path = path, .cid = root, .size = entry.s, .mtime = entry.m, .blocks = cids });
         }
-        return out.toOwnedSlice(a);
+        return .{ .files = try out.toOwnedSlice(a), .waiting = waiting };
     }
 };

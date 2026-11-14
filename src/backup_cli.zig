@@ -67,7 +67,9 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const []const u8) !u8 {
         return 2;
     };
     var result = service.execute(a, io, request) catch |err| {
-        std.debug.print("Backup \"{s}\" failed: {s}\n", .{ request.target.?, @errorName(err) });
+        if (err == error.DeepBackupOff) {
+            std.debug.print("Backup \"{s}\" {s} (deep_backup = true, or Settings → Deep backup in the app)\n", .{ request.target.?, service.Gate.needs_deep_backup.text() });
+        } else std.debug.print("Backup \"{s}\" failed: {s}\n", .{ request.target.?, @errorName(err) });
         return 1;
     };
     defer service.deinitResult(a, &result);
@@ -79,10 +81,13 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const []const u8) !u8 {
             var last: [10]u8 = undefined;
             std.debug.print("{d} packs waiting to be removed (minimum storage time): from {s} to {s}\n", .{ status.deferred_packs, date(status.deferred_first, &first), date(status.deferred_last, &last) });
         }
+        if (result.gate != .uploading) std.debug.print("{s}\n", .{result.gate.text()});
+        if (result.archive_missing) std.debug.print("deep backup is on: {s}\n", .{service.no_archive});
         for (status.snapshots) |name| std.debug.print("{s}\n", .{name});
     }
     if (result.report) |report| {
         std.debug.print("Uploaded {d} new blocks ({d} bytes)\nSnapshot: {s}\n", .{ report.uploaded_blocks, report.uploaded_bytes, report.snapshot });
+        if (report.waiting_files > 0) std.debug.print("{d} files waiting for blocks: not in this snapshot, a later run takes them\n", .{report.waiting_files});
         if (report.recovery_phrase) |phrase| {
             if (report.reused_key) std.debug.print("This target opens with the recovery words of your other backup target:\n{s}\n", .{phrase}) else std.debug.print("Save these recovery words:\n{s}\n", .{phrase});
         }
