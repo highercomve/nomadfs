@@ -210,7 +210,7 @@ pub const Worker = struct {
             if (waited < 3_600_000) continue;
             waited = 0;
             self.round(false) catch |err| {
-                if (err != error.Cancelled) std.debug.print("offsite: upload failed: {s}\n", .{@errorName(err)});
+                if (err != error.Cancelled) std.debug.print("offsite: upload failed: {s}\n", .{if (err == error.BucketVersioningEnabled) core.versioned_bucket else @errorName(err)});
                 waited = 3_540_000;
             };
         }

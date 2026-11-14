@@ -79,6 +79,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const []const u8) !u8 {
     var result = service.execute(a, io, request) catch |err| {
         if (err == error.DeepBackupOff) {
             std.debug.print("Backup \"{s}\" {s} (deep_backup = true, or Settings → Deep backup in the app)\n", .{ request.target.?, service.Gate.needs_deep_backup.text() });
+        } else if (err == error.BucketVersioningEnabled) {
+            std.debug.print("Backup \"{s}\" refused: {s}\n", .{ request.target.?, service.versioned_bucket });
         } else std.debug.print("Backup \"{s}\" failed: {s}\n", .{ request.target.?, @errorName(err) });
         return 1;
     };
@@ -121,6 +123,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const []const u8) !u8 {
     }
     if (result.restore) |restored| {
         std.debug.print("Restored {d} files\n", .{restored.files});
+        if (restored.purged_files > 0) std.debug.print("{d} files were deleted from the backup after this restore began and were left out\n", .{restored.purged_files});
         if (restored.thawing_packs > 0) printThaw(restored.thawing_packs, restored.thawing_bytes, request.tier);
     }
     if (request.action == .forget) std.debug.print("Purge recorded; the next run removes this path from offsite history and packs.\n", .{});

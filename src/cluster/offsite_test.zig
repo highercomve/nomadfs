@@ -39,6 +39,17 @@ const Fake = struct {
     /// another writer does while this request is stalled on the wire.
     before_put: ?*const fn (*Fake) anyerror!void = null,
     before_key: []const u8 = "",
+    /// GetBucketVersioning: the Status the bucket reports (null: never set,
+    /// like R2), or a store that does not know the request at all (501).
+    versioning: ?[]const u8 = null,
+    versioning_unsupported: bool = false,
+    /// The next PUT of a key ending like this is refused (403), once.
+    fail_put_once: []const u8 = "",
+    /// The next PUT of a key ending like this is stored, then its answer is
+    /// lost on the wire, once: the client sends it again.
+    lose_put_once: []const u8 = "",
+    /// The last multipart completion carried If-None-Match.
+    complete_conditional: bool = false,
     /// Every running thaw ends: the archived packs become readable.
     fn finishThaws(self: *Fake) void {
         var it = self.objects.valueIterator();
@@ -102,6 +113,7 @@ const Fake = struct {
     fn send(ctx: *anyopaque, allocator: std.mem.Allocator, request: s3.transport.Request) s3.transport.Error!s3.Response {
         return sendImpl(ctx, allocator, request) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
+            error.NetworkFailure => error.NetworkFailure,
             else => error.InvalidRequest,
         };
     }
@@ -128,6 +140,11 @@ const Fake = struct {
         var etag_buf: [32]u8 = undefined;
         const existing = self.objects.get(key);
         const old_etag = try std.fmt.bufPrint(&etag_buf, "\"{d}\"", .{if (existing) |o| o.version else 0});
+        if (request.method == .GET and key.len == 0 and std.mem.startsWith(u8, query, "versioning=")) {
+            if (self.versioning_unsupported) return s3.Response.init(allocator, 501, &.{}, "<Error><Code>NotImplemented</Code></Error>");
+            const status = self.versioning orelse return s3.Response.init(allocator, 200, &.{}, "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>");
+            return s3.Response.init(allocator, 200, &.{}, try std.fmt.allocPrint(scratch, "<VersioningConfiguration><Status>{s}</Status></VersioningConfiguration>", .{status}));
+        }
         if (request.method == .GET and key.len == 0) {
             var params = std.mem.splitScalar(u8, query, '&');
             var prefix: []const u8 = "";
@@ -161,6 +178,8 @@ const Fake = struct {
                 self.multipart_class = if (header(request, "x-amz-storage-class")) |class| @tagName(std.meta.stringToEnum(Classes, class).?) else null;
                 return s3.Response.init(allocator, 200, &.{}, "<InitiateMultipartUploadResult><UploadId>test</UploadId></InitiateMultipartUploadResult>");
             }
+            self.complete_conditional = header(request, "if-none-match") != null;
+            if (self.complete_conditional and existing != null) return s3.Response.init(allocator, 412, &.{}, "");
             try self.set(key, self.multipart.items);
             self.objects.getPtr(key).?.class = self.multipart_class;
             self.pack_puts += 1;
@@ -171,6 +190,13 @@ const Fake = struct {
             if (header(request, "if-match")) |match| if (existing == null or !std.mem.eql(u8, match, old_etag)) return s3.Response.init(allocator, 412, &.{}, "");
             if (std.mem.startsWith(u8, query, "partNumber=")) {
                 try self.multipart.appendSlice(a, body);
+            } else if (self.fail_put_once.len > 0 and std.mem.endsWith(u8, key, self.fail_put_once)) {
+                self.fail_put_once = "";
+                return s3.Response.init(allocator, 403, &.{}, "");
+            } else if (self.lose_put_once.len > 0 and std.mem.endsWith(u8, key, self.lose_put_once)) {
+                self.lose_put_once = "";
+                try self.set(key, body);
+                return error.NetworkFailure;
             } else {
                 if (std.mem.indexOf(u8, key, "index/") != null) self.segments += 1;
                 if ((self.fail_segment_once or self.segments == self.fail_segment_at) and std.mem.indexOf(u8, key, "index/") != null) {
@@ -229,6 +255,8 @@ const Fixture = struct {
     arena: std.heap.ArenaAllocator,
     store: storage.engine.StorageEngine = undefined,
     files: std.ArrayList(core.File) = .empty,
+    /// Versions the folder lists whose blocks are not in the store yet.
+    absent: []const core.Version = &.{},
     fn create() !*Fixture {
         const f = try a.create(Fixture);
         errdefer a.destroy(f);
@@ -273,7 +301,25 @@ const Fixture = struct {
     }
     fn filesFn(ctx: *anyopaque, _: std.mem.Allocator) !core.Listing {
         const f: *Fixture = @ptrCast(@alignCast(ctx));
-        return .{ .files = f.files.items };
+        return .{ .files = f.files.items, .waiting = f.absent.len, .absent = f.absent };
+    }
+    fn forget(f: *Fixture, path: []const u8) !void {
+        return f.service.forget(path, f.source());
+    }
+    /// Objects under the backup's prefix whose name starts like this.
+    fn countUnder(f: *Fixture, prefix: []const u8) usize {
+        var n: usize = 0;
+        var it = f.fake.objects.keyIterator();
+        while (it.next()) |key| n += @intFromBool(std.mem.startsWith(u8, key.*, prefix));
+        return n;
+    }
+    /// A device that has no wrap in the bucket: only the words open it.
+    fn stranger(f: *Fixture) !core.Service {
+        const pair = try std.crypto.dh.X25519.KeyPair.generateDeterministic([_]u8{8} ** 32);
+        var service = try core.Service.init(a, &f.client, f.service.config, .{ .id = [_]u8{8} ** 32, .public = pair.public_key, .secret = pair.secret_key });
+        service.clock_ctx = &f.fake;
+        service.clockFn = Fake.clock;
+        return service;
     }
     fn source(f: *Fixture) core.Source {
         return .{ .ctx = f, .filesFn = filesFn };
@@ -339,7 +385,8 @@ test "offsite: first run creates layout and wraps; repeated run deduplicates; ne
     try std.testing.expectEqual(@as(usize, 1), first.uploaded_blocks);
     try std.testing.expect(first.recovery_phrase != null);
     try std.testing.expect(f.fake.objects.contains("swarm/nomadfs-backup.json"));
-    try std.testing.expect(f.fake.objects.contains("swarm/keys/recovery.wrap"));
+    // The root names one setup: the two wraps and the sealed words.
+    try std.testing.expectEqual(@as(usize, 3), f.countUnder("swarm/keys/"));
     const words = try f.service.recoveryKey();
     try std.testing.expectEqualStrings(first.recovery_phrase.?, words);
     const puts = f.fake.pack_puts;
@@ -361,6 +408,7 @@ test "offsite: foreign lease refused; expired lease replaced with CAS; stolen le
     try f.fake.set("swarm/lease", "stolen");
     f.fake.time += 101;
     f.service.key = [_]u8{7} ** 32;
+    f.service.setup_id = "0123456789abcdef0123456789abcdef";
     try std.testing.expectError(error.LeaseLost, f.service.wrapDevice([_]u8{3} ** 32, f.service.device.public));
     // release cannot erase a new owner's lease.
     f.service.release();
@@ -432,8 +480,8 @@ test "offsite: ordinary deletes and retention keep data; forget rewrites history
     f.fake.time += 90 * 86400;
     _ = try f.run();
     try std.testing.expect(f.fake.objects.contains(old_pack));
-    try f.service.forget("private.txt");
-    try f.service.forget("shared-a.txt");
+    try f.forget("private.txt");
+    try f.forget("shared-a.txt");
     f.service.config.schedule = .monthly;
     _ = try f.run();
     // Out of the index at once; the replaced pack goes after the grace, and
@@ -476,6 +524,8 @@ test "offsite: multipart upload and rate limiting renew the lease during long up
     const report = try f.run();
     try std.testing.expectEqual(@as(usize, 1), report.uploaded_blocks);
     try std.testing.expectEqual(@as(usize, 1), f.fake.multipart_calls);
+    // The completion refuses to replace a pack that already has the name.
+    try std.testing.expect(f.fake.complete_conditional);
     try std.testing.expect(f.fake.sleeps >= 300_000);
     try std.testing.expectEqual(@as(usize, 1), try f.service.verify(null));
 }
@@ -502,7 +552,7 @@ test "offsite: purge retries after replacement index failure without losing shar
     _ = try f.add("remove.txt", "remove");
     _ = try f.add("keep.txt", "keep");
     _ = try f.run();
-    try f.service.forget("remove.txt");
+    try f.forget("remove.txt");
     f.fake.fail_segment_once = true;
     try std.testing.expectError(error.AccessDenied, f.run());
     _ = try f.run();
@@ -514,13 +564,13 @@ test "offsite: clear mode restores with integrity; purge log and recovery entrop
     const f = try Fixture.create();
     defer f.destroy();
     f.service.config.encrypt = false;
-    try std.testing.expectError(error.Locked, f.service.forget("a.txt"));
+    try std.testing.expectError(error.Locked, f.forget("a.txt"));
     _ = try f.add("a.txt", "clear text");
     const report = try f.run();
-    try f.service.forget("a.txt");
+    try f.forget("a.txt");
     var it = f.fake.objects.iterator();
     while (it.next()) |e| {
-        if (std.mem.startsWith(u8, e.key_ptr.*, "swarm/purges/") or std.mem.eql(u8, e.key_ptr.*, "swarm/keys/recovery-entropy")) {
+        if (std.mem.startsWith(u8, e.key_ptr.*, "swarm/purges/") or std.mem.endsWith(u8, e.key_ptr.*, "/recovery-entropy")) {
             try std.testing.expectEqual(backup.pack.Mode.encrypted, (try backup.pack.Header.decode(e.value_ptr.bytes)).mode);
         }
     }
@@ -581,7 +631,7 @@ test "offsite: multi-level DAG restore preserves repeated shared blocks and purg
     const bytes = try target.dir.readFileAlloc(io, "keep.txt", a, .limited(100));
     defer a.free(bytes);
     try std.testing.expectEqualStrings("sharedretainedshared", bytes);
-    try f.service.forget("remove.txt");
+    try f.forget("remove.txt");
     _ = try f.run();
     try std.testing.expect(!f.service.index.contains(backup.index.keyedBlockId(f.service.key.?, removed)));
     try std.testing.expectEqual(@as(usize, 3), try f.service.verify(null));
@@ -641,7 +691,7 @@ test "offsite: retention prunes snapshots but historical catalog keeps normally 
     f.fake.time += 90 * 86400;
     _ = try f.run();
     try std.testing.expect(!(try f.names(first.snapshot)));
-    try f.service.forget("purge.txt");
+    try f.forget("purge.txt");
     _ = try f.run();
     const bytes = try f.service.readBlock(historical);
     defer a.free(bytes);
@@ -671,7 +721,7 @@ test "offsite: only packs take the cold storage class; metadata stays standard" 
     @memset(bytes, 'p');
     _ = try f.add("large.bin", bytes);
     _ = try f.run();
-    try f.service.forget("nothing.txt");
+    try f.forget("nothing.txt");
     try std.testing.expectEqual(@as(usize, 1), f.fake.multipart_calls);
     var packs: usize = 0;
     var others: usize = 0;
@@ -715,7 +765,7 @@ test "offsite: cold target retention prunes snapshots and never deletes a young 
     const orphan = "swarm/packs/000102030405060708090a0b0c0d0e0f";
     try f.fake.set(orphan, "orphan pack bytes");
     f.fake.objects.getPtr(orphan).?.class = "DEEP_ARCHIVE";
-    try f.service.forget("never-there.txt");
+    try f.forget("never-there.txt");
     f.fake.time += 40 * day;
     _ = try f.run();
     try std.testing.expect(f.fake.objects.contains(pack));
@@ -742,7 +792,7 @@ test "offsite: purge on a cold target forgets the file at once and removes the p
     _ = try f.run();
     const old_pack = try f.packKey(removed);
     const born = f.fake.objects.get(old_pack).?.modified;
-    try f.service.forget("private.txt");
+    try f.forget("private.txt");
     // The monthly rule keeps this later snapshot; the purge filters the new one too.
     const second = try f.run();
     // Gone from history and index now; the pack itself waits.
@@ -1253,6 +1303,336 @@ test "offsite: a restore killed half way resumes: recorded files stay, the rest 
     try std.testing.expectError(error.FileNotFound, half.dir.statFile(io, ".nomadfs-restore", .{}));
 }
 
+test "offsite: a recorded file changed to other bytes of the same size is written again on resume" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    const first = try f.add("a.txt", "good");
+    _ = try f.run();
+    _ = try f.add("b.txt", "later");
+    const report = try f.run();
+    f.fake.objects.getPtr(try f.packKey(first)).?.thaw = .ready;
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    const partial = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 1), partial.files);
+    // The record holds the digest of the bytes written, not only the name.
+    const log = try target.dir.readFileAlloc(io, ".nomadfs-restore/done.log", a, .limited(4096));
+    defer a.free(log);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash("good", &digest, .{});
+    try std.testing.expect(std.mem.indexOf(u8, log, &std.fmt.bytesToHex(digest, .lower)) != null);
+    // Recorded as finished, then replaced by other bytes of the same size.
+    try target.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "EVIL" });
+    f.fake.finishThaws();
+    const done = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 2), done.files);
+    try expectFile(target.dir, "a.txt", "good");
+    try expectFile(target.dir, "b.txt", "later");
+    try std.testing.expectError(error.FileNotFound, target.dir.statFile(io, ".nomadfs-restore", .{}));
+}
+
+test "offsite: a cold restore resumes from its own plan after retention dropped its snapshot" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    _ = try f.add("a.txt", "good");
+    const report = try f.run();
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    const first = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 1), first.thawing_packs);
+    // The next runs (same month, no dailies) stop naming the snapshot, and
+    // after the grace its object is deleted: a bulk thaw takes up to 48 h.
+    f.fake.time += day;
+    _ = try f.run();
+    try std.testing.expect(!(try f.names(report.snapshot)));
+    f.fake.time += 2 * day;
+    _ = try f.run();
+    const object = try std.fmt.allocPrint(f.arena.allocator(), "swarm/{s}", .{report.snapshot});
+    try std.testing.expect(!f.fake.objects.contains(object));
+    f.fake.finishThaws();
+    // A restart: the new session cannot read that snapshot, the job needs none.
+    var again = try f.other();
+    defer again.deinit();
+    try again.unlock(null);
+    try std.testing.expectError(error.InvalidSnapshot, again.snapshot(report.snapshot));
+    const done = try restoreRequest(&again, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 1), done.files);
+    try std.testing.expectEqual(@as(usize, 0), done.thawing_packs);
+    try expectFile(target.dir, "a.txt", "good");
+    try std.testing.expectError(error.FileNotFound, target.dir.statFile(io, ".nomadfs-restore", .{}));
+}
+
+/// A restore of three files in two packs that stopped at its first file (its
+/// pack was unreachable), then a purge of one of the other two: the pack
+/// they share is copied without it and waits to be deleted.
+const Interrupted = struct {
+    f: *Fixture,
+    reader: core.Service,
+    target: std.testing.TmpDir,
+    snapshot: []const u8,
+    /// The pack the purge replaced.
+    shared: []const u8,
+    fn create() !Interrupted {
+        const f = try Fixture.create();
+        errdefer f.destroy();
+        const lost = try f.add("first.txt", "one");
+        _ = try f.run();
+        _ = try f.add("private.txt", "secret");
+        const kept = try f.add("keep.txt", "good");
+        const report = try f.run();
+        var self: Interrupted = .{ .f = f, .reader = try f.other(), .target = std.testing.tmpDir(.{}), .snapshot = report.snapshot, .shared = try f.packKey(kept) };
+        errdefer self.reader.deinit();
+        errdefer self.target.cleanup();
+        try self.reader.unlock(null);
+        const removed = f.fake.objects.fetchRemove(try f.packKey(lost)).?;
+        try std.testing.expectError(error.NotFound, restore(&self.reader, report.snapshot, null, self.target.dir));
+        try f.fake.objects.put(a, removed.key, removed.value);
+        try std.testing.expectEqual(@as(usize, 1), self.pins());
+        try f.forget("private.txt");
+        _ = try f.run();
+        try std.testing.expect(!std.mem.eql(u8, self.shared, try f.packKey(kept)));
+        return self;
+    }
+    fn destroy(self: *Interrupted) void {
+        self.target.cleanup();
+        self.reader.deinit();
+        self.f.destroy();
+    }
+    fn pins(self: *Interrupted) usize {
+        var count: usize = 0;
+        var it = self.f.fake.objects.keyIterator();
+        while (it.next()) |key| count += @intFromBool(std.mem.startsWith(u8, key.*, "swarm/pins/"));
+        return count;
+    }
+};
+
+test "offsite: a pack a restore job pins outlives the purge that replaced it, then goes" {
+    var t = try Interrupted.create();
+    defer t.destroy();
+    const f = t.f;
+    // Past the grace: every other piece of garbage goes, the pinned pack waits.
+    f.fake.time += 2 * day;
+    _ = try f.run();
+    try std.testing.expect(f.fake.objects.contains(t.shared));
+    try std.testing.expectEqual(@as(usize, 1), (try f.service.status()).deferred_packs);
+    // The reader still has the index from before the purge: its job reads
+    // the plan, and the plan's packs are all there.
+    try std.testing.expectEqual(@as(usize, 3), try restore(&t.reader, t.snapshot, null, t.target.dir));
+    try expectFile(t.target.dir, "first.txt", "one");
+    try expectFile(t.target.dir, "keep.txt", "good");
+    try expectFile(t.target.dir, "private.txt", "secret");
+    // The job is over and its pin with it: the pack goes within the grace.
+    try std.testing.expectEqual(@as(usize, 0), t.pins());
+    f.fake.time += day;
+    _ = try f.run();
+    try std.testing.expect(!f.fake.objects.contains(t.shared));
+    try std.testing.expectEqual(@as(usize, 0), (try f.service.status()).deferred_packs);
+}
+
+test "offsite: a restore whose pin ran out plans the rest again from the current head" {
+    var t = try Interrupted.create();
+    defer t.destroy();
+    const f = t.f;
+    // Nobody resumed for longer than a pin lasts: the pack is deleted, and
+    // the forgotten pin a grace later.
+    f.fake.time += core.pin_seconds + day;
+    _ = try f.run();
+    try std.testing.expect(!f.fake.objects.contains(t.shared));
+    try std.testing.expectEqual(@as(usize, 0), t.pins());
+    // The stale reader finds the pack gone and reads the head again: the
+    // kept file is restored from the copy, the purged one is left out.
+    const done = try restoreRequest(&t.reader, t.snapshot, null, t.target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 2), done.files);
+    try std.testing.expectEqual(@as(usize, 1), done.purged_files);
+    try expectFile(t.target.dir, "first.txt", "one");
+    try expectFile(t.target.dir, "keep.txt", "good");
+    try std.testing.expectError(error.FileNotFound, t.target.dir.statFile(io, "private.txt", .{}));
+    try std.testing.expectError(error.FileNotFound, t.target.dir.statFile(io, ".nomadfs-restore", .{}));
+}
+
+test "offsite: pins are sealed, renewed by every pass, and one that cannot be read protects nothing" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    _ = try f.add("private.txt", "secret");
+    const kept = try f.add("keep.txt", "good");
+    _ = try f.run();
+    const at = try f.service.locate(kept);
+    const pack = try f.packKey(kept);
+    const job = [_]u8{0xab} ** 16;
+    try f.service.pin(job, &.{at.pack_id});
+    const name = "swarm/pins/" ++ "ab" ** 16;
+    const sealed = f.fake.objects.get(name).?;
+    try std.testing.expect(sealed.class == null);
+    try std.testing.expect(std.mem.indexOf(u8, sealed.bytes, "expires") == null);
+    try f.forget("private.txt");
+    _ = try f.run();
+    // Renewed on day 10: the pack is still pinned on day 20, gone after day 24.
+    f.fake.time += 10 * day;
+    try f.service.pin(job, &.{at.pack_id});
+    f.fake.time += 10 * day;
+    _ = try f.run();
+    try std.testing.expect(f.fake.objects.contains(pack));
+    // The location recorded before the purge still reads the kept block.
+    const bytes = try f.service.readAt(kept, at);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("\x00good", bytes);
+    f.fake.time += 5 * day;
+    _ = try f.run();
+    try std.testing.expect(!f.fake.objects.contains(pack));
+
+    // A pin nobody can open defers nothing, and is deleted once it is old.
+    const other = try f.add("other.txt", "more");
+    _ = try f.add("doomed.txt", "bytes");
+    _ = try f.run();
+    const second = try f.packKey(other);
+    try f.fake.set("swarm/pins/" ++ "cd" ** 16, "not a pin");
+    try f.forget("doomed.txt");
+    _ = try f.run();
+    f.fake.time += 2 * day;
+    _ = try f.run();
+    try std.testing.expect(!f.fake.objects.contains(second));
+    try std.testing.expect(f.fake.objects.contains("swarm/pins/" ++ "cd" ** 16));
+    f.fake.time += core.pin_seconds;
+    try f.forget("other.txt");
+    _ = try f.run();
+    f.fake.time += 2 * day;
+    _ = try f.run();
+    try std.testing.expect(!f.fake.objects.contains("swarm/pins/" ++ "cd" ** 16));
+}
+
+test "offsite: the history keeps a content that came back as a second interval, and a time picks the right one" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    const original = try f.add("a.txt", "original");
+    _ = try f.run();
+    const first = f.fake.time;
+    f.fake.time += day;
+    _ = try f.run(); // unchanged: the interval grows
+    f.files.clearRetainingCapacity();
+    f.fake.time += day;
+    _ = try f.add("a.txt", "changed");
+    _ = try f.run();
+    const changed = f.fake.time;
+    f.files.clearRetainingCapacity();
+    f.fake.time += day;
+    _ = try f.add("a.txt", "original");
+    _ = try f.run();
+    const reverted = f.fake.time;
+    f.fake.time += day;
+    _ = try f.run();
+
+    const versions = try f.service.history("a.txt");
+    try std.testing.expectEqual(@as(usize, 3), versions.len);
+    var stretches: usize = 0;
+    for (versions) |v| {
+        if (!std.mem.eql(u8, &v.cid, &original)) {
+            try std.testing.expect(v.first_seen == changed and v.last_seen == changed);
+            continue;
+        }
+        stretches += 1;
+        if (v.first_seen == first) try std.testing.expectEqual(first + day + 1, v.last_seen) else {
+            try std.testing.expectEqual(reverted, v.first_seen);
+            try std.testing.expectEqual(f.fake.time, v.last_seen);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), stretches);
+
+    const cases = [_]struct { at: u64, expected: []const u8 }{
+        .{ .at = first, .expected = "original" },
+        .{ .at = changed - 1, .expected = "original" },
+        .{ .at = changed, .expected = "changed" },
+        .{ .at = reverted - 1, .expected = "changed" },
+        .{ .at = reverted, .expected = "original" },
+        .{ .at = f.fake.time, .expected = "original" },
+    };
+    for (cases) |case| {
+        var target = std.testing.tmpDir(.{});
+        defer target.cleanup();
+        _ = try restoreHistory(&f.service, "a.txt", .{ .at = case.at }, target.dir);
+        try expectFile(target.dir, "a.txt", case.expected);
+    }
+    // A file deleted and seen again later also begins a new interval.
+    f.files.clearRetainingCapacity();
+    _ = try f.add("other.txt", "stays");
+    _ = try f.run();
+    _ = try f.add("a.txt", "original");
+    _ = try f.run();
+    try std.testing.expectEqual(@as(usize, 4), (try f.service.history("a.txt")).len);
+    try std.testing.expectEqual(@as(usize, 1), (try f.service.history("other.txt")).len);
+}
+
+test "offsite: packs uploaded cold are thawed after the target is set to a warm class" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    _ = try f.add("a.txt", "good");
+    const report = try f.run();
+    // Today's class only chooses where new packs go.
+    f.service.config.storage_class = .STANDARD;
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    const first = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 0), first.files);
+    try std.testing.expectEqual(@as(usize, 1), first.thawing_packs);
+    try std.testing.expectEqual(@as(usize, 1), f.fake.restore_requests);
+    // A check still goes by listing instead of reading archived packs.
+    try std.testing.expect(!(try f.service.check(null, false, .Bulk)).downloaded);
+    try std.testing.expectEqual(@as(usize, 1), (try f.service.check(null, true, .Bulk)).thawing_packs);
+    f.fake.finishThaws();
+    const done = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 1), done.files);
+    try std.testing.expectEqual(@as(usize, 1), f.fake.restore_requests);
+    try expectFile(target.dir, "a.txt", "good");
+    try std.testing.expectEqual(@as(usize, 1), (try f.service.check(null, true, .Bulk)).blocks);
+}
+
+test "offsite: a pack the bucket archived by itself is thawed when its read is refused" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    const moved = try f.add("a.txt", "archived");
+    _ = try f.run();
+    _ = try f.add("b.txt", "warm");
+    const report = try f.run();
+    // Uploaded warm and recorded so; a lifecycle rule moved it since.
+    f.fake.objects.getPtr(try f.packKey(moved)).?.class = "DEEP_ARCHIVE";
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    const first = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Standard);
+    try std.testing.expectEqual(@as(usize, 1), first.files);
+    try std.testing.expectEqual(@as(usize, 1), first.thawing_packs);
+    try std.testing.expect(first.thawing_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 1), f.fake.restore_requests);
+    try std.testing.expectEqualStrings("Standard", f.fake.last_tier);
+    try expectFile(target.dir, "b.txt", "warm");
+    // Still thawing: the same refusal asks for nothing new.
+    const waiting = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Standard);
+    try std.testing.expectEqual(@as(usize, 1), waiting.thawing_packs);
+    try std.testing.expectEqual(@as(usize, 1), f.fake.restore_requests);
+    f.fake.finishThaws();
+    const done = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Standard);
+    try std.testing.expectEqual(@as(usize, 2), done.files);
+    try std.testing.expectEqual(@as(usize, 0), done.thawing_packs);
+    try expectFile(target.dir, "a.txt", "archived");
+}
+
+test "offsite: a restore job's plan is checked again: a path out of the destination is refused" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    _ = try f.add("a.txt", "good");
+    const report = try f.run();
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    _ = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    const plan = try target.dir.readFileAlloc(io, ".nomadfs-restore/plan.bin", a, .limited(4096));
+    defer a.free(plan);
+    const at = std.mem.indexOf(u8, plan, "a.txt").?;
+    @memcpy(plan[at..][0..5], "../up");
+    try target.dir.writeFile(io, .{ .sub_path = ".nomadfs-restore/plan.bin", .data = plan });
+    f.fake.finishThaws();
+    try std.testing.expectError(error.InvalidRestoreJob, restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk));
+    try target.dir.writeFile(io, .{ .sub_path = ".nomadfs-restore/plan.bin", .data = plan[0 .. plan.len - 3] });
+    try std.testing.expectError(error.InvalidRestoreJob, restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk));
+}
+
 test "offsite: a file retention left in no snapshot is listed in the history and restored from it" {
     const f = try Fixture.create();
     defer f.destroy();
@@ -1305,7 +1685,7 @@ test "offsite: a file retention left in no snapshot is listed in the history and
     try std.testing.expectError(error.InvalidPath, restoreHistory(&f.service, "../up", .latest, earlier.dir));
 
     // A purge is the only thing that takes a file out of the history.
-    try f.service.forget("gone.txt");
+    try f.forget("gone.txt");
     _ = try f.run();
     try std.testing.expectEqual(@as(usize, 0), (try f.service.history("gone.txt")).len);
 }
@@ -1337,7 +1717,7 @@ test "offsite: a writer stalled past its lease cannot publish after another writ
     _ = try f.add("private.txt", "secret");
     const kept = try f.add("kept.txt", "good");
     _ = try f.run();
-    try f.service.forget("private.txt");
+    try f.forget("private.txt");
     // The purge copies kept.txt's block into a new pack; the commit naming
     // it stalls after the lease was renewed, so only the head can fence it.
     Rival.fixture = f;
@@ -1393,7 +1773,7 @@ test "offsite: a purge covers the versions that were there; new content at the s
     defer f.destroy();
     const old = try f.add("a.txt", "old");
     _ = try f.run();
-    try f.service.forget("a.txt");
+    try f.forget("a.txt");
     // The folder still lists the purged version: it is not uploaded again.
     const purged = try f.run();
     try std.testing.expectEqual(@as(usize, 0), purged.uploaded_blocks);
@@ -1425,7 +1805,7 @@ test "offsite: a purge of a directory does not exclude later files under it" {
     // In the folder when the purge is asked for, but not uploaded yet.
     const unsent = try f.add("Trip/unsent.jpg", "never uploaded");
     f.files.items[f.files.items.len - 1].mtime = f.fake.time;
-    try f.service.forget("Trip");
+    try f.forget("Trip");
     // Both are still in the folder next to a photo made later, the directory too.
     f.fake.time += 60;
     try f.files.append(f.arena.allocator(), .{ .path = "Trip", .cid = [_]u8{0} ** 32, .size = 0, .blocks = &.{}, .directory = true });
@@ -1454,7 +1834,7 @@ test "offsite: a pack keeps the class and minimum storage time of its upload whe
     _ = try f.run();
     const pack = try f.packKey(cid);
     const born = f.fake.objects.get(pack).?.modified;
-    try f.service.forget("a.txt");
+    try f.forget("a.txt");
     f.service.config.storage_class = .STANDARD;
     _ = try f.run();
     try std.testing.expect(f.fake.objects.contains(pack));
@@ -1495,4 +1875,164 @@ test "offsite: files waiting for blocks keep the target due after a restart" {
     var again = try f.other();
     defer again.deinit();
     try std.testing.expect(!(try again.due()));
+}
+
+test "offsite: a purge covers the versions there when it was asked for, whatever a file's time says" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    const old = try f.add("a.txt", "old");
+    _ = try f.run();
+    const before = f.fake.time;
+    try f.forget("a.txt");
+    // Different content arrives at the path afterwards, with a preserved
+    // older time (an import): it was not there to be purged.
+    f.fake.time += 60;
+    f.files.clearRetainingCapacity();
+    const new = try f.add("a.txt", "new");
+    f.files.items[0].mtime = before - day;
+    const report = try f.run();
+    try std.testing.expectEqual(@as(usize, 1), (try f.service.snapshot(report.snapshot)).files.len);
+    const versions = try f.service.history("a.txt");
+    try std.testing.expectEqual(@as(usize, 1), versions.len);
+    try std.testing.expectEqualSlices(u8, &new, &versions[0].cid);
+    try std.testing.expectError(error.BlockNotFound, f.service.readBlock(old));
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    try std.testing.expectEqual(@as(usize, 1), try restore(&f.service, report.snapshot, null, target.dir));
+    try expectFile(target.dir, "a.txt", "new");
+}
+
+test "offsite: a purge covers a version still waiting for its blocks, and it is never uploaded" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    _ = try f.run();
+    // The folder lists the file; its blocks have not reached this device.
+    const cid = try f.add("private.txt", "secret");
+    const waiting = f.files.pop().?;
+    f.absent = &.{.{ .path = "private.txt", .cid = cid }};
+    try f.forget("private.txt");
+    // The purge is applied while the file still waits.
+    const first = try f.run();
+    try std.testing.expectEqual(@as(usize, 1), first.waiting_files);
+    // The blocks came: the version is uploadable now, and stays out.
+    f.absent = &.{};
+    try f.files.append(f.arena.allocator(), waiting);
+    const second = try f.run();
+    try std.testing.expectEqual(@as(usize, 0), second.uploaded_blocks);
+    try std.testing.expectEqual(@as(usize, 0), (try f.service.snapshot(second.snapshot)).files.len);
+    try std.testing.expectEqual(@as(usize, 0), (try f.service.history("private.txt")).len);
+    try std.testing.expectError(error.BlockNotFound, f.service.readBlock(cid));
+    // Still out after a restart: the purge lives in the bucket.
+    var restarted = try f.other();
+    defer restarted.deinit();
+    const third = try restarted.run(f.source(), &f.store);
+    try std.testing.expectEqual(@as(usize, 0), third.uploaded_blocks);
+    // Other content at the path is not the purged version.
+    f.files.clearRetainingCapacity();
+    _ = try f.add("private.txt", "public now");
+    const fourth = try f.run();
+    try std.testing.expectEqual(@as(usize, 1), fourth.uploaded_blocks);
+    try std.testing.expectEqual(@as(usize, 1), (try f.service.history("private.txt")).len);
+}
+
+test "offsite: a setup that stopped after its wraps and before its root starts again" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    _ = try f.add("a.txt", "good");
+    f.fake.fail_put_once = "nomadfs-backup.json";
+    try std.testing.expectError(error.AccessDenied, f.run());
+    try std.testing.expectEqual(@as(usize, 3), f.countUnder("swarm/keys/"));
+    try std.testing.expect(!f.fake.objects.contains("swarm/nomadfs-backup.json"));
+    // A new process: it makes its own key material and publishes the root.
+    var again = try f.other();
+    defer again.deinit();
+    const report = try again.run(f.source(), &f.store);
+    try std.testing.expect(report.recovery_phrase != null);
+    // The unfinished setup's objects are gone; the root's are there.
+    try std.testing.expectEqual(@as(usize, 3), f.countUnder("swarm/keys/"));
+    var stranger = try f.stranger();
+    defer stranger.deinit();
+    try stranger.unlock(report.recovery_phrase);
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    try std.testing.expectEqual(@as(usize, 1), try restore(&stranger, report.snapshot, null, target.dir));
+    try expectFile(target.dir, "a.txt", "good");
+}
+
+test "offsite: a lost answer to the root's write does not stop the setup, and the words are still shown" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    _ = try f.add("a.txt", "good");
+    // The root is stored, its answer is lost, the retry finds it there (412).
+    f.fake.lose_put_once = "nomadfs-backup.json";
+    // And the run then stops before its first commit.
+    f.fake.fail_put_once = "swarm/head";
+    try std.testing.expectError(error.AccessDenied, f.run());
+    try std.testing.expect(f.fake.objects.contains("swarm/nomadfs-backup.json"));
+    const words = try a.dupe(u8, try f.service.recoveryKey());
+    defer a.free(words);
+    // A new process finds its own root with no run finished: it goes on
+    // with the same key and reports the words it made.
+    var again = try f.other();
+    defer again.deinit();
+    const report = try again.run(f.source(), &f.store);
+    try std.testing.expectEqualStrings(words, report.recovery_phrase.?);
+    try std.testing.expectEqual(@as(usize, 3), f.countUnder("swarm/keys/"));
+    var stranger = try f.stranger();
+    defer stranger.deinit();
+    try stranger.unlock(words);
+    try std.testing.expectEqual(@as(usize, 1), try stranger.verify(null));
+    // Once a run has finished the words are not repeated.
+    const later = try again.run(f.source(), &f.store);
+    try std.testing.expect(later.recovery_phrase == null);
+}
+
+test "offsite: the lost answer alone: the same run finishes the setup" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    _ = try f.add("a.txt", "good");
+    f.fake.lose_put_once = "nomadfs-backup.json";
+    const report = try f.run();
+    try std.testing.expect(report.recovery_phrase != null);
+    var stranger = try f.stranger();
+    defer stranger.deinit();
+    try stranger.unlock(report.recovery_phrase);
+    try std.testing.expectEqual(@as(usize, 1), try stranger.verify(report.snapshot));
+}
+
+const OtherDevice = struct {
+    /// Another device publishes its root while ours is on the wire.
+    fn publish(fake: *Fake) !void {
+        try fake.set("swarm/nomadfs-backup.json", "{\"version\":3,\"encrypt\":true,\"key_id\":[1,2,3,4,5,6,7,8],\"setup\":\"00112233445566778899aabbccddeeff\",\"creator\":[" ++ "5," ** 31 ++ "5]}");
+    }
+};
+test "offsite: of two devices setting up one empty bucket the loser stops and leaves no key material" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    _ = try f.add("a.txt", "good");
+    f.fake.before_key = "nomadfs-backup.json";
+    f.fake.before_put = OtherDevice.publish;
+    try std.testing.expectError(error.LeaseLost, f.run());
+    try std.testing.expectEqual(@as(usize, 0), f.countUnder("swarm/keys/"));
+    try std.testing.expectEqual(@as(usize, 0), f.countUnder("swarm/packs/"));
+}
+
+test "offsite: a versioned bucket is refused before anything is written; a store without versioning is accepted" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    _ = try f.add("a.txt", "good");
+    for ([_][]const u8{ "Enabled", "Suspended" }) |status| {
+        f.fake.versioning = status;
+        try std.testing.expectError(error.BucketVersioningEnabled, f.run());
+        try std.testing.expectEqual(@as(usize, 0), f.fake.objects.count());
+    }
+    // R2 answers without a Status; other stores do not know the request.
+    f.fake.versioning = null;
+    _ = try f.run();
+    f.fake.versioning_unsupported = true;
+    _ = try f.run();
+    // Versioning turned on later stops the next run too.
+    f.fake.versioning_unsupported = false;
+    f.fake.versioning = "Enabled";
+    try std.testing.expectError(error.BucketVersioningEnabled, f.run());
 }

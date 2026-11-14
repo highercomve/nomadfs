@@ -182,6 +182,22 @@ pub fn parse(allocator: Allocator, source: []const u8) Error!Document {
     return .{ .arena = arena, .nodes = parser.nodes.items };
 }
 
+/// Whether a bucket keeps old versions of replaced and deleted objects.
+pub const Versioning = enum { off, enabled, suspended };
+
+/// Reads a GetBucketVersioning answer. A bucket that never had versioning
+/// (and a store without it) sends no Status.
+pub fn parseVersioning(allocator: Allocator, source: []const u8) Error!Versioning {
+    var document = try parse(allocator, source);
+    defer document.deinit();
+    if (!document.rootIs("VersioningConfiguration")) return error.InvalidXml;
+    const status = std.mem.trim(u8, document.text(0, "Status") orelse return .off, " \r\n\t");
+    if (status.len == 0) return .off;
+    if (std.mem.eql(u8, status, "Enabled")) return .enabled;
+    if (std.mem.eql(u8, status, "Suspended")) return .suspended;
+    return error.InvalidXml;
+}
+
 /// Returns owned XML character data suitable for an ETag in multipart completion.
 pub fn escape(allocator: Allocator, source: []const u8) Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -203,6 +219,18 @@ test "XML namespaces entities empty elements and CDATA" {
     try std.testing.expect(document.rootIs("Result"));
     try std.testing.expectEqualStrings("a&é/<b>", document.text(0, "Key").?);
     try std.testing.expectEqualStrings("", document.text(0, "Empty").?);
+}
+
+test "XML bucket versioning status" {
+    const cases = [_]struct { []const u8, Versioning }{
+        .{ "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>", .off },
+        .{ "<VersioningConfiguration><Status></Status></VersioningConfiguration>", .off },
+        .{ "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>", .enabled },
+        .{ "<VersioningConfiguration><Status>Suspended</Status><MfaDelete>Disabled</MfaDelete></VersioningConfiguration>", .suspended },
+    };
+    for (cases) |case| try std.testing.expectEqual(case[1], try parseVersioning(std.testing.allocator, case[0]));
+    try std.testing.expectError(error.InvalidXml, parseVersioning(std.testing.allocator, "<VersioningConfiguration><Status>Maybe</Status></VersioningConfiguration>"));
+    try std.testing.expectError(error.InvalidXml, parseVersioning(std.testing.allocator, "<ListBucketResult/>"));
 }
 
 test "XML rejects malformed responses and entity declarations" {

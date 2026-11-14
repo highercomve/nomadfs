@@ -14,6 +14,7 @@ pub const Action = enum { status, run, verify, restore, history, @"recovery-key"
 pub const Tier = offsite.Tier;
 pub const Gate = worker.Gate;
 pub const no_archive = worker.no_archive;
+pub const versioned_bucket = offsite.versioned_bucket;
 pub const Request = struct {
     action: Action,
     /// A `[backup.<name>]` section; null (or "s3" with no such section) is the first.
@@ -75,6 +76,12 @@ pub fn execute(a: std.mem.Allocator, io: std.Io, request: Request) !Result {
         worker.shareKey(a, io, core, cfg.backup_targets, identity);
         return run(a, core, cfg);
     }
+    if (request.action == .forget) {
+        const doomed = request.path orelse return error.PathRequired;
+        if (!manifest.validPath(doomed)) return error.InvalidPath;
+        try core.unlock(request.recovery_words);
+        return forget(a, core, cfg, doomed);
+    }
     try core.unlock(request.recovery_words);
     switch (request.action) {
         .status => {
@@ -118,13 +125,7 @@ pub fn execute(a: std.mem.Allocator, io: std.Io, request: Request) !Result {
             return .{ .history = list, .count = list.len };
         },
         .@"recovery-key" => return .{ .recovery_phrase = try a.dupe(u8, try core.recoveryKey()) },
-        .forget => {
-            const doomed = request.path orelse return error.PathRequired;
-            if (!manifest.validPath(doomed)) return error.InvalidPath;
-            try core.forget(doomed);
-            return .{};
-        },
-        .run => unreachable,
+        .run, .forget => unreachable,
     }
 }
 fn olderVersion(_: void, x: FileVersion, y: FileVersion) bool {
@@ -147,6 +148,16 @@ fn run(a: std.mem.Allocator, core: *offsite.Service, cfg: config_mod.Config) !Re
     errdefer a.free(report.snapshot);
     if (report.recovery_phrase) |phrase| report.recovery_phrase = try a.dupe(u8, phrase);
     return .{ .report = report };
+}
+/// The purge names the versions the folder lists at this moment (also the
+/// ones still waiting for blocks), so it reads the swarm manifest through
+/// the node's composition root, like a run by hand.
+fn forget(a: std.mem.Allocator, core: *offsite.Service, cfg: config_mod.Config, path: []const u8) !Result {
+    var node = try Node.init(a, cfg);
+    defer node.deinit();
+    var source: fs_source.Source = .{ .folder = node.swarm orelse return error.StorageRequired, .store = node.store orelse return error.StorageRequired };
+    try core.forget(path, source.source());
+    return .{};
 }
 pub fn deinitResult(a: std.mem.Allocator, result: *Result) void {
     if (result.report) |r| {

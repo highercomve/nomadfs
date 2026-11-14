@@ -7,8 +7,11 @@
 //! without following links, every file is written to a new, exclusively
 //! created temporary file in the job directory, synced, and renamed into
 //! place. The job directory (`.nomadfs-restore/` in the destination) holds
-//! the request and the list of finished files while a restore is under way,
-//! so the same call, repeated after a thaw, an error or a crash, continues.
+//! the request, the plan and the list of finished files while a restore is
+//! under way, so the same call, repeated after a thaw, an error or a crash,
+//! continues. The plan is the whole view the job needs: its files and where
+//! every block of them is. A later pass reads neither the snapshot nor the
+//! index, which the backup may have moved on from in the days a thaw takes.
 const std = @import("std");
 const offsite = @import("../cluster/offsite.zig");
 const manifest = @import("manifest.zig");
@@ -19,9 +22,15 @@ const Dir = std.Io.Dir;
 /// Reserved in the destination: no restored path may start with it.
 pub const job_dir = ".nomadfs-restore";
 const job_file = "job.json";
+const plan_file = "plan.bin";
 const done_file = "done.log";
 const tmp_suffix = ".tmp";
 const max_job = 64 * 1024;
+const max_plan = 1 << 30;
+const plan_magic = "NFRPLAN1";
+/// BLAKE3 of the bytes a finished file was written with.
+const Digest = [32]u8;
+const Blake3 = std.crypto.hash.Blake3;
 const max_done = 512 * 1024 * 1024;
 /// The finished-files list is synced after this many files.
 const sync_every = 64;
@@ -40,7 +49,9 @@ pub const Request = struct {
 };
 
 const Job = struct {
-    version: u32 = 2,
+    version: u32 = 3,
+    /// 32 hex digits: names the job's pin in the bucket.
+    id: []const u8 = "",
     /// "snapshots/<id>", or the picked history version ("latest", "at:…", "cid:…").
     source: []const u8,
     history: bool = false,
@@ -84,8 +95,11 @@ fn describe(a: Allocator, from: From) ![]const u8 {
     };
 }
 
-/// One version per path out of the history. A version seen first after
-/// `at` did not exist yet; among the rest the newest wins.
+/// One version per path out of the history, whose entries are intervals:
+/// the stretch of runs a version was seen in. At a time, the interval that
+/// holds it wins, else the last one that began before it (the file was
+/// deleted, or changed between two runs); one that began later did not
+/// exist yet. Otherwise the newest wins.
 pub fn pick(a: Allocator, versions: []const offsite.File, version: Version) ![]const offsite.File {
     var chosen: std.StringArrayHashMapUnmanaged(offsite.File) = .empty;
     for (versions) |file| {
@@ -95,14 +109,18 @@ pub fn pick(a: Allocator, versions: []const offsite.File, version: Version) ![]c
             .cid => |cid| if (!std.mem.eql(u8, &cid, &file.cid)) continue,
         }
         const slot = try chosen.getOrPut(a, file.path);
-        if (!slot.found_existing or newer(file, slot.value_ptr.*, version == .at)) slot.value_ptr.* = file;
+        if (!slot.found_existing or newer(file, slot.value_ptr.*, version)) slot.value_ptr.* = file;
     }
     return chosen.values();
 }
 
-fn newer(x: offsite.File, y: offsite.File, by_first: bool) bool {
-    const kx = if (by_first) [3]u64{ x.first_seen, x.last_seen, x.mtime } else [3]u64{ x.last_seen, x.first_seen, x.mtime };
-    const ky = if (by_first) [3]u64{ y.first_seen, y.last_seen, y.mtime } else [3]u64{ y.last_seen, y.first_seen, y.mtime };
+fn newer(x: offsite.File, y: offsite.File, version: Version) bool {
+    const by_first = version == .at;
+    // Two intervals can hold a time only at a shared end: the later one wins.
+    const hx: u64 = if (by_first) @intFromBool(x.last_seen >= version.at) else 0;
+    const hy: u64 = if (by_first) @intFromBool(y.last_seen >= version.at) else 0;
+    const kx = if (by_first) [4]u64{ hx, x.first_seen, x.last_seen, x.mtime } else [4]u64{ 0, x.last_seen, x.first_seen, x.mtime };
+    const ky = if (by_first) [4]u64{ hy, y.first_seen, y.last_seen, y.mtime } else [4]u64{ 0, y.last_seen, y.first_seen, y.mtime };
     return std.mem.order(u64, &kx, &ky) == .gt;
 }
 
@@ -114,7 +132,6 @@ fn reserved(path: []const u8) bool {
 /// The files the request names, checked: every path is a valid swarm path
 /// and none collides with the job directory.
 fn select(a: Allocator, service: *offsite.Service, request: Request) ![]const offsite.File {
-    if (request.path) |p| if (!manifest.validPath(p)) return error.InvalidPath;
     var files: std.ArrayList(offsite.File) = .empty;
     switch (request.from) {
         .snapshot => |name| for ((try service.snapshot(name)).files) |file| {
@@ -187,6 +204,203 @@ fn tmpName(prefix: []const u8, out: *[64]u8) ![]const u8 {
     return std.fmt.bufPrint(out, "{s}-{s}" ++ tmp_suffix, .{ prefix, std.fmt.bytesToHex(random, .lower) }) catch unreachable;
 }
 
+/// Writes `bytes` to `name` in the job directory: a new temporary file,
+/// synced, then renamed.
+fn writeWhole(io: std.Io, dir: Dir, prefix: []const u8, name: []const u8, bytes: []const u8) !void {
+    var buf: [64]u8 = undefined;
+    const tmp = try tmpName(prefix, &buf);
+    errdefer dir.deleteFile(io, tmp) catch {};
+    {
+        const out = try dir.createFile(io, tmp, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer out.close(io);
+        try out.writePositionalAll(io, bytes, 0);
+        try out.sync(io);
+    }
+    try dir.rename(tmp, dir, name, io);
+}
+
+/// The digest of a regular file of exactly `size` bytes, read without
+/// following a link; null when what is there is anything else.
+fn digestOf(io: std.Io, dir: Dir, name: []const u8, size: u64) !?Digest {
+    const st = dir.statFile(io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    if (st.kind != .file or st.size != size) return null;
+    const file = dir.openFile(io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.SymLinkLoop => return null,
+        else => return err,
+    };
+    defer file.close(io);
+    if ((try file.stat(io)).kind != .file) return null;
+    var hasher = Blake3.init(.{});
+    var buf: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < size) {
+        const got = try file.readPositionalAll(io, buf[0..@intCast(@min(buf.len, size - offset))], offset);
+        if (got == 0) return null;
+        hasher.update(buf[0..got]);
+        offset += got;
+    }
+    var digest: Digest = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn putInt(a: Allocator, out: *std.ArrayList(u8), comptime T: type, value: T) !void {
+    var buf: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &buf, value, .little);
+    try out.appendSlice(a, &buf);
+}
+
+/// Reads a stored plan; anything that does not fit is an invalid job.
+const Cursor = struct {
+    bytes: []const u8,
+    at: usize = 0,
+    fn take(self: *Cursor, len: usize) ![]const u8 {
+        if (self.bytes.len - self.at < len) return error.InvalidRestoreJob;
+        defer self.at += len;
+        return self.bytes[self.at..][0..len];
+    }
+    fn int(self: *Cursor, comptime T: type) !T {
+        return std.mem.readInt(T, (try self.take(@sizeOf(T)))[0..@sizeOf(T)], .little);
+    }
+    /// A count of records of at least `each` bytes: never more than fit.
+    fn count(self: *Cursor, each: usize) !usize {
+        const n = try self.int(u32);
+        if (n > (self.bytes.len - self.at) / each) return error.InvalidRestoreJob;
+        return n;
+    }
+};
+
+/// What a job restores and where every block of it is, fixed when the job
+/// starts and kept in the job directory. `packs`: each pack the job reads
+/// with the class it was uploaded with (null: the head had no record).
+const Plan = struct {
+    files: []const offsite.File = &.{},
+    packs: std.AutoArrayHashMapUnmanaged([16]u8, ?offsite.Class) = .empty,
+    blocks: std.AutoArrayHashMapUnmanaged(Cid, Block) = .empty,
+    /// Files of the plan before this one that the backup no longer holds.
+    dropped: usize = 0,
+
+    const Block = struct { pack: u32, offset: u64, length: u32 };
+
+    fn add(self: *Plan, a: Allocator, cid: Cid, at: offsite.Location, class: ?offsite.Class) !void {
+        const pack = try self.packs.getOrPut(a, at.pack_id);
+        if (!pack.found_existing) pack.value_ptr.* = class;
+        try self.blocks.put(a, cid, .{ .pack = @intCast(pack.index), .offset = at.offset, .length = at.length });
+    }
+    /// Where the committed index has every block of `files`. Planning again
+    /// (`old`, with the files already restored in `kept`): a file the backup
+    /// no longer holds was purged since. A restored one keeps the places
+    /// `old` had; one still to write is dropped from the plan.
+    fn build(a: Allocator, service: *offsite.Service, files: []const offsite.File, old: ?*const Plan, kept: ?*const Done) !Plan {
+        var self: Plan = .{};
+        var planned: std.ArrayList(offsite.File) = .empty;
+        for (files) |file| {
+            const held = for (file.blocks) |cid| {
+                _ = service.locate(cid) catch break false;
+            } else true;
+            const before = if (held) null else old orelse return error.BlockNotFound;
+            if (before != null and !kept.?.contains(file.path)) {
+                self.dropped += 1;
+                continue;
+            }
+            for (file.blocks) |cid| {
+                if (before) |plan| {
+                    const block = plan.blocks.get(cid) orelse return error.InvalidRestoreJob;
+                    try self.add(a, cid, .{ .pack_id = plan.packs.keys()[block.pack], .offset = block.offset, .length = block.length }, plan.packs.values()[block.pack]);
+                } else {
+                    const at = try service.locate(cid);
+                    try self.add(a, cid, at, service.recordedClass(at.pack_id));
+                }
+            }
+            try planned.append(a, file);
+        }
+        self.files = planned.items;
+        return self;
+    }
+    fn find(ctx: *anyopaque, cid: Cid) ?offsite.Location {
+        const self: *const Plan = @ptrCast(@alignCast(ctx));
+        const block = self.blocks.get(cid) orelse return null;
+        return .{ .pack_id = self.packs.keys()[block.pack], .offset = block.offset, .length = block.length };
+    }
+    fn locator(self: *Plan) offsite.Locator {
+        return .{ .ctx = self, .findFn = find };
+    }
+    fn encode(self: *const Plan, a: Allocator) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(a, plan_magic);
+        try putInt(a, &out, u32, @intCast(self.packs.count()));
+        for (self.packs.keys(), self.packs.values()) |id, class| {
+            try out.appendSlice(a, &id);
+            try out.append(a, if (class) |c| @as(u8, @intFromEnum(c)) + 1 else 0);
+        }
+        try putInt(a, &out, u32, @intCast(self.blocks.count()));
+        for (self.blocks.keys(), self.blocks.values()) |cid, block| {
+            try out.appendSlice(a, &cid);
+            try putInt(a, &out, u32, block.pack);
+            try putInt(a, &out, u64, block.offset);
+            try putInt(a, &out, u32, block.length);
+        }
+        try putInt(a, &out, u32, @intCast(self.files.len));
+        for (self.files) |file| {
+            try out.append(a, @intFromBool(file.directory));
+            try out.appendSlice(a, &file.cid);
+            try putInt(a, &out, u64, file.size);
+            try putInt(a, &out, u64, file.mtime);
+            try putInt(a, &out, u32, @intCast(file.path.len));
+            try out.appendSlice(a, file.path);
+            try putInt(a, &out, u32, @intCast(file.blocks.len));
+            for (file.blocks) |cid| try putInt(a, &out, u32, @intCast(self.blocks.getIndex(cid).?));
+        }
+        if (out.items.len > max_plan) return error.RestoreJobTooLarge;
+        return out.items;
+    }
+    /// The job directory is not trusted more than a snapshot: every path is
+    /// checked again before anything is written.
+    fn decode(a: Allocator, bytes: []const u8) !Plan {
+        var in: Cursor = .{ .bytes = bytes };
+        if (!std.mem.eql(u8, try in.take(plan_magic.len), plan_magic)) return error.InvalidRestoreJob;
+        var self: Plan = .{};
+        for (0..try in.count(17)) |_| {
+            const id = (try in.take(16))[0..16].*;
+            const tag = try in.int(u8);
+            const class: ?offsite.Class = if (tag == 0) null else std.enums.fromInt(offsite.Class, tag - 1) orelse return error.InvalidRestoreJob;
+            try self.packs.put(a, id, class);
+        }
+        for (0..try in.count(48)) |_| {
+            const cid = (try in.take(32))[0..32].*;
+            const block: Block = .{ .pack = try in.int(u32), .offset = try in.int(u64), .length = try in.int(u32) };
+            if (block.pack >= self.packs.count()) return error.InvalidRestoreJob;
+            try self.blocks.put(a, cid, block);
+        }
+        const files = try a.alloc(offsite.File, try in.count(57));
+        if (files.len > manifest.max_entries) return error.InvalidRestoreJob;
+        for (files) |*file| {
+            const directory = (try in.int(u8)) != 0;
+            const cid = (try in.take(32))[0..32].*;
+            const size = try in.int(u64);
+            const mtime = try in.int(u64);
+            const path = try in.take(try in.int(u32));
+            const blocks = try a.alloc(Cid, try in.count(4));
+            for (blocks) |*cid_out| {
+                const index = try in.int(u32);
+                if (index >= self.blocks.count()) return error.InvalidRestoreJob;
+                cid_out.* = self.blocks.keys()[index];
+            }
+            if (!manifest.validPath(path) or reserved(path)) return error.InvalidRestoreJob;
+            file.* = .{ .path = path, .cid = cid, .size = size, .mtime = mtime, .blocks = blocks, .directory = directory };
+        }
+        if (in.at != bytes.len) return error.InvalidRestoreJob;
+        self.files = files;
+        return self;
+    }
+};
+
+/// Finished files: path to the content it is and the bytes it was written with.
+const Done = std.StringHashMapUnmanaged(struct { cid: Cid, digest: Digest });
+
 /// The state of one restore into one destination.
 const Session = struct {
     a: Allocator,
@@ -194,55 +408,62 @@ const Session = struct {
     destination: Dir,
     dir: Dir,
     /// True when an earlier call left this job: files in the way are its own.
-    resumed: bool,
-    /// Finished files: path to content id.
-    done: std.StringHashMapUnmanaged(Cid) = .empty,
+    resumed: bool = false,
+    id: [16]u8 = undefined,
+    plan: Plan = .{},
+    /// Files planning again left out: purged from the backup meanwhile.
+    purged: usize = 0,
+    done: Done = .empty,
     log: std.Io.File,
     log_end: u64 = 0,
     unsynced: usize = 0,
 
-    fn open(a: Allocator, io: std.Io, destination: Dir, job: Job, files: []const offsite.File) !Session {
+    /// Continues the job the destination holds, from its own plan, or starts
+    /// one: only a new job reads the snapshot or the history and the index.
+    fn open(a: Allocator, io: std.Io, destination: Dir, service: *offsite.Service, request: Request) !Session {
         const existed = try exists(io, destination, job_dir);
         // An exclusive create never follows a link; an existing entry must
         // be a real directory (opened without following a link).
         if (!existed) try destination.createDir(io, job_dir, .fromMode(0o700));
+        errdefer if (!existed) destination.deleteTree(io, job_dir) catch {};
         var dir = try destination.openDir(io, job_dir, .{ .follow_symlinks = false, .iterate = true });
         errdefer dir.close(io);
         if (existed) try sweep(a, io, dir);
-        var resumed = false;
+        var self: Session = .{ .a = a, .io = io, .destination = destination, .dir = dir, .log = undefined };
+        var job: Job = .{ .source = try describe(a, request.from), .history = request.from == .history, .path = request.path, .tier = request.tier, .requested = service.now() };
         if (try readPlain(a, io, dir, job_file, max_job)) |bytes| {
             const old = std.json.parseFromSliceLeaky(Job, a, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidRestoreJob;
             const same_path = if (old.path) |p| job.path != null and std.mem.eql(u8, p, job.path.?) else job.path == null;
             if (old.version != job.version or old.history != job.history or !std.mem.eql(u8, old.source, job.source) or !same_path) return error.RestoreJobMismatch;
-            resumed = true;
+            if (old.id.len != 32) return error.InvalidRestoreJob;
+            _ = std.fmt.hexToBytes(&self.id, old.id) catch return error.InvalidRestoreJob;
+            self.plan = try Plan.decode(a, (try readPlain(a, io, dir, plan_file, max_plan)) orelse return error.InvalidRestoreJob);
+            self.resumed = true;
         } else {
             // A new job: nothing it will write may be there already, so
             // whatever a later pass finds at those paths is this job's.
-            errdefer if (!existed) destination.deleteTree(io, job_dir) catch {};
+            const files = try select(a, service, request);
+            self.plan = try Plan.build(a, service, files, null, null);
             for (files) |file| if (!file.directory and try exists(io, destination, file.path)) return error.PathAlreadyExists;
-            var buf: [64]u8 = undefined;
-            const tmp = try tmpName("job", &buf);
-            errdefer dir.deleteFile(io, tmp) catch {};
-            {
-                const out = try dir.createFile(io, tmp, .{ .exclusive = true, .permissions = .fromMode(0o600) });
-                defer out.close(io);
-                try out.writePositionalAll(io, try std.json.Stringify.valueAlloc(a, job, .{}), 0);
-                try out.sync(io);
-            }
-            try dir.rename(tmp, dir, job_file, io);
+            try std.Io.Threaded.global_single_threaded.io().randomSecure(&self.id);
+            job.id = try a.dupe(u8, &std.fmt.bytesToHex(self.id, .lower));
+            // The plan first: a job file always has its plan.
+            try writeWhole(io, dir, "plan", plan_file, try self.plan.encode(a));
+            try writeWhole(io, dir, "job", job_file, try std.json.Stringify.valueAlloc(a, job, .{}));
         }
-        var self: Session = .{ .a = a, .io = io, .destination = destination, .dir = dir, .resumed = resumed, .log = undefined };
-        const kept = if (resumed) (try readPlain(a, io, dir, done_file, max_done)) orelse "" else "";
+        const kept = if (self.resumed) (try readPlain(a, io, dir, done_file, max_done)) orelse "" else "";
         // Only whole lines count: a crash can cut the last one.
         var lines = std.mem.splitScalar(u8, kept, '\n');
         while (lines.next()) |line| {
             if (lines.peek() == null) break;
             self.log_end += line.len + 1;
-            if (line.len < 67 or line[64] != ' ') continue;
+            if (line.len < 132 or line[64] != ' ' or line[129] != ' ') continue;
             var cid: Cid = undefined;
+            var digest: Digest = undefined;
             _ = std.fmt.hexToBytes(&cid, line[0..64]) catch continue;
-            const path = std.json.parseFromSliceLeaky([]const u8, a, line[65..], .{}) catch continue;
-            try self.done.put(a, path, cid);
+            _ = std.fmt.hexToBytes(&digest, line[65..129]) catch continue;
+            const path = std.json.parseFromSliceLeaky([]const u8, a, line[130..], .{}) catch continue;
+            try self.done.put(a, path, .{ .cid = cid, .digest = digest });
         }
         self.log = dir.createFile(io, done_file, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch |err| switch (err) {
             error.PathAlreadyExists => try dir.openFile(io, done_file, .{ .mode = .read_write, .follow_symlinks = false }),
@@ -267,22 +488,23 @@ const Session = struct {
         }
         for (stale.items) |name| dir.deleteFile(io, name) catch {};
     }
-    /// True when an earlier pass finished this file and it is still there.
-    fn finished(self: *Session, parent: Dir, file: offsite.File) !bool {
-        const cid = self.done.get(file.path) orelse return false;
-        if (!std.mem.eql(u8, &cid, &file.cid)) return false;
-        const st = parent.statFile(self.io, std.fs.path.basename(file.path), .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => return false,
-            else => return err,
-        };
-        return st.kind == .file and st.size == file.size;
+    /// True when an earlier pass recorded this file and the bytes at its
+    /// name still are the ones it wrote: a size and a log line prove nothing.
+    fn finished(self: *Session, file: offsite.File) !bool {
+        const entry = self.done.get(file.path) orelse return false;
+        if (!std.mem.eql(u8, &entry.cid, &file.cid)) return false;
+        var parent = (try openBelow(self.io, self.destination, std.fs.path.dirname(file.path) orelse "", false)) orelse return false;
+        defer parent.close(self.io);
+        const digest = (try digestOf(self.io, parent, std.fs.path.basename(file.path), file.size)) orelse return false;
+        return std.mem.eql(u8, &digest, &entry.digest);
     }
-    fn record(self: *Session, file: offsite.File) !void {
+    fn record(self: *Session, file: offsite.File, digest: Digest) !void {
         const quoted = try std.json.Stringify.valueAlloc(self.a, file.path, .{});
-        const line = try std.fmt.allocPrint(self.a, "{s} {s}\n", .{ std.fmt.bytesToHex(file.cid, .lower), quoted });
+        const line = try std.fmt.allocPrint(self.a, "{s} {s} {s}\n", .{ std.fmt.bytesToHex(file.cid, .lower), std.fmt.bytesToHex(digest, .lower), quoted });
         try self.log.writePositionalAll(self.io, line, self.log_end);
         self.log_end += line.len;
         self.unsynced += 1;
+        try self.done.put(self.a, file.path, .{ .cid = file.cid, .digest = digest });
         if (self.unsynced >= sync_every) try self.flush();
     }
     fn flush(self: *Session) !void {
@@ -292,73 +514,153 @@ const Session = struct {
     }
     /// Writes one file: a new temporary file in the job directory, synced,
     /// then renamed over whatever is at the final name (a link is replaced,
-    /// never followed).
+    /// never followed). The digest of the bytes written goes on record.
     fn write(self: *Session, service: *offsite.Service, parent: Dir, file: offsite.File) !void {
         const base = std.fs.path.basename(file.path);
         if (!self.resumed and try exists(self.io, parent, base)) return error.PathAlreadyExists;
         var buf: [64]u8 = undefined;
         const tmp = try tmpName("file", &buf);
         errdefer self.dir.deleteFile(self.io, tmp) catch {};
+        var target: Output = .{ .io = self.io, .file = undefined, .hasher = Blake3.init(.{}) };
         {
             const out = try self.dir.createFile(self.io, tmp, .{ .exclusive = true, .permissions = .fromMode(0o600) });
             defer out.close(self.io);
-            var target: Output = .{ .io = self.io, .file = out };
-            try service.streamFile(file, .{ .ctx = &target, .writeFn = Output.write });
+            target.file = out;
+            try service.streamFile(file, self.plan.locator(), .{ .ctx = &target, .writeFn = Output.write });
             try out.sync(self.io);
         }
         try self.dir.rename(tmp, parent, base, self.io);
-        try self.record(file);
+        var digest: Digest = undefined;
+        target.hasher.final(&digest);
+        try self.record(file, digest);
+    }
+    /// The packs of the files still to write: what the job's pin names.
+    fn needed(self: *Session) ![]const [16]u8 {
+        var packs: std.AutoArrayHashMapUnmanaged([16]u8, void) = .empty;
+        for (self.plan.files) |file| {
+            if (self.done.contains(file.path)) continue;
+            for (file.blocks) |cid| {
+                const block = self.plan.blocks.get(cid) orelse return error.InvalidRestoreJob;
+                try packs.put(self.a, self.plan.packs.keys()[block.pack], {});
+            }
+        }
+        return packs.keys();
+    }
+    /// True when every pack of the file can be read now; asks for the thaw
+    /// of each archived one. Decided pack by pack, from the class each was
+    /// uploaded with or what the bucket reports, never from today's settings.
+    fn ready(self: *Session, service: *offsite.Service, file: offsite.File, packs: *offsite.Packs, tier: offsite.Tier, result: *offsite.Restore) !bool {
+        var all = true;
+        for (file.blocks) |cid| {
+            const block = self.plan.blocks.get(cid) orelse return error.InvalidRestoreJob;
+            const id = self.plan.packs.keys()[block.pack];
+            if (!(try service.packReady(id, self.plan.packs.values()[block.pack], packs, tier, result))) all = false;
+        }
+        return all;
+    }
+    /// A read was refused as archived: asks for the thaw of the file's
+    /// packs. True when one is thawing now, so the file waits for a later pass.
+    fn refused(self: *Session, service: *offsite.Service, file: offsite.File, packs: *offsite.Packs, tier: offsite.Tier, result: *offsite.Restore) !bool {
+        var thawing = false;
+        for (file.blocks) |cid| {
+            const block = self.plan.blocks.get(cid) orelse return error.InvalidRestoreJob;
+            if (!(try service.packRefused(self.plan.packs.keys()[block.pack], packs, tier, result))) thawing = true;
+        }
+        return thawing;
+    }
+    /// One pass over the plan: the files already written and still intact
+    /// are counted, the ones whose packs are readable are written, the
+    /// others wait for their thaw.
+    fn pass(self: *Session, gpa: Allocator, service: *offsite.Service, tier: offsite.Tier) !offsite.Restore {
+        var result: offsite.Restore = .{};
+        var packs: offsite.Packs = .init(gpa);
+        defer packs.deinit();
+        for (self.plan.files) |file| {
+            if (file.directory) {
+                var made = (try openBelow(self.io, self.destination, file.path, true)).?;
+                made.close(self.io);
+                continue;
+            }
+            if (try self.finished(file)) {
+                result.files += 1;
+                continue;
+            }
+            if (!(try self.ready(service, file, &packs, tier, &result))) continue;
+            var parent = (try openBelow(self.io, self.destination, std.fs.path.dirname(file.path) orelse "", true)).?;
+            defer parent.close(self.io);
+            self.write(service, parent, file) catch |err| {
+                self.flush() catch {};
+                if (err == error.InvalidObjectState and try self.refused(service, file, &packs, tier, &result)) continue;
+                return err;
+            };
+            result.files += 1;
+        }
+        try self.flush();
+        result.purged_files = self.purged;
+        return result;
+    }
+    /// A pack of the plan is gone from the bucket: the files not yet written
+    /// are planned again from the current head, where their blocks are now.
+    /// One purged since leaves the plan.
+    fn replan(self: *Session, service: *offsite.Service) !void {
+        try service.refresh();
+        const old = self.plan;
+        self.plan = try Plan.build(self.a, service, old.files, &old, &self.done);
+        self.purged += self.plan.dropped;
+        try writeWhole(self.io, self.dir, "plan", plan_file, try self.plan.encode(self.a));
     }
 };
 
+/// Receives a file's bytes in order and hashes them on the way to the disk.
 const Output = struct {
     io: std.Io,
     file: std.Io.File,
+    hasher: Blake3,
+    written: u64 = 0,
     fn write(ctx: *anyopaque, offset: u64, bytes: []const u8) anyerror!void {
         const self: *Output = @ptrCast(@alignCast(ctx));
+        if (offset != self.written) return error.SizeMismatch;
         try self.file.writePositionalAll(self.io, bytes, offset);
+        self.hasher.update(bytes);
+        self.written += bytes.len;
     }
 };
 
-/// Restores through an already-open directory capability. A cold target is
-/// first asked to thaw every pack the request needs; the files whose packs
-/// are readable are written, and the job stays in the destination while
-/// packs are thawing. The same call, repeated, skips the files the job
-/// recorded as finished, writes every other one again (a file changed or
-/// cut short in between is replaced) and ends when none is left.
-/// A new restore refuses a destination that already has one of its files.
+/// Restores through an already-open directory capability. A new restore
+/// refuses a destination that already has one of its files, and writes its
+/// plan into the job directory: the files and where each of their blocks is.
+/// Every pass pins the packs still to read (the backup keeps them while it
+/// repacks and prunes), asks for the thaw of each archived one, writes the
+/// files whose packs are readable and leaves the job while packs are
+/// thawing. The same call, repeated, continues from the plan alone: it
+/// skips a recorded file only when its bytes still hash to what was written,
+/// writes every other one again and ends when none is left. If a pack is
+/// gone all the same, the rest is planned once more from the current head.
 pub fn restore(a: Allocator, io: std.Io, service: *offsite.Service, request: Request, destination: Dir) !offsite.Restore {
     var arena_state: std.heap.ArenaAllocator = .init(a);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const files = try select(arena, service, request);
-    const job: Job = .{ .source = try describe(arena, request.from), .history = request.from == .history, .path = request.path, .tier = request.tier, .requested = service.now() };
-    var session = try Session.open(arena, io, destination, job, files);
+    if (request.path) |p| if (!manifest.validPath(p)) return error.InvalidPath;
+    var session = try Session.open(arena, io, destination, service, request);
     var open = true;
     defer if (open) session.close();
     var result: offsite.Restore = .{};
-    var ready: offsite.Packs = .init(a);
-    defer ready.deinit();
-    const is_cold = service.cold();
-    for (files) |file| {
-        if (file.directory) {
-            var made = (try openBelow(io, destination, file.path, true)).?;
-            made.close(io);
-            continue;
-        }
-        if (is_cold and !(try service.fileReady(file, &ready, request.tier, &result))) continue;
-        var parent = (try openBelow(io, destination, std.fs.path.dirname(file.path) orelse "", true)).?;
-        defer parent.close(io);
-        if (!(try session.finished(parent, file))) {
-            session.write(service, parent, file) catch |err| {
-                session.flush() catch {};
-                return err;
-            };
-        }
-        result.files += 1;
+    for (0..2) |round| {
+        // Credentials that may only read cannot pin: the restore goes on and
+        // plans again should a pack go.
+        service.pin(session.id, try session.needed()) catch |err| if (err != error.AccessDenied) return err;
+        result = session.pass(a, service, request.tier) catch |err| switch (err) {
+            error.PackMissing, error.NotFound => {
+                if (round > 0) return err;
+                try session.replan(service);
+                continue;
+            },
+            else => return err,
+        };
+        break;
     }
-    try session.flush();
     if (result.thawing_packs > 0) return result;
+    service.unpin(session.id) catch {};
     session.close();
     open = false;
     try destination.deleteTree(io, job_dir);
@@ -388,5 +690,26 @@ test "offsite: restore version is the newest, one content, or the one current at
     try std.testing.expectEqual(@as(u64, 1), early[0].size);
     const exact = try pick(arena.allocator(), &versions, .{ .cid = [_]u8{1} ** 32 });
     try std.testing.expectEqual(@as(u64, 1), exact[0].size);
+    // One content came back after another: its two stretches are two entries,
+    // and a time picks the stretch that holds it (or the last one before it).
+    const reverted = [_]offsite.File{
+        .{ .path = "a", .cid = [_]u8{1} ** 32, .size = 1, .blocks = &.{}, .first_seen = 10, .last_seen = 20 },
+        .{ .path = "a", .cid = [_]u8{2} ** 32, .size = 2, .blocks = &.{}, .first_seen = 30, .last_seen = 40 },
+        .{ .path = "a", .cid = [_]u8{1} ** 32, .size = 1, .blocks = &.{}, .first_seen = 50, .last_seen = 60 },
+    };
+    for ([_][2]u64{ .{ 10, 1 }, .{ 25, 1 }, .{ 30, 2 }, .{ 40, 2 }, .{ 45, 2 }, .{ 50, 1 }, .{ 60, 1 }, .{ 99, 1 } }) |case| {
+        const at = try pick(arena.allocator(), &reverted, .{ .at = case[0] });
+        try std.testing.expectEqual(case[1], at[0].size);
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try pick(arena.allocator(), &reverted, .{ .at = 9 })).len);
+    try std.testing.expectEqual(@as(u64, 60), (try pick(arena.allocator(), &reverted, .latest))[0].last_seen);
+    // A catalog written before intervals were kept merged the two stretches:
+    // the version seen in between still wins at its own time.
+    const merged = [_]offsite.File{
+        .{ .path = "a", .cid = [_]u8{1} ** 32, .size = 1, .blocks = &.{}, .first_seen = 10, .last_seen = 60 },
+        .{ .path = "a", .cid = [_]u8{2} ** 32, .size = 2, .blocks = &.{}, .first_seen = 30, .last_seen = 40 },
+    };
+    try std.testing.expectEqual(@as(u64, 2), (try pick(arena.allocator(), &merged, .{ .at = 35 }))[0].size);
+    try std.testing.expectEqual(@as(u64, 1), (try pick(arena.allocator(), &merged, .{ .at = 60 }))[0].size);
     try std.testing.expect(reserved(".nomadfs-restore/job.json") and reserved(".nomadfs-restore") and !reserved(".nomadfs-restore.json"));
 }

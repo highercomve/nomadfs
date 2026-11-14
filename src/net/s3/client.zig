@@ -21,6 +21,7 @@ pub const Error = http.Error || sigv4.Error || xml.Error || error{
     RestoreAlreadyInProgress,
     InvalidObjectState,
     NoSuchUpload,
+    NotImplemented,
     Throttled,
     ServiceUnavailable,
     Redirect,
@@ -120,6 +121,7 @@ pub const ListResult = struct {
         self.* = undefined;
     }
 };
+pub const Versioning = xml.Versioning;
 pub const CompletedPart = struct { part_number: u16, etag: []const u8 };
 
 const Operation = struct {
@@ -221,6 +223,20 @@ pub const Client = struct {
         response.deinit();
     }
 
+    /// Whether the bucket keeps old versions of deleted objects. A store
+    /// without versioning (no Status, or the request is not implemented) is off.
+    pub fn getBucketVersioning(self: *Client, timestamp: []const u8) Error!Versioning {
+        var response = self.execute(.{ .method = .GET, .key = null, .query = &.{.{ .name = "versioning", .value = "" }}, .xml_root = "VersioningConfiguration" }, timestamp) catch |err| switch (err) {
+            error.NotImplemented => return .off,
+            else => return err,
+        };
+        defer response.deinit();
+        return xml.parseVersioning(self.allocator, response.body) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidXml => error.InvalidResponse,
+        };
+    }
+
     /// Returns one page. Pass next_continuation_token to the next call.
     pub fn listObjectsV2(self: *Client, options: ListOptions, timestamp: []const u8) Error!ListResult {
         if (options.max_keys == 0 or options.max_keys > 1000) return error.InvalidInput;
@@ -263,11 +279,27 @@ pub const Client = struct {
         } }, timestamp);
     }
 
-    pub fn completeMultipartUpload(self: *Client, key: []const u8, upload_id: []const u8, parts: []const CompletedPart, timestamp: []const u8) Error!Response {
+    /// `if_none_match` refuses to replace an object that already has the name.
+    pub fn completeMultipartUpload(self: *Client, key: []const u8, upload_id: []const u8, parts: []const CompletedPart, condition: Condition, timestamp: []const u8) Error!Response {
         if (upload_id.len == 0 or parts.len == 0 or parts.len > 10000) return error.InvalidInput;
         const body = try completionXml(self.allocator, parts);
         defer self.allocator.free(body);
-        return self.execute(.{ .method = .POST, .key = key, .body = .{ .bytes = body }, .headers = &.{.{ .name = "content-type", .value = "application/xml" }}, .query = &.{.{ .name = "uploadId", .value = upload_id }}, .xml_root = "CompleteMultipartUploadResult" }, timestamp);
+        var headers: [2]sigv4.Header = undefined;
+        headers[0] = .{ .name = "content-type", .value = "application/xml" };
+        var count: usize = 1;
+        switch (condition) {
+            .none => {},
+            .if_none_match => {
+                headers[count] = .{ .name = "if-none-match", .value = "*" };
+                count += 1;
+            },
+            .if_match => |etag| {
+                if (etag.len == 0) return error.InvalidInput;
+                headers[count] = .{ .name = "if-match", .value = etag };
+                count += 1;
+            },
+        }
+        return self.execute(.{ .method = .POST, .key = key, .body = .{ .bytes = body }, .headers = headers[0..count], .query = &.{.{ .name = "uploadId", .value = upload_id }}, .xml_root = "CompleteMultipartUploadResult" }, timestamp);
     }
 
     pub fn abortMultipartUpload(self: *Client, key: []const u8, upload_id: []const u8, timestamp: []const u8) Error!void {
@@ -332,7 +364,7 @@ pub const Client = struct {
                 return err;
             };
             if (failure == null) return response;
-            const retry = response.status == 429 or (response.status >= 500 and response.status < 600) or
+            const retry = response.status == 429 or (response.status >= 500 and response.status < 600 and response.status != 501) or
                 (response.status == 200 and (failure.? == error.ServiceUnavailable or failure.? == error.Throttled));
             response.deinit();
             if (!retry or attempt + 1 == self.config.retry.max_attempts) return failure.?;
@@ -356,6 +388,7 @@ fn codeError(code: []const u8) Error {
     if (std.mem.eql(u8, code, "PreconditionFailed")) return error.PreconditionFailed;
     if (std.mem.eql(u8, code, "RestoreAlreadyInProgress")) return error.RestoreAlreadyInProgress;
     if (std.mem.eql(u8, code, "InvalidObjectState")) return error.InvalidObjectState;
+    if (std.mem.eql(u8, code, "NotImplemented")) return error.NotImplemented;
     if (std.mem.eql(u8, code, "SlowDown") or std.mem.eql(u8, code, "Throttling")) return error.Throttled;
     if (std.mem.eql(u8, code, "InternalError") or std.mem.eql(u8, code, "ServiceUnavailable"))
         return error.ServiceUnavailable;
@@ -372,8 +405,9 @@ fn statusError(status: u16) Error {
         412 => error.PreconditionFailed,
         416 => error.InvalidRange,
         429 => error.Throttled,
+        501 => error.NotImplemented,
         300...399 => error.Redirect,
-        500...599 => error.ServiceUnavailable,
+        500, 502...599 => error.ServiceUnavailable,
         else => error.S3Error,
     };
 }
@@ -604,7 +638,7 @@ test "multipart create upload complete abort and XML escaping" {
     var fake: Fake = .{ .steps = &.{
         .{ .method = .POST, .url = "https://endpoint/bucket/pack?uploads=", .body = "<InitiateMultipartUploadResult><UploadId>a+/=</UploadId></InitiateMultipartUploadResult>" },
         .{ .method = .PUT, .url = "https://endpoint/bucket/pack?partNumber=1&uploadId=a%2B%2F%3D", .request_body = "part", .response_headers = &.{.{ .name = "ETag", .value = "\"a&b\"" }} },
-        .{ .method = .POST, .url = "https://endpoint/bucket/pack?uploadId=a%2B%2F%3D", .request_body = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;a&amp;b&quot;</ETag></Part></CompleteMultipartUpload>", .body = "<CompleteMultipartUploadResult><ETag>&quot;done&quot;</ETag></CompleteMultipartUploadResult>" },
+        .{ .method = .POST, .url = "https://endpoint/bucket/pack?uploadId=a%2B%2F%3D", .request_headers = &.{.{ .name = "if-none-match", .value = "*" }}, .request_body = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;a&amp;b&quot;</ETag></Part></CompleteMultipartUpload>", .body = "<CompleteMultipartUploadResult><ETag>&quot;done&quot;</ETag></CompleteMultipartUploadResult>" },
         .{ .method = .DELETE, .url = "https://endpoint/bucket/pack?uploadId=a%2B%2F%3D", .status = 204 },
     } };
     var client = try fake.client();
@@ -612,10 +646,33 @@ test "multipart create upload complete abort and XML escaping" {
     defer testing.allocator.free(upload_id);
     var part = try client.uploadPart("pack", upload_id, 1, .{ .bytes = "part" }, test_timestamp);
     defer part.deinit();
-    var complete = try client.completeMultipartUpload("pack", upload_id, &.{.{ .part_number = 1, .etag = part.header("etag").? }}, test_timestamp);
+    var complete = try client.completeMultipartUpload("pack", upload_id, &.{.{ .part_number = 1, .etag = part.header("etag").? }}, .if_none_match, test_timestamp);
     defer complete.deinit();
     try client.abortMultipartUpload("pack", upload_id, test_timestamp);
     try testing.expectEqual(@as(usize, 4), fake.calls);
+}
+
+test "GetBucketVersioning: enabled, suspended, never set, and a store without it" {
+    const url = "https://endpoint/bucket?versioning=";
+    var fake: Fake = .{ .steps = &.{
+        .{ .method = .GET, .url = url, .body = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>" },
+        .{ .method = .GET, .url = url, .body = "<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>" },
+        .{ .method = .GET, .url = url, .body = "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>" },
+        .{ .method = .GET, .url = url, .status = 501, .body = "<Error><Code>NotImplemented</Code></Error>" },
+        .{ .method = .GET, .url = url, .status = 501 },
+        .{ .method = .GET, .url = url, .body = "<VersioningConfiguration><Status>Other</Status></VersioningConfiguration>" },
+        .{ .method = .GET, .url = url, .status = 403, .body = "<Error><Code>AccessDenied</Code></Error>" },
+    } };
+    var client = try fake.client();
+    try testing.expectEqual(Versioning.enabled, try client.getBucketVersioning(test_timestamp));
+    try testing.expectEqual(Versioning.suspended, try client.getBucketVersioning(test_timestamp));
+    try testing.expectEqual(Versioning.off, try client.getBucketVersioning(test_timestamp));
+    try testing.expectEqual(Versioning.off, try client.getBucketVersioning(test_timestamp));
+    try testing.expectEqual(Versioning.off, try client.getBucketVersioning(test_timestamp));
+    try testing.expectError(error.InvalidResponse, client.getBucketVersioning(test_timestamp));
+    try testing.expectError(error.AccessDenied, client.getBucketVersioning(test_timestamp));
+    // A 501 is an answer, not an outage: never retried.
+    try testing.expectEqual(@as(usize, 0), fake.sleeps);
 }
 
 test "storage class is a signed header on PUT and CreateMultipartUpload only when asked" {
@@ -698,7 +755,7 @@ test "multipart embedded 200 error is retried" {
         .{ .method = .POST, .url = "https://endpoint/bucket/pack?uploadId=id", .body = "<CompleteMultipartUploadResult/>" },
     } };
     var client = try fake.client();
-    var response = try client.completeMultipartUpload("pack", "id", &.{.{ .part_number = 1, .etag = "etag" }}, test_timestamp);
+    var response = try client.completeMultipartUpload("pack", "id", &.{.{ .part_number = 1, .etag = "etag" }}, .none, test_timestamp);
     defer response.deinit();
     try testing.expectEqual(@as(usize, 1), fake.sleeps);
 }
@@ -852,7 +909,7 @@ fn liveMultipartChecks(client: *Client, key: []const u8, timestamp: []const u8) 
     errdefer client.abortMultipartUpload(key, upload_id, timestamp) catch {};
     var part = try client.uploadPart(key, upload_id, 1, .{ .bytes = "multipart" }, timestamp);
     defer part.deinit();
-    var complete = try client.completeMultipartUpload(key, upload_id, &.{.{ .part_number = 1, .etag = part.header("etag").? }}, timestamp);
+    var complete = try client.completeMultipartUpload(key, upload_id, &.{.{ .part_number = 1, .etag = part.header("etag").? }}, .none, timestamp);
     defer complete.deinit();
     var get = try client.getObject(key, null, timestamp);
     defer get.deinit();

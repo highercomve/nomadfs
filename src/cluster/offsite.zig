@@ -36,14 +36,18 @@ const schedule_slack = 3600;
 const max_files = 100_000;
 const max_name = 4096;
 pub const Tier = s3.RestoreTier;
-/// `first_seen`/`last_seen`: set in the catalog only, the times of the first
-/// and the last upload run that found this version (0: before they were kept).
+/// `first_seen`/`last_seen`: set in the catalog only, one unbroken stretch
+/// of upload runs that found this version at the path (0: before they were
+/// kept). A version that comes back after another one has a second entry.
 pub const File = struct { path: []const u8, cid: Cid, size: u64, mtime: u64 = 0, blocks: []const Cid, directory: bool = false, first_seen: u64 = 0, last_seen: u64 = 0 };
 pub const Snapshot = struct { time: u64, files: []const File };
+/// One content of one path: what a purge names.
+pub const Version = struct { path: []const u8, cid: Cid };
 /// What the source can describe now. `waiting`: files left out because
 /// their blocks are not all in the local store yet (the keeper is still
-/// fetching them); a later run takes them.
-pub const Listing = struct { files: []const File, waiting: usize = 0 };
+/// fetching them); a later run takes them. `absent` names them: the folder
+/// lists these versions although they cannot be uploaded yet.
+pub const Listing = struct { files: []const File, waiting: usize = 0, absent: []const Version = &.{} };
 pub const Source = struct {
     ctx: *anyopaque,
     filesFn: *const fn (*anyopaque, Allocator) anyerror!Listing,
@@ -70,8 +74,9 @@ pub const Status = struct {
     deferred_first: u64 = 0,
     deferred_last: u64 = 0,
 };
-/// A restore on a cold target ends when no pack is thawing any more.
-pub const Restore = struct { files: usize = 0, thawing_packs: usize = 0, thawing_bytes: u64 = 0 };
+/// A restore ends when no pack is thawing any more. `purged_files`: files
+/// of the job left out because they were deleted from the backup meanwhile.
+pub const Restore = struct { files: usize = 0, thawing_packs: usize = 0, thawing_bytes: u64 = 0, purged_files: usize = 0 };
 /// Receives a file's bytes in order, each piece with its offset in the file.
 pub const Sink = struct {
     ctx: *anyopaque,
@@ -94,10 +99,11 @@ const PackRecord = struct { pack: [16]u8, class: StorageClass, removable: u64, p
 const Garbage = struct { name: []const u8, removable: u64 };
 /// A snapshot keeps its name when a purge rewrites it into a new object.
 const SnapshotRef = struct { name: []const u8, object: []const u8 };
-const Version = struct { path: []const u8, cid: Cid };
-/// A purge covers the file versions that were there when it was asked for:
-/// `versions` once applied. It is kept while the source still lists one of
-/// them, so that one is not uploaded again; anything else at the path is.
+/// A purge covers exactly the file versions that were there when it was
+/// asked for: `versions`, taken from the history and the folder by `forget`
+/// (also the ones whose blocks were not here yet). It is kept while the
+/// source still lists one of them, so that one is never uploaded; anything
+/// else at the path is. `applied`: the history was rewritten without them.
 const Purge = struct { path: []const u8, time: u64, applied: bool = false, versions: []const Version = &.{} };
 /// The one mutable object: names the committed generation and is replaced
 /// only with If-Match. Readable without the key: `newest` is the time of the
@@ -115,7 +121,27 @@ const Manifest = struct {
 };
 /// Packs already asked about in one request: true when readable now.
 pub const Packs = std.AutoHashMap([16]u8, bool);
-const Layout = struct { version: u32 = 2, encrypt: bool, key_id: [8]u8 };
+/// The create-only root of a backup. `setup` names the immutable key
+/// material it was made with (`keys/<setup>/`), `creator` the device that
+/// made it. Whatever else is under `keys/` belongs to a setup that never
+/// finished.
+const Layout = struct { version: u32 = 3, encrypt: bool, key_id: [8]u8, setup: []const u8 = "", creator: Cid = [_]u8{0} ** 32 };
+const layout_name = "nomadfs-backup.json";
+/// What every front end says for error.BucketVersioningEnabled.
+pub const versioned_bucket = "the bucket has versioning on: turn off versioning or use a bucket without it; a versioned bucket keeps deleted backup data";
+/// Where a block's bytes are. A pack is never rewritten, so this holds for
+/// as long as the pack exists, whatever the head names later.
+pub const Location = backup.index.Location;
+/// Answers where a block is from a plan made earlier (null: not in it).
+pub const Locator = struct {
+    ctx: *anyopaque,
+    findFn: *const fn (*anyopaque, Cid) ?Location,
+};
+pub const Class = StorageClass;
+/// A restore job keeps the packs it still reads: no run deletes a pack an
+/// unexpired pin names. Every pass of the restore writes it again.
+pub const pin_seconds = 14 * 86400;
+const Pin = struct { version: u32 = 1, expires: u64, packs: []const [16]u8 };
 const Lease = struct { owner: [16]u8, expires: u64 };
 
 /// One operation/session at a time. Scratch metadata belongs to this bounded
@@ -148,6 +174,8 @@ pub const Service = struct {
     garbage: std.ArrayList(Garbage) = .empty,
     purges: std.ArrayList([]const u8) = .empty,
     catalog: []const u8 = "",
+    /// The key material the root names: `keys/<setup>/`.
+    setup_id: []const u8 = "",
 
     pub fn init(allocator: Allocator, client: *s3.Client, config: Config, device: Device) !Service {
         if (config.pack_mb == 0 or config.pack_mb > 512) return error.InvalidPackSize;
@@ -203,9 +231,16 @@ pub const Service = struct {
         var response = try self.client.putObject(try self.name(relative), .{ .bytes = bytes }, .{ .storage_class = class }, &ts);
         defer response.deinit();
     }
-    /// True when packs must be thawed before they can be read.
+    /// True when a pack may need a thaw before it can be read: the target
+    /// is cold, or it was when one of its packs was uploaded.
     pub fn cold(self: *Service) bool {
-        return self.config.storage_class.cold();
+        if (self.config.storage_class.cold()) return true;
+        for (self.packs.items) |p| if (p.class.cold()) return true;
+        return false;
+    }
+    /// The class a pack was uploaded with; null when the head has no record.
+    pub fn recordedClass(self: *Service, id: [16]u8) ?StorageClass {
+        return self.packs.items[self.packIndex(id) orelse return null].class;
     }
     /// Seconds a pack uploaded now must stay before it may be deleted.
     fn hold(self: *Service) u64 {
@@ -335,9 +370,32 @@ pub const Service = struct {
         var response = self.client.putObject(self.name("lease") catch return, .{ .bytes = self.json(Lease{ .owner = self.owner, .expires = 0 }) catch return }, .{ .condition = .{ .if_match = etag } }, &ts) catch return;
         response.deinit();
     }
-    fn deviceWrapName(self: *Service) ![]const u8 {
-        const id = std.fmt.bytesToHex(self.device.id, .lower);
-        return std.fmt.allocPrint(self.a(), "keys/{s}.wrap", .{id});
+    /// An object of the setup the root names.
+    fn keyName(self: *Service, leaf: []const u8) ![]const u8 {
+        if (self.setup_id.len == 0) return error.Locked;
+        return std.fmt.allocPrint(self.a(), "keys/{s}/{s}", .{ self.setup_id, leaf });
+    }
+    fn wrapName(self: *Service, id: Cid) ![]const u8 {
+        const hex = std.fmt.bytesToHex(id, .lower);
+        return self.keyName(try std.fmt.allocPrint(self.a(), "{s}.wrap", .{hex}));
+    }
+    /// The root, or null for a bucket (prefix) no setup has finished in.
+    fn loadLayout(self: *Service) !?Layout {
+        const bytes = self.get(layout_name) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        const layout = try self.parse(Layout, bytes);
+        if (layout.version != 3) return error.UnsupportedBackupVersion;
+        if (layout.setup.len != 32) return error.InvalidMetadata;
+        for (layout.setup) |c| if (!std.ascii.isHex(c)) return error.InvalidMetadata;
+        return layout;
+    }
+    /// A versioned bucket keeps every deleted object as an old version: a
+    /// purge would never remove its bytes. Such a bucket is refused.
+    fn requireUnversioned(self: *Service) !void {
+        const ts = self.timestamp();
+        if (try self.client.getBucketVersioning(&ts) != .off) return error.BucketVersioningEnabled;
     }
     pub fn unlock(self: *Service, phrase: ?[]const u8) !void {
         try self.unlockKey(phrase);
@@ -383,6 +441,13 @@ pub const Service = struct {
         }
         return error.HeadChanged;
     }
+    /// Reads the committed generation again: what a reader does when an
+    /// object of the one it had is gone.
+    pub fn refresh(self: *Service) !void {
+        if (self.key == null) return error.Locked;
+        try self.loadHead();
+        try self.loadIndex();
+    }
     fn loadIndex(self: *Service) !void {
         self.index.deinit();
         self.index = .init(self.allocator);
@@ -423,16 +488,82 @@ pub const Service = struct {
     }
     /// Deletes the garbage whose time has come. Only records a committed
     /// head holds are old enough, and nothing ever names such an object again.
+    /// A pack a restore job pins waits, and is looked at again within the grace.
     fn sweep(self: *Service) !void {
+        var pinned: std.AutoHashMap([16]u8, u64) = .init(self.allocator);
+        defer pinned.deinit();
+        var pins_read = false;
         var i: usize = 0;
         while (i < self.garbage.items.len) {
-            if (self.now() < self.garbage.items[i].removable) {
+            const item = &self.garbage.items[i];
+            if (self.now() < item.removable) {
                 i += 1;
                 continue;
             }
-            try self.delete(self.garbage.items[i].name);
+            if (std.mem.startsWith(u8, item.name, "packs/")) {
+                if (!pins_read) try self.loadPins(&pinned);
+                pins_read = true;
+                const id: ?[16]u8 = backup.index.parsePackId(item.name["packs/".len..]) catch null;
+                if (if (id) |pack| pinned.get(pack) else null) |expires| {
+                    item.removable = @min(expires, self.now() + grace_seconds);
+                    i += 1;
+                    continue;
+                }
+            }
+            try self.delete(item.name);
             _ = self.garbage.swapRemove(i);
         }
+    }
+    fn pinName(self: *Service, job: [16]u8) ![]const u8 {
+        return std.fmt.allocPrint(self.a(), "pins/{s}", .{std.fmt.bytesToHex(job, .lower)});
+    }
+    /// Keeps `packs` in the bucket for a restore job, for `pin_seconds` from
+    /// now. Needs no lease: only the job writes its pin. It must be written
+    /// within the grace of the generation the packs were read from.
+    pub fn pin(self: *Service, job: [16]u8, packs: []const [16]u8) !void {
+        if (self.key == null) return error.Locked;
+        if (packs.len > max_objects) return error.TooManyObjects;
+        const sealed = try self.seal(try self.json(Pin{ .expires = self.now() + pin_seconds, .packs = packs }));
+        const ts = self.timestamp();
+        var response = try self.client.putObject(try self.name(try self.pinName(job)), .{ .bytes = sealed }, .{}, &ts);
+        defer response.deinit();
+    }
+    /// The job is over: its packs follow the head again.
+    pub fn unpin(self: *Service, job: [16]u8) !void {
+        const ts = self.timestamp();
+        try self.client.deleteObject(try self.name(try self.pinName(job)), &ts);
+    }
+    /// The packs unexpired pins name, each with its latest expiry. A pin a
+    /// grace past its time is deleted. One that cannot be read protects
+    /// nothing: its restore plans again from the head.
+    fn loadPins(self: *Service, pinned: *std.AutoHashMap([16]u8, u64)) !void {
+        for (try self.listObjects("pins")) |object| {
+            const sealed = self.get(object.name) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            const found: ?Pin = self.readPin(sealed) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null,
+            };
+            const written = if (object.modified == 0) self.now() else object.modified;
+            const expires = if (found) |p| p.expires else written + pin_seconds;
+            if (self.now() >= expires + grace_seconds) {
+                try self.delete(object.name);
+                continue;
+            }
+            const live = found orelse continue;
+            if (self.now() >= live.expires) continue;
+            for (live.packs) |pack| {
+                const slot = try pinned.getOrPut(pack);
+                slot.value_ptr.* = if (slot.found_existing) @max(slot.value_ptr.*, live.expires) else live.expires;
+            }
+        }
+    }
+    fn readPin(self: *Service, sealed: []const u8) !Pin {
+        const result = try self.parse(Pin, try self.open(sealed));
+        if (result.version != 1 or result.packs.len > max_objects) return error.InvalidMetadata;
+        return result;
     }
     /// Objects no head names: left by a run that stopped before its commit
     /// or by a writer that lost the race. Recorded now, deleted after the grace.
@@ -479,13 +610,9 @@ pub const Service = struct {
         if (self.catalog.len == 0) return &.{};
         return self.getJson([]const File, self.catalog);
     }
-    /// False for a bucket (prefix) no run has written its layout to yet.
+    /// False for a bucket (prefix) no setup has finished in yet.
     pub fn initialised(self: *Service) !bool {
-        _ = self.get("nomadfs-backup.json") catch |err| switch (err) {
-            error.NotFound => return false,
-            else => return err,
-        };
-        return true;
+        return (try self.loadLayout()) != null;
     }
     /// A new target is created with this key and these 24 words (those of
     /// another target this device opened) instead of fresh ones.
@@ -498,48 +625,83 @@ pub const Service = struct {
     }
     /// The key alone, without loading the index.
     pub fn unlockKey(self: *Service, phrase: ?[]const u8) !void {
-        const layout = try self.parse(Layout, try self.get("nomadfs-backup.json"));
-        if (layout.version != 2) return error.UnsupportedBackupVersion;
+        const layout = (try self.loadLayout()) orelse return error.NotFound;
+        try self.unlockWith(layout, phrase);
+    }
+    fn unlockWith(self: *Service, layout: Layout, phrase: ?[]const u8) !void {
         self.encrypted = layout.encrypt;
-        const blob = self.get(try self.deviceWrapName()) catch |err| switch (err) {
+        self.setup_id = layout.setup;
+        const blob = self.get(try self.wrapName(self.device.id)) catch |err| switch (err) {
             error.NotFound => "",
             else => return err,
         };
         self.key = backup.keys.unwrapForDevice(blob, self.device.secret) catch blk: {
             const words = phrase orelse return error.RecoveryPhraseRequired;
-            break :blk try backup.keys.unwrapWithRecovery(self.allocator, try self.get("keys/recovery.wrap"), words);
+            break :blk try backup.keys.unwrapWithRecovery(self.allocator, try self.get(try self.keyName("recovery.wrap")), words);
         };
         if (!std.mem.eql(u8, &layout.key_id, &backup.keys.keyId(self.key.?))) return error.KeyIdMismatch;
     }
+    /// Opens the backup, creating it in an empty bucket. Creation is one
+    /// create-only root naming key material already written under a random
+    /// setup id: a setup that stopped before its root left nothing a later
+    /// one trips over, and two devices cannot both win.
     fn setup(self: *Service) !void {
-        _ = self.get("nomadfs-backup.json") catch |err| {
-            if (err != error.NotFound) return err;
-            self.encrypted = self.config.encrypt;
-            self.key = self.seed_key orelse try backup.keys.generateKey();
-            var entropy = if (self.seed_phrase) |words| try backup.recovery_words.decodePhrase(words) else try backup.keys.generateKey();
-            defer std.crypto.secureZero(u8, &entropy);
-            var buf: [backup.recovery_words.max_phrase_len]u8 = undefined;
-            defer std.crypto.secureZero(u8, &buf);
-            const phrase = backup.recovery_words.formatPhrase(entropy, &buf);
-            const recovery = try backup.keys.wrapWithRecovery(self.allocator, self.key.?, phrase);
-            // Create-only: of two devices setting up the same empty bucket,
-            // the second stops here (LeaseLost) before writing anything.
-            try self.create("keys/recovery.wrap", &recovery);
-            const device_wrap = try backup.keys.wrapForDevice(self.key.?, self.device.public);
-            try self.put(try self.deviceWrapName(), &device_wrap);
-            // Recovery words stay encrypted even in the explicitly clear backup mode.
-            const saved_mode = self.encrypted;
-            self.encrypted = true;
-            const sealed_entropy = try self.seal(&entropy);
-            self.encrypted = saved_mode;
-            try self.create("keys/recovery-entropy", sealed_entropy);
-            try self.create("nomadfs-backup.json", try self.json(Layout{ .encrypt = self.encrypted, .key_id = backup.keys.keyId(self.key.?) }));
-            self.created_phrase = try self.a().dupe(u8, phrase);
-            try self.loadHead();
-            try self.loadIndex();
-            return;
+        const layout = (try self.loadLayout()) orelse return self.initialise();
+        try self.unlockWith(layout, null);
+        try self.loadHead();
+        try self.loadIndex();
+        // This device made the backup and no run has committed since: the
+        // words were perhaps never shown (the run stopped after the root).
+        if (self.head_etag == null and std.mem.eql(u8, &layout.creator, &self.device.id)) _ = try self.recoveryKey();
+    }
+    fn initialise(self: *Service) !void {
+        self.encrypted = self.config.encrypt;
+        self.key = self.seed_key orelse try backup.keys.generateKey();
+        var entropy = if (self.seed_phrase) |words| try backup.recovery_words.decodePhrase(words) else try backup.keys.generateKey();
+        defer std.crypto.secureZero(u8, &entropy);
+        var buf: [backup.recovery_words.max_phrase_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buf);
+        const phrase = backup.recovery_words.formatPhrase(entropy, &buf);
+        const id = backup.index.formatPackId(try backup.index.generatePackId());
+        self.setup_id = try self.a().dupe(u8, &id);
+        const recovery = try backup.keys.wrapWithRecovery(self.allocator, self.key.?, phrase);
+        try self.create(try self.keyName("recovery.wrap"), &recovery);
+        const device_wrap = try backup.keys.wrapForDevice(self.key.?, self.device.public);
+        try self.create(try self.wrapName(self.device.id), &device_wrap);
+        // Recovery words stay encrypted even in the explicitly clear backup mode.
+        const saved_mode = self.encrypted;
+        self.encrypted = true;
+        const sealed_entropy = try self.seal(&entropy);
+        self.encrypted = saved_mode;
+        try self.create(try self.keyName("recovery-entropy"), sealed_entropy);
+        const root = Layout{ .encrypt = self.encrypted, .key_id = backup.keys.keyId(self.key.?), .setup = self.setup_id, .creator = self.device.id };
+        self.create(layout_name, try self.json(root)) catch |err| {
+            if (err != error.LeaseLost) return err;
+            // A root is there. Ours, when the answer to our write was lost:
+            // go on. Another device's: it won, and this setup is dropped.
+            const winner = (try self.loadLayout()) orelse return err;
+            if (!std.mem.eql(u8, winner.setup, self.setup_id)) {
+                self.dropSetup(self.setup_id);
+                return err;
+            }
         };
-        try self.unlock(null);
+        self.created_phrase = try self.a().dupe(u8, phrase);
+        self.sweepSetups();
+        try self.loadHead();
+        try self.loadIndex();
+    }
+    /// Best effort: the three objects of a setup no root names.
+    fn dropSetup(self: *Service, id: []const u8) void {
+        const dir = std.fmt.allocPrint(self.a(), "keys/{s}", .{id}) catch return;
+        for (self.list(dir) catch return) |relative| self.delete(relative) catch {};
+    }
+    /// Best effort, by the device that just published the root: key material
+    /// of setups that stopped before theirs. Nothing can name it any more.
+    fn sweepSetups(self: *Service) void {
+        const mine = std.fmt.allocPrint(self.a(), "keys/{s}/", .{self.setup_id}) catch return;
+        for (self.list("keys") catch return) |relative| {
+            if (!std.mem.startsWith(u8, relative, mine)) self.delete(relative) catch {};
+        }
     }
     /// Explicitly requested re-display requires an unlockable envelope.
     pub fn recoveryKey(self: *Service) ![]const u8 {
@@ -548,7 +710,7 @@ pub const Service = struct {
         const mode = self.encrypted;
         self.encrypted = true;
         defer self.encrypted = mode;
-        const entropy = try self.open(try self.get("keys/recovery-entropy"));
+        const entropy = try self.open(try self.get(try self.keyName("recovery-entropy")));
         defer std.crypto.secureZero(u8, @constCast(entropy));
         if (entropy.len != 32) return error.InvalidRecoveryEntropy;
         var buf: [backup.recovery_words.max_phrase_len]u8 = undefined;
@@ -561,8 +723,7 @@ pub const Service = struct {
     /// Enroll a trusted device using its identity-derived X25519 public key.
     /// Caller holds the uploader lease; never creates a new backup key.
     pub fn wrapDevice(self: *Service, id: Cid, public: Key) !void {
-        const hex = std.fmt.bytesToHex(id, .lower);
-        const relative = try std.fmt.allocPrint(self.a(), "keys/{s}.wrap", .{hex});
+        const relative = try self.wrapName(id);
         _ = self.get(relative) catch |err| {
             if (err != error.NotFound) return err;
             const wrapped = try backup.keys.wrapForDevice(self.key orelse return error.Locked, public);
@@ -656,7 +817,8 @@ pub const Service = struct {
         }
         try self.renew();
         ts = self.timestamp();
-        var response = try self.client.completeMultipartUpload(full_name, upload, parts.items, &ts);
+        // A pack is immutable: its name is never given to other bytes.
+        var response = try self.client.completeMultipartUpload(full_name, upload, parts.items, .if_none_match, &ts);
         response.deinit();
     }
     /// Uploads the pack and its index segment; returns the segment for the
@@ -687,6 +849,7 @@ pub const Service = struct {
     pub fn run(self: *Service, source: Source, store: *storage.engine.StorageEngine) !Report {
         if (self.created_phrase) |old| std.crypto.secureZero(u8, @constCast(old));
         self.created_phrase = null;
+        try self.requireUnversioned();
         try self.acquire();
         defer self.release();
         try self.setup();
@@ -697,10 +860,15 @@ pub const Service = struct {
         const files = listing.files;
         if (files.len > max_files) return error.TooManyFiles;
         for (files) |file| if (!validFile(file)) return error.InvalidFile;
+        for (listing.absent) |v| if (!validName(v.path)) return error.InvalidFile;
         const left_out = try self.applyPurges(listing);
         var live: std.ArrayList(File) = .empty;
         var catalog: std.ArrayList(File) = .empty;
         try catalog.appendSlice(self.a(), try self.loadCatalog());
+        var newest: std.StringHashMap(usize) = .init(self.allocator);
+        defer newest.deinit();
+        const last_run = try newestIntervals(catalog.items, &newest);
+        const seen = self.now();
         var writer = try backup.pack.Writer.init(self.allocator, .{ .key = self.cryptoKey(), .target_size = @as(usize, self.config.pack_mb) * 1024 * 1024 });
         defer writer.deinit();
         var id = try backup.index.generatePackId();
@@ -711,14 +879,7 @@ pub const Service = struct {
             if (listed(&.{file}, left_out)) continue;
             try live.append(self.a(), file);
             // The catalog is the history: each version with when it was seen.
-            if (catalogIndex(catalog.items, file)) |known| {
-                catalog.items[known].last_seen = self.now();
-            } else {
-                var version = file;
-                version.first_seen = self.now();
-                version.last_seen = self.now();
-                try catalog.append(self.a(), version);
-            }
+            try observe(self.a(), &catalog, &newest, file, last_run, seen);
             for (file.blocks) |cid| {
                 try self.renew();
                 const bid = self.blockId(cid);
@@ -753,8 +914,16 @@ pub const Service = struct {
         report.reused_key = self.created_phrase != null and self.seed_key != null;
         return report;
     }
+    /// Where the committed index says the block is.
+    pub fn locate(self: *Service, cid: Cid) !Location {
+        return self.index.get(self.blockId(cid)) orelse error.BlockNotFound;
+    }
     pub fn readBlock(self: *Service, cid: Cid) ![]u8 {
-        const location = self.index.get(self.blockId(cid)) orelse return error.BlockNotFound;
+        return self.readAt(cid, try self.locate(cid));
+    }
+    /// The block's bytes from a known location, checked against its content id.
+    pub fn readAt(self: *Service, cid: Cid, location: Location) ![]u8 {
+        if (location.length == 0) return error.InvalidRangeResponse;
         const ts = self.timestamp();
         var response = try self.client.getObject(try self.name(try self.packName(location.pack_id)), .{ .start = location.offset, .end = location.offset + location.length - 1 }, &ts);
         defer response.deinit();
@@ -824,8 +993,11 @@ pub const Service = struct {
         return .{ .blocks = seen.count(), .packs = ends.count(), .downloaded = false };
     }
     /// HEADs one pack. An archived pack with no thaw running gets one asked
-    /// for; the answer says whether its bytes can be read now.
-    fn thawPack(self: *Service, id: [16]u8, tier: Tier) !struct { readable: bool, size: u64 } {
+    /// for; the answer says whether its bytes can be read now. The class is
+    /// the one the bucket reports, never today's configuration. `refused`:
+    /// a GET was just answered InvalidObjectState, so a class not known here
+    /// counts as archived.
+    fn thawPack(self: *Service, id: [16]u8, tier: Tier, refused: bool) !struct { readable: bool, size: u64 } {
         const ts = self.timestamp();
         const key = try self.name(try self.packName(id));
         var response = self.client.headObject(key, &ts) catch |err| switch (err) {
@@ -835,8 +1007,8 @@ pub const Service = struct {
         defer response.deinit();
         const state = s3.objectState(&response);
         const size = state.size orelse 0;
-        const class = std.meta.stringToEnum(StorageClass, state.storage_class) orelse StorageClass.STANDARD;
-        if (!class.cold() or state.restore == .ready) return .{ .readable = true, .size = size };
+        const archived = if (std.meta.stringToEnum(StorageClass, state.storage_class)) |class| class.cold() else refused;
+        if (!archived or state.restore == .ready) return .{ .readable = true, .size = size };
         if (state.restore == .none) try self.client.restoreObject(key, .{ .days = thaw_days, .tier = tier }, &ts);
         return .{ .readable = false, .size = size };
     }
@@ -845,24 +1017,50 @@ pub const Service = struct {
     pub fn fileReady(self: *Service, file: File, ready: *Packs, tier: Tier, progress: *Restore) !bool {
         var all = true;
         for (file.blocks) |cid| {
-            const location = self.index.get(self.blockId(cid)) orelse return error.BlockNotFound;
-            const slot = try ready.getOrPut(location.pack_id);
-            if (!slot.found_existing) {
-                slot.value_ptr.* = false; // stays "not ready" if the HEAD fails
-                const pack = try self.thawPack(location.pack_id, tier);
-                ready.getPtr(location.pack_id).?.* = pack.readable;
-                if (!pack.readable) {
-                    progress.thawing_packs += 1;
-                    progress.thawing_bytes += pack.size;
-                }
-            }
-            if (!ready.get(location.pack_id).?) all = false;
+            const pack = (try self.locate(cid)).pack_id;
+            if (!(try self.packReady(pack, self.recordedClass(pack), ready, tier, progress))) all = false;
         }
         return all;
     }
+    /// True when the pack can be read now, asked once per pack (`ready`
+    /// remembers). `class` is the one recorded at its upload: a warm one
+    /// needs no question; a cold one, or none (null), is asked with a HEAD
+    /// and its thaw requested when the bucket holds it archived.
+    pub fn packReady(self: *Service, id: [16]u8, class: ?StorageClass, ready: *Packs, tier: Tier, progress: *Restore) !bool {
+        const slot = try ready.getOrPut(id);
+        if (slot.found_existing) return slot.value_ptr.*;
+        slot.value_ptr.* = false; // stays "not ready" if the HEAD fails
+        var readable = true;
+        if (if (class) |c| c.cold() else true) {
+            const pack = try self.thawPack(id, tier, false);
+            readable = pack.readable;
+            if (!readable) {
+                progress.thawing_packs += 1;
+                progress.thawing_bytes += pack.size;
+            }
+        }
+        ready.getPtr(id).?.* = readable;
+        return readable;
+    }
+    /// A GET of this pack was answered InvalidObjectState although nothing
+    /// said it was archived (a lifecycle rule moved it): asks the bucket and
+    /// requests the thaw. False when it is thawing now; true when the bucket
+    /// calls it readable all the same.
+    pub fn packRefused(self: *Service, id: [16]u8, ready: *Packs, tier: Tier, progress: *Restore) !bool {
+        const counted = if (ready.get(id)) |was| !was else false;
+        const pack = try self.thawPack(id, tier, true);
+        try ready.put(id, pack.readable);
+        if (!pack.readable and !counted) {
+            progress.thawing_packs += 1;
+            progress.thawing_bytes += pack.size;
+        }
+        return pack.readable;
+    }
     /// Every version of every file the backup still holds, also the ones no
     /// kept snapshot lists any more (retention never removes them, only a
-    /// purge does). `path` limits it to one file or subtree.
+    /// purge does). One entry per stretch of runs a version was seen in: a
+    /// version that came back after another has two. `path` limits it to
+    /// one file or subtree.
     pub fn history(self: *Service, path: ?[]const u8) ![]const File {
         if (self.key == null) return error.Locked;
         var versions: std.ArrayList(File) = .empty;
@@ -875,7 +1073,9 @@ pub const Service = struct {
     }
     /// Sends the bytes of one file, in order, to `sink`. Every block is
     /// checked against its content id; the total must match the file's size.
-    pub fn streamFile(self: *Service, file: File, sink: Sink) !void {
+    /// With a `locator` the blocks are read where it says and the index is
+    /// never asked: a restore job reads its own plan.
+    pub fn streamFile(self: *Service, file: File, locator: ?Locator, sink: Sink) !void {
         var stack: std.ArrayList(Cid) = .empty;
         defer stack.deinit(self.allocator);
         try stack.append(self.allocator, file.cid);
@@ -884,7 +1084,8 @@ pub const Service = struct {
         while (stack.pop()) |cid| {
             visited += 1;
             if (visited > storage.dag.walk.blockBudget(file.size)) return error.DagTooLarge;
-            const bytes = try self.readBlock(cid);
+            const location = if (locator) |l| l.findFn(l.ctx, cid) orelse return error.BlockNotFound else try self.locate(cid);
+            const bytes = try self.readAt(cid, location);
             defer self.allocator.free(bytes);
             switch (try storage.dag.codec.decode(bytes)) {
                 .leaf => |data| {
@@ -898,14 +1099,24 @@ pub const Service = struct {
         }
         if (offset != file.size) return error.SizeMismatch;
     }
-    /// Offsite portion only: durable encrypted intent, applied by the next run.
-    pub fn forget(self: *Service, path: []const u8) !void {
+    /// Offsite portion only: durable encrypted intent, applied by the next
+    /// run. What it covers is fixed here, by content: every version under the
+    /// path the history holds and every one the folder lists now, also those
+    /// still waiting for their blocks. Content that comes later is not in it.
+    pub fn forget(self: *Service, path: []const u8, source: Source) !void {
         if (self.key == null) return error.Locked;
         if (!validName(path)) return error.InvalidPath;
         try self.acquire();
         defer self.release();
         try self.loadHead();
-        try self.purges.append(self.a(), try self.createPurge(.{ .path = path, .time = self.now() }));
+        var versions: std.ArrayList(Version) = .empty;
+        for (try self.loadCatalog()) |f| if (!f.directory and under(f.path, path)) try addVersion(self.a(), &versions, f.path, f.cid);
+        const listing = try source.filesFn(source.ctx, self.a());
+        if (listing.files.len > max_files or listing.absent.len > max_files) return error.TooManyFiles;
+        for (listing.files) |f| if (!f.directory and under(f.path, path)) try addVersion(self.a(), &versions, f.path, f.cid);
+        for (listing.absent) |v| if (under(v.path, path)) try addVersion(self.a(), &versions, v.path, v.cid);
+        if (versions.items.len > max_objects) return error.TooManyFiles;
+        try self.purges.append(self.a(), try self.createPurge(.{ .path = path, .time = self.now(), .versions = versions.items }));
         try self.commit();
     }
     /// Purges stay encrypted even in the explicitly clear backup mode.
@@ -920,47 +1131,50 @@ pub const Service = struct {
         self.encrypted = true;
         defer self.encrypted = mode;
         const purge = try self.getJson(Purge, relative);
-        if (!validName(purge.path)) return error.InvalidPurge;
+        if (!validName(purge.path) or purge.versions.len > max_objects) return error.InvalidPurge;
+        for (purge.versions) |v| if (!validName(v.path)) return error.InvalidPurge;
         return purge;
     }
-    fn filtered(self: *Service, files: []const File, paths: []const []const u8) ![]const File {
+    /// `files` without the purged versions, and without the directories under
+    /// a purged path (a directory has no content to tell it by).
+    fn filtered(self: *Service, files: []const File, paths: []const []const u8, versions: []const Version) ![]const File {
         var result: std.ArrayList(File) = .empty;
-        for (files) |f| if (!purged(f.path, paths)) try result.append(self.a(), f);
+        for (files) |f| {
+            if (if (f.directory) purged(f.path, paths) else listed(&.{f}, versions)) continue;
+            try result.append(self.a(), f);
+        }
         return result.toOwnedSlice(self.a());
     }
-    /// Applies the purges asked for since the last run, in one commit: the
-    /// versions under the path leave every snapshot, the catalog and the
-    /// index, and their pack bytes follow. A purge covers what was there when
-    /// it was asked for (all the history, and what the source lists with a
-    /// time from before); it never names the path for good. Returns the versions
-    /// this run leaves out: those the source still lists. Once it lists none
-    /// the purge is done and dropped; later content at the path is backed up.
+    /// Applies the purges asked for since the last run, in one commit: their
+    /// versions leave every snapshot, the catalog and the index, and their
+    /// pack bytes follow. A purge covers the versions `forget` recorded and
+    /// nothing else: it never names the path for good, and no file time
+    /// decides what is in it. Returns the versions this run leaves out: a
+    /// purge is kept while the source still lists one of its versions (also
+    /// one waiting for blocks, so it is never uploaded when they come). Once
+    /// the source lists none it is done and dropped.
     fn applyPurges(self: *Service, listing: Listing) ![]const Version {
         var left_out: std.ArrayList(Version) = .empty;
         var paths: std.ArrayList([]const u8) = .empty;
+        var fresh: std.ArrayList(Version) = .empty;
         var kept: std.ArrayList([]const u8) = .empty;
-        const history_ = try self.loadCatalog();
         for (self.purges.items) |relative| {
             var purge = try self.getPurge(relative);
-            const fresh = !purge.applied;
-            if (fresh) {
-                var versions: std.ArrayList(Version) = .empty;
-                for (history_) |f| if (!f.directory and under(f.path, purge.path)) try addVersion(self.a(), &versions, f);
-                for (listing.files) |f| if (!f.directory and f.mtime != 0 and f.mtime <= purge.time and under(f.path, purge.path)) try addVersion(self.a(), &versions, f);
+            const first = !purge.applied;
+            if (first) {
                 try paths.append(self.a(), purge.path);
-                purge.applied = true;
-                purge.versions = versions.items;
+                try fresh.appendSlice(self.a(), purge.versions);
             }
-            // A file waiting for blocks is not listed: it may be one of them.
-            if (listing.waiting == 0 and !listed(listing.files, purge.versions)) {
+            if (!listed(listing.files, purge.versions) and !named(listing.absent, purge.versions)) {
                 try self.discard(relative, 0);
                 continue;
             }
             try left_out.appendSlice(self.a(), purge.versions);
-            if (!fresh) {
+            if (!first) {
                 try kept.append(self.a(), relative);
                 continue;
             }
+            purge.applied = true;
             try kept.append(self.a(), try self.createPurge(purge));
             try self.discard(relative, 0);
         }
@@ -970,13 +1184,14 @@ pub const Service = struct {
         for (self.snapshots.items) |*ref| {
             if (paths.items.len == 0) break;
             const snap = try self.snapshot(ref.name);
-            const files = try self.filtered(snap.files, paths.items);
+            const files = try self.filtered(snap.files, paths.items, fresh.items);
             if (files.len == snap.files.len) continue;
             try self.discard(ref.object, 0);
             ref.object = try self.createJson("snapshots", Snapshot{ .time = snap.time, .files = files });
         }
-        const catalog = try self.filtered(history_, paths.items);
-        if (paths.items.len > 0) {
+        const history_ = try self.loadCatalog();
+        const catalog = try self.filtered(history_, paths.items, fresh.items);
+        if (catalog.len != history_.len) {
             if (self.catalog.len > 0) try self.discard(self.catalog, 0);
             self.catalog = try self.createJson("catalog", catalog);
         }
@@ -1024,7 +1239,7 @@ pub const Service = struct {
                 _ = self.packs.swapRemove(at);
                 continue;
             }
-            if (self.now() < record.removable or !(try self.thawPack(pack, .Bulk)).readable) {
+            if (self.now() < record.removable or !(try self.thawPack(pack, .Bulk, false)).readable) {
                 self.packs.items[at].purged = true;
                 if (!removed) {
                     try live.append(self.a(), segment);
@@ -1082,9 +1297,42 @@ fn validFile(file: File) bool {
     for (file.blocks) |cid| if (std.mem.eql(u8, &cid, &file.cid)) return true;
     return false;
 }
-fn catalogIndex(files: []const File, file: File) ?usize {
-    for (files, 0..) |f, i| if (std.mem.eql(u8, f.path, file.path) and std.mem.eql(u8, &f.cid, &file.cid) and f.directory == file.directory) return i;
-    return null;
+/// Fills `newest` with the latest interval of each path in the catalog.
+/// Returns the time of the last run that saw any file (a run that listed
+/// none leaves no mark, so a file missing only from such runs keeps its
+/// interval).
+fn newestIntervals(catalog: []const File, newest: *std.StringHashMap(usize)) !u64 {
+    var last_run: u64 = 0;
+    for (catalog, 0..) |file, i| {
+        last_run = @max(last_run, file.last_seen);
+        const slot = try newest.getOrPut(file.path);
+        if (!slot.found_existing) {
+            slot.value_ptr.* = i;
+            continue;
+        }
+        const other = catalog[slot.value_ptr.*];
+        if (file.last_seen > other.last_seen or (file.last_seen == other.last_seen and file.first_seen > other.first_seen)) slot.value_ptr.* = i;
+    }
+    return last_run;
+}
+/// This run (`seen`) found `file`. The path's latest interval grows when it
+/// is this version and the last run saw it too; after a gap (another version
+/// in between, or a run without the file) the version gets a new interval,
+/// so the history says what was at the path at any time.
+fn observe(a: Allocator, catalog: *std.ArrayList(File), newest: *std.StringHashMap(usize), file: File, last_run: u64, seen: u64) !void {
+    const slot = try newest.getOrPut(file.path);
+    if (slot.found_existing) {
+        const known = &catalog.items[slot.value_ptr.*];
+        if (known.last_seen >= last_run and known.directory == file.directory and std.mem.eql(u8, &known.cid, &file.cid)) {
+            known.last_seen = @max(known.last_seen, seen);
+            return;
+        }
+    }
+    var version = file;
+    version.first_seen = seen;
+    version.last_seen = seen;
+    slot.value_ptr.* = catalog.items.len;
+    try catalog.append(a, version);
 }
 /// True for `prefix` itself and for every name below it.
 pub fn under(path: []const u8, prefix: []const u8) bool {
@@ -1094,9 +1342,14 @@ fn purged(path: []const u8, paths: []const []const u8) bool {
     for (paths) |p| if (under(path, p)) return true;
     return false;
 }
-fn addVersion(a: Allocator, versions: *std.ArrayList(Version), file: File) !void {
-    for (versions.items) |v| if (std.mem.eql(u8, v.path, file.path) and std.mem.eql(u8, &v.cid, &file.cid)) return;
-    try versions.append(a, .{ .path = file.path, .cid = file.cid });
+fn addVersion(a: Allocator, versions: *std.ArrayList(Version), path: []const u8, cid: Cid) !void {
+    for (versions.items) |v| if (std.mem.eql(u8, v.path, path) and std.mem.eql(u8, &v.cid, &cid)) return;
+    try versions.append(a, .{ .path = path, .cid = cid });
+}
+/// True when one of `some` is one of these versions.
+fn named(some: []const Version, versions: []const Version) bool {
+    for (some) |s| for (versions) |v| if (std.mem.eql(u8, v.path, s.path) and std.mem.eql(u8, &v.cid, &s.cid)) return true;
+    return false;
 }
 /// True when one of `files` is one of these versions (same path and content).
 fn listed(files: []const File, versions: []const Version) bool {

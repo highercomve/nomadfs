@@ -23,6 +23,9 @@ pub const Source = struct {
         defer parsed.deinit();
         var out: std.ArrayList(offsite.File) = .empty;
         var waiting: usize = 0;
+        // Listed by the folder but not uploadable yet: named, so a purge
+        // asked for now covers them too.
+        var absent: std.ArrayList(offsite.Version) = .empty;
         for (parsed.wire) |entry| {
             if (entry.x) continue;
             if (!@import("manifest.zig").validPath(entry.p)) return error.InvalidPath;
@@ -36,6 +39,7 @@ pub const Source = struct {
             _ = try std.fmt.hexToBytes(&root, entry.h);
             var reached = storage.dag.walk.collectReachableWithOptions(a, self.store, &root, .{ .read_leaves = false }) catch |err| switch (err) {
                 error.BlockNotFound => {
+                    try absent.append(a, .{ .path = path, .cid = root });
                     waiting += 1;
                     continue;
                 },
@@ -49,6 +53,6 @@ pub const Source = struct {
             while (it.next()) |cid| : (i += 1) cids[i] = cid.*;
             try out.append(a, .{ .path = path, .cid = root, .size = entry.s, .mtime = entry.m, .blocks = cids });
         }
-        return .{ .files = try out.toOwnedSlice(a), .waiting = waiting };
+        return .{ .files = try out.toOwnedSlice(a), .waiting = waiting, .absent = try absent.toOwnedSlice(a) };
     }
 };
