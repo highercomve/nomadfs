@@ -39,6 +39,11 @@ pub const SwarmFolder = struct {
     mutex: sync.Mutex = .{},
     /// Edited since the last write (flushSave).
     dirty: bool = false,
+    /// Counts manifest changes: raised under `mutex` by every local edit
+    /// (`saveLocked`) and every merge that changed something, so a reader
+    /// holding `mutex` sees the generation of the entries it reads.
+    /// Starts at 1 each run: 0 is never a generation.
+    generation: std.atomic.Value(u64) = .init(1),
     /// When the manifest was last written (monotonic ms); writes are at
     /// most one a second, so copying many files doesn't rewrite it each.
     written_ms: i64 = 0,
@@ -233,6 +238,13 @@ pub const SwarmFolder = struct {
     /// before the lock), writes it.
     fn saveLocked(self: *SwarmFolder) !void {
         self.dirty = true;
+        _ = self.generation.fetchAdd(1, .release);
+    }
+
+    /// Which change of the manifest this is: different after any edit or
+    /// merge. Views built from the entries are current while it holds.
+    pub fn changeGeneration(self: *const SwarmFolder) u64 {
+        return self.generation.load(.acquire);
     }
 
     /// Caller holds `mutex`. Local edits are refused while the folder waits
@@ -594,6 +606,18 @@ pub const SwarmFolder = struct {
         return .{ .cid = e.cid, .size = e.size, .mtime = e.mtime, .author = e.version.device };
     }
 
+    /// The size of the file with content ID `cid`, or null if not live in the manifest.
+    pub fn sizeOfCid(self: *SwarmFolder, cid: *const [32]u8) ?u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.manifest.entries.values()) |e| {
+            if (!e.deleted and e.kind == .file and std.mem.eql(u8, &e.cid, cid)) {
+                return e.size;
+            }
+        }
+        return null;
+    }
+
     /// Whether `path` is known to be deleted: a tombstone, or no entry at
     /// all once a sync round has run (a tombstone is pruned after 90 days).
     /// Before the first round an unknown path may just not have arrived.
@@ -729,6 +753,24 @@ pub const SwarmFolder = struct {
         const out = try arena.alloc(Item, found.len);
         for (found, out) |e, *o| o.* = try itemOf(arena, e);
         return out;
+    }
+
+    /// Calls `visit(ctx, entry)` for every live file at any depth, in one
+    /// pass under the lock (so `visit` must not call the folder); the entry
+    /// is borrowed for the call. Returns the change generation of the
+    /// entries visited.
+    pub fn eachLiveFile(
+        self: *SwarmFolder,
+        ctx: anytype,
+        comptime visit: fn (@TypeOf(ctx), *const Entry) std.mem.Allocator.Error!void,
+    ) std.mem.Allocator.Error!u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.manifest.entries.values()) |*e| {
+            if (e.deleted or e.kind != .file) continue;
+            try visit(ctx, e);
+        }
+        return self.changeGeneration();
     }
 
     /// The live file at `path`, or null.
@@ -954,7 +996,11 @@ pub const SwarmFolder = struct {
         defer parsed.deinit();
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.manifest.mergeParsed(&parsed);
+        const changed = self.manifest.mergeParsed(&parsed);
+        // Here, not only when the round saves: the entries change under
+        // this lock, and a view built in between must not pass as current.
+        if (changed > 0) _ = self.generation.fetchAdd(1, .release);
+        return changed;
     }
 
     /// A callback of the folder's thread. Hooks run outside the folder's

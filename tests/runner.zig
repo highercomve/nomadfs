@@ -33,6 +33,7 @@ test {
     _ = @import("cluster/holders_test.zig");
     _ = @import("cluster/fuse_inodes_test.zig");
     _ = @import("cluster/fuse_mt_test.zig");
+    _ = @import("cluster/fuse_write_test.zig");
     _ = @import("cluster/device_names_test.zig");
     _ = @import("cluster/traffic_test.zig");
     _ = @import("cluster/webdav_test.zig");

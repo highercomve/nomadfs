@@ -131,21 +131,36 @@ const Handle = struct {
     ino: u64,
     staging: [:0]u8,  // <storage_path>.swarm.json.staging/<fh>.part
     fd: i32,
-    dirty: bool,
+    dirty: bool,      // bytes not saved to the swarm folder yet
+    path: []u8,       // where it is saved, resolved when it is opened
+    saving: bool,     // a save is running; the next one waits
+    unlinked: bool,   // removed or replaced while open: no longer saved
 };
 ```
 
 1. **`OPEN` with write access, or `CREATE`** → `openForWrite` / `newHandle` creates the staging
-   file (mode 0600). Opening an existing file **without `O_TRUNC`** first copies its current
-   content in through `SwarmFolder.readAt` (fetching blocks if needed), so appends and in-place
-   edits work. Concurrent `openForWrite` on the same file is refused with `EBUSY`.
+   file (mode 0600) and keeps the file's swarm path on the handle. Opening an existing file
+   **without `O_TRUNC`** first copies its current content in through `SwarmFolder.readAt`
+   (fetching blocks if needed), so appends and in-place edits work. Concurrent `openForWrite` on
+   the same file is refused with `EBUSY`.
 2. **`WRITE`** → `pwrite` into the staging file under local handle bounds; the inode's size and mtime are updated at once.
 3. **`SETATTR` with a size** → `ftruncate` on the open handle; a truncate with no open file is
-   staged, cut and committed immediately.
-4. **`RELEASE`** (last close) → `commit`: if dirty, `SwarmFolder.addFile(dir, name, staging)`
-   chunks the staged bytes into the block store and records **one** manifest edit outside `Mount.lock`.
-   Other devices never see a half-written file. The staging file is removed. A file unlinked while open is
-   dropped, not re-added, when it is closed.
+   staged, cut and saved immediately, and fails when the save does.
+4. **`FLUSH`** (every `close()`) and **`FSYNC`** → `save`: if dirty, `SwarmFolder.addFileAt(dir,
+   name, staging)` chunks the staged bytes into the block store and records **one** manifest edit
+   outside `Mount.lock`. The reply waits for it and carries its error, so `close()` and `fsync()`
+   fail when the file could not be saved; the bytes stay staged and dirty for another try. Other
+   devices never see a half-written file.
+5. **`RELEASE`** (after the last close has returned) → saves what is still dirty (a flush that
+   failed, writes after the last flush), tried a few times; a failure there has nobody left to
+   tell and is logged as `fuse: LOST <path>`. Then the staging file is removed. A file unlinked
+   while open is dropped, not re-added, when it is closed.
+
+The save goes to the path kept on the handle, not to a path looked up in the inode table: a name
+detaches from the table whenever a `LOOKUP` no longer finds it in the listing, and unsaved bytes
+must still have somewhere to go. A rename moves the paths of the open files under it. A folder
+that so far only holds files being written is listed too, so the kernel's lookups keep finding it.
+An inode whose name is gone answers `ESTALE`, which makes the kernel look the path up again.
 
 Directory operations map onto the swarm API directly: `MKDIR` → `makeDir`; `UNLINK` → `remove`;
 `RMDIR` → `remove`, refused with `ENOTEMPTY` while the folder has live entries; `RENAME` /
@@ -162,7 +177,8 @@ it over the original.
 | Concurrent open for write on a swarm file | `EBUSY` |
 | `rmdir` on a non-empty swarm folder | `ENOTEMPTY` |
 | Extended attributes | `ENOSYS` |
-| Swarm errors (`errnoFor`) | `FileNotFound` → `ENOENT`, `PathAlreadyExists` → `EEXIST`, `InvalidPath` → `EINVAL`, `NameTooLong` → `ENAMETOOLONG`, `ReadOnly` → `EROFS`, other → `EIO` |
+| Swarm errors (`errnoFor`) | `FileNotFound` → `ENOENT`, `PathAlreadyExists` → `EEXIST`, `InvalidPath` → `EINVAL`, `NameTooLong` → `ENAMETOOLONG`, `ReadOnly` → `EROFS`, `Detached` (the inode's name is gone) → `ESTALE`, no descriptors left → `EMFILE` / `ENFILE`, disk full → `ENOSPC`, out of memory → `ENOMEM`, other → `EIO` |
+| A save that fails on `close()` / `fsync()` | the save's error, from that call |
 | A block no device can serve / down peer | `EIO` on that read |
 
 ## 7. Limits & Concurrency

@@ -66,7 +66,7 @@ pub const Opcode = enum(u32) {
 pub const CreateIn = extern struct { flags: u32, mode: u32, umask: u32, open_flags: u32 };
 pub const WriteIn = extern struct { fh: u64, offset: u64, size: u32, write_flags: u32, lock_owner: u64, flags: u32, padding: u32 };
 const WriteOut = extern struct { size: u32, padding: u32 = 0 };
-const SetattrIn = extern struct {
+pub const SetattrIn = extern struct {
     valid: u32,
     padding: u32,
     fh: u64,
@@ -84,7 +84,7 @@ const SetattrIn = extern struct {
     gid: u32,
     unused5: u32,
 };
-const MkdirIn = extern struct { mode: u32, umask: u32 };
+pub const MkdirIn = extern struct { mode: u32, umask: u32 };
 pub const RenameIn = extern struct { newdir: u64 };
 pub const Rename2In = extern struct { newdir: u64, flags: u32, padding: u32 };
 pub const ReleaseIn = extern struct { fh: u64, flags: u32, release_flags: u32, lock_owner: u64 };
@@ -250,6 +250,7 @@ const Errno = enum(i32) {
     NOENT = 2,
     IO = 5,
     BADF = 9,
+    NOMEM = 12,
     ACCES = 13,
     BUSY = 16,
     EXIST = 17,
@@ -257,10 +258,14 @@ const Errno = enum(i32) {
     NOTDIR = 20,
     ISDIR = 21,
     INVAL = 22,
+    NFILE = 23,
+    MFILE = 24,
+    NOSPC = 28,
     ROFS = 30,
     NAMETOOLONG = 36,
     NOSYS = 38,
     NOTEMPTY = 39,
+    STALE = 116,
 };
 
 /// Seconds the kernel may cache names and attributes. Short, because a
@@ -300,13 +305,24 @@ pub const Inode = struct {
 };
 
 /// A swarm file open for writing: bytes go to a staging file and are added
-/// to the swarm folder on release.
+/// to the swarm folder when the file is flushed (close, fsync), so a save
+/// that fails reaches the writer as an error.
 pub const Handle = struct {
     ino: u64,
     /// Staging file (owned, NUL-terminated for open(2)).
     staging: [:0]u8,
     fd: i32,
+    /// Bytes not saved to the swarm folder yet.
     dirty: bool,
+    /// Where the file goes in the swarm folder (owned). Resolved when it is
+    /// opened and kept here, not looked up in the inode table at save time:
+    /// names there detach when a listing changes, and unsaved bytes must
+    /// still have somewhere to go. A rename updates it.
+    path: []u8 = &.{},
+    /// A save is running (outside the lock); the next one waits for it.
+    saving: bool = false,
+    /// Removed or replaced while open: its bytes are not saved any more.
+    unlinked: bool = false,
     /// Set through setattr while open (cp -p, futimens): the file's
     /// modified time when committed, instead of the staging file's.
     mtime: ?u64 = null,
@@ -387,7 +403,12 @@ pub const Mount = struct {
         self.pool.threads.deinit(self.allocator);
         if (self.fd >= 0) _ = linux.close(self.fd);
         var hit = self.handles.iterator();
-        while (hit.next()) |entry| self.dropHandle(entry.key_ptr.*, entry.value_ptr.*);
+        while (hit.next()) |entry| {
+            const h = entry.value_ptr.*;
+            // Still open when the mount went away: nobody can save it now.
+            if (h.dirty and !h.unlinked) std.debug.print("fuse: LOST {s}: still open and unsaved when the mount stopped\n", .{h.path});
+            self.dropHandle(entry.key_ptr.*, h);
+        }
         self.handles.deinit(self.allocator);
         self.writing.deinit(self.allocator);
         self.table.deinit();
@@ -532,7 +553,8 @@ pub const Mount = struct {
             .statfs => try self.replyStruct(header, StatfsOut{}),
             .access => try self.opAccess(header, body),
             .release => try self.opRelease(header, body),
-            .releasedir, .flush, .fsync => try self.replyEmpty(header),
+            .releasedir => try self.replyEmpty(header),
+            .flush, .fsync => try self.opFlush(header, body),
             .create => try self.opCreate(header, body),
             .write => try self.opWrite(header, body),
             .setattr => try self.opSetattr(header, body),
@@ -717,9 +739,9 @@ pub const Mount = struct {
         return self.handles.getPtr(self.writing.get(ino) orelse return null);
     }
 
-    /// A staging file and handle for `path`; when `copy_from` is set its
-    /// current bytes are copied in first.
-    fn newHandle(self: *Mount, ino: u64, copy_from: ?Inode) !u64 {
+    /// A staging file and handle for the swarm file at `path`; when
+    /// `copy_from` is set its current bytes are copied in first.
+    fn newHandle(self: *Mount, ino: u64, path: []const u8, copy_from: ?Inode) !u64 {
         const folder = self.swarm orelse return error.ReadOnly;
         {
             self.lock.lock();
@@ -738,8 +760,17 @@ pub const Mount = struct {
         };
         const staging = try std.fmt.allocPrintSentinel(self.allocator, "{s}/{d}.part", .{ dir, fh }, 0);
         errdefer self.allocator.free(staging);
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
         const rc = linux.open(staging.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
-        if (linux.errno(rc) != .SUCCESS) return error.InputOutput;
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            // Named, so the writer and the log say what ran out.
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOSPC, .DQUOT => return error.NoSpaceLeft,
+            else => return error.InputOutput,
+        }
         const fd: i32 = @intCast(rc);
         errdefer {
             _ = linux.close(fd);
@@ -763,7 +794,7 @@ pub const Mount = struct {
         if (self.writing.contains(ino)) return error.DeviceOrResourceBusy;
         try self.handles.ensureUnusedCapacity(self.allocator, 1);
         try self.writing.ensureUnusedCapacity(self.allocator, 1);
-        self.handles.putAssumeCapacity(fh, .{ .ino = ino, .staging = staging, .fd = fd, .dirty = copy_from == null });
+        self.handles.putAssumeCapacity(fh, .{ .ino = ino, .staging = staging, .fd = fd, .dirty = copy_from == null, .path = owned_path });
         self.writing.putAssumeCapacity(ino, fh);
         self.table.pin(ino);
         return fh;
@@ -783,10 +814,18 @@ pub const Mount = struct {
             self.table.unpin(h.ino);
         }
         self.allocator.free(h.staging);
+        self.allocator.free(h.path);
     }
 
     pub fn openForWrite(self: *Mount, ino: u64, node: Inode, truncate: bool) !u64 {
-        const fh = try self.newHandle(ino, if (truncate) null else node);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const path = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            break :blk try self.swarmPath(arena.allocator(), ino);
+        };
+        const fh = try self.newHandle(ino, path, if (truncate) null else node);
         if (truncate) {
             self.lock.lock();
             defer self.lock.unlock();
@@ -795,42 +834,90 @@ pub const Mount = struct {
         return fh;
     }
 
-    /// Adds a handle's bytes to the swarm folder (when changed).
-    fn commit(self: *Mount, h: *Handle) !void {
-        if (!h.dirty) return;
+    /// Saves a handle's unsaved bytes to the swarm folder, at the path the
+    /// handle keeps. Runs for FLUSH and FSYNC (the writer waits and gets the
+    /// error) and again for RELEASE (whatever is still unsaved). One save
+    /// per handle at a time; bytes written while it runs stay unsaved for
+    /// the next one. On error the bytes stay unsaved.
+    fn save(self: *Mount, fh: u64) !void {
         const folder = self.swarm orelse return error.ReadOnly;
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const path = blk: {
-            self.lock.lock();
-            defer self.lock.unlock();
-            break :blk self.swarmPath(arena.allocator(), h.ino) catch |err| {
-                if (err == error.Detached) {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const Snapshot = struct { ino: u64, path: []const u8, staging: [:0]const u8, mtime: ?u64 };
+        const snap: Snapshot = while (true) {
+            {
+                self.lock.lock();
+                defer self.lock.unlock();
+                const h = self.handles.getPtr(fh) orelse return;
+                if (!h.saving) {
+                    if (!h.dirty) return;
+                    if (h.unlinked) {
+                        h.dirty = false;
+                        return;
+                    }
+                    const path = try arena.dupe(u8, h.path);
+                    h.saving = true;
                     h.dirty = false;
-                    return;
+                    // The staging name lives as long as the handle, and the
+                    // handle is only dropped by RELEASE after its own save.
+                    break .{ .ino = h.ino, .path = path, .staging = h.staging, .mtime = h.mtime };
                 }
-                return err;
-            };
+            }
+            sync.sleep(std.time.ns_per_ms);
         };
-        const slash = std.mem.lastIndexOfScalar(u8, path, '/');
-        const dir = if (slash) |sl| path[0..sl] else "";
-        const name = path[if (slash) |sl| sl + 1 else 0..];
-        h.dirty = false;
-        folder.addFileAt(dir, name, h.staging, h.mtime) catch |err| {
-            h.dirty = true;
-            return err;
-        };
-        if (folder.fileInfo(path)) |info| {
+
+        const at = swarm_mod.SwarmFolder.splitParent(snap.path);
+        const result = folder.addFileAt(at.dir, at.name, snap.staging, snap.mtime);
+        const info = if (result) |_| folder.fileInfo(snap.path) else |_| null;
+        // A time set while the save ran (touch right after close) is not in
+        // what was saved: apply it now the file is in.
+        const late_mtime: ?u64 = blk: {
             self.lock.lock();
             defer self.lock.unlock();
-            if (self.table.map.getPtr(h.ino)) |e| {
-                const node = &e.data;
-                node.cid = info.cid;
-                node.size = info.size;
-                node.mtime = info.mtime;
-                node.author = info.author;
+            const h = self.handles.getPtr(fh) orelse break :blk null;
+            h.saving = false;
+            if (result) |_| {} else |_| {
+                h.dirty = true;
+                break :blk null;
             }
-        }
+            const late = if (h.mtime) |m| (if (snap.mtime == null or snap.mtime.? != m) m else null) else null;
+            if (!h.dirty) if (info) |i| if (self.table.map.getPtr(snap.ino)) |e| {
+                const node = &e.data;
+                node.cid = i.cid;
+                node.size = i.size;
+                node.mtime = late orelse i.mtime;
+                node.author = i.author;
+            };
+            break :blk late;
+        };
+        try result;
+        if (late_mtime) |m| folder.setMtime(snap.path, m) catch |err|
+            std.debug.print("fuse: setting the time of {s} failed: {any}\n", .{ snap.path, err });
+    }
+
+    /// The path a handle saves to, for the log (allocated in `arena`).
+    fn handlePath(self: *Mount, arena: std.mem.Allocator, fh: u64) []const u8 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const h = self.handles.getPtr(fh) orelse return "?";
+        return arena.dupe(u8, h.path) catch "?";
+    }
+
+    /// FLUSH (every close of the file) and FSYNC: the bytes are saved to the
+    /// swarm folder before the reply, so close() and fsync() fail when the
+    /// save does. The kernel sends RELEASE only after close() has returned,
+    /// too late to tell anyone.
+    fn opFlush(self: *Mount, header: *const InHeader, body: []const u8) !void {
+        // Both requests start with the file handle.
+        const fh = readStruct(u64, body) orelse return self.replyEmpty(header);
+        self.save(fh) catch |err| {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            std.debug.print("fuse: saving {s} failed: {any} (the writer gets the error)\n", .{ self.handlePath(arena.allocator(), fh), err });
+            return self.replyError(header, errnoFor(err));
+        };
+        try self.replyEmpty(header);
     }
 
     fn opCreate(self: *Mount, header: *const InHeader, body: []const u8) !void {
@@ -838,23 +925,24 @@ pub const Mount = struct {
         const name = std.mem.sliceTo(body[@sizeOf(CreateIn)..], 0);
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
-        {
+        const path = blk: {
             self.lock.lock();
             defer self.lock.unlock();
-            _ = self.swarmChildPath(arena_state.allocator(), header.nodeid, name) catch |err| return self.replyError(header, errnoFor(err));
-        }
+            break :blk self.swarmChildPath(arena_state.allocator(), header.nodeid, name) catch |err| return self.replyError(header, errnoFor(err));
+        };
 
         const swarm = self.swarm orelse return self.replyError(header, .ROFS);
-        const ino = try self.upsert(header.nodeid, name, .{
+        const ino = self.upsert(header.nodeid, name, .{
             .kind = .swarm_file,
             .size = 0,
             .mtime = nowSeconds(),
             .author = swarm.self_id.bytes,
-        });
-        const fh = self.newHandle(ino, null) catch |err| {
+        }) catch |err| return self.replyError(header, errnoFor(err));
+        const fh = self.newHandle(ino, path, null) catch |err| {
             self.lock.lock();
             self.table.evictIfDead(ino);
             self.lock.unlock();
+            std.debug.print("fuse: creating {s} failed: {any}\n", .{ path, err });
             return self.replyError(header, errnoFor(err));
         };
         const node = self.inode(ino) orelse return self.replyError(header, .NOENT);
@@ -912,29 +1000,28 @@ pub const Mount = struct {
                 }
             } else {
                 // Truncate without an open file: stage, cut, add at once.
-                const f = self.newHandle(header.nodeid, if (in.size == 0) null else node) catch |err| return self.replyError(header, errnoFor(err));
-                var cut_failed = false;
-                var h_removed = blk: {
+                const f = self.openForWrite(header.nodeid, node, in.size == 0) catch |err| return self.replyError(header, errnoFor(err));
+                const cut_failed = blk: {
                     self.lock.lock();
                     defer self.lock.unlock();
                     const h = self.handles.getPtr(f) orelse return self.replyError(header, .BADF);
-                    if (linux.errno(linux.ftruncate(h.fd, @intCast(in.size))) != .SUCCESS) {
-                        cut_failed = true;
-                    } else {
-                        h.dirty = true;
-                    }
-                    break :blk self.handles.fetchRemove(f).?.value;
+                    if (linux.errno(linux.ftruncate(h.fd, @intCast(in.size))) != .SUCCESS) break :blk true;
+                    h.dirty = true;
+                    break :blk false;
+                };
+                const saved: anyerror!void = if (cut_failed) error.InputOutput else self.save(f);
+                const removed = blk: {
+                    self.lock.lock();
+                    defer self.lock.unlock();
+                    break :blk self.handles.fetchRemove(f);
                 };
                 // dropHandle takes the lock itself, so it runs after the
                 // block above has released it.
-                if (cut_failed) {
-                    self.dropHandle(f, h_removed);
-                    return self.replyError(header, .IO);
-                }
-                self.commit(&h_removed) catch |err| {
-                    std.debug.print("fuse: truncate inode {d} failed: {any}\n", .{ h_removed.ino, err });
+                if (removed) |kv| self.dropHandle(f, kv.value);
+                saved catch |err| {
+                    std.debug.print("fuse: truncate inode {d} failed: {any}\n", .{ header.nodeid, err });
+                    return self.replyError(header, errnoFor(err));
                 };
-                self.dropHandle(f, h_removed);
             }
         }
         if (in.valid & (FATTR_MTIME | FATTR_MTIME_NOW) != 0 and (node.kind == .swarm_file or node.kind == .swarm_dir)) {
@@ -948,71 +1035,66 @@ pub const Mount = struct {
     }
 
     /// A swarm file's or folder's modified time (touch -d, cp -p, rsync -t):
-    /// kept for the commit while the file is open for writing, else set in
-    /// the folder now (a new version, which spreads).
+    /// kept for the save while the file has unsaved bytes, else set in the
+    /// folder now (a new version, which spreads).
     fn setSwarmMtime(self: *Mount, ino: u64, in: SetattrIn, mtime: u64) !void {
         const folder = self.swarm orelse return error.ReadOnly;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
+        var is_dir = false;
         const path = blk: {
             self.lock.lock();
             defer self.lock.unlock();
-            if (self.table.map.getPtr(ino)) |e| e.data.mtime = mtime;
+            if (self.table.map.getPtr(ino)) |e| {
+                e.data.mtime = mtime;
+                is_dir = e.data.kind == .swarm_dir;
+            }
             const fh = if (in.valid & FATTR_FH != 0 and self.handles.contains(in.fh)) in.fh else self.writing.get(ino);
-            // Open for writing, or being committed (release): the commit
-            // (or release, right after it) applies it.
-            if (fh) |f| if (self.handles.getPtr(f)) |h| if (h.dirty) {
+            if (fh) |f| if (self.handles.getPtr(f)) |h| {
                 h.mtime = mtime;
-                return;
+                // Unsaved bytes, or a save under way: that save applies it
+                // (with the bytes, or right after them).
+                if (h.dirty or h.saving or h.unlinked) return;
+                break :blk try arena.allocator().dupe(u8, h.path);
             };
             break :blk try self.swarmPath(arena.allocator(), ino);
         };
         folder.setMtime(path, mtime) catch |err| switch (err) {
-            error.FileNotFound => {}, // a folder only implied by its files
+            // A folder only implied by its files has no time of its own. A
+            // file that isn't there is an error: its writer must hear it.
+            error.FileNotFound => if (!is_dir) return err,
             else => return err,
         };
-    }
-
-    /// Sets a committed swarm file's time in the folder.
-    fn applyMtime(self: *Mount, ino: u64, mtime: u64) !void {
-        const folder = self.swarm orelse return error.ReadOnly;
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const path = blk: {
-            self.lock.lock();
-            defer self.lock.unlock();
-            if (self.table.map.getPtr(ino)) |e| e.data.mtime = mtime;
-            break :blk try self.swarmPath(arena.allocator(), ino);
-        };
-        try folder.setMtime(path, mtime);
     }
 
     fn opRelease(self: *Mount, header: *const InHeader, body: []const u8) !void {
         const in = readStruct(ReleaseIn, body) orelse return self.replyEmpty(header);
         // The kernel sends RELEASE after close() has returned, so other
         // workers may already serve a fresh open, read or unlink of this
-        // file. The handle stays registered (reads use its staging copy)
-        // until the commit has stored the blocks and updated the inode;
-        // only then is it removed. No other request uses this fh any more.
-        var h = blk: {
+        // file. FLUSH saved the bytes already; what is still unsaved here
+        // (a flush that failed, or writes after the last flush) has nobody
+        // left to tell, so it is tried a few times and a failure is logged
+        // as a lost file. The handle stays registered (reads use its
+        // staging copy) until then. No other request uses this fh any more.
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            self.save(in.fh) catch |err| {
+                if (attempt < 3) {
+                    sync.sleep((attempt + 1) * 200 * std.time.ns_per_ms);
+                    continue;
+                }
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                std.debug.print("fuse: LOST {s}: saving it failed after close: {any}\n", .{ self.handlePath(arena.allocator(), in.fh), err });
+            };
+            break;
+        }
+        const removed = blk: {
             self.lock.lock();
             defer self.lock.unlock();
-            break :blk self.handles.get(in.fh) orelse return self.replyEmpty(header);
+            break :blk self.handles.fetchRemove(in.fh);
         };
-        self.commit(&h) catch |err| std.debug.print("fuse: saving inode {d} failed: {any}\n", .{ h.ino, err });
-        // A time set while the commit ran (touch right after close) went to
-        // the registered handle, not this copy: apply it now the file is in.
-        const late_mtime = blk: {
-            self.lock.lock();
-            defer self.lock.unlock();
-            const stored = self.handles.fetchRemove(in.fh) orelse break :blk null;
-            const m = stored.value.mtime orelse break :blk null;
-            if (h.mtime != null and h.mtime.? == m) break :blk null;
-            break :blk m;
-        };
-        if (late_mtime) |m| self.applyMtime(h.ino, m) catch |err|
-            std.debug.print("fuse: setting the time of inode {d} failed: {any}\n", .{ h.ino, err });
-        self.dropHandle(in.fh, h);
+        if (removed) |kv| self.dropHandle(in.fh, kv.value);
         try self.replyEmpty(header);
     }
 
@@ -1059,9 +1141,32 @@ pub const Mount = struct {
         {
             self.lock.lock();
             defer self.lock.unlock();
+            self.unlinkHandles(path);
             self.table.detach(header.nodeid, name);
         }
         try self.replyEmpty(header);
+    }
+
+    /// Caller holds the lock. A file removed or replaced while it is open
+    /// for writing is gone: what is written to it is no longer saved.
+    fn unlinkHandles(self: *Mount, path: []const u8) void {
+        var it = self.handles.valueIterator();
+        while (it.next()) |h| {
+            if (std.mem.eql(u8, h.path, path)) h.unlinked = true;
+        }
+    }
+
+    /// Caller holds the lock. Files open for writing at `from` or below it
+    /// save to their new place under `to`.
+    fn retargetHandles(self: *Mount, from: []const u8, to: []const u8) !void {
+        var it = self.handles.valueIterator();
+        while (it.next()) |h| {
+            if (h.unlinked) continue;
+            const rest = pathUnder(from, h.path) orelse continue;
+            const moved = if (rest.len == 0) try self.allocator.dupe(u8, to) else try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ to, rest });
+            self.allocator.free(h.path);
+            h.path = moved;
+        }
     }
 
     fn opRename(self: *Mount, header: *const InHeader, body: []const u8, v2: bool) !void {
@@ -1100,29 +1205,22 @@ pub const Mount = struct {
         };
 
         // A file still open for writing is saved before it moves.
-        const maybe_h_copy = blk: {
+        const open_fh = blk: {
             self.lock.lock();
             defer self.lock.unlock();
-            const moved_ino = self.table.find(header.nodeid, old_name);
-            if (moved_ino) |ino| {
-                if (self.writing.get(ino)) |fh| {
-                    if (self.handles.get(fh)) |h| {
-                        break :blk h;
-                    }
-                }
-            }
-            break :blk null;
+            const moved_ino = self.table.find(header.nodeid, old_name) orelse break :blk null;
+            break :blk self.writing.get(moved_ino);
         };
-        if (maybe_h_copy) |h_const| {
-            var h = h_const;
-            self.commit(&h) catch {};
-        }
+        if (open_fh) |fh| self.save(fh) catch |err| return self.replyError(header, errnoFor(err));
 
         const folder = self.swarm orelse return self.replyError(header, .ROFS);
         folder.move(from, to, .{ .replace = replace }) catch |err| return self.replyError(header, errnoFor(err));
         {
             self.lock.lock();
             defer self.lock.unlock();
+            // What was at the target is replaced; open files move along.
+            self.unlinkHandles(to);
+            try self.retargetHandles(from, to);
             try self.table.move(header.nodeid, old_name, newdir, new_name);
         }
         try self.replyEmpty(header);
@@ -1200,22 +1298,38 @@ pub const Mount = struct {
                     defer self.lock.unlock();
                     break :blk try self.swarmPath(arena, parent_ino);
                 };
-                const items = try folder.list(arena, path);
-                // Files still being written aren't in the manifest yet.
+                // Files still being written aren't in the manifest yet, nor
+                // are folders that so far only hold such files. Taken before
+                // the listing: a save that finishes in between leaves a file
+                // in both (the listing wins below), never in neither, which
+                // would tell the kernel the name is gone.
+                var open: std.ArrayList(Child) = .empty;
                 {
                     self.lock.lock();
                     defer self.lock.unlock();
                     var hit = self.handles.valueIterator();
                     while (hit.next()) |h| {
-                        const e = self.table.map.get(h.ino) orelse continue;
-                        if (e.parent != parent_ino) continue;
-                        const name = e.key[8..];
-                        const listed = for (items) |it| {
-                            if (std.mem.eql(u8, it.name, name)) break true;
+                        if (h.unlinked) continue;
+                        const rest = pathUnder(path, h.path) orelse continue;
+                        if (rest.len == 0) continue;
+                        const slash = std.mem.indexOfScalar(u8, rest, '/');
+                        const name = if (slash) |sl| rest[0..sl] else rest;
+                        const known = for (open.items) |o| {
+                            if (std.mem.eql(u8, o.name, name)) break true;
                         } else false;
-                        if (listed) continue;
-                        try out.append(arena, .{ .name = try arena.dupe(u8, name), .node = e.data });
+                        if (known) continue;
+                        const node: Inode = if (slash != null)
+                            .{ .kind = .swarm_dir, .mtime = self.mounted_at }
+                        else if (self.table.map.get(h.ino)) |e| e.data else continue;
+                        try open.append(arena, .{ .name = try arena.dupe(u8, name), .node = node });
                     }
+                }
+                const items = try folder.list(arena, path);
+                for (open.items) |o| {
+                    const listed = for (items) |it| {
+                        if (std.mem.eql(u8, it.name, o.name)) break true;
+                    } else false;
+                    if (!listed) try out.append(arena, o);
                 }
                 for (items) |it| {
                     try out.append(arena, .{ .name = it.name, .node = .{
@@ -1271,6 +1385,11 @@ pub const Mount = struct {
     fn upsert(self: *Mount, parent: u64, name: []const u8, node: Inode) !u64 {
         self.lock.lock();
         defer self.lock.unlock();
+        // A file open for writing knows its size and time; a listing taken
+        // a moment ago (before a save finished) must not put old ones back.
+        if (self.table.find(parent, name)) |ino| if (self.writing.contains(ino)) {
+            if (self.table.map.get(ino)) |e| if (sameInode(e.data, node)) return ino;
+        };
         return self.table.getOrCreate(parent, name, node, sameInode);
     }
 
@@ -1379,6 +1498,16 @@ fn synthIno(parent: u64, name: []const u8) u64 {
     return (@as(u64, 1) << 63) | (h.final() >> 1);
 }
 
+/// What follows `dir` in `path` ("" when they are the same; everything
+/// when `dir` is the top, ""), or null when `path` is not at or below it.
+fn pathUnder(dir: []const u8, path: []const u8) ?[]const u8 {
+    if (dir.len == 0) return path;
+    if (!std.mem.startsWith(u8, path, dir)) return null;
+    if (path.len == dir.len) return "";
+    if (path[dir.len] != '/') return null;
+    return path[dir.len + 1 ..];
+}
+
 fn readStruct(comptime T: type, body: []const u8) ?T {
     if (body.len < @sizeOf(T)) return null;
     var value: T = undefined;
@@ -1398,6 +1527,14 @@ fn errnoFor(err: anyerror) Errno {
         error.DirNotEmpty => .NOTEMPTY,
         error.PathAlreadyExists => .EXIST,
         error.PeerDown => .IO,
+        // The inode no longer names anything (its name went from a listing,
+        // or its folder did). ESTALE makes the kernel look the path up again
+        // and retry, instead of failing the caller with EIO.
+        error.Detached => .STALE,
+        error.OutOfMemory => .NOMEM,
+        error.ProcessFdQuotaExceeded => .MFILE,
+        error.SystemFdQuotaExceeded => .NFILE,
+        error.NoSpaceLeft => .NOSPC,
         else => .IO,
     };
 }
