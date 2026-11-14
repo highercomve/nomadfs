@@ -516,22 +516,24 @@ pub const Service = struct {
             if (err != error.NotFound) return err;
             self.encrypted = self.config.encrypt;
             self.key = self.seed_key orelse try backup.keys.generateKey();
-            const device_wrap = try backup.keys.wrapForDevice(self.key.?, self.device.public);
-            try self.put(try self.deviceWrapName(), &device_wrap);
             var entropy = if (self.seed_phrase) |words| try backup.recovery_words.decodePhrase(words) else try backup.keys.generateKey();
             defer std.crypto.secureZero(u8, &entropy);
             var buf: [backup.recovery_words.max_phrase_len]u8 = undefined;
             defer std.crypto.secureZero(u8, &buf);
             const phrase = backup.recovery_words.formatPhrase(entropy, &buf);
             const recovery = try backup.keys.wrapWithRecovery(self.allocator, self.key.?, phrase);
-            try self.put("keys/recovery.wrap", &recovery);
+            // Create-only: of two devices setting up the same empty bucket,
+            // the second stops here (LeaseLost) before writing anything.
+            try self.create("keys/recovery.wrap", &recovery);
+            const device_wrap = try backup.keys.wrapForDevice(self.key.?, self.device.public);
+            try self.put(try self.deviceWrapName(), &device_wrap);
             // Recovery words stay encrypted even in the explicitly clear backup mode.
             const saved_mode = self.encrypted;
             self.encrypted = true;
             const sealed_entropy = try self.seal(&entropy);
             self.encrypted = saved_mode;
-            try self.put("keys/recovery-entropy", sealed_entropy);
-            try self.put("nomadfs-backup.json", try self.json(Layout{ .encrypt = self.encrypted, .key_id = backup.keys.keyId(self.key.?) }));
+            try self.create("keys/recovery-entropy", sealed_entropy);
+            try self.create("nomadfs-backup.json", try self.json(Layout{ .encrypt = self.encrypted, .key_id = backup.keys.keyId(self.key.?) }));
             self.created_phrase = try self.a().dupe(u8, phrase);
             try self.loadHead();
             try self.loadIndex();
