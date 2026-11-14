@@ -193,11 +193,18 @@ pub fn sign(allocator: Allocator, credentials: Credentials, options: Options) Er
     const to_sign = try std.fmt.allocPrint(scratch, "AWS4-HMAC-SHA256\n{s}\n{s}\n{s}", .{
         options.timestamp, scope, request_hash,
     });
+    // The secret and every key derived from it are wiped on all exits: the
+    // arena frees without zeroing.
     const secret = try std.mem.concat(scratch, u8, &.{ "AWS4", credentials.secret_access_key });
-    const date_key = hmac(secret, options.timestamp[0..8]);
-    const region_key = hmac(&date_key, options.region);
-    const service_key = hmac(&region_key, "s3");
-    const signing_key = hmac(&service_key, "aws4_request");
+    defer std.crypto.secureZero(u8, secret);
+    var date_key = hmac(secret, options.timestamp[0..8]);
+    defer std.crypto.secureZero(u8, &date_key);
+    var region_key = hmac(&date_key, options.region);
+    defer std.crypto.secureZero(u8, &region_key);
+    var service_key = hmac(&region_key, "s3");
+    defer std.crypto.secureZero(u8, &service_key);
+    var signing_key = hmac(&service_key, "aws4_request");
+    defer std.crypto.secureZero(u8, &signing_key);
     const signature = std.fmt.bytesToHex(hmac(&signing_key, to_sign), .lower);
     return std.fmt.allocPrint(allocator, "AWS4-HMAC-SHA256 Credential={s}/{s},SignedHeaders={s},Signature={s}", .{
         credentials.access_key_id, scope, request.names, signature,
