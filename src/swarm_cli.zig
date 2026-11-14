@@ -88,7 +88,7 @@ pub fn request(arena: std.mem.Allocator, ep: Endpoint, method: []const u8, path:
 
 /// `request` with a query: `query` is what follows the `?`, its values
 /// already encoded (`writeEncoded`); "" for none.
-fn send(arena: std.mem.Allocator, ep: Endpoint, method: []const u8, path: []const u8, query: []const u8, headers: []const [2][]const u8, body: []const u8) !Response {
+pub fn send(arena: std.mem.Allocator, ep: Endpoint, method: []const u8, path: []const u8, query: []const u8, headers: []const [2][]const u8, body: []const u8) !Response {
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", ep.port);
     const stream = compat.tcpConnectToAddress(.{ .ip = addr }) catch return error.NodeNotRunning;
     defer stream.close();
@@ -119,7 +119,7 @@ fn send(arena: std.mem.Allocator, ep: Endpoint, method: []const u8, path: []cons
 }
 
 /// A path's segments percent-encoded (anything but unreserved bytes).
-fn writeEncoded(w: *std.Io.Writer, path: []const u8) !void {
+pub fn writeEncoded(w: *std.Io.Writer, path: []const u8) !void {
     for (path) |c| switch (c) {
         'a'...'z', 'A'...'Z', '0'...'9', '-', '.', '_', '~', '/' => try w.writeByte(c),
         else => try w.print("%{X:0>2}", .{c}),

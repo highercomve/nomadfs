@@ -21,7 +21,9 @@ fn isCold(class: ?[]const u8) bool {
     const text = class orelse return false;
     return std.mem.eql(u8, text, "GLACIER") or std.mem.eql(u8, text, "DEEP_ARCHIVE");
 }
-const Fake = struct {
+/// A bucket in memory, behind the S3 client's transport. Not for two
+/// threads at once.
+pub const Fake = struct {
     objects: std.StringHashMapUnmanaged(Object) = .empty,
     version: u64 = 0,
     pack_puts: usize = 0,
@@ -64,7 +66,7 @@ const Fake = struct {
         const ds = epoch.getDaySeconds();
         return std.fmt.bufPrint(out, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z", .{ yd.year, md.month.numeric(), @as(u8, md.day_index) + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute() }) catch unreachable;
     }
-    fn deinit(self: *Fake) void {
+    pub fn deinit(self: *Fake) void {
         var it = self.objects.iterator();
         while (it.next()) |entry| {
             a.free(entry.key_ptr.*);
@@ -77,7 +79,7 @@ const Fake = struct {
         const self: *Fake = @ptrCast(@alignCast(ctx.?));
         return self.time;
     }
-    fn transport(self: *Fake) s3.Transport {
+    pub fn transport(self: *Fake) s3.Transport {
         return .{ .context = self, .send = send, .sleep = sleep };
     }
     fn sleep(ctx: *anyopaque, ms: u64) s3.transport.Error!void {

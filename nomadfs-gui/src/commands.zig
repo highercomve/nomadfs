@@ -848,6 +848,92 @@ pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
     };
 }
 
+/// One offsite target for the settings page. Times are Unix seconds.
+pub const OffsiteTarget = struct {
+    name: []const u8,
+    storage_class: []const u8,
+    /// "daily", "weekly" or "monthly".
+    schedule: []const u8,
+    /// A GLACIER or DEEP_ARCHIVE target.
+    cold: bool,
+    uploading: bool,
+    /// Why this device doesn't upload to it; "" when it does.
+    not_uploading: []const u8,
+    running: bool,
+    requested: bool,
+    /// The last upload since the node started (0, "": none yet).
+    last_upload: u64,
+    snapshot: []const u8,
+    uploaded_blocks: u64,
+    uploaded_bytes: u64,
+    /// Files that upload left out: their blocks were not all here.
+    waiting_files: u64,
+    /// The error the last look at the target ended with; "" for none.
+    failure: []const u8,
+    /// Packs waiting for their minimum storage time to end, and when the
+    /// first and the last may be removed.
+    deferred_packs: u64,
+    deferred_first: u64,
+    deferred_last: u64,
+};
+
+pub const OffsiteInfo = struct {
+    supported: bool = true,
+    /// The node runs here: the targets carry how its uploads go.
+    running: bool = false,
+    swarm_backup: bool = false,
+    deep_backup: bool = false,
+    /// Deep backup is on and no target is an archive.
+    archive_missing: bool = false,
+    targets: []OffsiteTarget = &.{},
+};
+
+/// `offsite_status { config_path }`: the offsite (S3) backup targets and
+/// how their uploads go, from the running node's uploader, else from the
+/// configuration. What `nomadfs backup` and the local API's `backup`
+/// answer from (backup/service.zig); no bucket is asked.
+pub fn offsiteStatus(gpa: std.mem.Allocator, args: ListArgs) !OffsiteInfo {
+    if (!backup_supported) return .{ .supported = false };
+    const service = nomadfs.backup_service;
+    var running = true;
+    var all: service.Overview = live: {
+        {
+            g_mutex.lock();
+            defer g_mutex.unlock();
+            if (runningNode()) |node| break :live node.backupOverview(gpa) catch |err| switch (err) {
+                error.BackupNotConfigured => return .{ .running = true, .swarm_backup = node.swarm_backup.load(.acquire), .deep_backup = node.deepBackup() },
+                else => return err,
+            };
+        }
+        running = false;
+        var config = config_mod.parseConfig(gpa, args.config_path) catch return error.ConfigInvalid;
+        defer config.deinit(gpa);
+        break :live try service.overviewOf(gpa, config.backup_targets, .{ .swarm_backup = config.storage.swarm_backup, .deep_backup = config.storage.deep_backup });
+    };
+    defer service.deinitOverview(gpa, &all);
+    const targets = try gpa.alloc(OffsiteTarget, all.targets.len);
+    for (all.targets, targets) |t, *out| out.* = .{
+        .name = try gpa.dupe(u8, t.name),
+        .storage_class = @tagName(t.storage_class),
+        .schedule = @tagName(t.schedule),
+        .cold = t.cold,
+        .uploading = t.gate == .uploading,
+        .not_uploading = t.not_uploading,
+        .running = t.running,
+        .requested = t.requested,
+        .last_upload = t.last_upload,
+        .snapshot = try gpa.dupe(u8, t.snapshot),
+        .uploaded_blocks = t.uploaded_blocks,
+        .uploaded_bytes = t.uploaded_bytes,
+        .waiting_files = t.waiting_files,
+        .failure = t.failure orelse "",
+        .deferred_packs = t.deferred_packs,
+        .deferred_first = t.deferred_first,
+        .deferred_last = t.deferred_last,
+    };
+    return .{ .running = running, .swarm_backup = all.swarm_backup, .deep_backup = all.deep_backup, .archive_missing = all.archive_missing, .targets = targets };
+}
+
 /// `swarm_backup_set { config_path, on }`: saved in the config
 /// (`swarm_backup`), and applied to the running node at once.
 pub fn swarmBackupSet(gpa: std.mem.Allocator, args: BackupArgs) !BackupInfo {

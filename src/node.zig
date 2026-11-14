@@ -20,6 +20,7 @@ comptime {
 }
 const cluster = @import("cluster/mod.zig");
 const offsite_worker = @import("cluster/offsite_worker.zig");
+const backup_service = @import("backup/service.zig");
 const sync = @import("sync.zig");
 const node_info = @import("node_info.zig");
 const version = node_info.version;
@@ -449,6 +450,9 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        // The local API's backup requests work on the uploader: none is
+        // left when this returns.
+        if (self.swarm_api) |api| api.setBackup(null);
         if (self.offsite) |worker| worker.destroy();
         self.offsite = null;
         self.stopCacheThread();
@@ -852,6 +856,13 @@ pub const Node = struct {
         return if (self.offsite) |worker| worker.archiveStatus() else null;
     }
 
+    /// Every offsite target and how its uploads go, as the local API's
+    /// `backup` lists them (backup/service.zig `overview`); the caller
+    /// frees it with `backup_service.deinitOverview`.
+    pub fn backupOverview(self: *Node, allocator: std.mem.Allocator) !backup_service.Overview {
+        return backup_service.overview(allocator, self.offsite orelse return error.BackupNotConfigured);
+    }
+
     pub fn runOffsite(self: *Node) !void {
         const worker = self.offsite orelse return error.BackupNotConfigured;
         try worker.round(true);
@@ -874,6 +885,7 @@ pub const Node = struct {
                 host.setRoles(self.backupRoles());
                 try host.start();
                 self.offsite = host;
+                if (self.swarm_api) |api| api.setBackup(host);
             };
         }
         if (self.store != null and self.cache_thread == null) {

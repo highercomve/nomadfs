@@ -14,6 +14,11 @@
 //!   GET    /<token>/v1/photos          a page of its items
 //!   GET    /<token>/v1/thumb/<path>    a small JPEG of the picture at <path>
 //!   GET    /<token>/v1/content/<cid>   a file's bytes by content ID, with Range
+//!   GET    /<token>/v1/backup                          the offsite targets and how their uploads go
+//!   GET    /<token>/v1/backup/<target>                 one target's bucket: snapshots, blocks, packs to remove
+//!   POST   /<token>/v1/backup/<target>/run             upload now: 202 {"name", "manual_runs"}
+//!   POST   /<token>/v1/backup/<target>/forget?path=    purge a path from the backup: 204
+//!   GET    /<token>/v1/backup/<target>/history[?path=] every file version the backup holds
 //!
 //! The photos timeline (fs/photos.zig) is every picture and film in the
 //! folder, newest first. Both requests take `folder=` (only below it),
@@ -35,6 +40,22 @@
 //! gets the URL as an argument, which other accounts can read from the
 //! process list, so that URL is under a second token that opens `content`
 //! and nothing else.
+//!
+//! The backup routes are `nomadfs backup` (backup_cli.zig) on a device
+//! whose node runs: the operations of backup/service.zig on the node's
+//! uploader (cluster/offsite_worker.zig) and its live swarm folder.
+//! `<target>` is a `[backup.<target>]` section (`s3`: the first). The list
+//! asks no bucket: per target its `gate` (and `not_uploading`, the reason
+//! in words), `running`, `requested`, `manual_runs`, the last upload
+//! (`last_upload`, `snapshot`, `uploaded_blocks`, `uploaded_bytes`,
+//! `waiting_files`, `new_key`), `failure` and the `deferred_packs` that
+//! upload found. One target's status, its history and a purge ask the
+//! bucket and take as long as it answers. `run` only starts the upload: it
+//! is over, well or with a `failure`, once the list's `manual_runs` passed
+//! the number `run` answered. 404 `BackupNotConfigured` when this node
+//! uploads nowhere, 404 `UnknownBackupTarget`, 409 `DeepBackupOff` (an
+//! archive target on a device without deep backup), 409 `LeaseHeld` (an
+//! upload holds the bucket: purge after it).
 //!
 //! A PUT with `If-Match: "<etag>"` writes only while the file is still that
 //! version, and with `If-None-Match: *` only while nothing is there (412
@@ -59,6 +80,8 @@ const thumbs_mod = @import("fs/thumbs.zig");
 const media = @import("fs/media.zig");
 const http = @import("webdav/http.zig");
 const peer = @import("webdav/peer.zig");
+const backup = @import("backup/service.zig");
+const offsite_worker = @import("cluster/offsite_worker.zig");
 
 const SwarmFolder = swarm_mod.SwarmFolder;
 const Conn = http.Conn;
@@ -75,6 +98,28 @@ const max_list = 10_000;
 const thumb_deadline_ms = 20_000;
 /// How much of a file `content` reads and sends at a time.
 const content_chunk = 256 * 1024;
+
+/// What `GET backup/<target>` answers: the bucket's committed state, and
+/// whether this device uploads to it.
+pub const BackupStatus = struct {
+    storage_class: backup.StorageClass,
+    schedule: backup.Schedule,
+    indexed_blocks: usize,
+    snapshots: []const []const u8,
+    /// Packs a purge left behind until their minimum storage time ends,
+    /// and when the first and the last may go (Unix seconds).
+    deferred_packs: usize,
+    deferred_first: u64,
+    deferred_last: u64,
+    gate: backup.Gate,
+    /// Deep backup is on and no target is cold.
+    archive_missing: bool,
+};
+/// One item of `GET backup/<target>/history`. `cid`: 64 hex digits.
+pub const BackupVersion = struct { path: []const u8, cid: []const u8, size: u64, mtime: u64, first_seen: u64, last_seen: u64 };
+/// What `POST backup/<target>/run` answers: the target as the list names
+/// it, and its `manual_runs` at that moment.
+pub const BackupRun = struct { name: []const u8, manual_runs: u64 };
 
 /// What `api.json` holds.
 pub const Info = struct {
@@ -98,6 +143,17 @@ pub const Server = struct {
     token: [64]u8 = undefined,
     /// Opens `content` only: the token in the URL ffmpeg is given.
     content_token: [64]u8 = undefined,
+    /// The node's offsite uploader, while it has one (`setBackup`), and
+    /// the requests using it now.
+    backup: struct {
+        mutex: sync.Mutex = .{},
+        idle: sync.Condition = .{},
+        worker: ?*offsite_worker.Worker = null,
+        users: usize = 0,
+        /// False once the uploader is being taken away: a request talking
+        /// to a bucket ends.
+        open: std.atomic.Value(bool) = .init(false),
+    } = .{},
     port: u16 = 0,
     listener: ?compat.Server = null,
     running: std.atomic.Value(bool) = .init(false),
@@ -162,6 +218,32 @@ pub const Server = struct {
         std.crypto.secureZero(u8, &self.token);
         std.crypto.secureZero(u8, &self.content_token);
         self.allocator.destroy(self);
+    }
+
+    /// The uploader the backup routes work on; null takes it away, and
+    /// returns once no request uses it (before the node destroys it).
+    pub fn setBackup(self: *Server, worker: ?*offsite_worker.Worker) void {
+        self.backup.open.store(worker != null, .release);
+        self.backup.mutex.lock();
+        defer self.backup.mutex.unlock();
+        while (self.backup.users > 0) self.backup.idle.wait(&self.backup.mutex);
+        self.backup.worker = worker;
+    }
+
+    fn holdBackup(self: *Server) ?*offsite_worker.Worker {
+        self.backup.mutex.lock();
+        defer self.backup.mutex.unlock();
+        if (!self.backup.open.load(.acquire)) return null;
+        const worker = self.backup.worker orelse return null;
+        self.backup.users += 1;
+        return worker;
+    }
+
+    fn releaseBackup(self: *Server) void {
+        self.backup.mutex.lock();
+        defer self.backup.mutex.unlock();
+        self.backup.users -= 1;
+        self.backup.idle.broadcast();
     }
 
     /// `http://127.0.0.1:<port>/<token>/v1/` into `buf`.
@@ -306,6 +388,7 @@ pub const Server = struct {
             if (rest.len == 1 and eql(rest[0], "index")) return self.photosIndex(arena, conn, &req);
         }
         if (std.mem.eql(u8, what, "thumb") and rest.len > 0 and eql(method, "GET")) return self.thumb(arena, conn, try joinPath(arena, rest));
+        if (std.mem.eql(u8, what, "backup")) return self.backupRoute(arena, conn, &req, rest);
         if (std.mem.eql(u8, what, "files") and rest.len > 0) {
             const path = try joinPath(arena, rest);
             if (eql(method, "GET")) return self.get(arena, conn, path);
@@ -314,6 +397,60 @@ pub const Server = struct {
             return conn.respond(405, "Method Not Allowed", &close, "");
         }
         return conn.respond(404, "Not Found", &close, "");
+    }
+
+    /// The backup routes: which operation of backup/service.zig a request
+    /// means, and its answer as JSON.
+    fn backupRoute(self: *Server, arena: std.mem.Allocator, conn: *Conn, req: *const Request, rest: []const []const u8) !void {
+        const read = eql(req.method, "GET");
+        if (!read and !eql(req.method, "POST")) return conn.respond(405, "Method Not Allowed", &close, "");
+        // Null: the list, of no one target.
+        const action: ?backup.Action = if (rest.len == 0 and read)
+            null
+        else if (rest.len == 1 and read)
+            .status
+        else if (rest.len == 2 and read and eql(rest[1], "history"))
+            .history
+        else if (rest.len == 2 and !read and eql(rest[1], "run"))
+            .run
+        else if (rest.len == 2 and !read and eql(rest[1], "forget"))
+            .forget
+        else
+            return conn.respond(404, "Not Found", &close, "");
+        const worker = self.holdBackup() orelse return answerBackupError(conn, error.BackupNotConfigured);
+        defer self.releaseBackup();
+        const wanted = action orelse {
+            const all = try backup.overview(arena, worker);
+            return conn.respond(200, "OK", &json_close, try std.json.Stringify.valueAlloc(arena, all, .{}));
+        };
+        const path = req.param(arena, "path") catch return conn.respond(400, "Bad Request", &close, "");
+        const result = backup.executeLive(arena, self.io, worker, .{ .action = wanted, .target = rest[0], .path = path }, &self.backup.open) catch |err| return answerBackupError(conn, err);
+        switch (wanted) {
+            .run => return conn.respond(202, "Accepted", &json_close, try std.json.Stringify.valueAlloc(arena, BackupRun{ .name = result.started.?.name, .manual_runs = result.started.?.manual_runs }, .{})),
+            .forget => return conn.respond(204, "No Content", &close, ""),
+            .history => {
+                const versions = result.history.?;
+                const out = try arena.alloc(BackupVersion, versions.len);
+                for (versions, out) |*v, *o| o.* = .{ .path = v.path, .cid = &v.cid, .size = v.size, .mtime = v.mtime, .first_seen = v.first_seen, .last_seen = v.last_seen };
+                return conn.respond(200, "OK", &json_close, try std.json.Stringify.valueAlloc(arena, out, .{}));
+            },
+            .status => {
+                const s = result.status.?;
+                const body = try std.json.Stringify.valueAlloc(arena, BackupStatus{
+                    .storage_class = s.storage_class,
+                    .schedule = s.schedule,
+                    .indexed_blocks = s.indexed_blocks,
+                    .snapshots = s.snapshots,
+                    .deferred_packs = s.deferred_packs,
+                    .deferred_first = s.deferred_first,
+                    .deferred_last = s.deferred_last,
+                    .gate = result.gate,
+                    .archive_missing = result.archive_missing,
+                }, .{});
+                return conn.respond(200, "OK", &json_close, body);
+            },
+            else => unreachable,
+        }
     }
 
     fn status(self: *Server, arena: std.mem.Allocator, conn: *Conn) !void {
@@ -552,6 +689,18 @@ fn answerError(conn: *Conn, err: anyerror) !void {
     return conn.respond(code, text, &.{ .{ "Connection", "close" }, .{ "X-NomadFS-Error", @errorName(err) } }, "");
 }
 
+/// A backup operation's error as the API's answer.
+fn answerBackupError(conn: *Conn, err: anyerror) !void {
+    const code: u16, const text: []const u8 = switch (err) {
+        error.BackupNotConfigured, error.UnknownBackupTarget => .{ 404, "Not Found" },
+        error.InvalidPath, error.PathRequired => .{ 400, "Bad Request" },
+        error.DeepBackupOff, error.LeaseHeld, error.Locked, error.BucketVersioningEnabled => .{ 409, "Conflict" },
+        error.Cancelled => .{ 503, "Unavailable" },
+        else => .{ 500, "Internal Server Error" },
+    };
+    return conn.respond(code, text, &.{ .{ "Connection", "close" }, .{ "X-NomadFS-Error", @errorName(err) } }, "");
+}
+
 const TestFolder = @import("fs/test_fixture.zig").Fixture(SwarmFolder);
 
 /// One GET of `target` (after `/<token>/v1/`) on a test server: the status
@@ -565,11 +714,16 @@ const TestAnswer = struct { code: u16, head: []const u8, body: []const u8 };
 /// `testGet` under `token`, with `headers` (whole lines, each ending in
 /// CRLF) added to the request.
 fn testGetWith(arena: std.mem.Allocator, server: *Server, token: []const u8, target: []const u8, headers: []const u8) !TestAnswer {
+    return testSend(arena, server, "GET", token, target, headers);
+}
+
+/// One request with no body.
+fn testSend(arena: std.mem.Allocator, server: *Server, method: []const u8, token: []const u8, target: []const u8, headers: []const u8) !TestAnswer {
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", server.port);
     const stream = try compat.tcpConnectToAddress(.{ .ip = addr });
     defer stream.close();
     try stream.setTimeout(10_000);
-    try stream.writeAll(try std.fmt.allocPrint(arena, "GET /{s}/v1/{s} HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}Connection: close\r\n\r\n", .{ token, target, headers }));
+    try stream.writeAll(try std.fmt.allocPrint(arena, "{s} /{s}/v1/{s} HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}Content-Length: 0\r\nConnection: close\r\n\r\n", .{ method, token, target, headers }));
     var raw: std.ArrayList(u8) = .empty;
     var buf: [4096]u8 = undefined;
     while (raw.items.len < 8 << 20) {
@@ -788,6 +942,142 @@ test "swarm api: ffmpeg takes a film's frame through the content endpoint" {
     try testing.expectEqual(@as(u32, 320), dims.width);
     try testing.expectEqual(@as(u32, 180), dims.height);
     try testing.expectEqual(@as(u64, 1), thumbs.generated.load(.monotonic));
+}
+
+/// The list's state of target `name`, once its runs by hand passed `after`.
+fn testBackupRun(arena: std.mem.Allocator, server: *Server, name: []const u8, after: u64) !backup.TargetState {
+    var tries: usize = 0;
+    while (tries < 600) : (tries += 1) {
+        const all = try std.json.parseFromSliceLeaky(backup.Overview, arena, (try testGet(arena, server, "backup")).body, .{});
+        for (all.targets) |t| if (eql(t.name, name) and t.manual_runs > after) return t;
+        sync.sleep(50 * std.time.ns_per_ms);
+    }
+    return error.RunNeverEnded;
+}
+
+test "swarm api: backup lists the targets, runs one, and a purge names the versions of the live folder" {
+    const testing = std.testing;
+    const device = @import("device/mod.zig");
+    var t: TestFolder = undefined;
+    try t.open(0x65, "Desk");
+    defer t.close();
+    _ = try t.folder.putBytes("keep.txt", "keep", null);
+    _ = try t.folder.putBytes("Photos/old.jpg", "old", null);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The node's uploader on a bucket in memory: two targets, the second
+    // an archive this device (swarm backup only) doesn't upload to.
+    var fake: @import("cluster/offsite_test.zig").Fake = .{};
+    defer fake.deinit();
+    const credentials = try std.fs.path.join(arena, &.{ t.dir, "credentials" });
+    {
+        const f = try t.tmp.dir.createFile(testing.io, "credentials", .{ .permissions = .fromMode(0o600) });
+        defer f.close(testing.io);
+        try f.writeStreamingAll(testing.io, "access_key_id = id\nsecret_access_key = secret\n");
+    }
+    var trust = try device.trust.Store.load(testing.allocator, try std.fs.path.join(arena, &.{ t.dir, "trusted" }), null);
+    defer trust.deinit();
+    var source: @import("fs/offsite.zig").Source = .{ .folder = t.folder, .store = &t.store };
+    const worker = try offsite_worker.Worker.create(testing.allocator, &.{
+        .{ .name = "main", .endpoint = "https://endpoint", .bucket = "bucket", .credentials = credentials, .prefix = "swarm", .pack_mb = 1 },
+        .{ .name = "archive", .endpoint = "https://endpoint", .bucket = "bucket", .credentials = credentials, .prefix = "cold", .pack_mb = 1, .storage_class = .DEEP_ARCHIVE },
+    }, try device.identity.Identity.fromSeed([_]u8{5} ** 32), &trust, source.source(), &t.store);
+    defer worker.destroy();
+    worker.transport = fake.transport();
+    worker.setRoles(.{ .swarm_backup = true });
+
+    const server = try Server.start(testing.allocator, t.folder, null, null, t.dir);
+    defer server.stop();
+    // A node that uploads nowhere.
+    const none = try testGet(arena, server, "backup");
+    try testing.expectEqual(@as(u16, 404), none.code);
+    try testing.expect(std.mem.indexOf(u8, none.head, "X-NomadFS-Error: BackupNotConfigured") != null);
+    server.setBackup(worker);
+    defer server.setBackup(null);
+    try worker.start();
+
+    // The list: every target, why one doesn't upload, nothing run yet.
+    const listed = try testGet(arena, server, "backup");
+    try testing.expectEqual(@as(u16, 200), listed.code);
+    const all = try std.json.parseFromSliceLeaky(backup.Overview, arena, listed.body, .{});
+    try testing.expect(all.swarm_backup and !all.deep_backup and !all.archive_missing);
+    try testing.expectEqual(@as(usize, 2), all.targets.len);
+    try testing.expectEqualStrings("main", all.targets[0].name);
+    try testing.expectEqual(backup.Gate.uploading, all.targets[0].gate);
+    try testing.expectEqualStrings("", all.targets[0].not_uploading);
+    try testing.expectEqual(@as(u64, 0), all.targets[0].last_upload);
+    try testing.expect(!all.targets[0].running and all.targets[0].failure == null);
+    try testing.expect(all.targets[1].cold);
+    try testing.expectEqual(backup.Gate.needs_deep_backup, all.targets[1].gate);
+    try testing.expect(std.mem.indexOf(u8, all.targets[1].not_uploading, "deep backup") != null);
+
+    // No such target, no such route; an archive without deep backup.
+    for ([_][2][]const u8{ .{ "GET", "backup/nope" }, .{ "POST", "backup/nope/run" }, .{ "POST", "backup/nope/forget?path=a" }, .{ "GET", "backup/nope/history" } }) |q| {
+        const unknown = try testSend(arena, server, q[0], &server.token, q[1], "");
+        try testing.expectEqual(@as(u16, 404), unknown.code);
+        try testing.expect(std.mem.indexOf(u8, unknown.head, "X-NomadFS-Error: UnknownBackupTarget") != null);
+    }
+    try testing.expectEqual(@as(u16, 404), (try testGet(arena, server, "backup/main/run")).code);
+    try testing.expectEqual(@as(u16, 404), (try testSend(arena, server, "POST", &server.token, "backup/main", "")).code);
+    try testing.expectEqual(@as(u16, 405), (try testSend(arena, server, "DELETE", &server.token, "backup/main", "")).code);
+    const cold = try testSend(arena, server, "POST", &server.token, "backup/archive/run", "");
+    try testing.expectEqual(@as(u16, 409), cold.code);
+    try testing.expect(std.mem.indexOf(u8, cold.head, "X-NomadFS-Error: DeepBackupOff") != null);
+
+    // `run` only starts the upload ("s3" is the first target); the list
+    // tells when it ended and what it did.
+    const accepted = try testSend(arena, server, "POST", &server.token, "backup/s3/run", "");
+    try testing.expectEqual(@as(u16, 202), accepted.code);
+    const started = try std.json.parseFromSliceLeaky(BackupRun, arena, accepted.body, .{});
+    try testing.expectEqualStrings("main", started.name);
+    try testing.expectEqual(@as(u64, 0), started.manual_runs);
+    const first = try testBackupRun(arena, server, "main", 0);
+    try testing.expect(first.failure == null and !first.running and !first.requested);
+    try testing.expect(first.last_upload > 0 and first.uploaded_blocks > 0 and first.new_key);
+    try testing.expect(std.mem.startsWith(u8, first.snapshot, "snapshots/"));
+    try testing.expectEqual(@as(usize, 0), first.waiting_files);
+
+    // One target's bucket.
+    const detail = try testGet(arena, server, "backup/main");
+    try testing.expectEqual(@as(u16, 200), detail.code);
+    const status = try std.json.parseFromSliceLeaky(BackupStatus, arena, detail.body, .{});
+    try testing.expectEqual(@as(usize, 1), status.snapshots.len);
+    try testing.expectEqualStrings(first.snapshot, status.snapshots[0]);
+    try testing.expect(status.indexed_blocks > 0);
+    try testing.expectEqual(backup.Gate.uploading, status.gate);
+
+    const History = []const BackupVersion;
+    const before = try std.json.parseFromSliceLeaky(History, arena, (try testGet(arena, server, "backup/main/history")).body, .{});
+    try testing.expectEqual(@as(usize, 2), before.len);
+    try testing.expectEqualStrings("Photos/old.jpg", before[0].path);
+    try testing.expectEqualStrings(&std.fmt.bytesToHex(t.folder.fileInfo("Photos/old.jpg").?.cid, .lower), before[0].cid);
+    try testing.expectEqualStrings("keep.txt", before[1].path);
+    const under = try std.json.parseFromSliceLeaky(History, arena, (try testGet(arena, server, "backup/main/history?path=Photos")).body, .{});
+    try testing.expectEqual(@as(usize, 1), under.len);
+
+    // A file the folder has and the backup has never seen: the purge is
+    // recorded with its version, read from the node's live folder, so the
+    // next upload leaves it out too.
+    _ = try t.folder.putBytes("Photos/new.jpg", "new", null);
+    const no_path = try testSend(arena, server, "POST", &server.token, "backup/main/forget", "");
+    try testing.expectEqual(@as(u16, 400), no_path.code);
+    try testing.expect(std.mem.indexOf(u8, no_path.head, "X-NomadFS-Error: PathRequired") != null);
+    try testing.expectEqual(@as(u16, 400), (try testSend(arena, server, "POST", &server.token, "backup/main/forget?path=a%2F%2Fb", "")).code);
+    try testing.expectEqual(@as(u16, 204), (try testSend(arena, server, "POST", &server.token, "backup/main/forget?path=Photos", "")).code);
+    try testing.expectEqual(@as(u16, 202), (try testSend(arena, server, "POST", &server.token, "backup/main/run", "")).code);
+    const second = try testBackupRun(arena, server, "main", 1);
+    try testing.expect(second.failure == null and !second.new_key);
+    const after = try std.json.parseFromSliceLeaky(History, arena, (try testGet(arena, server, "backup/main/history")).body, .{});
+    try testing.expectEqual(@as(usize, 1), after.len);
+    try testing.expectEqualStrings("keep.txt", after[0].path);
+    // The folder still lists both pictures: only the backup forgot them.
+    try testing.expect(t.folder.fileInfo("Photos/new.jpg") != null);
+
+    // The uploader taken away (the node stopping): the routes are gone.
+    server.setBackup(null);
+    try testing.expectEqual(@as(u16, 404), (try testGet(arena, server, "backup")).code);
 }
 
 test tokenMatches {

@@ -51,10 +51,35 @@ pub const Status = struct {
     gate: Gate = .uploading,
     last_upload: u64 = 0,
     uploaded_blocks: usize = 0,
+    uploaded_bytes: u64 = 0,
     /// Files the last snapshot left out: their blocks were not all here.
     waiting_files: usize = 0,
     failure: ?anyerror = null,
+    /// An upload to this target is under way.
+    running: bool = false,
+    /// A run asked for by hand (`request`) that has not begun yet.
+    requested: bool = false,
+    /// Runs asked for by hand that ended, well or not, since the node
+    /// started: who asked waits for the count to pass what `request` gave.
+    manual_runs: u64 = 0,
+    /// The last upload made this target's key (its recovery words are new),
+    /// or took another target's (`reused_key`).
+    new_key: bool = false,
+    reused_key: bool = false,
+    /// Packs a purge left behind until their minimum storage time ends, and
+    /// when the first and the last may go, as the last upload found them.
+    deferred_packs: usize = 0,
+    deferred_first: u64 = 0,
+    deferred_last: u64 = 0,
+    snapshot_buf: [max_snapshot_name]u8 = undefined,
+    snapshot_len: u8 = 0,
+
+    /// The last upload's snapshot; "" before the first.
+    pub fn snapshot(self: *const Status) []const u8 {
+        return self.snapshot_buf[0..self.snapshot_len];
+    }
 };
+const max_snapshot_name = 128;
 
 /// One target's credentials, HTTP client and core service. The parts point
 /// at each other: open in place and never move it.
@@ -67,6 +92,10 @@ pub const Session = struct {
     service: core.Service,
 
     pub fn open(self: *Session, a: std.mem.Allocator, io: std.Io, config: cfg_mod.Config, identity: device.identity.Identity) !void {
+        return self.openOn(a, io, config, identity, null);
+    }
+    /// `open` over `transport` in place of HTTP (tests: a bucket in memory).
+    pub fn openOn(self: *Session, a: std.mem.Allocator, io: std.Io, config: cfg_mod.Config, identity: device.identity.Identity, transport: ?s3.Transport) !void {
         if (!config.configured()) return error.BackupNotConfigured;
         self.allocator = a;
         self.credentials = try cfg_mod.loadCredentials(a, io, config.credentials);
@@ -74,7 +103,7 @@ pub const Session = struct {
         self.http = .{ .allocator = a, .io = io };
         errdefer self.http.deinit();
         self.adapter = .{ .client = &self.http };
-        self.client = try s3.Client.init(a, .{ .endpoint = config.endpoint, .bucket = config.bucket, .region = if (config.region.len == 0) "auto" else config.region }, .{ .access_key_id = self.credentials.access_key_id, .secret_access_key = self.credentials.secret_access_key }, self.adapter.transport());
+        self.client = try s3.Client.init(a, .{ .endpoint = config.endpoint, .bucket = config.bucket, .region = if (config.region.len == 0) "auto" else config.region }, .{ .access_key_id = self.credentials.access_key_id, .secret_access_key = self.credentials.secret_access_key }, transport orelse self.adapter.transport());
         var pair = try std.crypto.dh.X25519.KeyPair.fromEd25519(identity.key_pair);
         defer std.crypto.secureZero(u8, &pair.secret_key);
         self.service = try core.Service.init(a, &self.client, config, .{ .id = identity.deviceId().bytes, .secret = pair.secret_key, .public = pair.public_key });
@@ -89,12 +118,12 @@ pub const Session = struct {
 /// A target not written yet takes the backup key and the recovery words of
 /// another target this device can open, so one set of 24 words opens every
 /// copy. Any failure leaves the target to make its own key, as before.
-pub fn shareKey(a: std.mem.Allocator, io: std.Io, service: *core.Service, others: []const cfg_mod.Config, identity: device.identity.Identity) void {
+pub fn shareKey(a: std.mem.Allocator, io: std.Io, service: *core.Service, others: []const cfg_mod.Config, identity: device.identity.Identity, transport: ?s3.Transport) void {
     if (service.initialised() catch true) return;
     for (others) |other| {
         if (std.mem.eql(u8, other.name, service.config.name)) continue;
         var session: Session = undefined;
-        session.open(a, io, other, identity) catch continue;
+        session.openOn(a, io, other, identity, transport) catch continue;
         defer session.close();
         session.service.unlockKey(null) catch continue;
         const phrase = session.service.recoveryKey() catch continue;
@@ -123,6 +152,9 @@ pub const Worker = struct {
     poked: std.atomic.Value(bool) = .init(false),
     /// One target's upload; tests replace it.
     uploadFn: *const fn (*Worker, cfg_mod.Config, usize, bool) anyerror!void = upload,
+    /// What the sessions reach the buckets over; null is HTTP. Tests set a
+    /// bucket in memory.
+    transport: ?s3.Transport = null,
     pub fn create(a: std.mem.Allocator, targets: []const cfg_mod.Config, identity: device.identity.Identity, trust: *device.trust.Store, source: core.Source, store: *storage.engine.StorageEngine) !*Worker {
         const self = try a.create(Worker);
         errdefer a.destroy(self);
@@ -196,6 +228,35 @@ pub const Worker = struct {
         for (self.states) |state| if (std.mem.eql(u8, state.name, name)) return state;
         return null;
     }
+    /// The state of target `i` of `configs`.
+    pub fn statusAt(self: *Worker, i: usize) Status {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.states[i];
+    }
+    /// Which of `configs` a command means, as the configuration names its
+    /// sections: null (or "s3" with no such section) is the first.
+    pub fn indexOf(self: *const Worker, name: ?[]const u8) ?usize {
+        const wanted = name orelse return 0;
+        for (self.configs, 0..) |config, i| if (std.mem.eql(u8, config.name, wanted)) return i;
+        return if (std.mem.eql(u8, wanted, "s3")) 0 else null;
+    }
+    /// A run of target `i` by hand: the loop starts it within a moment,
+    /// whatever its schedule says, and `statusAt` tells how it went once
+    /// `manual_runs` passed the count returned here. As a run in a process
+    /// of its own, a warm target uploads without the swarm backup role; an
+    /// archive takes the whole swarm backup or nothing (error.DeepBackupOff).
+    pub fn request(self: *Worker, i: usize) !u64 {
+        if (gate(self.configs[i], self.roles()) == .needs_deep_backup) return error.DeepBackupOff;
+        // Nothing would take it: the node is stopping, or never listened.
+        if (!self.worker.isRunning()) return error.Cancelled;
+        self.mutex.lock();
+        self.states[i].requested = true;
+        const done = self.states[i].manual_runs;
+        self.mutex.unlock();
+        self.poked.store(true, .release);
+        return done;
+    }
     fn loop(self: *Worker) void {
         var waited: u64 = 3_590_000;
         while (self.worker.isRunning()) {
@@ -226,13 +287,26 @@ pub const Worker = struct {
         for (self.configs, 0..) |config, i| {
             const allowed = gate(config, self.roles());
             self.mutex.lock();
-            self.states[i].gate = allowed;
+            const state = &self.states[i];
+            state.gate = allowed;
+            const asked = state.requested;
+            state.requested = false;
+            const go = allowed == .uploading or (asked and allowed == .needs_swarm_backup);
+            state.running = go;
+            // Deep backup went off between the request and this look.
+            if (asked and !go) {
+                state.failure = error.DeepBackupOff;
+                state.manual_runs += 1;
+            }
             self.mutex.unlock();
-            if (allowed != .uploading) continue;
-            self.uploadFn(self, config, i, force) catch |err| {
-                self.mutex.lock();
-                self.states[i].failure = err;
-                self.mutex.unlock();
+            if (!go) continue;
+            const result = self.uploadFn(self, config, i, force or asked);
+            self.mutex.lock();
+            state.running = false;
+            if (asked) state.manual_runs += 1;
+            if (result) |_| {} else |err| state.failure = err;
+            self.mutex.unlock();
+            result catch |err| {
                 if (failure == null) failure = err;
                 if (err == error.Cancelled) break;
             };
@@ -243,7 +317,7 @@ pub const Worker = struct {
         const a = self.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         var session: Session = undefined;
-        try session.open(a, io, config, self.identity);
+        try session.openOn(a, io, config, self.identity, self.transport);
         defer session.close();
         const service = &session.service;
         if (self.worker.isRunning()) service.keep_going = &self.worker.running;
@@ -251,14 +325,28 @@ pub const Worker = struct {
         // next daily, weekly or monthly snapshot: the bucket's head records
         // the unfinished round, so `due` says so after a restart too.
         if (!force and !(try service.due())) return;
-        shareKey(a, io, service, self.configs, self.identity);
+        shareKey(a, io, service, self.configs, self.identity, self.transport);
         const report = try service.run(self.source, self.store);
         if (report.recovery_phrase) |phrase| std.debug.print("S3 backup \"{s}\" recovery words — save these:\n{s}\n", .{ config.name, phrase });
         if (report.waiting_files > 0) std.debug.print("offsite: \"{s}\": {d} files waiting for blocks\n", .{ config.name, report.waiting_files });
         try enroll(service, self.trust);
+        // What the run left in the session: nothing more is asked of the bucket.
+        const bucket = service.status() catch core.Status{ .snapshots = &.{}, .indexed_blocks = 0 };
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.states[i] = .{ .name = config.name, .cold = config.storage_class.cold(), .last_upload = sync.nowSeconds(), .uploaded_blocks = report.uploaded_blocks, .waiting_files = report.waiting_files };
+        const state = &self.states[i];
+        state.last_upload = sync.nowSeconds();
+        state.uploaded_blocks = report.uploaded_blocks;
+        state.uploaded_bytes = report.uploaded_bytes;
+        state.waiting_files = report.waiting_files;
+        state.failure = null;
+        state.new_key = report.recovery_phrase != null;
+        state.reused_key = report.reused_key;
+        state.deferred_packs = bucket.deferred_packs;
+        state.deferred_first = bucket.deferred_first;
+        state.deferred_last = bucket.deferred_last;
+        state.snapshot_len = @intCast(@min(report.snapshot.len, max_snapshot_name));
+        @memcpy(state.snapshot_buf[0..state.snapshot_len], report.snapshot[0..state.snapshot_len]);
     }
 };
 /// Existing members receive identity-derived wraps, never Noise session keys.
