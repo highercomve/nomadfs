@@ -37,10 +37,13 @@ pub const Fake = struct {
     multipart_class: ?[]const u8 = null,
     restore_requests: usize = 0,
     last_tier: []const u8 = "",
-    /// Runs once, before the next PUT of a key ending in `before_key`: what
-    /// another writer does while this request is stalled on the wire.
+    /// Runs once, before the next PUT or DELETE of a key ending in
+    /// `before_key`: what another writer does while this request is stalled
+    /// on the wire.
     before_put: ?*const fn (*Fake) anyerror!void = null,
     before_key: []const u8 = "",
+    /// Runs before every DELETE, with its key, until it clears itself.
+    before_delete: ?*const fn (*Fake, []const u8) anyerror!void = null,
     /// GetBucketVersioning: the Status the bucket reports (null: never set,
     /// like R2), or a store that does not know the request at all (501).
     versioning: ?[]const u8 = null,
@@ -135,10 +138,11 @@ pub const Fake = struct {
             .bytes => |b| b,
             else => return error.InvalidRequest,
         };
-        if (request.method == .PUT and std.mem.endsWith(u8, key, self.before_key)) if (self.before_put) |hook| {
+        if ((request.method == .PUT or request.method == .DELETE) and std.mem.endsWith(u8, key, self.before_key)) if (self.before_put) |hook| {
             self.before_put = null;
             try hook(self);
         };
+        if (request.method == .DELETE) if (self.before_delete) |hook| try hook(self, key);
         var etag_buf: [32]u8 = undefined;
         const existing = self.objects.get(key);
         const old_etag = try std.fmt.bufPrint(&etag_buf, "\"{d}\"", .{if (existing) |o| o.version else 0});
@@ -1435,17 +1439,21 @@ test "offsite: a restore whose pin ran out plans the rest again from the current
     var t = try Interrupted.create();
     defer t.destroy();
     const f = t.f;
-    // Nobody resumed for longer than a pin lasts: the pack is deleted, and
-    // the forgotten pin a grace later.
+    // Nobody resumed for longer than a pin lasts: the pack is deleted. The
+    // expired pin itself stays: its job may be renewing it right now.
     f.fake.time += core.pin_seconds + day;
     _ = try f.run();
     try std.testing.expect(!f.fake.objects.contains(t.shared));
-    try std.testing.expectEqual(@as(usize, 0), t.pins());
+    try std.testing.expectEqual(@as(usize, 1), t.pins());
     // The stale reader finds the pack gone and reads the head again: the
-    // kept file is restored from the copy, the purged one is left out.
-    const done = try restoreRequest(&t.reader, t.snapshot, null, t.target.dir, .Bulk);
+    // kept file is restored from the copy, the purged one is left out and
+    // named.
+    var done = try restoreRequest(&t.reader, t.snapshot, null, t.target.dir, .Bulk);
+    defer done.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), done.files);
     try std.testing.expectEqual(@as(usize, 1), done.purged_files);
+    try std.testing.expectEqualStrings("private.txt", done.omitted[0].path);
+    try std.testing.expectEqual(@as(usize, 0), t.pins());
     try expectFile(t.target.dir, "first.txt", "one");
     try expectFile(t.target.dir, "keep.txt", "good");
     try std.testing.expectError(error.FileNotFound, t.target.dir.statFile(io, "private.txt", .{}));
@@ -1461,7 +1469,8 @@ test "offsite: pins are sealed, renewed by every pass, and one that cannot be re
     const at = try f.service.locate(kept);
     const pack = try f.packKey(kept);
     const job = [_]u8{0xab} ** 16;
-    try f.service.pin(job, &.{at.pack_id});
+    const began = f.fake.time;
+    try f.service.pin(job, &.{at.pack_id}, began);
     const name = "swarm/pins/" ++ "ab" ** 16;
     const sealed = f.fake.objects.get(name).?;
     try std.testing.expect(sealed.class == null);
@@ -1470,7 +1479,7 @@ test "offsite: pins are sealed, renewed by every pass, and one that cannot be re
     _ = try f.run();
     // Renewed on day 10: the pack is still pinned on day 20, gone after day 24.
     f.fake.time += 10 * day;
-    try f.service.pin(job, &.{at.pack_id});
+    try f.service.pin(job, &.{at.pack_id}, began);
     f.fake.time += 10 * day;
     _ = try f.run();
     try std.testing.expect(f.fake.objects.contains(pack));
@@ -1481,6 +1490,9 @@ test "offsite: pins are sealed, renewed by every pass, and one that cannot be re
     f.fake.time += 5 * day;
     _ = try f.run();
     try std.testing.expect(!f.fake.objects.contains(pack));
+
+    // The expired pin is still there: a pin goes long after its time only.
+    try std.testing.expect(f.fake.objects.contains(name));
 
     // A pin nobody can open defers nothing, and is deleted once it is old.
     const other = try f.add("other.txt", "more");
@@ -1499,7 +1511,17 @@ test "offsite: pins are sealed, renewed by every pass, and one that cannot be re
     _ = try f.run();
     f.fake.time += 2 * day;
     _ = try f.run();
+    // Expired, not yet old enough to delete: a run leaves both pins.
+    try std.testing.expect(f.fake.objects.contains("swarm/pins/" ++ "cd" ** 16));
+    try std.testing.expect(f.fake.objects.contains(name));
+    _ = try f.add("last.txt", "gone too");
+    _ = try f.run();
+    try f.forget("last.txt");
+    _ = try f.run();
+    f.fake.time += core.pin_keep_seconds;
+    _ = try f.run();
     try std.testing.expect(!f.fake.objects.contains("swarm/pins/" ++ "cd" ** 16));
+    try std.testing.expect(!f.fake.objects.contains(name));
 }
 
 test "offsite: the history keeps a content that came back as a second interval, and a time picks the right one" {
@@ -2037,4 +2059,377 @@ test "offsite: a versioned bucket is refused before anything is written; a store
     f.fake.versioning_unsupported = false;
     f.fake.versioning = "Enabled";
     try std.testing.expectError(error.BucketVersioningEnabled, f.run());
+}
+
+test "offsite: verify thaws a pack uploaded cold after the target is set to a warm class" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    _ = try f.add("a.txt", "good");
+    const report = try f.run();
+    f.service.config.storage_class = .STANDARD;
+    const pending = try f.service.check(report.snapshot, true, .Bulk);
+    try std.testing.expectEqual(@as(usize, 1), pending.thawing_packs);
+    try std.testing.expectEqual(@as(usize, 1), f.fake.restore_requests);
+}
+
+test "offsite: a purge covers a version only the history holds, and one only the folder lists" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    const old = try f.add("a.txt", "old");
+    _ = try f.run();
+    f.files.clearRetainingCapacity();
+    try f.forget("a.txt");
+    _ = try f.run();
+    try std.testing.expectEqual(@as(usize, 0), (try f.service.history("a.txt")).len);
+    try std.testing.expectError(error.BlockNotFound, f.service.locate(old));
+    // Never uploaded: the folder lists it when the purge is asked for.
+    const fresh = try f.add("b.txt", "fresh");
+    try f.forget("b.txt");
+    const report = try f.run();
+    try std.testing.expectEqual(@as(usize, 0), (try f.service.snapshot(report.snapshot)).files.len);
+    try std.testing.expectError(error.BlockNotFound, f.service.locate(fresh));
+}
+
+/// A restore that wrote a.txt and private.txt from one warm pack and waits
+/// for the thaw of b.txt's; then a purge of private.txt, which copies the
+/// shared pack without it.
+const Recorded = struct {
+    f: *Fixture,
+    target: std.testing.TmpDir,
+    snapshot: []const u8,
+    /// The pack the purge replaced.
+    shared: []const u8,
+    fn create() !Recorded {
+        const f = try Fixture.create();
+        errdefer f.destroy();
+        const keep = try f.add("a.txt", "good");
+        _ = try f.add("private.txt", "secret");
+        _ = try f.run();
+        const shared = try f.packKey(keep);
+        f.service.config.storage_class = .DEEP_ARCHIVE;
+        _ = try f.add("b.txt", "later");
+        const report = try f.run();
+        f.service.config.storage_class = .STANDARD;
+        var self: Recorded = .{ .f = f, .target = std.testing.tmpDir(.{}), .snapshot = report.snapshot, .shared = shared };
+        errdefer self.target.cleanup();
+        const partial = try restoreRequest(&f.service, report.snapshot, null, self.target.dir, .Bulk);
+        try std.testing.expectEqual(@as(usize, 2), partial.files);
+        try std.testing.expectEqual(@as(usize, 1), partial.thawing_packs);
+        try f.forget("private.txt");
+        _ = try f.run();
+        try std.testing.expect(!std.mem.eql(u8, shared, try f.packKey(keep)));
+        return self;
+    }
+    fn destroy(self: *Recorded) void {
+        self.target.cleanup();
+        self.f.destroy();
+    }
+};
+
+test "offsite: a written file keeps its pack pinned until the job ends: found changed later, it is written again" {
+    var t = try Recorded.create();
+    defer t.destroy();
+    const f = t.f;
+    // A later pass, b.txt still thawing: the pin goes on naming the pack of
+    // the two files already written.
+    _ = try restoreRequest(&f.service, t.snapshot, null, t.target.dir, .Bulk);
+    try t.target.dir.writeFile(io, .{ .sub_path = "private.txt", .data = "EVIL!!" });
+    f.fake.time += 2 * day;
+    _ = try f.run();
+    try std.testing.expect(f.fake.objects.contains(t.shared));
+    f.fake.finishThaws();
+    // The record of private.txt fails its digest and is dropped before
+    // anything is planned; the purged file is written again from the pack
+    // the job kept.
+    var done = try restoreRequest(&f.service, t.snapshot, null, t.target.dir, .Bulk);
+    defer done.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), done.files);
+    try std.testing.expectEqual(@as(usize, 0), done.purged_files);
+    try expectFile(t.target.dir, "a.txt", "good");
+    try expectFile(t.target.dir, "private.txt", "secret");
+    try expectFile(t.target.dir, "b.txt", "later");
+    try std.testing.expectError(error.FileNotFound, t.target.dir.statFile(io, ".nomadfs-restore", .{}));
+    // The job is over: the replaced pack goes within the grace.
+    f.fake.time += day;
+    _ = try f.run();
+    try std.testing.expect(!f.fake.objects.contains(t.shared));
+}
+
+test "offsite: recorded outputs found changed after their pack went are planned again; a purged one is reported, never retried for ever" {
+    var t = try Recorded.create();
+    defer t.destroy();
+    const f = t.f;
+    // Nobody resumed for longer than a pin lasts and the pack is deleted;
+    // both files written from it were replaced by other bytes meanwhile.
+    f.fake.time += core.pin_seconds + day;
+    _ = try f.run();
+    try std.testing.expect(!f.fake.objects.contains(t.shared));
+    try t.target.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "EVIL" });
+    try t.target.dir.writeFile(io, .{ .sub_path = "private.txt", .data = "EVIL!!" });
+    // Their records are dropped from the list before the plan is made again.
+    const log = try t.target.dir.readFileAlloc(io, ".nomadfs-restore/done.log", a, .limited(4096));
+    defer a.free(log);
+    try std.testing.expect(std.mem.indexOf(u8, log, "private.txt") != null);
+    var pending = try restoreRequest(&f.service, t.snapshot, null, t.target.dir, .Bulk);
+    defer pending.deinit(a);
+    // a.txt is still in the backup: read from the copy. private.txt is not.
+    try std.testing.expectEqual(@as(usize, 1), pending.files);
+    try std.testing.expectEqual(@as(usize, 1), pending.thawing_packs);
+    try std.testing.expectEqual(@as(usize, 1), pending.purged_files);
+    try expectFile(t.target.dir, "a.txt", "good");
+    const kept = try t.target.dir.readFileAlloc(io, ".nomadfs-restore/done.log", a, .limited(4096));
+    defer a.free(kept);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "private.txt") == null);
+    f.fake.finishThaws();
+    var done = try restoreRequest(&f.service, t.snapshot, null, t.target.dir, .Bulk);
+    defer done.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), done.files);
+    try std.testing.expectEqual(@as(usize, 1), done.purged_files);
+    try std.testing.expectEqualStrings("private.txt", done.omitted[0].path);
+    try expectFile(t.target.dir, "b.txt", "later");
+    // What is at the purged file's name is not the job's: left as found.
+    try expectFile(t.target.dir, "private.txt", "EVIL!!");
+    try std.testing.expectError(error.FileNotFound, t.target.dir.statFile(io, ".nomadfs-restore", .{}));
+}
+
+test "offsite: a recorded file the backup purged stays restored when the plan is made again" {
+    var t = try Recorded.create();
+    defer t.destroy();
+    const f = t.f;
+    f.fake.time += core.pin_seconds + day;
+    _ = try f.run();
+    // Only a.txt was changed: the plan is made again for it, and the intact
+    // private.txt, which nothing can read any more, still counts.
+    try t.target.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "EVIL" });
+    f.fake.finishThaws();
+    var done = try restoreRequest(&f.service, t.snapshot, null, t.target.dir, .Bulk);
+    defer done.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), done.files);
+    try std.testing.expectEqual(@as(usize, 0), done.purged_files);
+    try expectFile(t.target.dir, "a.txt", "good");
+    try expectFile(t.target.dir, "private.txt", "secret");
+}
+
+test "offsite: the files a restore left out are kept with its plan and named by every later result" {
+    var t = try Interrupted.create();
+    defer t.destroy();
+    const f = t.f;
+    f.fake.time += core.pin_seconds + day;
+    _ = try f.run();
+    // The bucket archived the first file's pack by itself: it must thaw.
+    const first = f.files.items[0];
+    f.fake.objects.getPtr(try f.packKey(first.cid)).?.class = "DEEP_ARCHIVE";
+    var pending = try restoreRequest(&t.reader, t.snapshot, null, t.target.dir, .Bulk);
+    defer pending.deinit(a);
+    try std.testing.expect(pending.thawing_packs > 0);
+    try std.testing.expectEqual(@as(usize, 1), pending.purged_files);
+    try std.testing.expectEqualStrings("private.txt", pending.omitted[0].path);
+    // The plan in the job directory names it: a crash here loses nothing.
+    const plan = try t.target.dir.readFileAlloc(io, ".nomadfs-restore/plan.bin", a, .limited(4096));
+    defer a.free(plan);
+    try std.testing.expect(std.mem.indexOf(u8, plan, "private.txt") != null);
+    f.fake.finishThaws();
+    // A new process ends the job: its result still carries the omission.
+    var again = try f.other();
+    defer again.deinit();
+    try again.unlock(null);
+    var done = try restoreRequest(&again, t.snapshot, null, t.target.dir, .Bulk);
+    defer done.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), done.files);
+    try std.testing.expectEqual(@as(usize, 1), done.purged_files);
+    try std.testing.expectEqual(@as(usize, 1), done.omitted.len);
+    try std.testing.expectEqualStrings("private.txt", done.omitted[0].path);
+    var secret: Cid = undefined;
+    std.crypto.hash.sha2.Sha256.hash("\x00secret", &secret, .{});
+    try std.testing.expectEqualSlices(u8, &secret, &done.omitted[0].cid);
+    try std.testing.expectError(error.FileNotFound, t.target.dir.statFile(io, ".nomadfs-restore", .{}));
+}
+
+/// The id of the restore job a destination holds.
+fn jobId(dir: std.Io.Dir) ![16]u8 {
+    const job = try dir.readFileAlloc(io, ".nomadfs-restore/job.json", a, .limited(4096));
+    defer a.free(job);
+    const at = std.mem.indexOf(u8, job, "\"id\":\"").? + 6;
+    var id: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&id, job[at..][0..32]);
+    return id;
+}
+/// A restore job writing its pin again while a run is deleting.
+const Renewal = struct {
+    var service: *core.Service = undefined;
+    var job: [16]u8 = undefined;
+    var pack: [16]u8 = undefined;
+    var created: u64 = 0;
+    fn arm(t: *Interrupted) !void {
+        service = &t.reader;
+        job = try jobId(t.target.dir);
+        pack = try backup.index.parsePackId(t.shared["swarm/packs/".len..]);
+        created = t.f.fake.time;
+    }
+    fn renew(_: *Fake) !void {
+        try service.pin(job, &.{pack}, created);
+    }
+};
+
+test "offsite: a pin renewed after the run read it loses the pack, and the restore plans again" {
+    var t = try Interrupted.create();
+    defer t.destroy();
+    const f = t.f;
+    try Renewal.arm(&t);
+    f.fake.time += core.pin_seconds + day;
+    // The run read the expired pin and decided; the job renews it just
+    // before the pack's DELETE reaches the bucket.
+    f.fake.before_key = t.shared["swarm/".len..];
+    f.fake.before_put = Renewal.renew;
+    _ = try f.run();
+    try std.testing.expect(f.fake.before_put == null);
+    try std.testing.expect(!f.fake.objects.contains(t.shared));
+    try std.testing.expectEqual(@as(usize, 1), t.pins());
+    var done = try restoreRequest(&t.reader, t.snapshot, null, t.target.dir, .Bulk);
+    defer done.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), done.files);
+    try std.testing.expectEqual(@as(usize, 1), done.purged_files);
+    try expectFile(t.target.dir, "first.txt", "one");
+    try expectFile(t.target.dir, "keep.txt", "good");
+}
+
+test "offsite: a pin is deleted only long after it expired; one renewed under that delete costs a new plan at most" {
+    var t = try Interrupted.create();
+    defer t.destroy();
+    const f = t.f;
+    try Renewal.arm(&t);
+    // Expired for less than the keeping time: no run deletes it.
+    f.fake.time += core.pin_seconds + core.pin_keep_seconds - day;
+    _ = try f.run();
+    try std.testing.expectEqual(@as(usize, 1), t.pins());
+    try std.testing.expect(!f.fake.objects.contains(t.shared));
+    // Past it, with a pack to sweep: the job renews while the DELETE of
+    // its pin is on the wire, and the renewed pin goes.
+    _ = try f.add("more.txt", "more");
+    _ = try f.run();
+    try f.forget("more.txt");
+    _ = try f.run();
+    f.fake.time += 2 * day;
+    f.fake.before_key = "pins/" ++ &std.fmt.bytesToHex(Renewal.job, .lower);
+    f.fake.before_put = Renewal.renew;
+    _ = try f.run();
+    try std.testing.expect(f.fake.before_put == null);
+    try std.testing.expectEqual(@as(usize, 0), t.pins());
+    // The job goes on all the same, from the head.
+    var done = try restoreRequest(&t.reader, t.snapshot, null, t.target.dir, .Bulk);
+    defer done.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), done.files);
+    try std.testing.expectEqual(@as(usize, 1), done.purged_files);
+    try expectFile(t.target.dir, "keep.txt", "good");
+    try std.testing.expectError(error.FileNotFound, t.target.dir.statFile(io, ".nomadfs-restore", .{}));
+}
+
+/// A pin written while a sweep is deleting packs: names every pack but the
+/// one whose DELETE is on the wire.
+const LatePin = struct {
+    var fixture: *Fixture = undefined;
+    var packs: [2][16]u8 = undefined;
+    fn publish(fake: *Fake, key: []const u8) !void {
+        if (!std.mem.startsWith(u8, key, "swarm/packs/")) return;
+        fake.before_delete = null;
+        const going = try backup.index.parsePackId(key["swarm/packs/".len..]);
+        const other = if (std.mem.eql(u8, &going, &packs[0])) packs[1] else packs[0];
+        try fixture.service.pin([_]u8{0xee} ** 16, &.{other}, fake.time);
+    }
+};
+test "offsite: the sweep reads the pins again before each batch of packs: a pin written meanwhile counts" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    const x = try f.add("x.txt", "one pack");
+    _ = try f.run();
+    LatePin.packs[0] = (try f.service.locate(x)).pack_id;
+    f.files.clearRetainingCapacity();
+    const y = try f.add("y.txt", "another");
+    _ = try f.run();
+    LatePin.packs[1] = (try f.service.locate(y)).pack_id;
+    f.files.clearRetainingCapacity();
+    try f.forget("x.txt");
+    try f.forget("y.txt");
+    _ = try f.run();
+    try std.testing.expectEqual(@as(usize, 2), f.packCount());
+    f.fake.time += 2 * day;
+    LatePin.fixture = f;
+    f.fake.before_delete = LatePin.publish;
+    f.service.sweep_batch = 1;
+    _ = try f.run();
+    try std.testing.expect(f.fake.before_delete == null);
+    // The first went; the second was decided after the pin was written.
+    try std.testing.expectEqual(@as(usize, 1), f.packCount());
+    try std.testing.expectEqual(@as(usize, 1), (try f.service.status()).deferred_packs);
+}
+
+test "offsite: a pin renewed for ever stops protecting its packs a fixed time after its job began" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    _ = try f.add("private.txt", "secret");
+    const kept = try f.add("keep.txt", "good");
+    _ = try f.run();
+    const at = try f.service.locate(kept);
+    const pack = try f.packKey(kept);
+    const job = [_]u8{0xab} ** 16;
+    const began = f.fake.time;
+    try f.forget("private.txt");
+    _ = try f.run();
+    for (0..2) |_| {
+        try f.service.pin(job, &.{at.pack_id}, began);
+        f.fake.time += 10 * day;
+        _ = try f.run();
+        try std.testing.expect(f.fake.objects.contains(pack));
+    }
+    // Day 20: renewed once more, to day 34; the limit is the job's age.
+    try f.service.pin(job, &.{at.pack_id}, began);
+    f.fake.time += 10 * day;
+    _ = try f.run();
+    try std.testing.expect(!f.fake.objects.contains(pack));
+    try std.testing.expect(f.fake.objects.contains("swarm/pins/" ++ "ab" ** 16));
+}
+
+test "offsite: runs within one second are ordered by their number: the last content is the latest" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    const original = try f.add("a.txt", "original");
+    _ = try f.add("other.txt", "stays");
+    _ = try f.run();
+    // The same second, a later run: the fake clock does not move.
+    f.files.items[0] = f.files.pop().?;
+    const changed = try f.add("a.txt", "changed");
+    _ = try f.service.run(f.source(), &f.store);
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    var versions = try f.service.history("a.txt");
+    try std.testing.expectEqual(@as(usize, 2), versions.len);
+    try std.testing.expectEqual(versions[0].last_seen, versions[1].last_seen);
+    try std.testing.expect(versions[0].last_run != versions[1].last_run);
+    try std.testing.expectEqualSlices(u8, &changed, &(try fs_restore.pick(arena.allocator(), versions, .latest))[0].cid);
+    try std.testing.expectEqualSlices(u8, &changed, &(try fs_restore.pick(arena.allocator(), versions, .{ .at = f.fake.time }))[0].cid);
+    {
+        var target = std.testing.tmpDir(.{});
+        defer target.cleanup();
+        _ = try restoreHistory(&f.service, "a.txt", .latest, target.dir);
+        try expectFile(target.dir, "a.txt", "changed");
+    }
+    // Back to the first content, still within the second: a third stretch,
+    // and the latest again.
+    _ = f.files.pop();
+    _ = try f.add("a.txt", "original");
+    _ = try f.service.run(f.source(), &f.store);
+    versions = try f.service.history("a.txt");
+    try std.testing.expectEqual(@as(usize, 3), versions.len);
+    try std.testing.expectEqualSlices(u8, &original, &(try fs_restore.pick(arena.allocator(), versions, .latest))[0].cid);
+    // A run without the file, then with it: the gap splits the stretch
+    // although the clock never moved.
+    _ = f.files.pop();
+    _ = try f.service.run(f.source(), &f.store);
+    _ = try f.add("a.txt", "original");
+    _ = try f.service.run(f.source(), &f.store);
+    try std.testing.expectEqual(@as(usize, 4), (try f.service.history("a.txt")).len);
+    // Unchanged in the next run: the stretch grows, no new entry.
+    _ = try f.service.run(f.source(), &f.store);
+    try std.testing.expectEqual(@as(usize, 4), (try f.service.history("a.txt")).len);
+    try std.testing.expectEqual(@as(usize, 1), (try f.service.history("other.txt")).len);
 }

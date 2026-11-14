@@ -287,7 +287,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const []const u8) !u8 {
     }
     if (result.restore) |restored| {
         std.debug.print("Restored {d} files\n", .{restored.files});
-        if (restored.purged_files > 0) std.debug.print("{d} files were deleted from the backup after this restore began and were left out\n", .{restored.purged_files});
+        if (restored.purged_files > 0) std.debug.print("{d} files were deleted from the backup after this restore began and were left out:\n", .{restored.purged_files});
+        for (restored.omitted) |v| std.debug.print("  {s}\n", .{v.path});
         if (restored.thawing_packs > 0) printThaw(restored.thawing_packs, restored.thawing_bytes, request.tier);
     }
     if (request.action == .forget) std.debug.print("Purge recorded; the next run removes this path from offsite history and packs.\n", .{});

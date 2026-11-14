@@ -39,7 +39,10 @@ pub const Tier = s3.RestoreTier;
 /// `first_seen`/`last_seen`: set in the catalog only, one unbroken stretch
 /// of upload runs that found this version at the path (0: before they were
 /// kept). A version that comes back after another one has a second entry.
-pub const File = struct { path: []const u8, cid: Cid, size: u64, mtime: u64 = 0, blocks: []const Cid, directory: bool = false, first_seen: u64 = 0, last_seen: u64 = 0 };
+/// `first_run`/`last_run`: the numbers of those runs. Run numbers only grow,
+/// so they order what the clock cannot: two runs within one second (0: the
+/// catalog was written before they were kept).
+pub const File = struct { path: []const u8, cid: Cid, size: u64, mtime: u64 = 0, blocks: []const Cid, directory: bool = false, first_seen: u64 = 0, last_seen: u64 = 0, first_run: u64 = 0, last_run: u64 = 0 };
 pub const Snapshot = struct { time: u64, files: []const File };
 /// One content of one path: what a purge names.
 pub const Version = struct { path: []const u8, cid: Cid };
@@ -75,8 +78,22 @@ pub const Status = struct {
     deferred_last: u64 = 0,
 };
 /// A restore ends when no pack is thawing any more. `purged_files`: files
-/// of the job left out because they were deleted from the backup meanwhile.
-pub const Restore = struct { files: usize = 0, thawing_packs: usize = 0, thawing_bytes: u64 = 0, purged_files: usize = 0 };
+/// of the job left out because they were deleted from the backup meanwhile,
+/// counted since the job began; `omitted` names them (path and content),
+/// in the allocator the restore was called with: `deinit` frees them.
+pub const Restore = struct {
+    files: usize = 0,
+    thawing_packs: usize = 0,
+    thawing_bytes: u64 = 0,
+    purged_files: usize = 0,
+    omitted: []const Version = &.{},
+
+    pub fn deinit(self: *Restore, allocator: Allocator) void {
+        for (self.omitted) |v| allocator.free(v.path);
+        allocator.free(self.omitted);
+        self.omitted = &.{};
+    }
+};
 /// Receives a file's bytes in order, each piece with its offset in the file.
 pub const Sink = struct {
     ctx: *anyopaque,
@@ -138,10 +155,31 @@ pub const Locator = struct {
     findFn: *const fn (*anyopaque, Cid) ?Location,
 };
 pub const Class = StorageClass;
-/// A restore job keeps the packs it still reads: no run deletes a pack an
+/// A restore job keeps the packs of its plan: no run deletes a pack an
 /// unexpired pin names. Every pass of the restore writes it again.
 pub const pin_seconds = 14 * 86400;
-const Pin = struct { version: u32 = 1, expires: u64, packs: []const [16]u8 };
+/// However often it is renewed, a pin protects nothing this long after its
+/// job began: a job resumed for ever cannot keep purged bytes. The restore
+/// then plans again from the head.
+pub const pin_limit_seconds = 30 * 86400;
+/// A pin is deleted only this long after it expired. A restore may renew its
+/// pin while a run is deleting it; this far past the expiry the job has long
+/// been planning from the head, so the lost pin costs it nothing.
+pub const pin_keep_seconds = 30 * 86400;
+/// Packs a sweep decides on between two reads of the pins.
+const sweep_batch = 64;
+/// `created`: when the job began (0: unknown, protects nothing).
+const Pin = struct {
+    version: u32 = 2,
+    expires: u64,
+    created: u64 = 0,
+    packs: []const [16]u8,
+
+    /// The time this pin stops protecting its packs.
+    fn until(self: Pin) u64 {
+        return @min(self.expires, self.created +| pin_limit_seconds);
+    }
+};
 const Lease = struct { owner: [16]u8, expires: u64 };
 
 /// One operation/session at a time. Scratch metadata belongs to this bounded
@@ -176,6 +214,8 @@ pub const Service = struct {
     catalog: []const u8 = "",
     /// The key material the root names: `keys/<setup>/`.
     setup_id: []const u8 = "",
+    /// Packs a sweep deletes before it reads the pins again.
+    sweep_batch: usize = sweep_batch,
 
     pub fn init(allocator: Allocator, client: *s3.Client, config: Config, device: Device) !Service {
         if (config.pack_mb == 0 or config.pack_mb > 512) return error.InvalidPackSize;
@@ -488,11 +528,16 @@ pub const Service = struct {
     }
     /// Deletes the garbage whose time has come. Only records a committed
     /// head holds are old enough, and nothing ever names such an object again.
-    /// A pack a restore job pins waits, and is looked at again within the grace.
+    /// A pack a restore job pins waits, and is looked at again within the
+    /// grace. The pins are read again before every batch of packs: one
+    /// written or renewed while the sweep runs counts for the packs still to
+    /// go. A pin that lands after its batch was decided loses the pack; its
+    /// restore finds the pack gone and plans again from the head.
     fn sweep(self: *Service) !void {
         var pinned: std.AutoHashMap([16]u8, u64) = .init(self.allocator);
         defer pinned.deinit();
-        var pins_read = false;
+        const batch = @max(self.sweep_batch, 1);
+        var decided: usize = batch;
         var i: usize = 0;
         while (i < self.garbage.items.len) {
             const item = &self.garbage.items[i];
@@ -501,11 +546,15 @@ pub const Service = struct {
                 continue;
             }
             if (std.mem.startsWith(u8, item.name, "packs/")) {
-                if (!pins_read) try self.loadPins(&pinned);
-                pins_read = true;
+                if (decided >= batch) {
+                    pinned.clearRetainingCapacity();
+                    try self.loadPins(&pinned);
+                    decided = 0;
+                }
+                decided += 1;
                 const id: ?[16]u8 = backup.index.parsePackId(item.name["packs/".len..]) catch null;
-                if (if (id) |pack| pinned.get(pack) else null) |expires| {
-                    item.removable = @min(expires, self.now() + grace_seconds);
+                if (if (id) |pack| pinned.get(pack) else null) |until| {
+                    item.removable = @min(until, self.now() + grace_seconds);
                     i += 1;
                     continue;
                 }
@@ -517,13 +566,15 @@ pub const Service = struct {
     fn pinName(self: *Service, job: [16]u8) ![]const u8 {
         return std.fmt.allocPrint(self.a(), "pins/{s}", .{std.fmt.bytesToHex(job, .lower)});
     }
-    /// Keeps `packs` in the bucket for a restore job, for `pin_seconds` from
-    /// now. Needs no lease: only the job writes its pin. It must be written
-    /// within the grace of the generation the packs were read from.
-    pub fn pin(self: *Service, job: [16]u8, packs: []const [16]u8) !void {
+    /// Keeps `packs` in the bucket for a restore job that began at `created`,
+    /// for `pin_seconds` from now and never past `pin_limit_seconds` after
+    /// `created`. Needs no lease: only the job writes its pin. A pin is a
+    /// request, not a lock: a run that read the pins before this write may
+    /// still delete a pack, and the job must then plan again from the head.
+    pub fn pin(self: *Service, job: [16]u8, packs: []const [16]u8, created: u64) !void {
         if (self.key == null) return error.Locked;
         if (packs.len > max_objects) return error.TooManyObjects;
-        const sealed = try self.seal(try self.json(Pin{ .expires = self.now() + pin_seconds, .packs = packs }));
+        const sealed = try self.seal(try self.json(Pin{ .expires = self.now() + pin_seconds, .created = created, .packs = packs }));
         const ts = self.timestamp();
         var response = try self.client.putObject(try self.name(try self.pinName(job)), .{ .bytes = sealed }, .{}, &ts);
         defer response.deinit();
@@ -533,8 +584,10 @@ pub const Service = struct {
         const ts = self.timestamp();
         try self.client.deleteObject(try self.name(try self.pinName(job)), &ts);
     }
-    /// The packs unexpired pins name, each with its latest expiry. A pin a
-    /// grace past its time is deleted. One that cannot be read protects
+    /// The packs live pins name, each with the latest time one protects it
+    /// to. A pin is deleted `pin_keep_seconds` after it expired and nothing
+    /// is checked afterwards: one renewed at that very moment is written
+    /// again by its job's next pass. One that cannot be read protects
     /// nothing: its restore plans again from the head.
     fn loadPins(self: *Service, pinned: *std.AutoHashMap([16]u8, u64)) !void {
         for (try self.listObjects("pins")) |object| {
@@ -548,21 +601,22 @@ pub const Service = struct {
             };
             const written = if (object.modified == 0) self.now() else object.modified;
             const expires = if (found) |p| p.expires else written + pin_seconds;
-            if (self.now() >= expires + grace_seconds) {
+            if (self.now() >= expires +| pin_keep_seconds) {
                 try self.delete(object.name);
                 continue;
             }
             const live = found orelse continue;
-            if (self.now() >= live.expires) continue;
+            const until = live.until();
+            if (self.now() >= until) continue;
             for (live.packs) |pack| {
                 const slot = try pinned.getOrPut(pack);
-                slot.value_ptr.* = if (slot.found_existing) @max(slot.value_ptr.*, live.expires) else live.expires;
+                slot.value_ptr.* = if (slot.found_existing) @max(slot.value_ptr.*, until) else until;
             }
         }
     }
     fn readPin(self: *Service, sealed: []const u8) !Pin {
         const result = try self.parse(Pin, try self.open(sealed));
-        if (result.version != 1 or result.packs.len > max_objects) return error.InvalidMetadata;
+        if (result.version != 2 or result.packs.len > max_objects) return error.InvalidMetadata;
         return result;
     }
     /// Objects no head names: left by a run that stopped before its commit
@@ -867,8 +921,10 @@ pub const Service = struct {
         try catalog.appendSlice(self.a(), try self.loadCatalog());
         var newest: std.StringHashMap(usize) = .init(self.allocator);
         defer newest.deinit();
-        const last_run = try newestIntervals(catalog.items, &newest);
-        const seen = self.now();
+        const last = try newestIntervals(catalog.items, &newest);
+        // This run's number: the generation its next commit makes, above
+        // every generation, and so every run, committed before it.
+        const seen: Run = .{ .time = self.now(), .number = self.head.generation + 1 };
         var writer = try backup.pack.Writer.init(self.allocator, .{ .key = self.cryptoKey(), .target_size = @as(usize, self.config.pack_mb) * 1024 * 1024 });
         defer writer.deinit();
         var id = try backup.index.generatePackId();
@@ -879,7 +935,7 @@ pub const Service = struct {
             if (listed(&.{file}, left_out)) continue;
             try live.append(self.a(), file);
             // The catalog is the history: each version with when it was seen.
-            try observe(self.a(), &catalog, &newest, file, last_run, seen);
+            try observe(self.a(), &catalog, &newest, file, last, seen);
             for (file.blocks) |cid| {
                 try self.renew();
                 const bid = self.blockId(cid);
@@ -1297,40 +1353,49 @@ fn validFile(file: File) bool {
     for (file.blocks) |cid| if (std.mem.eql(u8, &cid, &file.cid)) return true;
     return false;
 }
-/// Fills `newest` with the latest interval of each path in the catalog.
-/// Returns the time of the last run that saw any file (a run that listed
-/// none leaves no mark, so a file missing only from such runs keeps its
-/// interval).
-fn newestIntervals(catalog: []const File, newest: *std.StringHashMap(usize)) !u64 {
-    var last_run: u64 = 0;
+/// One upload run: its time and its number.
+const Run = struct { time: u64 = 0, number: u64 = 0 };
+/// True when interval `x` of a path is later than its interval `y`: by the
+/// last run that saw it, the run's number deciding within one second.
+fn later(x: File, y: File) bool {
+    const kx = [4]u64{ x.last_seen, x.last_run, x.first_seen, x.first_run };
+    const ky = [4]u64{ y.last_seen, y.last_run, y.first_seen, y.first_run };
+    return std.mem.order(u64, &kx, &ky) == .gt;
+}
+/// Fills `newest` with the latest interval of each path in the catalog
+/// (of two that tie, the one written later). Returns the last run that saw
+/// any file (a run that listed none leaves no mark, so a file missing only
+/// from such runs keeps its interval).
+fn newestIntervals(catalog: []const File, newest: *std.StringHashMap(usize)) !Run {
+    var last: Run = .{};
     for (catalog, 0..) |file, i| {
-        last_run = @max(last_run, file.last_seen);
+        last.time = @max(last.time, file.last_seen);
+        last.number = @max(last.number, file.last_run);
         const slot = try newest.getOrPut(file.path);
-        if (!slot.found_existing) {
-            slot.value_ptr.* = i;
-            continue;
-        }
-        const other = catalog[slot.value_ptr.*];
-        if (file.last_seen > other.last_seen or (file.last_seen == other.last_seen and file.first_seen > other.first_seen)) slot.value_ptr.* = i;
+        if (!slot.found_existing or !later(catalog[slot.value_ptr.*], file)) slot.value_ptr.* = i;
     }
-    return last_run;
+    return last;
 }
 /// This run (`seen`) found `file`. The path's latest interval grows when it
-/// is this version and the last run saw it too; after a gap (another version
-/// in between, or a run without the file) the version gets a new interval,
-/// so the history says what was at the path at any time.
-fn observe(a: Allocator, catalog: *std.ArrayList(File), newest: *std.StringHashMap(usize), file: File, last_run: u64, seen: u64) !void {
+/// is this version and the last run (`last`) saw it too; after a gap
+/// (another version in between, or a run without the file) the version gets
+/// a new interval, so the history says what was at the path at any time.
+/// Two runs in one second are told apart by their numbers.
+fn observe(a: Allocator, catalog: *std.ArrayList(File), newest: *std.StringHashMap(usize), file: File, last: Run, seen: Run) !void {
     const slot = try newest.getOrPut(file.path);
     if (slot.found_existing) {
         const known = &catalog.items[slot.value_ptr.*];
-        if (known.last_seen >= last_run and known.directory == file.directory and std.mem.eql(u8, &known.cid, &file.cid)) {
-            known.last_seen = @max(known.last_seen, seen);
+        if (known.last_seen >= last.time and known.last_run >= last.number and known.directory == file.directory and std.mem.eql(u8, &known.cid, &file.cid)) {
+            known.last_seen = @max(known.last_seen, seen.time);
+            known.last_run = seen.number;
             return;
         }
     }
     var version = file;
-    version.first_seen = seen;
-    version.last_seen = seen;
+    version.first_seen = seen.time;
+    version.last_seen = seen.time;
+    version.first_run = seen.number;
+    version.last_run = seen.number;
     slot.value_ptr.* = catalog.items.len;
     try catalog.append(a, version);
 }

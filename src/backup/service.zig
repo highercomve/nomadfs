@@ -356,4 +356,5 @@ pub fn deinitResult(a: std.mem.Allocator, result: *Result) void {
         std.crypto.secureZero(u8, @constCast(p));
         a.free(p);
     }
+    if (result.restore) |*r| r.deinit(a);
 }
