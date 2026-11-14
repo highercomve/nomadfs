@@ -3,9 +3,17 @@ const core = @import("offsite.zig");
 const s3 = @import("../net/s3/mod.zig");
 const backup = @import("../backup/mod.zig");
 const storage = @import("../storage/mod.zig");
+const fs_restore = @import("../fs/restore.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;
 const Cid = [32]u8;
+/// The warm restore of a snapshot: every pack is readable, the count is final.
+fn restore(service: *core.Service, name: []const u8, path: ?[]const u8, destination: std.Io.Dir) !usize {
+    return (try restoreRequest(service, name, path, destination, .Bulk)).files;
+}
+fn restoreRequest(service: *core.Service, name: []const u8, path: ?[]const u8, destination: std.Io.Dir, tier: core.Tier) !core.Restore {
+    return fs_restore.restore(a, io, service, .{ .from = .{ .snapshot = name }, .path = path, .tier = tier }, destination);
+}
 const Thaw = enum { none, ongoing, ready };
 const Object = struct { bytes: []u8, version: u64, modified: u64 = 0, class: ?[]const u8 = null, thaw: Thaw = .none };
 fn isCold(class: ?[]const u8) bool {
@@ -337,7 +345,7 @@ test "offsite: restore folder byte for byte and recovery-only restore" {
     const report = try f.run();
     var target = std.testing.tmpDir(.{});
     defer target.cleanup();
-    try std.testing.expectEqual(@as(usize, 2), try f.service.restore(io, report.snapshot, null, target.dir));
+    try std.testing.expectEqual(@as(usize, 2), try restore(&f.service, report.snapshot, null, target.dir));
     const bytes = try target.dir.readFileAlloc(io, "Notes/b.txt", a, .limited(100));
     defer a.free(bytes);
     try std.testing.expectEqualStrings("notes bytes\n", bytes);
@@ -353,7 +361,7 @@ test "offsite: restore folder byte for byte and recovery-only restore" {
     try other.unlock(report.recovery_phrase);
     var recovered = std.testing.tmpDir(.{});
     defer recovered.cleanup();
-    try std.testing.expectEqual(@as(usize, 1), try other.restore(io, report.snapshot, "Photos", recovered.dir));
+    try std.testing.expectEqual(@as(usize, 1), try restore(&other, report.snapshot, "Photos", recovered.dir));
     try std.testing.expectEqual(@as(usize, 2), try other.verify(null));
 }
 
@@ -479,7 +487,7 @@ test "offsite: clear mode restores with integrity; purge log and recovery entrop
     }
     var target = std.testing.tmpDir(.{});
     defer target.cleanup();
-    try std.testing.expectEqual(@as(usize, 1), try f.service.restore(io, report.snapshot, null, target.dir));
+    try std.testing.expectEqual(@as(usize, 1), try restore(&f.service, report.snapshot, null, target.dir));
     try std.testing.expectEqual(@as(usize, 1), try f.service.verify(null));
     _ = try f.run();
     try std.testing.expectEqual(@as(usize, 0), f.service.index.count());
@@ -494,11 +502,11 @@ test "offsite: restore refuses symlink parents and existing output" {
     var target = std.testing.tmpDir(.{});
     defer target.cleanup();
     try target.dir.symLink(io, "/tmp", "Photos", .{ .is_directory = true });
-    const result = f.service.restore(io, report.snapshot, null, target.dir);
+    const result = restore(&f.service, report.snapshot, null, target.dir);
     if (result) |_| return error.TestExpectedError else |_| {}
     try target.dir.deleteFile(io, "Photos");
-    _ = try f.service.restore(io, report.snapshot, null, target.dir);
-    try std.testing.expectError(error.PathAlreadyExists, f.service.restore(io, report.snapshot, null, target.dir));
+    _ = try restore(&f.service, report.snapshot, null, target.dir);
+    try std.testing.expectError(error.PathAlreadyExists, restore(&f.service, report.snapshot, null, target.dir));
 }
 
 test "offsite: missing device wrap never replaces an existing bucket key" {
@@ -530,7 +538,7 @@ test "offsite: multi-level DAG restore preserves repeated shared blocks and purg
     const report = try f.run();
     var target = std.testing.tmpDir(.{});
     defer target.cleanup();
-    try std.testing.expectEqual(@as(usize, 2), try f.service.restore(io, report.snapshot, null, target.dir));
+    try std.testing.expectEqual(@as(usize, 2), try restore(&f.service, report.snapshot, null, target.dir));
     const bytes = try target.dir.readFileAlloc(io, "keep.txt", a, .limited(100));
     defer a.free(bytes);
     try std.testing.expectEqualStrings("sharedretainedshared", bytes);
@@ -557,7 +565,7 @@ test "offsite: fs source snapshots the public manifest with nested files and emp
     const report = try f.service.run(source.source(), &f.store);
     var target = std.testing.tmpDir(.{});
     defer target.cleanup();
-    try std.testing.expectEqual(@as(usize, 1), try f.service.restore(io, report.snapshot, null, target.dir));
+    try std.testing.expectEqual(@as(usize, 1), try restore(&f.service, report.snapshot, null, target.dir));
     const empty = try target.dir.openDir(io, "Empty", .{});
     empty.close(io);
     const bytes = try target.dir.readFileAlloc(io, "Folder/a.txt", a, .limited(100));
@@ -747,7 +755,7 @@ test "offsite: cold restore asks for thaws first, then restores when the packs a
     const report = try f.run();
     var target = std.testing.tmpDir(.{});
     defer target.cleanup();
-    const first = try f.service.restoreRequest(io, report.snapshot, null, target.dir, .Standard);
+    const first = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Standard);
     try std.testing.expectEqual(@as(usize, 0), first.files);
     try std.testing.expectEqual(@as(usize, 1), first.thawing_packs);
     try std.testing.expect(first.thawing_bytes > 0);
@@ -755,7 +763,7 @@ test "offsite: cold restore asks for thaws first, then restores when the packs a
     try std.testing.expectEqualStrings("Standard", f.fake.last_tier);
     try std.testing.expectError(error.FileNotFound, target.dir.statFile(io, "Notes/b.txt", .{}));
     // The pending job is on disk: a new session (a restart) picks it up.
-    const job = try target.dir.readFileAlloc(io, ".nomadfs-restore.json", a, .limited(4096));
+    const job = try target.dir.readFileAlloc(io, ".nomadfs-restore/job.json", a, .limited(4096));
     defer a.free(job);
     try std.testing.expect(std.mem.indexOf(u8, job, report.snapshot) != null);
     var other = try core.Service.init(a, &f.client, f.service.config, f.service.device);
@@ -764,14 +772,14 @@ test "offsite: cold restore asks for thaws first, then restores when the packs a
     other.clockFn = Fake.clock;
     try other.unlock(null);
     // Still thawing: no second request, nothing written.
-    const waiting = try other.restoreRequest(io, report.snapshot, null, target.dir, .Standard);
+    const waiting = try restoreRequest(&other, report.snapshot, null, target.dir, .Standard);
     try std.testing.expectEqual(@as(usize, 0), waiting.files);
     try std.testing.expectEqual(@as(usize, 1), waiting.thawing_packs);
     try std.testing.expectEqual(@as(usize, 1), f.fake.restore_requests);
     // A different request must not reuse this directory's job.
-    try std.testing.expectError(error.RestoreJobMismatch, other.restoreRequest(io, report.snapshot, "Photos", target.dir, .Standard));
+    try std.testing.expectError(error.RestoreJobMismatch, restoreRequest(&other, report.snapshot, "Photos", target.dir, .Standard));
     f.fake.finishThaws();
-    const done = try other.restoreRequest(io, report.snapshot, null, target.dir, .Standard);
+    const done = try restoreRequest(&other, report.snapshot, null, target.dir, .Standard);
     try std.testing.expectEqual(@as(usize, 2), done.files);
     try std.testing.expectEqual(@as(usize, 0), done.thawing_packs);
     try std.testing.expectEqual(@as(usize, 1), f.fake.restore_requests);
@@ -781,7 +789,7 @@ test "offsite: cold restore asks for thaws first, then restores when the packs a
     const photo = try target.dir.readFileAlloc(io, "Photos/a.jpg", a, .limited(100));
     defer a.free(photo);
     try std.testing.expectEqualStrings("photo bytes", photo);
-    try std.testing.expectError(error.FileNotFound, target.dir.statFile(io, ".nomadfs-restore.json", .{}));
+    try std.testing.expectError(error.FileNotFound, target.dir.statFile(io, ".nomadfs-restore", .{}));
 }
 
 test "offsite: cold restore writes the files of ready packs and resumes for the rest" {
@@ -798,11 +806,11 @@ test "offsite: cold restore writes the files of ready packs and resumes for the 
     f.fake.objects.getPtr(try f.packKey(b)).?.thaw = .none;
     var target = std.testing.tmpDir(.{});
     defer target.cleanup();
-    const first = try f.service.restoreRequest(io, report.snapshot, null, target.dir, .Bulk);
+    const first = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
     try std.testing.expectEqual(@as(usize, 1), first.files);
     try std.testing.expectEqual(@as(usize, 1), first.thawing_packs);
     f.fake.finishThaws();
-    const done = try f.service.restoreRequest(io, report.snapshot, null, target.dir, .Bulk);
+    const done = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
     try std.testing.expectEqual(@as(usize, 2), done.files);
     try std.testing.expectEqual(@as(usize, 0), done.thawing_packs);
     const bytes = try target.dir.readFileAlloc(io, "b.txt", a, .limited(100));
@@ -923,7 +931,7 @@ test "offsite: a file with a missing block is left out and counted, then uploade
     try std.testing.expectEqual(@as(usize, 3), second.uploaded_blocks);
     var target = std.testing.tmpDir(.{});
     defer target.cleanup();
-    try std.testing.expectEqual(@as(usize, 2), try f.service.restore(io, second.snapshot, null, target.dir));
+    try std.testing.expectEqual(@as(usize, 2), try restore(&f.service, second.snapshot, null, target.dir));
     const bytes = try target.dir.readFileAlloc(io, "Phone/Camera/partial.bin", a, .limited(100));
     defer a.free(bytes);
     try std.testing.expectEqualStrings("first chunksecond chunk", bytes);
@@ -960,7 +968,7 @@ test "offsite: the worker uploads to cold targets only on a deep backup device, 
     try std.testing.expect(!worker_mod.hasArchive(&.{.{ .name = "half", .storage_class = .GLACIER }}));
 
     const identity = try @import("../device/mod.zig").identity.Identity.fromSeed([_]u8{3} ** 32);
-    const w = try worker_mod.Worker.create(a, &.{ warm, cold, glacier }, identity, undefined, .{ .folder = undefined, .store = undefined });
+    const w = try worker_mod.Worker.create(a, &.{ warm, cold, glacier }, identity, undefined, undefined, undefined);
     defer w.destroy();
     w.uploadFn = Uploads.record;
 
@@ -997,10 +1005,271 @@ test "offsite: the worker uploads to cold targets only on a deep backup device, 
     try std.testing.expect(!Uploads.took("archive"));
 
     // A deep backup device with warm targets only has no archive to fill.
-    const lone = try worker_mod.Worker.create(a, &.{warm}, identity, undefined, .{ .folder = undefined, .store = undefined });
+    const lone = try worker_mod.Worker.create(a, &.{warm}, identity, undefined, undefined, undefined);
     defer lone.destroy();
     lone.setRoles(.{ .swarm_backup = true, .deep_backup = true });
     try std.testing.expect(lone.archiveMissing());
     try std.testing.expect(lone.archiveStatus() == null);
     try std.testing.expectEqualStrings("no archive target configured", worker_mod.no_archive);
+}
+
+fn restoreHistory(service: *core.Service, path: ?[]const u8, version: fs_restore.Version, destination: std.Io.Dir) !core.Restore {
+    return fs_restore.restore(a, io, service, .{ .from = .{ .history = version }, .path = path }, destination);
+}
+fn expectFile(dir: std.Io.Dir, path: []const u8, expected: []const u8) !void {
+    const bytes = try dir.readFileAlloc(io, path, a, .limited(4096));
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings(expected, bytes);
+}
+/// The absolute path of `name` inside a test directory.
+fn pathIn(dir: std.Io.Dir, name: []const u8) ![]u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try dir.realPath(io, &buf)];
+    return std.fs.path.join(a, &.{ root, name });
+}
+
+test "offsite: restore job files never follow a symlink placed in the destination" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    _ = try f.add("a.txt", "good");
+    const report = try f.run();
+    var victim = std.testing.tmpDir(.{});
+    defer victim.cleanup();
+    try victim.dir.writeFile(io, .{ .sub_path = "victim", .data = "precious" });
+    const precious = try pathIn(victim.dir, "victim");
+    defer a.free(precious);
+
+    // The old predictable temporary name: nothing opens it any more.
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    try target.dir.symLink(io, precious, ".nomadfs-restore.json.tmp", .{});
+    const first = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 1), first.thawing_packs);
+    try expectFile(victim.dir, "victim", "precious");
+
+    // The job directory itself is a link to somewhere else: refused.
+    var linked = std.testing.tmpDir(.{});
+    defer linked.cleanup();
+    const outside = try pathIn(victim.dir, ".");
+    defer a.free(outside);
+    try linked.dir.symLink(io, outside, ".nomadfs-restore", .{ .is_directory = true });
+    if (restoreRequest(&f.service, report.snapshot, null, linked.dir, .Bulk)) |_| return error.TestExpectedError else |_| {}
+    try std.testing.expectError(error.FileNotFound, victim.dir.statFile(io, "job.json", .{}));
+    try std.testing.expectError(error.FileNotFound, victim.dir.statFile(io, "done.log", .{}));
+
+    // A job directory made in advance, with links where the job files go.
+    var planted = std.testing.tmpDir(.{});
+    defer planted.cleanup();
+    try planted.dir.createDir(io, ".nomadfs-restore", .fromMode(0o700));
+    try planted.dir.symLink(io, precious, ".nomadfs-restore/done.log", .{});
+    if (restoreRequest(&f.service, report.snapshot, null, planted.dir, .Bulk)) |_| return error.TestExpectedError else |_| {}
+    try planted.dir.deleteFile(io, ".nomadfs-restore/job.json");
+    try planted.dir.symLink(io, precious, ".nomadfs-restore/job.json", .{});
+    if (restoreRequest(&f.service, report.snapshot, null, planted.dir, .Bulk)) |_| return error.TestExpectedError else |_| {}
+    try expectFile(victim.dir, "victim", "precious");
+    try std.testing.expectError(error.FileNotFound, planted.dir.statFile(io, "a.txt", .{}));
+
+    // A link at a file's final name is replaced, never written through.
+    f.fake.finishThaws();
+    try target.dir.symLink(io, precious, "a.txt", .{});
+    const done = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 1), done.files);
+    try expectFile(target.dir, "a.txt", "good");
+    try expectFile(victim.dir, "victim", "precious");
+}
+
+test "offsite: restored files named like the job files are plain files; the job directory name is reserved" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    _ = try f.add(".nomadfs-restore.json", "first");
+    _ = try f.add(".nomadfs-restore.json.tmp", "second");
+    _ = try f.add("job.json", "third");
+    const report = try f.run();
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    const first = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 0), first.files);
+    f.fake.finishThaws();
+    const done = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 3), done.files);
+    try expectFile(target.dir, ".nomadfs-restore.json", "first");
+    try expectFile(target.dir, ".nomadfs-restore.json.tmp", "second");
+    try expectFile(target.dir, "job.json", "third");
+    try std.testing.expectError(error.FileNotFound, target.dir.statFile(io, ".nomadfs-restore", .{}));
+
+    // A snapshot path inside the job directory would collide: refused whole.
+    _ = try f.add(".nomadfs-restore/job.json", "fourth");
+    const colliding = try f.run();
+    var other = std.testing.tmpDir(.{});
+    defer other.cleanup();
+    try std.testing.expectError(error.ReservedPath, restoreRequest(&f.service, colliding.snapshot, null, other.dir, .Bulk));
+    try std.testing.expectError(error.FileNotFound, other.dir.statFile(io, ".nomadfs-restore", .{}));
+    // The other files are still reachable one by one (their pack is thawed).
+    try std.testing.expectEqual(@as(usize, 1), (try restoreRequest(&f.service, colliding.snapshot, "job.json", other.dir, .Bulk)).files);
+    try expectFile(other.dir, "job.json", "third");
+}
+
+test "offsite: cold restore resume rewrites a file with wrong bytes of the same size" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    _ = try f.add("a.txt", "good");
+    const report = try f.run();
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    _ = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    f.fake.finishThaws();
+    try target.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "EVIL" });
+    const done = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 1), done.files);
+    try expectFile(target.dir, "a.txt", "good");
+}
+
+test "offsite: cold restore resume replaces a file cut short" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    _ = try f.add("a.txt", "good");
+    const report = try f.run();
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    _ = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    f.fake.finishThaws();
+    try target.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "go" });
+    const done = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 1), done.files);
+    try expectFile(target.dir, "a.txt", "good");
+}
+
+test "offsite: a restore killed half way resumes: recorded files stay, the rest is written again, stale temporary files go" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    _ = try f.add("a.txt", "first pack");
+    _ = try f.run();
+    const b = try f.add("Sub/b.txt", "second pack");
+    _ = try f.run();
+    _ = try f.add("c.txt", "third");
+    const report = try f.run();
+    var it = f.fake.objects.valueIterator();
+    while (it.next()) |object| {
+        if (isCold(object.class)) object.thaw = .ready;
+    }
+    f.fake.objects.getPtr(try f.packKey(b)).?.thaw = .none;
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    const first = try restoreRequest(&f.service, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 2), first.files);
+    try std.testing.expectEqual(@as(usize, 1), first.thawing_packs);
+
+    // What a kill leaves: a temporary file, a half-written record at the
+    // end of the list, and a file that reached its name but not the list.
+    try target.dir.writeFile(io, .{ .sub_path = ".nomadfs-restore/file-0123456789abcdef0123456789abcdef.tmp", .data = "half a fi" });
+    const log = try target.dir.readFileAlloc(io, ".nomadfs-restore/done.log", a, .limited(4096));
+    defer a.free(log);
+    const one = std.mem.indexOfScalar(u8, log, '\n').? + 1;
+    const torn = try std.mem.concat(a, u8, &.{ log[0..one], log[one .. one + 20] });
+    defer a.free(torn);
+    try target.dir.writeFile(io, .{ .sub_path = ".nomadfs-restore/done.log", .data = torn });
+    const recorded_first = std.mem.indexOf(u8, log[0..one], "a.txt") != null;
+    const recorded: []const u8 = if (recorded_first) "a.txt" else "c.txt";
+    const unrecorded: []const u8 = if (recorded_first) "c.txt" else "a.txt";
+    try target.dir.writeFile(io, .{ .sub_path = unrecorded, .data = "junk" });
+    const before = (try target.dir.statFile(io, recorded, .{})).inode;
+
+    f.fake.finishThaws();
+    var again = try core.Service.init(a, &f.client, f.service.config, f.service.device);
+    defer again.deinit();
+    again.clock_ctx = &f.fake;
+    again.clockFn = Fake.clock;
+    try again.unlock(null);
+    const done = try restoreRequest(&again, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 3), done.files);
+    try std.testing.expectEqual(@as(usize, 0), done.thawing_packs);
+    try expectFile(target.dir, "a.txt", "first pack");
+    try expectFile(target.dir, "Sub/b.txt", "second pack");
+    try expectFile(target.dir, "c.txt", "third");
+    // The recorded file was not written again.
+    try std.testing.expectEqual(before, (try target.dir.statFile(io, recorded, .{})).inode);
+    try std.testing.expectError(error.FileNotFound, target.dir.statFile(io, ".nomadfs-restore", .{}));
+
+    // A warm restore that failed half way leaves its job and resumes too.
+    const w = try Fixture.create();
+    defer w.destroy();
+    const lost = try w.add("x.txt", "one");
+    _ = try w.run();
+    _ = try w.add("y.txt", "two");
+    const warm = try w.run();
+    const pack = try a.dupe(u8, try w.packKey(lost));
+    defer a.free(pack);
+    const removed = w.fake.objects.fetchRemove(pack).?;
+    var half = std.testing.tmpDir(.{});
+    defer half.cleanup();
+    try std.testing.expectError(error.NotFound, restore(&w.service, warm.snapshot, null, half.dir));
+    _ = try half.dir.statFile(io, ".nomadfs-restore/job.json", .{});
+    try w.fake.objects.put(a, removed.key, removed.value);
+    try std.testing.expectEqual(@as(usize, 2), try restore(&w.service, warm.snapshot, null, half.dir));
+    try expectFile(half.dir, "x.txt", "one");
+    try expectFile(half.dir, "y.txt", "two");
+    try std.testing.expectError(error.FileNotFound, half.dir.statFile(io, ".nomadfs-restore", .{}));
+    // Finished: the same restore again finds its files in the way.
+    try std.testing.expectError(error.PathAlreadyExists, restore(&w.service, warm.snapshot, null, half.dir));
+    try std.testing.expectError(error.FileNotFound, half.dir.statFile(io, ".nomadfs-restore", .{}));
+}
+
+test "offsite: a file retention left in no snapshot is listed in the history and restored from it" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    const short_lived = try f.add("gone.txt", "here for a week");
+    _ = try f.add("Notes/doc.txt", "draft");
+    const first = try f.run();
+    const seen = f.fake.time;
+    f.files.clearRetainingCapacity();
+    const final = try f.add("Notes/doc.txt", "final text");
+    _ = try f.run(); // same month: gone.txt deleted, doc.txt changed
+    const changed = f.fake.time;
+    f.fake.time += 90 * day;
+    _ = try f.run();
+    const old_snapshot = try std.fmt.allocPrint(a, "swarm/{s}", .{first.snapshot});
+    defer a.free(old_snapshot);
+    try std.testing.expect(!f.fake.objects.contains(old_snapshot));
+    // No kept snapshot lists the deleted file.
+    for ((try f.service.status()).snapshots) |name| {
+        for ((try f.service.snapshot(name)).files) |file| try std.testing.expect(!std.mem.eql(u8, file.path, "gone.txt"));
+    }
+
+    // The history still does, with when it was there.
+    const all = try f.service.history(null);
+    try std.testing.expectEqual(@as(usize, 3), all.len);
+    const one = try f.service.history("gone.txt");
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+    try std.testing.expectEqualSlices(u8, &short_lived, &one[0].cid);
+    try std.testing.expectEqual(@as(u64, "here for a week".len), one[0].size);
+    try std.testing.expectEqual(seen, one[0].first_seen);
+    try std.testing.expectEqual(seen, one[0].last_seen);
+    const versions = try f.service.history("Notes");
+    try std.testing.expectEqual(@as(usize, 2), versions.len);
+    for (versions) |v| {
+        if (std.mem.eql(u8, &v.cid, &final)) try std.testing.expect(v.first_seen == changed and v.last_seen == f.fake.time);
+    }
+
+    // Restored from the history: the deleted file, and the newest version.
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    try std.testing.expectEqual(@as(usize, 2), (try restoreHistory(&f.service, null, .latest, target.dir)).files);
+    try expectFile(target.dir, "gone.txt", "here for a week");
+    try expectFile(target.dir, "Notes/doc.txt", "final text");
+    // An older version by time, and by content id.
+    var earlier = std.testing.tmpDir(.{});
+    defer earlier.cleanup();
+    try std.testing.expectEqual(@as(usize, 1), (try restoreHistory(&f.service, "Notes", .{ .at = seen }, earlier.dir)).files);
+    try expectFile(earlier.dir, "Notes/doc.txt", "draft");
+    try std.testing.expectEqual(@as(usize, 1), (try restoreHistory(&f.service, "gone.txt", .{ .cid = short_lived }, earlier.dir)).files);
+    try expectFile(earlier.dir, "gone.txt", "here for a week");
+    try std.testing.expectError(error.PathNotFound, restoreHistory(&f.service, "gone.txt", .{ .at = seen - 10 }, earlier.dir));
+    try std.testing.expectError(error.PathNotFound, restoreHistory(&f.service, "never.txt", .latest, earlier.dir));
+    try std.testing.expectError(error.InvalidPath, restoreHistory(&f.service, "../up", .latest, earlier.dir));
+
+    // A purge is the only thing that takes a file out of the history.
+    try f.service.forget("gone.txt");
+    _ = try f.run();
+    try std.testing.expectEqual(@as(usize, 0), (try f.service.history("gone.txt")).len);
 }

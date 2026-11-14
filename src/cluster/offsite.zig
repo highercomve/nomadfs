@@ -1,13 +1,15 @@
 //! Offsite is a cluster distribution target: fs supplies the files and their
 //! reachable CIDs, storage supplies verified local blocks, net transports S3.
-//! All upload, retention, purge and restore policy lives here for every UI.
+//! All upload, retention, purge and thaw policy lives here for every UI.
+//! Paths are opaque names here: what a path means, which version of a file
+//! is wanted and how files reach a local directory belong to fs (restore.zig),
+//! which asks this target for snapshots, history, thaws and verified bytes.
 //! The historical catalog deliberately outlives snapshots: ordinary deletes
 //! and retention must never release backup data. Only a purge runs pack GC.
 const std = @import("std");
 const backup = @import("../backup/mod.zig");
 const s3 = @import("../net/s3/mod.zig");
 const storage = @import("../storage/mod.zig");
-const manifest = @import("../fs/manifest.zig");
 const Config = @import("../backup/config.zig").Config;
 const StorageClass = @import("../backup/config.zig").StorageClass;
 const Schedule = @import("../backup/config.zig").Schedule;
@@ -22,9 +24,13 @@ const lease_seconds = 300;
 const thaw_days = 7;
 /// Uploads run on an hourly poll; a round this close to its time is due.
 const schedule_slack = 3600;
-const job_name = ".nomadfs-restore.json";
+/// Bounds of what a source or a stored snapshot may describe.
+const max_files = 100_000;
+const max_name = 4096;
 pub const Tier = s3.RestoreTier;
-pub const File = struct { path: []const u8, cid: Cid, size: u64, mtime: u64 = 0, blocks: []const Cid, directory: bool = false };
+/// `first_seen`/`last_seen`: set in the catalog only, the times of the first
+/// and the last upload run that found this version (0: before they were kept).
+pub const File = struct { path: []const u8, cid: Cid, size: u64, mtime: u64 = 0, blocks: []const Cid, directory: bool = false, first_seen: u64 = 0, last_seen: u64 = 0 };
 pub const Snapshot = struct { time: u64, files: []const File };
 /// What the source can describe now. `waiting`: files left out because
 /// their blocks are not all in the local store yet (the keeper is still
@@ -58,6 +64,11 @@ pub const Status = struct {
 };
 /// A restore on a cold target ends when no pack is thawing any more.
 pub const Restore = struct { files: usize = 0, thawing_packs: usize = 0, thawing_bytes: u64 = 0 };
+/// Receives a file's bytes in order, each piece with its offset in the file.
+pub const Sink = struct {
+    ctx: *anyopaque,
+    writeFn: *const fn (*anyopaque, u64, []const u8) anyerror!void,
+};
 pub const Check = struct {
     blocks: usize = 0,
     packs: usize = 0,
@@ -68,8 +79,8 @@ pub const Check = struct {
 };
 const Info = struct { name: []const u8, size: u64, modified: u64 };
 const Deferred = struct { pack: [16]u8, removable: u64 };
-const Job = struct { version: u32 = 1, snapshot: []const u8, path: ?[]const u8 = null, tier: Tier = .Bulk, requested: u64 = 0, packs: usize = 0, bytes: u64 = 0 };
-const Packs = std.AutoHashMap([16]u8, bool);
+/// Packs already asked about in one request: true when readable now.
+pub const Packs = std.AutoHashMap([16]u8, bool);
 const Layout = struct { version: u32 = 1, encrypt: bool, key_id: [8]u8 };
 const Lease = struct { owner: [16]u8, expires: u64 };
 
@@ -111,7 +122,7 @@ pub const Service = struct {
     fn a(self: *Service) Allocator {
         return self.arena.allocator();
     }
-    fn now(self: *Service) u64 {
+    pub fn now(self: *Service) u64 {
         return if (self.clockFn) |f| f(self.clock_ctx) else @import("../sync.zig").nowSeconds();
     }
     fn timestamp(self: *Service) [16]u8 {
@@ -149,7 +160,8 @@ pub const Service = struct {
         var response = try self.client.putObject(try self.name(relative), .{ .bytes = bytes }, .{ .storage_class = class }, &ts);
         defer response.deinit();
     }
-    fn cold(self: *Service) bool {
+    /// True when packs must be thawed before they can be read.
+    pub fn cold(self: *Service) bool {
         return self.config.storage_class.cold();
     }
     /// Seconds a pack must stay before it may be deleted or replaced.
@@ -389,7 +401,7 @@ pub const Service = struct {
     pub fn snapshot(self: *Service, name_: []const u8) !Snapshot {
         if (!std.mem.startsWith(u8, name_, "snapshots/") or std.mem.indexOf(u8, name_, "..") != null) return error.InvalidSnapshot;
         const result = try self.getJson(Snapshot, name_);
-        if (result.files.len > manifest.max_entries) return error.InvalidSnapshot;
+        if (result.files.len > max_files) return error.InvalidSnapshot;
         for (result.files) |file| if (!validFile(file)) return error.InvalidSnapshot;
         return result;
     }
@@ -465,7 +477,7 @@ pub const Service = struct {
         try self.applyPurges();
         const listing = try source.filesFn(source.ctx, self.a());
         const files = listing.files;
-        if (files.len > manifest.max_entries) return error.TooManyFiles;
+        if (files.len > max_files) return error.TooManyFiles;
         const purges = try self.purgePaths();
         var live: std.ArrayList(File) = .empty;
         var catalog: std.ArrayList(File) = .empty;
@@ -480,7 +492,15 @@ pub const Service = struct {
             if (!validFile(file)) return error.InvalidFile;
             if (purged(file.path, purges)) continue;
             try live.append(self.a(), file);
-            if (!catalogHas(catalog.items, file)) try catalog.append(self.a(), file);
+            // The catalog is the history: each version with when it was seen.
+            if (catalogIndex(catalog.items, file)) |known| {
+                catalog.items[known].last_seen = self.now();
+            } else {
+                var version = file;
+                version.first_seen = self.now();
+                version.last_seen = self.now();
+                try catalog.append(self.a(), version);
+            }
             for (file.blocks) |cid| {
                 try self.renew();
                 const bid = self.blockId(cid);
@@ -548,7 +568,7 @@ pub const Service = struct {
             defer ready.deinit();
             var thaw: Restore = .{};
             for (names) |n| for ((try self.snapshot(n)).files) |file| {
-                _ = try self.packsReady(file, &ready, tier, &thaw);
+                _ = try self.fileReady(file, &ready, tier, &thaw);
             };
             if (thaw.thawing_packs > 0) return .{ .packs = ready.count(), .thawing_packs = thaw.thawing_packs, .thawing_bytes = thaw.thawing_bytes };
             return .{ .blocks = try self.verify(name_), .packs = ready.count() };
@@ -599,7 +619,7 @@ pub const Service = struct {
     }
     /// True when every pack holding the file's blocks is readable. Asks for
     /// the thaw of each pack that is not, once per pack (`ready` remembers).
-    fn packsReady(self: *Service, file: File, ready: *Packs, tier: Tier, progress: *Restore) !bool {
+    pub fn fileReady(self: *Service, file: File, ready: *Packs, tier: Tier, progress: *Restore) !bool {
         var all = true;
         for (file.blocks) |cid| {
             const location = self.index.get(self.blockId(cid)) orelse return error.BlockNotFound;
@@ -617,86 +637,22 @@ pub const Service = struct {
         }
         return all;
     }
-    /// The pending job of an earlier restore into this directory, if any.
-    fn loadJob(self: *Service, io: std.Io, destination: std.Io.Dir) !?Job {
-        const bytes = destination.readFileAlloc(io, job_name, self.a(), .limited(64 * 1024)) catch |err| switch (err) {
-            error.FileNotFound => return null,
-            else => return err,
-        };
-        return self.parse(Job, bytes) catch error.InvalidRestoreJob;
-    }
-    fn saveJob(self: *Service, io: std.Io, destination: std.Io.Dir, job: Job) !void {
-        const tmp = job_name ++ ".tmp";
-        errdefer destination.deleteFile(io, tmp) catch {};
-        {
-            var file = try destination.createFile(io, tmp, .{ .truncate = true, .permissions = .fromMode(0o600) });
-            defer file.close(io);
-            try file.writePositionalAll(io, try self.json(job), 0);
-            try file.sync(io);
-        }
-        try destination.rename(tmp, destination, job_name, io);
-    }
-    /// The warm restore: every pack is readable, so the count is final.
-    pub fn restore(self: *Service, io: std.Io, name_: []const u8, path: ?[]const u8, destination: std.Io.Dir) !usize {
-        return (try self.restoreRequest(io, name_, path, destination, .Bulk)).files;
-    }
-    /// Restores through an already-open directory capability. Every component
-    /// is opened without following symlinks; existing output files are refused.
-    /// On a cold target it first asks for the thaw of every pack the request
-    /// needs, writes the files whose packs are readable, and leaves a job file
-    /// in the destination while packs are thawing: the same call, repeated,
-    /// skips the files already written and ends when none is left.
-    pub fn restoreRequest(self: *Service, io: std.Io, name_: []const u8, path: ?[]const u8, destination: std.Io.Dir, tier: Tier) !Restore {
-        if (path) |p| if (!manifest.validPath(p)) return error.InvalidPath;
-        var result: Restore = .{};
-        var matched = false;
-        const is_cold = self.cold();
-        var ready: Packs = .init(self.allocator);
-        defer ready.deinit();
-        const job = if (is_cold) try self.loadJob(io, destination) else null;
-        if (job) |j| {
-            const same_path = if (j.path) |old| path != null and std.mem.eql(u8, old, path.?) else path == null;
-            if (j.version != 1 or !std.mem.eql(u8, j.snapshot, name_) or !same_path) return error.RestoreJobMismatch;
-        }
-        for ((try self.snapshot(name_)).files) |file| {
+    /// Every version of every file the backup still holds, also the ones no
+    /// kept snapshot lists any more (retention never removes them, only a
+    /// purge does). `path` limits it to one file or subtree.
+    pub fn history(self: *Service, path: ?[]const u8) ![]const File {
+        if (self.key == null) return error.Locked;
+        var versions: std.ArrayList(File) = .empty;
+        for (try self.getJson([]const File, "catalog")) |file| {
+            if (file.directory or !validFile(file)) continue;
             if (path) |p| if (!under(file.path, p)) continue;
-            matched = true;
-            if (is_cold and !file.directory and !(try self.packsReady(file, &ready, tier, &result))) continue;
-            if (file.directory) {
-                const dummy = try std.fmt.allocPrint(self.a(), "{s}/.directory", .{file.path});
-                const dir = try safeParent(io, destination, dummy);
-                dir.close(io);
-                continue;
-            }
-            var parent = try safeParent(io, destination, file.path);
-            defer parent.close(io);
-            if (job != null) {
-                // Written by an earlier pass of this job: complete files only.
-                if (parent.statFile(io, std.fs.path.basename(file.path), .{ .follow_symlinks = false })) |st| {
-                    if (st.kind == .file and st.size == file.size) {
-                        result.files += 1;
-                        continue;
-                    }
-                } else |err| if (err != error.FileNotFound) return err;
-            }
-            const out = try parent.createFile(io, std.fs.path.basename(file.path), .{ .exclusive = true, .permissions = .fromMode(0o600) });
-            var complete = false;
-            defer {
-                out.close(io);
-                if (!complete) parent.deleteFile(io, std.fs.path.basename(file.path)) catch {};
-            }
-            try self.restoreFile(io, out, file);
-            try out.sync(io);
-            complete = true;
-            result.files += 1;
+            try versions.append(self.a(), file);
         }
-        if (path != null and !matched) return error.PathNotFound;
-        if (result.thawing_packs > 0) {
-            try self.saveJob(io, destination, .{ .snapshot = name_, .path = path, .tier = tier, .requested = if (job) |j| j.requested else self.now(), .packs = result.thawing_packs, .bytes = result.thawing_bytes });
-        } else if (job != null) try destination.deleteFile(io, job_name);
-        return result;
+        return versions.toOwnedSlice(self.a());
     }
-    fn restoreFile(self: *Service, io: std.Io, out: std.Io.File, file: File) !void {
+    /// Sends the bytes of one file, in order, to `sink`. Every block is
+    /// checked against its content id; the total must match the file's size.
+    pub fn streamFile(self: *Service, file: File, sink: Sink) !void {
         var stack: std.ArrayList(Cid) = .empty;
         defer stack.deinit(self.allocator);
         try stack.append(self.allocator, file.cid);
@@ -710,7 +666,7 @@ pub const Service = struct {
             switch (try storage.dag.codec.decode(bytes)) {
                 .leaf => |data| {
                     if (data.len > file.size - offset) return error.FileTooLarge;
-                    try out.writePositionalAll(io, data, offset);
+                    try sink.writeFn(sink.ctx, offset, data);
                     offset += data.len;
                 },
                 .parent => |links| try storage.dag.walk.pushChildren(self.allocator, &stack, links),
@@ -722,7 +678,7 @@ pub const Service = struct {
     /// Offsite portion only: durable encrypted intent, applied by the next run.
     pub fn forget(self: *Service, path: []const u8) !void {
         if (self.key == null) return error.Locked;
-        if (!manifest.validPath(path)) return error.InvalidPath;
+        if (!validName(path)) return error.InvalidPath;
         try self.acquire();
         defer self.release();
         const mode = self.encrypted;
@@ -737,7 +693,7 @@ pub const Service = struct {
         var paths: std.ArrayList([]const u8) = .empty;
         for (try self.list("purges")) |n| {
             const p = try self.getJson([]const u8, n);
-            if (!manifest.validPath(p)) return error.InvalidPurge;
+            if (!validName(p)) return error.InvalidPurge;
             try paths.append(self.a(), p);
         }
         return paths.toOwnedSlice(self.a());
@@ -884,35 +840,28 @@ pub const Service = struct {
         for (names, retain) |n, yes| if (!yes) try self.delete(n);
     }
 };
+/// A bounded name. Whether it is a valid path is the source's and the
+/// restorer's question (fs), asked before anything is read or written.
+fn validName(path: []const u8) bool {
+    return path.len > 0 and path.len <= max_name and std.mem.indexOfScalar(u8, path, 0) == null;
+}
 fn validFile(file: File) bool {
-    if (!manifest.validPath(file.path) or file.blocks.len > 1 << 20) return false;
+    if (!validName(file.path) or file.blocks.len > 1 << 20) return false;
     if (file.directory) return file.blocks.len == 0 and file.size == 0;
     for (file.blocks) |cid| if (std.mem.eql(u8, &cid, &file.cid)) return true;
     return false;
 }
-fn catalogHas(files: []const File, file: File) bool {
-    for (files) |f| if (std.mem.eql(u8, f.path, file.path) and std.mem.eql(u8, &f.cid, &file.cid) and f.directory == file.directory) return true;
-    return false;
+fn catalogIndex(files: []const File, file: File) ?usize {
+    for (files, 0..) |f, i| if (std.mem.eql(u8, f.path, file.path) and std.mem.eql(u8, &f.cid, &file.cid) and f.directory == file.directory) return i;
+    return null;
 }
-fn under(path: []const u8, prefix: []const u8) bool {
+/// True for `prefix` itself and for every name below it.
+pub fn under(path: []const u8, prefix: []const u8) bool {
     return std.mem.eql(u8, path, prefix) or (std.mem.startsWith(u8, path, prefix) and path.len > prefix.len and path[prefix.len] == '/');
 }
 fn purged(path: []const u8, paths: []const []const u8) bool {
     for (paths) |p| if (under(path, p)) return true;
     return false;
-}
-fn safeParent(io: std.Io, root: std.Io.Dir, path: []const u8) !std.Io.Dir {
-    var dir = try root.openDir(io, ".", .{ .follow_symlinks = false });
-    errdefer dir.close(io);
-    var parts = std.mem.splitScalar(u8, std.fs.path.dirname(path) orelse "", '/');
-    while (parts.next()) |part| {
-        if (part.len == 0) continue;
-        dir.createDir(io, part, .fromMode(0o700)) catch |err| if (err != error.PathAlreadyExists) return err;
-        const next = try dir.openDir(io, part, .{ .follow_symlinks = false });
-        dir.close(io);
-        dir = next;
-    }
-    return dir;
 }
 fn month(time: u64) u64 {
     const epoch: std.time.epoch.EpochSeconds = .{ .secs = time };

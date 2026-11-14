@@ -31,6 +31,8 @@ const HashRing = cluster.ring.HashRing;
 
 pub const Node = struct {
     offsite: ?*offsite_worker.Worker = null,
+    /// What the offsite worker backs up: the swarm folder, described by fs.
+    offsite_source: @import("fs/offsite.zig").Source = undefined,
     /// Swarm backup is on (settings change it while the node runs); deep
     /// backup is kept by `info_provider`, which reports it.
     swarm_backup: std.atomic.Value(bool) = .init(false),
@@ -866,7 +868,8 @@ pub const Node = struct {
         // is its policy, from the backup roles (changed while running).
         if (cfg.backupTarget(null) != null and self.offsite == null) {
             if (self.swarm) |folder| if (self.store) |store| {
-                const host = try offsite_worker.Worker.create(self.allocator, cfg.backup_targets, self.device_identity, self.trust_store, .{ .folder = folder, .store = store });
+                self.offsite_source = .{ .folder = folder, .store = store };
+                const host = try offsite_worker.Worker.create(self.allocator, cfg.backup_targets, self.device_identity, self.trust_store, self.offsite_source.source(), store);
                 errdefer host.destroy();
                 host.setRoles(self.backupRoles());
                 try host.start();

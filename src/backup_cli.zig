@@ -1,11 +1,14 @@
 //! CLI parsing and presentation only; backup/service.zig owns operations.
 const std = @import("std");
 const service = @import("nomadfs").backup_service;
-const usage = "nomadfs backup <target> status|run|verify|restore|recovery-key|forget [options]\n" ++
+const usage = "nomadfs backup <target> status|run|verify|restore|history|recovery-key|forget [options]\n" ++
     "  <target>                      a [backup.<target>] section of the configuration (s3: the first)\n" ++
     "  --config FILE                 configuration file\n" ++
     "  --snapshot snapshots/ID       verify/restore snapshot (status lists IDs)\n" ++
-    "  --path PATH                   restore one path or subtree\n" ++
+    "  --path PATH                   restore (or list the history of) one path or subtree\n" ++
+    "  history                       every file version the backup holds, also deleted files\n" ++
+    "  --from-history                restore from the history instead of a snapshot\n" ++
+    "  --version latest|DATE|TIME|ID  with --from-history: YYYY-MM-DD, Unix time or content id\n" ++
     "  --to DIRECTORY                restore destination\n" ++
     "  --recovery-words WORDS         unlock with quoted 24 words\n" ++
     "  --tier bulk|standard|expedited  thaw speed on an archive target (restore, verify --download)\n" ++
@@ -31,11 +34,18 @@ pub fn parse(args: []const []const u8) !service.Request {
             request.download = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--from-history")) {
+            request.from_history = true;
+            continue;
+        }
         if (i + 1 >= args.len) return error.InvalidArguments;
         i += 1;
-        if (std.mem.eql(u8, arg, "--config")) request.config_path = args[i] else if (std.mem.eql(u8, arg, "--snapshot")) request.snapshot = args[i] else if (std.mem.eql(u8, arg, "--path")) request.path = args[i] else if (std.mem.eql(u8, arg, "--to")) request.destination = args[i] else if (std.mem.eql(u8, arg, "--recovery-words")) request.recovery_words = args[i] else if (std.mem.eql(u8, arg, "--tier")) request.tier = parseTier(args[i]) orelse return error.InvalidArguments else return error.InvalidArguments;
+        if (std.mem.eql(u8, arg, "--config")) request.config_path = args[i] else if (std.mem.eql(u8, arg, "--snapshot")) request.snapshot = args[i] else if (std.mem.eql(u8, arg, "--path")) request.path = args[i] else if (std.mem.eql(u8, arg, "--to")) request.destination = args[i] else if (std.mem.eql(u8, arg, "--recovery-words")) request.recovery_words = args[i] else if (std.mem.eql(u8, arg, "--version")) request.version = args[i] else if (std.mem.eql(u8, arg, "--tier")) request.tier = parseTier(args[i]) orelse return error.InvalidArguments else return error.InvalidArguments;
     }
-    if (request.action == .restore and (request.snapshot == null or request.destination == null)) return error.InvalidArguments;
+    // A restore names exactly one source: a snapshot or the history.
+    if (request.action == .restore and (request.destination == null or (request.snapshot == null) != request.from_history)) return error.InvalidArguments;
+    if (request.from_history and request.action != .restore) return error.InvalidArguments;
+    if (request.version != null and !request.from_history) return error.InvalidArguments;
     if (request.action == .forget and request.path == null) return error.InvalidArguments;
     if (request.download and request.action != .verify) return error.InvalidArguments;
     return request;
@@ -85,6 +95,15 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const []const u8) !u8 {
         if (result.archive_missing) std.debug.print("deep backup is on: {s}\n", .{service.no_archive});
         for (status.snapshots) |name| std.debug.print("{s}\n", .{name});
     }
+    if (result.history) |versions| {
+        for (versions) |v| {
+            var first: [10]u8 = undefined;
+            var last: [10]u8 = undefined;
+            var changed: [10]u8 = undefined;
+            std.debug.print("{s}  {d} bytes  modified {s}  seen {s} to {s}  {s}\n", .{ v.path, v.size, date(v.mtime, &changed), if (v.first_seen == 0) "?" else date(v.first_seen, &first), if (v.last_seen == 0) "?" else date(v.last_seen, &last), v.cid });
+        }
+        std.debug.print("{d} file versions\n", .{versions.len});
+    }
     if (result.report) |report| {
         std.debug.print("Uploaded {d} new blocks ({d} bytes)\nSnapshot: {s}\n", .{ report.uploaded_blocks, report.uploaded_bytes, report.snapshot });
         if (report.waiting_files > 0) std.debug.print("{d} files waiting for blocks: not in this snapshot, a later run takes them\n", .{report.waiting_files});
@@ -125,6 +144,15 @@ test "backup CLI: parse target, restore, forget, tier and download" {
     try std.testing.expect(!(try parse(&.{ "archive", "verify" })).download);
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "archive", "verify", "--tier", "slow" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "archive", "status", "--download" }));
+    const h = try parse(&.{ "s3", "history", "--path", "Photos" });
+    try std.testing.expectEqual(service.Action.history, h.action);
+    try std.testing.expectEqualStrings("Photos", h.path.?);
+    const old = try parse(&.{ "s3", "restore", "--from-history", "--path", "Photos/a.jpg", "--version", "2026-11-01", "--to", "/tmp/restore" });
+    try std.testing.expect(old.from_history and old.snapshot == null);
+    try std.testing.expectEqualStrings("2026-11-01", old.version.?);
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "s3", "restore", "--from-history", "--snapshot", "snapshots/test", "--to", "/tmp/restore" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "s3", "restore", "--snapshot", "snapshots/test", "--version", "latest", "--to", "/tmp/restore" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "s3", "status", "--from-history" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "status", "--config" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "--config", "status" }));
 }

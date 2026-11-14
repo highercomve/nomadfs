@@ -5,8 +5,11 @@ const config_mod = @import("../config.zig");
 const offsite = @import("../cluster/offsite.zig");
 const worker = @import("../cluster/offsite_worker.zig");
 const device = @import("../device/mod.zig");
+const fs_restore = @import("../fs/restore.zig");
+const fs_source = @import("../fs/offsite.zig");
+const manifest = @import("../fs/manifest.zig");
 const Node = @import("../node.zig").Node;
-pub const Action = enum { status, run, verify, restore, @"recovery-key", forget };
+pub const Action = enum { status, run, verify, restore, history, @"recovery-key", forget };
 /// How fast a cold target thaws packs: bulk is cheapest and slowest.
 pub const Tier = offsite.Tier;
 pub const Gate = worker.Gate;
@@ -20,13 +23,24 @@ pub const Request = struct {
     path: ?[]const u8 = null,
     destination: ?[]const u8 = null,
     recovery_words: ?[]const u8 = null,
+    /// Restore from the history instead of a snapshot: also the files no
+    /// kept snapshot lists any more.
+    from_history: bool = false,
+    /// With `from_history`: "latest" (the default), a content id (64 hex
+    /// digits), a Unix time or a YYYY-MM-DD day.
+    version: ?[]const u8 = null,
     /// Restore, and verify with `download`, on a cold target.
     tier: Tier = .Bulk,
     /// Verify a cold target by reading every block (thaws its packs).
     download: bool = false,
 };
+/// One version of one file the backup holds. Times are Unix seconds; a
+/// seen time of 0 is unknown (uploaded before the history kept them).
+pub const FileVersion = struct { path: []const u8, cid: [64]u8, size: u64, mtime: u64, first_seen: u64, last_seen: u64 };
 pub const Result = struct {
     report: ?offsite.Report = null,
+    /// `history`: every version, by path, oldest first.
+    history: ?[]const FileVersion = null,
     status: ?offsite.Status = null,
     restore: ?offsite.Restore = null,
     check: ?offsite.Check = null,
@@ -85,16 +99,40 @@ pub fn execute(a: std.mem.Allocator, io: std.Io, request: Request) !Result {
             try std.Io.Dir.cwd().createDirPath(io, destination);
             const dir = try std.Io.Dir.cwd().openDir(io, destination, .{ .follow_symlinks = false });
             defer dir.close(io);
-            const restored = try core.restoreRequest(io, request.snapshot orelse return error.SnapshotRequired, request.path, dir, request.tier);
+            const from: fs_restore.From = if (request.from_history) .{ .history = try fs_restore.parseVersion(request.version) } else .{ .snapshot = request.snapshot orelse return error.SnapshotRequired };
+            const restored = try fs_restore.restore(a, io, core, .{ .from = from, .path = request.path, .tier = request.tier }, dir);
             return .{ .restore = restored, .count = restored.files };
+        },
+        .history => {
+            if (request.path) |p| if (!manifest.validPath(p)) return error.InvalidPath;
+            const versions = try core.history(request.path);
+            const list = try a.alloc(FileVersion, versions.len);
+            errdefer a.free(list);
+            var copied: usize = 0;
+            errdefer for (list[0..copied]) |v| a.free(v.path);
+            for (versions, list) |v, *out| {
+                out.* = .{ .path = try a.dupe(u8, v.path), .cid = std.fmt.bytesToHex(v.cid, .lower), .size = v.size, .mtime = v.mtime, .first_seen = v.first_seen, .last_seen = v.last_seen };
+                copied += 1;
+            }
+            std.mem.sort(FileVersion, list, {}, olderVersion);
+            return .{ .history = list, .count = list.len };
         },
         .@"recovery-key" => return .{ .recovery_phrase = try a.dupe(u8, try core.recoveryKey()) },
         .forget => {
-            try core.forget(request.path orelse return error.PathRequired);
+            const doomed = request.path orelse return error.PathRequired;
+            if (!manifest.validPath(doomed)) return error.InvalidPath;
+            try core.forget(doomed);
             return .{};
         },
         .run => unreachable,
     }
+}
+fn olderVersion(_: void, x: FileVersion, y: FileVersion) bool {
+    return switch (std.mem.order(u8, x.path, y.path)) {
+        .lt => true,
+        .gt => false,
+        .eq => if (x.first_seen != y.first_seen) x.first_seen < y.first_seen else x.last_seen < y.last_seen,
+    };
 }
 fn run(a: std.mem.Allocator, core: *offsite.Service, cfg: config_mod.Config) !Result {
     // Uses the node's public composition root: shares/external leaves and the
@@ -102,7 +140,7 @@ fn run(a: std.mem.Allocator, core: *offsite.Service, cfg: config_mod.Config) !Re
     // a standalone run refuse simultaneous access by a running node process.
     var node = try Node.init(a, cfg);
     defer node.deinit();
-    var source: @import("../fs/offsite.zig").Source = .{ .folder = node.swarm orelse return error.StorageRequired, .store = node.store orelse return error.StorageRequired };
+    var source: fs_source.Source = .{ .folder = node.swarm orelse return error.StorageRequired, .store = node.store orelse return error.StorageRequired };
     var report = try core.run(source.source(), source.store);
     try worker.enroll(core, node.trust_store);
     report.snapshot = try a.dupe(u8, report.snapshot);
@@ -121,6 +159,10 @@ pub fn deinitResult(a: std.mem.Allocator, result: *Result) void {
     if (result.status) |s| {
         for (s.snapshots) |n| a.free(n);
         a.free(s.snapshots);
+    }
+    if (result.history) |versions| {
+        for (versions) |v| a.free(v.path);
+        a.free(versions);
     }
     if (result.recovery_phrase) |p| {
         std.crypto.secureZero(u8, @constCast(p));

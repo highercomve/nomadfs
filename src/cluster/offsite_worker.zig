@@ -7,7 +7,7 @@ const sync = @import("../sync.zig");
 const core = @import("offsite.zig");
 const cfg_mod = @import("../backup/config.zig");
 const device = @import("../device/mod.zig");
-const fs_source = @import("../fs/offsite.zig");
+const storage = @import("../storage/mod.zig");
 const s3 = @import("../net/s3/mod.zig");
 /// The roles of this device that decide where it uploads.
 pub const Roles = struct { swarm_backup: bool = false, deep_backup: bool = false };
@@ -110,7 +110,10 @@ pub const Worker = struct {
     states: []Status,
     identity: device.identity.Identity,
     trust: *device.trust.Store,
-    source: fs_source.Source,
+    /// What to back up, described by the layer above; the worker never
+    /// looks at folders itself.
+    source: core.Source,
+    store: *storage.engine.StorageEngine,
     worker: sync.Worker = .{},
     mutex: sync.Mutex = .{},
     round_mutex: sync.Mutex = .{},
@@ -120,7 +123,7 @@ pub const Worker = struct {
     poked: std.atomic.Value(bool) = .init(false),
     /// One target's upload; tests replace it.
     uploadFn: *const fn (*Worker, cfg_mod.Config, usize, bool) anyerror!void = upload,
-    pub fn create(a: std.mem.Allocator, targets: []const cfg_mod.Config, identity: device.identity.Identity, trust: *device.trust.Store, source: fs_source.Source) !*Worker {
+    pub fn create(a: std.mem.Allocator, targets: []const cfg_mod.Config, identity: device.identity.Identity, trust: *device.trust.Store, source: core.Source, store: *storage.engine.StorageEngine) !*Worker {
         const self = try a.create(Worker);
         errdefer a.destroy(self);
         var wanted: usize = 0;
@@ -137,7 +140,7 @@ pub const Worker = struct {
         }
         const states = try a.alloc(Status, wanted);
         for (states, configs) |*state, config| state.* = .{ .name = config.name, .cold = config.storage_class.cold(), .gate = gate(config, .{}) };
-        self.* = .{ .allocator = a, .configs = configs, .states = states, .identity = identity, .trust = trust, .source = source };
+        self.* = .{ .allocator = a, .configs = configs, .states = states, .identity = identity, .trust = trust, .source = source, .store = store };
         return self;
     }
     pub fn destroy(self: *Worker) void {
@@ -251,7 +254,7 @@ pub const Worker = struct {
         self.mutex.unlock();
         if (!force and !retry and !(try service.due())) return;
         shareKey(a, io, service, self.configs, self.identity);
-        const report = try service.run(self.source.source(), self.source.store);
+        const report = try service.run(self.source, self.store);
         if (report.recovery_phrase) |phrase| std.debug.print("S3 backup \"{s}\" recovery words — save these:\n{s}\n", .{ config.name, phrase });
         if (report.waiting_files > 0) std.debug.print("offsite: \"{s}\": {d} files waiting for blocks\n", .{ config.name, report.waiting_files });
         try enroll(service, self.trust);

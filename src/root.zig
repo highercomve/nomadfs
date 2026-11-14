@@ -76,6 +76,7 @@ test {
         @import("net/s3/mod.zig"),
         @import("cluster/offsite.zig"),
         @import("fs/offsite.zig"),
+        @import("fs/restore.zig"),
         @import("config.zig"),
         @import("config_file.zig"),
         @import("settings.zig"),
