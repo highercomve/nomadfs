@@ -177,11 +177,16 @@ fn askNode(a: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, ep: swarm
         .run => {
             const started = std.json.parseFromSliceLeaky(swarm_api.BackupRun, arena, r.body, json) catch return .{ .failed = "BadResponse" };
             // The upload takes as long as it takes, like one run here.
+            // Each poll's answer lives only until the next one, so a long
+            // first upload doesn't grow the command's memory.
+            var poll = std.heap.ArenaAllocator.init(a);
+            defer poll.deinit();
             while (true) {
+                _ = poll.reset(.retain_capacity);
                 nomadfs.sync.sleep(poll_ms * std.time.ns_per_ms);
-                const state = (try runState(arena, ep, started.name)) orelse return .{ .failed = "NodeStopped" };
+                const state = (try runState(poll.allocator(), ep, started.name)) orelse return .{ .failed = "NodeStopped" };
                 if (state.manual_runs <= started.manual_runs) continue;
-                if (state.failure) |name| return .{ .failed = name };
+                if (state.failure) |name| return .{ .failed = try arena.dupe(u8, name) };
                 return .{ .result = try runResult(a, io, request, state) };
             }
         },

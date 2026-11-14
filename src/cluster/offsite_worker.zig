@@ -62,6 +62,9 @@ pub const Status = struct {
     /// Runs asked for by hand that ended, well or not, since the node
     /// started: who asked waits for the count to pass what `request` gave.
     manual_runs: u64 = 0,
+    /// Runs asked for by hand that began: a request made while one is under
+    /// way waits for the next, not for the one already uploading.
+    manual_started: u64 = 0,
     /// The last upload made this target's key (its recovery words are new),
     /// or took another target's (`reused_key`).
     new_key: bool = false,
@@ -252,7 +255,9 @@ pub const Worker = struct {
         if (!self.worker.isRunning()) return error.Cancelled;
         self.mutex.lock();
         self.states[i].requested = true;
-        const done = self.states[i].manual_runs;
+        // The run that takes this request is the next to begin, so the
+        // caller waits until that many manual runs ended.
+        const done = self.states[i].manual_started;
         self.mutex.unlock();
         self.poked.store(true, .release);
         return done;
@@ -291,6 +296,7 @@ pub const Worker = struct {
             state.gate = allowed;
             const asked = state.requested;
             state.requested = false;
+            if (asked) state.manual_started += 1;
             const go = allowed == .uploading or (asked and allowed == .needs_swarm_backup);
             state.running = go;
             // Deep backup went off between the request and this look.

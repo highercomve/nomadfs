@@ -1107,6 +1107,40 @@ test "offsite: the worker uploads to cold targets only on a deep backup device, 
     try std.testing.expectEqualStrings("no archive target configured", worker_mod.no_archive);
 }
 
+/// Asks for a run by hand while one is uploading, as `Worker.request`
+/// does (without the running check, which needs the loop).
+const LateRequest = struct {
+    var ticket: u64 = 0;
+    fn upload(w: *worker_mod.Worker, _: TargetConfig, i: usize, _: bool) anyerror!void {
+        if (ticket != 0) return;
+        w.mutex.lock();
+        defer w.mutex.unlock();
+        w.states[i].requested = true;
+        ticket = w.states[i].manual_started;
+    }
+};
+
+test "offsite: a run asked for while another uploads waits for its own run" {
+    const warm: TargetConfig = .{ .name = "s3", .endpoint = "https://warm", .bucket = "b", .credentials = "/none" };
+    const identity = try @import("../device/mod.zig").identity.Identity.fromSeed([_]u8{4} ** 32);
+    const w = try worker_mod.Worker.create(a, &.{warm}, identity, undefined, undefined, undefined);
+    defer w.destroy();
+    w.uploadFn = LateRequest.upload;
+    w.setRoles(.{ .swarm_backup = true });
+    LateRequest.ticket = 0;
+    // Request A, then B arrives while A uploads.
+    w.states[0].requested = true;
+    const first = w.states[0].manual_started;
+    try w.round(false);
+    try std.testing.expect(w.statusAt(0).manual_runs > first);
+    try std.testing.expectEqual(@as(u64, 1), LateRequest.ticket);
+    // A's end is not B's: B is still queued.
+    try std.testing.expect(!(w.statusAt(0).manual_runs > LateRequest.ticket));
+    try std.testing.expect(w.statusAt(0).requested);
+    try w.round(false);
+    try std.testing.expect(w.statusAt(0).manual_runs > LateRequest.ticket);
+}
+
 fn restoreHistory(service: *core.Service, path: ?[]const u8, version: fs_restore.Version, destination: std.Io.Dir) !core.Restore {
     return fs_restore.restore(a, io, service, .{ .from = .{ .history = version }, .path = path }, destination);
 }
