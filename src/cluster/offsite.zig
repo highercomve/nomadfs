@@ -5,7 +5,12 @@
 //! is wanted and how files reach a local directory belong to fs (restore.zig),
 //! which asks this target for snapshots, history, thaws and verified bytes.
 //! The historical catalog deliberately outlives snapshots: ordinary deletes
-//! and retention must never release backup data. Only a purge runs pack GC.
+//! and retention must never release backup data. Only a purge removes blocks.
+//! Bucket metadata is generations: index segments, snapshots, the catalog,
+//! purges and the manifest listing them are written once under new names,
+//! and one small `head` names the committed manifest, moved only with
+//! If-Match. Whatever the head does not name is garbage, deleted by a later
+//! run after a grace much longer than the lease.
 const std = @import("std");
 const backup = @import("../backup/mod.zig");
 const s3 = @import("../net/s3/mod.zig");
@@ -20,6 +25,9 @@ const Key = backup.keys.Key;
 const max_objects = 1_000_000;
 const max_metadata = 64 * 1024 * 1024;
 const lease_seconds = 300;
+/// Garbage stays this long after the head stopped naming it: a reader that
+/// started before, or a writer still sending, never loses an object under it.
+const grace_seconds = 24 * 3600;
 /// A thawed copy stays readable this long: enough to finish a big restore.
 const thaw_days = 7;
 /// Uploads run on an hourly poll; a round this close to its time is due.
@@ -78,10 +86,36 @@ pub const Check = struct {
     thawing_bytes: u64 = 0,
 };
 const Info = struct { name: []const u8, size: u64, modified: u64 };
-const Deferred = struct { pack: [16]u8, removable: u64 };
+/// A pack the head names. Its class and the first time it may be deleted are
+/// fixed when it is uploaded, whatever the target is configured to later.
+/// `purged`: it still holds purged bytes and waits to be copied without them.
+const PackRecord = struct { pack: [16]u8, class: StorageClass, removable: u64, purged: bool = false };
+/// An object the head names no more, and when it may be deleted.
+const Garbage = struct { name: []const u8, removable: u64 };
+/// A snapshot keeps its name when a purge rewrites it into a new object.
+const SnapshotRef = struct { name: []const u8, object: []const u8 };
+const Version = struct { path: []const u8, cid: Cid };
+/// A purge covers the file versions that were there when it was asked for:
+/// `versions` once applied. It is kept while the source still lists one of
+/// them, so that one is not uploaded again; anything else at the path is.
+const Purge = struct { path: []const u8, time: u64, applied: bool = false, versions: []const Version = &.{} };
+/// The one mutable object: names the committed generation and is replaced
+/// only with If-Match. Readable without the key: `newest` is the time of the
+/// last finished run, `waiting` the files it left out, `sweep_at` when the
+/// first removed pack may be deleted (0: none).
+const Head = struct { version: u32 = 1, generation: u64 = 0, manifest: []const u8 = "", newest: u64 = 0, waiting: usize = 0, sweep_at: u64 = 0 };
+/// Everything a generation is made of. An object it does not name is garbage.
+const Manifest = struct {
+    segments: []const []const u8 = &.{},
+    snapshots: []const SnapshotRef = &.{},
+    catalog: []const u8 = "",
+    packs: []const PackRecord = &.{},
+    garbage: []const Garbage = &.{},
+    purges: []const []const u8 = &.{},
+};
 /// Packs already asked about in one request: true when readable now.
 pub const Packs = std.AutoHashMap([16]u8, bool);
-const Layout = struct { version: u32 = 1, encrypt: bool, key_id: [8]u8 };
+const Layout = struct { version: u32 = 2, encrypt: bool, key_id: [8]u8 };
 const Lease = struct { owner: [16]u8, expires: u64 };
 
 /// One operation/session at a time. Scratch metadata belongs to this bounded
@@ -105,6 +139,15 @@ pub const Service = struct {
     /// Key and recovery words of another target, used if this one is new.
     seed_key: ?Key = null,
     seed_phrase: ?[]const u8 = null,
+    /// The generation this session read (or last committed), in the arena.
+    head: Head = .{},
+    head_etag: ?[]const u8 = null,
+    segments: std.ArrayList([]const u8) = .empty,
+    snapshots: std.ArrayList(SnapshotRef) = .empty,
+    packs: std.ArrayList(PackRecord) = .empty,
+    garbage: std.ArrayList(Garbage) = .empty,
+    purges: std.ArrayList([]const u8) = .empty,
+    catalog: []const u8 = "",
 
     pub fn init(allocator: Allocator, client: *s3.Client, config: Config, device: Device) !Service {
         if (config.pack_mb == 0 or config.pack_mb > 512) return error.InvalidPackSize;
@@ -164,7 +207,7 @@ pub const Service = struct {
     pub fn cold(self: *Service) bool {
         return self.config.storage_class.cold();
     }
-    /// Seconds a pack must stay before it may be deleted or replaced.
+    /// Seconds a pack uploaded now must stay before it may be deleted.
     fn hold(self: *Service) u64 {
         return @as(u64, self.config.storage_class.minDays()) * 86400;
     }
@@ -203,8 +246,21 @@ pub const Service = struct {
         }
         return self.a().dupe(u8, plain);
     }
-    fn putJson(self: *Service, relative: []const u8, value: anytype) !void {
-        try self.put(relative, try self.seal(try self.json(value)));
+    /// Generation metadata is immutable: written once under a new name
+    /// (If-None-Match), never replaced. Only the head moves.
+    fn create(self: *Service, relative: []const u8, bytes: []const u8) !void {
+        try self.renew();
+        const ts = self.timestamp();
+        var response = self.client.putObject(try self.name(relative), .{ .bytes = bytes }, .{ .condition = .if_none_match }, &ts) catch |err| switch (err) {
+            error.PreconditionFailed => return error.LeaseLost,
+            else => return err,
+        };
+        defer response.deinit();
+    }
+    fn createJson(self: *Service, dir: []const u8, value: anytype) ![]const u8 {
+        const relative = try self.randomName(dir);
+        try self.create(relative, try self.seal(try self.json(value)));
+        return relative;
     }
     fn getJson(self: *Service, comptime T: type, relative: []const u8) !T {
         return self.parse(T, try self.open(try self.get(relative)));
@@ -285,9 +341,143 @@ pub const Service = struct {
     }
     pub fn unlock(self: *Service, phrase: ?[]const u8) !void {
         try self.unlockKey(phrase);
+        try self.loadHead();
+        try self.loadIndex();
+    }
+    /// Reads the committed generation. Readers and writers trust only what
+    /// the head names; a bucket with no head yet is an empty backup.
+    fn loadHead(self: *Service) !void {
+        self.head = .{};
+        self.head_etag = null;
+        self.segments = .empty;
+        self.snapshots = .empty;
+        self.packs = .empty;
+        self.garbage = .empty;
+        self.purges = .empty;
+        self.catalog = "";
+        for (0..3) |_| {
+            const ts = self.timestamp();
+            var response = self.client.getObject(try self.name("head"), null, &ts) catch |err| switch (err) {
+                error.NotFound => return,
+                else => return err,
+            };
+            defer response.deinit();
+            const head = try self.parse(Head, response.body);
+            if (head.version != 1) return error.UnsupportedBackupVersion;
+            if (!std.mem.startsWith(u8, head.manifest, "manifests/")) return error.InvalidMetadata;
+            // A commit between the two reads removed that manifest: read again.
+            const manifest = self.getJson(Manifest, head.manifest) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            if (manifest.segments.len > max_objects or manifest.packs.len > max_objects or manifest.garbage.len > max_objects) return error.InvalidMetadata;
+            self.head = head;
+            self.head_etag = try self.a().dupe(u8, response.header("etag") orelse return error.MissingEtag);
+            try self.segments.appendSlice(self.a(), manifest.segments);
+            try self.snapshots.appendSlice(self.a(), manifest.snapshots);
+            try self.packs.appendSlice(self.a(), manifest.packs);
+            try self.garbage.appendSlice(self.a(), manifest.garbage);
+            try self.purges.appendSlice(self.a(), manifest.purges);
+            self.catalog = manifest.catalog;
+            return;
+        }
+        return error.HeadChanged;
+    }
+    fn loadIndex(self: *Service) !void {
         self.index.deinit();
         self.index = .init(self.allocator);
-        for (try self.list("index")) |name_| try self.index.mergeSegment(try self.get(name_), self.cryptoKey());
+        for (self.segments.items) |segment| try self.index.mergeSegment(try self.get(segment), self.cryptoKey());
+    }
+    /// Publishes this session's state as the next generation. The manifest
+    /// is a new object and the head moves to it only if nobody committed
+    /// since it was read (If-Match): a writer whose lease ran out while a
+    /// request stalled finds the head changed and can never publish.
+    fn commit(self: *Service) !void {
+        const old = self.head.manifest;
+        var next = self.head;
+        next.generation += 1;
+        next.sweep_at = 0;
+        for (self.garbage.items) |g| {
+            if (!std.mem.startsWith(u8, g.name, "packs/")) continue;
+            next.sweep_at = if (next.sweep_at == 0) g.removable else @min(next.sweep_at, g.removable);
+        }
+        next.manifest = try self.createJson("manifests", Manifest{ .segments = self.segments.items, .snapshots = self.snapshots.items, .catalog = self.catalog, .packs = self.packs.items, .garbage = self.garbage.items, .purges = self.purges.items });
+        try self.renew();
+        const ts = self.timestamp();
+        const condition: s3.client.Condition = if (self.head_etag) |etag| .{ .if_match = etag } else .if_none_match;
+        var response = self.client.putObject(try self.name("head"), .{ .bytes = try self.json(next) }, .{ .condition = condition }, &ts) catch |err| switch (err) {
+            error.PreconditionFailed => return error.LeaseLost,
+            else => return err,
+        };
+        defer response.deinit();
+        self.head_etag = try self.a().dupe(u8, response.header("etag") orelse return error.MissingEtag);
+        self.head = next;
+        // Only the replaced head named the old manifest; a reader that still
+        // wants it reads the head again.
+        if (old.len > 0) self.delete(old) catch {};
+    }
+    /// The head stops naming an object. It stays for the grace (and a pack
+    /// for its minimum storage time, `hold_until`), then a later run deletes it.
+    fn discard(self: *Service, relative: []const u8, hold_until: u64) !void {
+        try self.garbage.append(self.a(), .{ .name = relative, .removable = @max(self.now() + grace_seconds, hold_until) });
+    }
+    /// Deletes the garbage whose time has come. Only records a committed
+    /// head holds are old enough, and nothing ever names such an object again.
+    fn sweep(self: *Service) !void {
+        var i: usize = 0;
+        while (i < self.garbage.items.len) {
+            if (self.now() < self.garbage.items[i].removable) {
+                i += 1;
+                continue;
+            }
+            try self.delete(self.garbage.items[i].name);
+            _ = self.garbage.swapRemove(i);
+        }
+    }
+    /// Objects no head names: left by a run that stopped before its commit
+    /// or by a writer that lost the race. Recorded now, deleted after the grace.
+    fn adoptOrphans(self: *Service) !void {
+        var known: std.StringHashMap(void) = .init(self.allocator);
+        defer known.deinit();
+        for (self.segments.items) |n| try known.put(n, {});
+        for (self.snapshots.items) |ref| try known.put(ref.object, {});
+        for (self.purges.items) |n| try known.put(n, {});
+        for (self.garbage.items) |g| try known.put(g.name, {});
+        for (self.packs.items) |p| try known.put(try self.packName(p.pack), {});
+        try known.put(self.catalog, {});
+        try known.put(self.head.manifest, {});
+        for ([_][]const u8{ "packs", "index", "snapshots", "catalog", "manifests", "purges" }) |dir| {
+            for (try self.listObjects(dir)) |object| {
+                if (known.contains(object.name)) continue;
+                try self.discard(object.name, if (std.mem.eql(u8, dir, "packs")) try self.orphanHold(object) else 0);
+            }
+        }
+    }
+    /// A pack with no record keeps the minimum storage time of the class the
+    /// bucket reports for it; a class not known here counts as the longest.
+    fn orphanHold(self: *Service, object: Info) !u64 {
+        const ts = self.timestamp();
+        var response = self.client.headObject(try self.name(object.name), &ts) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        defer response.deinit();
+        const class = std.meta.stringToEnum(StorageClass, s3.objectState(&response).storage_class) orelse StorageClass.DEEP_ARCHIVE;
+        const born = if (object.modified == 0) self.now() else object.modified;
+        return born + @as(u64, class.minDays()) * 86400;
+    }
+    /// True when a pack still holding purged bytes may now be copied without them.
+    fn packsAgedOut(self: *Service) bool {
+        for (self.packs.items) |p| if (p.purged and self.now() >= p.removable) return true;
+        return false;
+    }
+    fn packIndex(self: *Service, id: [16]u8) ?usize {
+        for (self.packs.items, 0..) |p, i| if (std.mem.eql(u8, &p.pack, &id)) return i;
+        return null;
+    }
+    fn loadCatalog(self: *Service) ![]const File {
+        if (self.catalog.len == 0) return &.{};
+        return self.getJson([]const File, self.catalog);
     }
     /// False for a bucket (prefix) no run has written its layout to yet.
     pub fn initialised(self: *Service) !bool {
@@ -309,7 +499,7 @@ pub const Service = struct {
     /// The key alone, without loading the index.
     pub fn unlockKey(self: *Service, phrase: ?[]const u8) !void {
         const layout = try self.parse(Layout, try self.get("nomadfs-backup.json"));
-        if (layout.version != 1) return error.UnsupportedBackupVersion;
+        if (layout.version != 2) return error.UnsupportedBackupVersion;
         self.encrypted = layout.encrypt;
         const blob = self.get(try self.deviceWrapName()) catch |err| switch (err) {
             error.NotFound => "",
@@ -341,9 +531,10 @@ pub const Service = struct {
             const sealed_entropy = try self.seal(&entropy);
             self.encrypted = saved_mode;
             try self.put("keys/recovery-entropy", sealed_entropy);
-            try self.putJson("catalog", @as([]const File, &.{}));
             try self.put("nomadfs-backup.json", try self.json(Layout{ .encrypt = self.encrypted, .key_id = backup.keys.keyId(self.key.?) }));
             self.created_phrase = try self.a().dupe(u8, phrase);
+            try self.loadHead();
+            try self.loadIndex();
             return;
         };
         try self.unlock(null);
@@ -377,30 +568,45 @@ pub const Service = struct {
             return;
         };
     }
+    /// Of an unlocked target: what the committed head names.
     pub fn status(self: *Service) !Status {
-        var result: Status = .{ .snapshots = try self.list("snapshots"), .indexed_blocks = self.index.count(), .storage_class = self.config.storage_class, .schedule = self.config.schedule };
-        if (self.hold() == 0 or self.key == null) return result;
-        for (try self.loadDeferred()) |d| {
-            result.deferred_first = if (result.deferred_packs == 0) d.removable else @min(result.deferred_first, d.removable);
-            result.deferred_last = @max(result.deferred_last, d.removable);
-            result.deferred_packs += 1;
-        }
+        const names = try self.snapshotNames();
+        var result: Status = .{ .snapshots = names, .indexed_blocks = self.index.count(), .storage_class = self.config.storage_class, .schedule = self.config.schedule };
+        for (self.packs.items) |p| if (p.purged) deferred(&result, p.removable);
+        for (self.garbage.items) |g| if (std.mem.startsWith(u8, g.name, "packs/")) deferred(&result, g.removable);
         return result;
     }
-    /// True when the newest snapshot is older than the target's schedule.
-    /// Only the periodic uploader asks; an explicit run always uploads.
+    fn deferred(result: *Status, removable: u64) void {
+        result.deferred_first = if (result.deferred_packs == 0) removable else @min(result.deferred_first, removable);
+        result.deferred_last = @max(result.deferred_last, removable);
+        result.deferred_packs += 1;
+    }
+    fn snapshotNames(self: *Service) ![]const []const u8 {
+        const names = try self.a().alloc([]const u8, self.snapshots.items.len);
+        for (self.snapshots.items, names) |ref, *n| n.* = ref.name;
+        return names;
+    }
+    /// True when the last finished run is older than the target's schedule,
+    /// when it left files out that waited for blocks (the head remembers, so
+    /// a restart keeps the hourly retry), or when a removed pack may now be
+    /// deleted. Only the periodic uploader asks; an explicit run always uploads.
     pub fn due(self: *Service) !bool {
-        var newest: u64 = 0;
-        for (try self.list("snapshots")) |n| {
-            const text = std.fs.path.basename(n);
-            if (text.len < 20) continue;
-            newest = @max(newest, std.fmt.parseInt(u64, text[0..20], 10) catch continue);
-        }
-        return newest == 0 or self.now() + schedule_slack >= newest + self.config.schedule.seconds();
+        const ts = self.timestamp();
+        var response = self.client.getObject(try self.name("head"), null, &ts) catch |err| switch (err) {
+            error.NotFound => return true,
+            else => return err,
+        };
+        defer response.deinit();
+        const head = try self.parse(Head, response.body);
+        if (head.newest == 0 or head.waiting > 0) return true;
+        if (head.sweep_at != 0 and self.now() >= head.sweep_at) return true;
+        return self.now() + schedule_slack >= head.newest + self.config.schedule.seconds();
     }
     pub fn snapshot(self: *Service, name_: []const u8) !Snapshot {
-        if (!std.mem.startsWith(u8, name_, "snapshots/") or std.mem.indexOf(u8, name_, "..") != null) return error.InvalidSnapshot;
-        const result = try self.getJson(Snapshot, name_);
+        const object = for (self.snapshots.items) |ref| {
+            if (std.mem.eql(u8, ref.name, name_)) break ref.object;
+        } else return error.InvalidSnapshot;
+        const result = try self.getJson(Snapshot, object);
         if (result.files.len > max_files) return error.InvalidSnapshot;
         for (result.files) |file| if (!validFile(file)) return error.InvalidSnapshot;
         return result;
@@ -410,9 +616,6 @@ pub const Service = struct {
     }
     fn packName(self: *Service, id: [16]u8) ![]const u8 {
         return std.fmt.allocPrint(self.a(), "packs/{s}", .{backup.index.formatPackId(id)});
-    }
-    fn segmentName(self: *Service, id: [16]u8) ![]const u8 {
-        return std.fmt.allocPrint(self.a(), "index/{s}", .{backup.index.formatPackId(id)});
     }
     fn throttle(self: *Service, bytes: usize) !void {
         if (self.config.upload_limit_kbps == 0) return;
@@ -454,18 +657,30 @@ pub const Service = struct {
         var response = try self.client.completeMultipartUpload(full_name, upload, parts.items, &ts);
         response.deinit();
     }
-    fn flush(self: *Service, writer: *backup.pack.Writer, id: [16]u8, segment: ?[]const u8) !void {
-        if (writer.blockCount() == 0 and segment == null) return;
+    /// Uploads the pack and its index segment; returns the segment for the
+    /// caller to add to the generation it commits (null: nothing to write).
+    fn flush(self: *Service, writer: *backup.pack.Writer, id: [16]u8) !?[]const u8 {
+        if (writer.blockCount() == 0) return null;
         var entries: std.ArrayList(Entry) = .empty;
         defer entries.deinit(self.allocator);
         for (writer.spans()) |span| try entries.append(self.allocator, .{ .block_id = span.block_id, .pack_id = id, .offset = span.offset, .length = span.length });
-        if (entries.items.len > 0) try self.uploadPack(try self.packName(id), writer.bytes());
-        // Each immutable pack has one segment. A purge atomically replaces that
-        // segment only after its replacement pack is durable, then removes bytes.
+        try self.uploadPack(try self.packName(id), writer.bytes());
+        // Each immutable pack has one immutable segment; a purge writes a new
+        // segment and the head moves from the old one to it.
         const encoded = try backup.index.encodeSegment(self.allocator, entries.items, self.cryptoKey());
         defer self.allocator.free(encoded);
-        try self.put(segment orelse try self.segmentName(id), encoded);
+        const segment = try self.randomName("index");
+        try self.create(segment, encoded);
+        // The class and the storage time of this upload, kept with the pack.
+        try self.packs.append(self.a(), .{ .pack = id, .class = self.config.storage_class, .removable = self.now() + self.hold() });
         try self.index.mergeEntries(entries.items);
+        return segment;
+    }
+    /// A finished pack is committed at once: an interrupted run keeps it.
+    fn flushCommit(self: *Service, writer: *backup.pack.Writer, id: [16]u8) !void {
+        const segment = (try self.flush(writer, id)) orelse return;
+        try self.segments.append(self.a(), segment);
+        try self.commit();
     }
     pub fn run(self: *Service, source: Source, store: *storage.engine.StorageEngine) !Report {
         if (self.created_phrase) |old| std.crypto.secureZero(u8, @constCast(old));
@@ -474,14 +689,16 @@ pub const Service = struct {
         defer self.release();
         try self.setup();
         if (self.config.encrypt != self.encrypted) return error.EncryptionModeMismatch;
-        try self.applyPurges();
+        try self.sweep();
+        try self.adoptOrphans();
         const listing = try source.filesFn(source.ctx, self.a());
         const files = listing.files;
         if (files.len > max_files) return error.TooManyFiles;
-        const purges = try self.purgePaths();
+        for (files) |file| if (!validFile(file)) return error.InvalidFile;
+        const left_out = try self.applyPurges(listing);
         var live: std.ArrayList(File) = .empty;
         var catalog: std.ArrayList(File) = .empty;
-        try catalog.appendSlice(self.a(), try self.getJson([]const File, "catalog"));
+        try catalog.appendSlice(self.a(), try self.loadCatalog());
         var writer = try backup.pack.Writer.init(self.allocator, .{ .key = self.cryptoKey(), .target_size = @as(usize, self.config.pack_mb) * 1024 * 1024 });
         defer writer.deinit();
         var id = try backup.index.generatePackId();
@@ -489,8 +706,7 @@ pub const Service = struct {
         var pending: std.AutoHashMap(Cid, void) = .init(self.allocator);
         defer pending.deinit();
         for (files) |file| {
-            if (!validFile(file)) return error.InvalidFile;
-            if (purged(file.path, purges)) continue;
+            if (listed(&.{file}, left_out)) continue;
             try live.append(self.a(), file);
             // The catalog is the history: each version with when it was seen.
             if (catalogIndex(catalog.items, file)) |known| {
@@ -508,7 +724,7 @@ pub const Service = struct {
                 const block = (try store.get(&cid, self.allocator)) orelse return error.BlockNotFound;
                 defer self.allocator.free(block.data);
                 if (!writer.wouldFit(block.data.len)) {
-                    try self.flush(&writer, id, null);
+                    try self.flushCommit(&writer, id);
                     const target = @max(@as(usize, self.config.pack_mb) * 1024 * 1024, backup.pack.header_len + writer.recordSize(block.data.len));
                     const replacement = try backup.pack.Writer.init(self.allocator, .{ .key = self.cryptoKey(), .target_size = target });
                     writer.deinit();
@@ -521,11 +737,16 @@ pub const Service = struct {
                 report.uploaded_bytes += block.data.len;
             }
         }
-        try self.flush(&writer, id, null);
-        try self.putJson("catalog", catalog.items);
-        report.snapshot = try self.randomName("snapshots");
-        try self.putJson(report.snapshot, Snapshot{ .time = self.now(), .files = live.items });
+        if (try self.flush(&writer, id)) |segment| try self.segments.append(self.a(), segment);
+        if (self.catalog.len > 0) try self.discard(self.catalog, 0);
+        self.catalog = try self.createJson("catalog", catalog.items);
+        report.snapshot = try self.createJson("snapshots", Snapshot{ .time = self.now(), .files = live.items });
+        try self.snapshots.append(self.a(), .{ .name = report.snapshot, .object = report.snapshot });
         try self.pruneSnapshots();
+        // The finished round: when it ran and what it could not take yet.
+        self.head.newest = self.now();
+        self.head.waiting = listing.waiting;
+        try self.commit();
         report.recovery_phrase = self.created_phrase;
         report.reused_key = self.created_phrase != null and self.seed_key != null;
         return report;
@@ -546,7 +767,7 @@ pub const Service = struct {
     pub fn verify(self: *Service, name_: ?[]const u8) !usize {
         var seen: std.AutoHashMap(Cid, void) = .init(self.allocator);
         defer seen.deinit();
-        const names = if (name_) |n| &[_][]const u8{n} else try self.list("snapshots");
+        const names = if (name_) |n| &[_][]const u8{n} else try self.snapshotNames();
         for (names) |n| for ((try self.snapshot(n)).files) |file| {
             for (file.blocks) |cid| {
                 if ((try seen.getOrPut(cid)).found_existing) continue;
@@ -562,7 +783,7 @@ pub const Service = struct {
     /// never thaws; `download` asks for the thaws and then checks like warm.
     pub fn check(self: *Service, name_: ?[]const u8, download: bool, tier: Tier) !Check {
         if (!self.cold()) return .{ .blocks = try self.verify(name_) };
-        const names = if (name_) |n| &[_][]const u8{n} else try self.list("snapshots");
+        const names = if (name_) |n| &[_][]const u8{n} else try self.snapshotNames();
         if (download) {
             var ready: Packs = .init(self.allocator);
             defer ready.deinit();
@@ -643,7 +864,7 @@ pub const Service = struct {
     pub fn history(self: *Service, path: ?[]const u8) ![]const File {
         if (self.key == null) return error.Locked;
         var versions: std.ArrayList(File) = .empty;
-        for (try self.getJson([]const File, "catalog")) |file| {
+        for (try self.loadCatalog()) |file| {
             if (file.directory or !validFile(file)) continue;
             if (path) |p| if (!under(file.path, p)) continue;
             try versions.append(self.a(), file);
@@ -681,117 +902,143 @@ pub const Service = struct {
         if (!validName(path)) return error.InvalidPath;
         try self.acquire();
         defer self.release();
-        const mode = self.encrypted;
-        self.encrypted = true;
-        defer self.encrypted = mode;
-        try self.putJson(try self.randomName("purges"), path);
+        try self.loadHead();
+        try self.purges.append(self.a(), try self.createPurge(.{ .path = path, .time = self.now() }));
+        try self.commit();
     }
-    fn purgePaths(self: *Service) ![]const []const u8 {
+    /// Purges stay encrypted even in the explicitly clear backup mode.
+    fn createPurge(self: *Service, purge: Purge) ![]const u8 {
         const mode = self.encrypted;
         self.encrypted = true;
         defer self.encrypted = mode;
-        var paths: std.ArrayList([]const u8) = .empty;
-        for (try self.list("purges")) |n| {
-            const p = try self.getJson([]const u8, n);
-            if (!validName(p)) return error.InvalidPurge;
-            try paths.append(self.a(), p);
-        }
-        return paths.toOwnedSlice(self.a());
+        return self.createJson("purges", purge);
+    }
+    fn getPurge(self: *Service, relative: []const u8) !Purge {
+        const mode = self.encrypted;
+        self.encrypted = true;
+        defer self.encrypted = mode;
+        const purge = try self.getJson(Purge, relative);
+        if (!validName(purge.path)) return error.InvalidPurge;
+        return purge;
     }
     fn filtered(self: *Service, files: []const File, paths: []const []const u8) ![]const File {
         var result: std.ArrayList(File) = .empty;
         for (files) |f| if (!purged(f.path, paths)) try result.append(self.a(), f);
         return result.toOwnedSlice(self.a());
     }
-    fn applyPurges(self: *Service) !void {
-        const paths = try self.purgePaths();
-        if (paths.len == 0) return;
-        for (try self.list("snapshots")) |n| {
-            const snap = try self.snapshot(n);
-            const files = try self.filtered(snap.files, paths);
-            if (files.len != snap.files.len) try self.putJson(n, Snapshot{ .time = snap.time, .files = files });
+    /// Applies the purges asked for since the last run, in one commit: the
+    /// versions under the path leave every snapshot, the catalog and the
+    /// index, and their pack bytes follow. A purge covers what was there when
+    /// it was asked for (all the history, and what the source lists with a
+    /// time from before); it never names the path for good. Returns the versions
+    /// this run leaves out: those the source still lists. Once it lists none
+    /// the purge is done and dropped; later content at the path is backed up.
+    fn applyPurges(self: *Service, listing: Listing) ![]const Version {
+        var left_out: std.ArrayList(Version) = .empty;
+        var paths: std.ArrayList([]const u8) = .empty;
+        var kept: std.ArrayList([]const u8) = .empty;
+        const history_ = try self.loadCatalog();
+        for (self.purges.items) |relative| {
+            var purge = try self.getPurge(relative);
+            const fresh = !purge.applied;
+            if (fresh) {
+                var versions: std.ArrayList(Version) = .empty;
+                for (history_) |f| if (!f.directory and under(f.path, purge.path)) try addVersion(self.a(), &versions, f);
+                for (listing.files) |f| if (!f.directory and f.mtime != 0 and f.mtime <= purge.time and under(f.path, purge.path)) try addVersion(self.a(), &versions, f);
+                try paths.append(self.a(), purge.path);
+                purge.applied = true;
+                purge.versions = versions.items;
+            }
+            // A file waiting for blocks is not listed: it may be one of them.
+            if (listing.waiting == 0 and !listed(listing.files, purge.versions)) {
+                try self.discard(relative, 0);
+                continue;
+            }
+            try left_out.appendSlice(self.a(), purge.versions);
+            if (!fresh) {
+                try kept.append(self.a(), relative);
+                continue;
+            }
+            try kept.append(self.a(), try self.createPurge(purge));
+            try self.discard(relative, 0);
         }
-        const catalog = try self.filtered(try self.getJson([]const File, "catalog"), paths);
-        // Commit the keep set before GC. Replaying the durable purge after any
-        // crash computes the same set, including when an old pack still exists.
-        try self.putJson("catalog", catalog);
+        self.purges = kept;
+        // No new purge: only a pack that waited out its storage time is left to copy.
+        if (paths.items.len == 0 and !self.packsAgedOut()) return left_out.items;
+        for (self.snapshots.items) |*ref| {
+            if (paths.items.len == 0) break;
+            const snap = try self.snapshot(ref.name);
+            const files = try self.filtered(snap.files, paths.items);
+            if (files.len == snap.files.len) continue;
+            try self.discard(ref.object, 0);
+            ref.object = try self.createJson("snapshots", Snapshot{ .time = snap.time, .files = files });
+        }
+        const catalog = try self.filtered(history_, paths.items);
+        if (paths.items.len > 0) {
+            if (self.catalog.len > 0) try self.discard(self.catalog, 0);
+            self.catalog = try self.createJson("catalog", catalog);
+        }
         var keep: std.AutoHashMap(Cid, void) = .init(self.allocator);
         defer keep.deinit();
         for (catalog) |f| for (f.blocks) |cid| {
             try keep.put(self.blockId(cid), {});
         };
         try self.repack(&keep);
+        // History, index and purge progress move together or not at all.
+        try self.commit();
+        return left_out.items;
     }
-    fn loadDeferred(self: *Service) ![]const Deferred {
-        return self.getJson([]const Deferred, "deferred") catch |err| switch (err) {
-            error.NotFound => &.{},
-            else => return err,
-        };
-    }
-    /// The packs waiting for their minimum storage time, with the day it ends.
-    fn saveDeferred(self: *Service, waiting: *std.AutoHashMap([16]u8, void), born: *std.AutoHashMap([16]u8, u64)) !void {
-        var list_: std.ArrayList(Deferred) = .empty;
-        var it = waiting.keyIterator();
-        while (it.next()) |id| try list_.append(self.a(), .{ .pack = id.*, .removable = (born.get(id.*) orelse self.now()) + self.hold() });
-        try self.putJson("deferred", list_.items);
-    }
-    /// A pack whose upload time is unknown counts as young: never delete early.
-    fn young(self: *Service, born: *std.AutoHashMap([16]u8, u64), id: [16]u8) bool {
-        const time = born.get(id) orelse return true;
-        return time == 0 or self.now() < time + self.hold();
-    }
-    /// Warm targets replace a pack holding purged bytes at once. A target
-    /// with a minimum storage time drops the purged blocks from the index at
-    /// once and leaves the pack until that time ends: then an unreferenced
-    /// pack is deleted, and one still holding kept blocks is thawed (asked
-    /// here, ready on a later run), copied without the purged bytes, deleted.
+    /// The purged blocks leave the index at once. A pack past its minimum
+    /// storage time (the one recorded at its upload, not today's class) is
+    /// copied without them, thawed first when archived (asked here, ready on
+    /// a later run); a younger one waits. The replaced packs and segments
+    /// become garbage: deleted by a later run, never before that time.
     fn repack(self: *Service, keep: *std.AutoHashMap(Cid, void)) !void {
-        const hold_seconds = self.hold();
-        var born: std.AutoHashMap([16]u8, u64) = .init(self.allocator);
-        defer born.deinit();
-        var waiting: std.AutoHashMap([16]u8, void) = .init(self.allocator);
-        defer waiting.deinit();
-        var recorded: usize = 0;
-        if (hold_seconds > 0) {
-            for (try self.listObjects("packs")) |object| try born.put(try backup.index.parsePackId(std.fs.path.basename(object.name)), object.modified);
-            for (try self.loadDeferred()) |d| try waiting.put(d.pack, {});
-            recorded = waiting.count();
-        }
-        var changed = false;
-        for (try self.list("index")) |segment| {
+        var live: std.ArrayList([]const u8) = .empty;
+        for (self.segments.items) |segment| {
             const entries = try backup.index.decodeSegment(self.allocator, try self.get(segment), self.cryptoKey());
             defer self.allocator.free(entries);
-            if (entries.len == 0) continue;
-            var kept: usize = 0;
+            if (entries.len == 0) {
+                try self.discard(segment, 0);
+                continue;
+            }
+            var remaining: std.ArrayList(Entry) = .empty;
+            defer remaining.deinit(self.allocator);
             for (entries) |entry| {
                 if (!std.mem.eql(u8, &entry.pack_id, &entries[0].pack_id)) return error.InvalidIndex;
-                if (keep.contains(entry.block_id)) kept += 1;
+                if (keep.contains(entry.block_id)) try remaining.append(self.allocator, entry);
             }
             const pack = entries[0].pack_id;
-            const removed = kept != entries.len;
-            if (!removed and !waiting.contains(pack)) continue;
-            if (hold_seconds > 0) {
-                if (removed) {
-                    // Record the pack before its segment forgets the purged blocks.
-                    if (!waiting.contains(pack)) {
-                        try waiting.put(pack, {});
-                        try self.saveDeferred(&waiting, &born);
-                        recorded = waiting.count();
-                    }
-                    var remaining: std.ArrayList(Entry) = .empty;
-                    defer remaining.deinit(self.allocator);
-                    for (entries) |entry| if (keep.contains(entry.block_id)) try remaining.append(self.allocator, entry);
-                    const encoded = try backup.index.encodeSegment(self.allocator, remaining.items, self.cryptoKey());
-                    defer self.allocator.free(encoded);
-                    try self.put(segment, encoded);
+            const at = self.packIndex(pack) orelse return error.InvalidIndex;
+            const record = self.packs.items[at];
+            const removed = remaining.items.len != entries.len;
+            if (!removed and !record.purged) {
+                try live.append(self.a(), segment);
+                continue;
+            }
+            if (remaining.items.len == 0) {
+                try self.discard(segment, 0);
+                try self.discard(try self.packName(pack), record.removable);
+                _ = self.packs.swapRemove(at);
+                continue;
+            }
+            if (self.now() < record.removable or !(try self.thawPack(pack, .Bulk)).readable) {
+                self.packs.items[at].purged = true;
+                if (!removed) {
+                    try live.append(self.a(), segment);
+                    continue;
                 }
-                if (kept == 0 or self.young(&born, pack)) continue;
-                if (!(try self.thawPack(pack, .Bulk)).readable) continue;
+                const encoded = try backup.index.encodeSegment(self.allocator, remaining.items, self.cryptoKey());
+                defer self.allocator.free(encoded);
+                const shorter = try self.randomName("index");
+                try self.create(shorter, encoded);
+                try live.append(self.a(), shorter);
+                try self.discard(segment, 0);
+                continue;
             }
             var writer = try backup.pack.Writer.init(self.allocator, .{ .key = self.cryptoKey(), .target_size = 512 * 1024 * 1024 });
             defer writer.deinit();
-            for (entries) |entry| {
-                if (!keep.contains(entry.block_id)) continue;
+            for (remaining.items) |entry| {
                 const ts = self.timestamp();
                 var response = try self.client.getObject(try self.name(try self.packName(entry.pack_id)), .{ .start = entry.offset, .end = entry.offset + entry.length - 1 }, &ts);
                 defer response.deinit();
@@ -800,44 +1047,26 @@ pub const Service = struct {
                 if (!std.mem.eql(u8, &decoded.block_id, &entry.block_id)) return error.CidMismatch;
                 _ = try writer.append(entry.block_id, decoded.data);
             }
-            const new_id = try backup.index.generatePackId();
-            try self.flush(&writer, new_id, segment);
+            const copy = (try self.flush(&writer, try backup.index.generatePackId())) orelse return error.InvalidIndex;
+            try live.append(self.a(), copy);
+            try self.discard(segment, 0);
+            try self.discard(try self.packName(pack), record.removable);
+            _ = self.packs.swapRemove(self.packIndex(pack).?);
         }
-        // Sweep packs only AFTER all segment replacements commit. A retry also
-        // finds old packs orphaned between a segment commit and its deletion.
-        var referenced: std.AutoHashMap([16]u8, void) = .init(self.allocator);
-        defer referenced.deinit();
-        self.index.deinit();
-        self.index = .init(self.allocator);
-        for (try self.list("index")) |segment| try self.index.mergeSegment(try self.get(segment), self.cryptoKey());
-        const entries = try self.index.toEntriesAlloc(self.allocator);
-        defer self.allocator.free(entries);
-        for (entries) |e| try referenced.put(e.pack_id, {});
-        for (try self.list("packs")) |n| {
-            const id = try backup.index.parsePackId(std.fs.path.basename(n));
-            if (referenced.contains(id)) continue;
-            if (hold_seconds > 0 and self.young(&born, id)) {
-                if (!waiting.contains(id)) changed = true;
-                try waiting.put(id, {});
-                continue;
-            }
-            try self.delete(n);
-            if (waiting.remove(id)) changed = true;
-        }
-        if (hold_seconds == 0) return;
-        // A replaced pack is gone; one whose upload this run just made is not waiting.
-        var gone: std.ArrayList([16]u8) = .empty;
-        var it = waiting.keyIterator();
-        while (it.next()) |id| if (!born.contains(id.*)) try gone.append(self.a(), id.*);
-        for (gone.items) |id| _ = waiting.remove(id);
-        if (changed or gone.items.len > 0 or waiting.count() != recorded) try self.saveDeferred(&waiting, &born);
+        self.segments = live;
+        try self.loadIndex();
     }
+    /// Retention only stops naming a snapshot; its object goes after the grace.
     fn pruneSnapshots(self: *Service) !void {
-        const names = try self.list("snapshots");
-        const times = try self.a().alloc(u64, names.len);
-        for (names, times) |n, *t| t.* = (try self.snapshot(n)).time;
+        const refs = self.snapshots.items;
+        const times = try self.a().alloc(u64, refs.len);
+        for (refs, times) |ref, *t| t.* = (try self.snapshot(ref.name)).time;
         const retain = try retention(self.a(), times, self.now(), self.config.retain_daily, self.config.retain_monthly);
-        for (names, retain) |n, yes| if (!yes) try self.delete(n);
+        var kept: std.ArrayList(SnapshotRef) = .empty;
+        for (refs, retain) |ref, yes| {
+            if (yes) try kept.append(self.a(), ref) else try self.discard(ref.object, 0);
+        }
+        self.snapshots = kept;
     }
 };
 /// A bounded name. Whether it is a valid path is the source's and the
@@ -861,6 +1090,18 @@ pub fn under(path: []const u8, prefix: []const u8) bool {
 }
 fn purged(path: []const u8, paths: []const []const u8) bool {
     for (paths) |p| if (under(path, p)) return true;
+    return false;
+}
+fn addVersion(a: Allocator, versions: *std.ArrayList(Version), file: File) !void {
+    for (versions.items) |v| if (std.mem.eql(u8, v.path, file.path) and std.mem.eql(u8, &v.cid, &file.cid)) return;
+    try versions.append(a, .{ .path = file.path, .cid = file.cid });
+}
+/// True when one of `files` is one of these versions (same path and content).
+fn listed(files: []const File, versions: []const Version) bool {
+    for (files) |f| {
+        if (f.directory) continue;
+        for (versions) |v| if (std.mem.eql(u8, v.path, f.path) and std.mem.eql(u8, &v.cid, &f.cid)) return true;
+    }
     return false;
 }
 fn month(time: u64) u64 {

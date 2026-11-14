@@ -248,11 +248,9 @@ pub const Worker = struct {
         const service = &session.service;
         if (self.worker.isRunning()) service.keep_going = &self.worker.running;
         // Files that waited for blocks go in on the next look, not at the
-        // next daily, weekly or monthly snapshot.
-        self.mutex.lock();
-        const retry = self.states[i].waiting_files > 0;
-        self.mutex.unlock();
-        if (!force and !retry and !(try service.due())) return;
+        // next daily, weekly or monthly snapshot: the bucket's head records
+        // the unfinished round, so `due` says so after a restart too.
+        if (!force and !(try service.due())) return;
         shareKey(a, io, service, self.configs, self.identity);
         const report = try service.run(self.source, self.store);
         if (report.recovery_phrase) |phrase| std.debug.print("S3 backup \"{s}\" recovery words — save these:\n{s}\n", .{ config.name, phrase });
