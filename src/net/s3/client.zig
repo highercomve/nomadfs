@@ -18,6 +18,8 @@ pub const Error = http.Error || sigv4.Error || xml.Error || error{
     InvalidCredentials,
     InvalidRange,
     Conflict,
+    RestoreAlreadyInProgress,
+    InvalidObjectState,
     NoSuchUpload,
     Throttled,
     ServiceUnavailable,
@@ -47,7 +49,49 @@ pub const PutOptions = struct {
     content_type: ?[]const u8 = null,
     /// Streaming bodies always use UNSIGNED-PAYLOAD and must be replayable.
     unsigned_payload: bool = false,
+    /// Sent as a signed x-amz-storage-class; null leaves the bucket default.
+    storage_class: ?[]const u8 = null,
 };
+pub const MultipartOptions = struct { storage_class: ?[]const u8 = null };
+/// Retrieval speed of an archived object: Bulk is cheapest and slowest.
+pub const RestoreTier = enum { Bulk, Standard, Expedited };
+pub const RestoreOptions = struct {
+    /// How long the readable copy stays available.
+    days: u16 = 7,
+    tier: RestoreTier = .Bulk,
+};
+/// The x-amz-restore header of a HEAD: no request yet, in progress, or readable.
+pub const RestoreState = union(enum) {
+    none,
+    ongoing,
+    /// The expiry-date text of the readable copy ("" when the server sent none).
+    ready: []const u8,
+};
+/// What a HEAD says about an object. Slices borrow from the response.
+pub const ObjectState = struct {
+    size: ?u64,
+    /// "STANDARD" when the server sends no x-amz-storage-class.
+    storage_class: []const u8,
+    restore: RestoreState,
+};
+/// Reads size, storage class and thaw progress from a headObject response.
+pub fn objectState(response: *const Response) ObjectState {
+    const length = response.header("content-length");
+    return .{
+        .size = if (length) |text| std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t"), 10) catch null else null,
+        .storage_class = response.header("x-amz-storage-class") orelse "STANDARD",
+        .restore = parseRestore(response.header("x-amz-restore")),
+    };
+}
+fn parseRestore(header: ?[]const u8) RestoreState {
+    const text = header orelse return .none;
+    if (std.mem.indexOf(u8, text, "ongoing-request=\"true\"") != null) return .ongoing;
+    if (std.mem.indexOf(u8, text, "ongoing-request=\"false\"") == null) return .none;
+    const mark = "expiry-date=\"";
+    const start = (std.mem.indexOf(u8, text, mark) orelse return .{ .ready = "" }) + mark.len;
+    const end = std.mem.indexOfScalarPos(u8, text, start, '"') orelse return .{ .ready = "" };
+    return .{ .ready = text[start..end] };
+}
 pub const Range = struct {
     start: u64,
     /// Inclusive. Null means all remaining bytes.
@@ -58,7 +102,13 @@ pub const ListOptions = struct {
     continuation_token: ?[]const u8 = null,
     max_keys: u16 = 1000,
 };
-pub const Object = struct { key: []const u8, size: u64, etag: []const u8 };
+pub const Object = struct {
+    key: []const u8,
+    size: u64,
+    etag: []const u8,
+    /// LastModified as Unix seconds; 0 when the server sent none.
+    last_modified: u64 = 0,
+};
 pub const ListResult = struct {
     arena: std.heap.ArenaAllocator,
     objects: []const Object,
@@ -106,8 +156,13 @@ pub const Client = struct {
 
     /// The response owns its body and headers, including the ETag used by a lease.
     pub fn putObject(self: *Client, key: []const u8, body: Body, options: PutOptions, timestamp: []const u8) Error!Response {
-        var headers: [2]sigv4.Header = undefined;
+        var headers: [3]sigv4.Header = undefined;
         var count: usize = 0;
+        if (options.storage_class) |class| {
+            if (class.len == 0) return error.InvalidInput;
+            headers[count] = .{ .name = "x-amz-storage-class", .value = class };
+            count += 1;
+        }
         switch (options.condition) {
             .none => {},
             .if_none_match => {
@@ -141,13 +196,28 @@ pub const Client = struct {
         return self.execute(.{ .method = .GET, .key = key, .headers = if (range != null) &headers else &.{} }, timestamp);
     }
 
-    /// Content-Length and ETag are exposed by Response.header.
+    /// Content-Length and ETag are exposed by Response.header; objectState
+    /// reads the storage class and the x-amz-restore thaw progress.
     pub fn headObject(self: *Client, key: []const u8, timestamp: []const u8) Error!Response {
         return self.execute(.{ .method = .HEAD, .key = key }, timestamp);
     }
 
     pub fn deleteObject(self: *Client, key: []const u8, timestamp: []const u8) Error!void {
         var response = try self.execute(.{ .method = .DELETE, .key = key }, timestamp);
+        response.deinit();
+    }
+
+    /// Asks for a temporary readable copy of an archived object. A thaw that
+    /// is already running (409 RestoreAlreadyInProgress) counts as success.
+    pub fn restoreObject(self: *Client, key: []const u8, options: RestoreOptions, timestamp: []const u8) Error!void {
+        if (options.days == 0 or options.days > 365) return error.InvalidInput;
+        var buffer: [256]u8 = undefined;
+        const body = std.fmt.bufPrint(&buffer, "<RestoreRequest xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Days>{d}</Days>" ++
+            "<GlacierJobParameters><Tier>{s}</Tier></GlacierJobParameters></RestoreRequest>", .{ options.days, @tagName(options.tier) }) catch unreachable;
+        var response = self.execute(.{ .method = .POST, .key = key, .body = .{ .bytes = body }, .headers = &.{.{ .name = "content-type", .value = "application/xml" }}, .query = &.{.{ .name = "restore", .value = "" }} }, timestamp) catch |err| switch (err) {
+            error.RestoreAlreadyInProgress => return,
+            else => return err,
+        };
         response.deinit();
     }
 
@@ -168,8 +238,13 @@ pub const Client = struct {
     }
 
     /// Returns an owned upload ID, freed with the client's allocator.
-    pub fn createMultipartUpload(self: *Client, key: []const u8, timestamp: []const u8) Error![]u8 {
-        var response = try self.execute(.{ .method = .POST, .key = key, .query = &.{.{ .name = "uploads", .value = "" }}, .xml_root = "InitiateMultipartUploadResult" }, timestamp);
+    pub fn createMultipartUpload(self: *Client, key: []const u8, options: MultipartOptions, timestamp: []const u8) Error![]u8 {
+        var headers: [1]sigv4.Header = undefined;
+        if (options.storage_class) |class| {
+            if (class.len == 0) return error.InvalidInput;
+            headers[0] = .{ .name = "x-amz-storage-class", .value = class };
+        }
+        var response = try self.execute(.{ .method = .POST, .key = key, .headers = if (options.storage_class != null) &headers else &.{}, .query = &.{.{ .name = "uploads", .value = "" }}, .xml_root = "InitiateMultipartUploadResult" }, timestamp);
         defer response.deinit();
         var document = try xml.parse(self.allocator, response.body);
         defer document.deinit();
@@ -279,6 +354,8 @@ fn codeError(code: []const u8) Error {
     if (std.mem.eql(u8, code, "InvalidAccessKeyId") or std.mem.eql(u8, code, "SignatureDoesNotMatch"))
         return error.InvalidCredentials;
     if (std.mem.eql(u8, code, "PreconditionFailed")) return error.PreconditionFailed;
+    if (std.mem.eql(u8, code, "RestoreAlreadyInProgress")) return error.RestoreAlreadyInProgress;
+    if (std.mem.eql(u8, code, "InvalidObjectState")) return error.InvalidObjectState;
     if (std.mem.eql(u8, code, "SlowDown") or std.mem.eql(u8, code, "Throttling")) return error.Throttled;
     if (std.mem.eql(u8, code, "InternalError") or std.mem.eql(u8, code, "ServiceUnavailable"))
         return error.ServiceUnavailable;
@@ -335,7 +412,8 @@ fn parseList(allocator: Allocator, source: []const u8) Error!ListResult {
         const key = document.text(i, "Key") orelse return error.InvalidResponse;
         const size = document.text(i, "Size") orelse return error.InvalidResponse;
         const etag = document.text(i, "ETag") orelse return error.InvalidResponse;
-        try objects.append(a, .{ .key = try a.dupe(u8, key), .etag = try a.dupe(u8, etag), .size = std.fmt.parseInt(u64, std.mem.trim(u8, size, " \r\n\t"), 10) catch return error.InvalidResponse });
+        const modified = if (document.text(i, "LastModified")) |text| parseTime(std.mem.trim(u8, text, " \r\n\t")) orelse return error.InvalidResponse else 0;
+        try objects.append(a, .{ .key = try a.dupe(u8, key), .etag = try a.dupe(u8, etag), .last_modified = modified, .size = std.fmt.parseInt(u64, std.mem.trim(u8, size, " \r\n\t"), 10) catch return error.InvalidResponse });
     }
     const truncated = std.mem.trim(u8, document.text(0, "IsTruncated") orelse return error.InvalidResponse, " \r\n\t");
     const is_truncated = std.mem.eql(u8, truncated, "true");
@@ -344,6 +422,23 @@ fn parseList(allocator: Allocator, source: []const u8) Error!ListResult {
     if (is_truncated and (token == null or token.?.len == 0)) return error.InvalidResponse;
     const copied_token = if (token) |value| try a.dupe(u8, value) else null;
     return .{ .arena = arena, .objects = objects.items, .is_truncated = is_truncated, .next_continuation_token = copied_token };
+}
+
+/// "2009-10-12T17:50:30.000Z" (ISO 8601, UTC) as Unix seconds.
+fn parseTime(text: []const u8) ?u64 {
+    if (text.len < 20 or text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':' or text[text.len - 1] != 'Z') return null;
+    const year = std.fmt.parseInt(u16, text[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u8, text[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u8, text[8..10], 10) catch return null;
+    const hour = std.fmt.parseInt(u8, text[11..13], 10) catch return null;
+    const minute = std.fmt.parseInt(u8, text[14..16], 10) catch return null;
+    const second = std.fmt.parseInt(u8, text[17..19], 10) catch return null;
+    if (year < 1970 or month == 0 or month > 12 or day == 0 or hour > 23 or minute > 59 or second > 60) return null;
+    if (day > std.time.epoch.getDaysInMonth(year, @enumFromInt(month))) return null;
+    var days: u64 = day - 1;
+    for (1970..year) |y| days += std.time.epoch.getDaysInYear(@intCast(y));
+    for (1..month) |m| days += std.time.epoch.getDaysInMonth(year, @enumFromInt(m));
+    return days * 86400 + @as(u64, hour) * 3600 + @as(u64, minute) * 60 + second;
 }
 
 fn completionXml(allocator: Allocator, parts: []const CompletedPart) Error![]u8 {
@@ -513,7 +608,7 @@ test "multipart create upload complete abort and XML escaping" {
         .{ .method = .DELETE, .url = "https://endpoint/bucket/pack?uploadId=a%2B%2F%3D", .status = 204 },
     } };
     var client = try fake.client();
-    const upload_id = try client.createMultipartUpload("pack", test_timestamp);
+    const upload_id = try client.createMultipartUpload("pack", .{}, test_timestamp);
     defer testing.allocator.free(upload_id);
     var part = try client.uploadPart("pack", upload_id, 1, .{ .bytes = "part" }, test_timestamp);
     defer part.deinit();
@@ -521,6 +616,80 @@ test "multipart create upload complete abort and XML escaping" {
     defer complete.deinit();
     try client.abortMultipartUpload("pack", upload_id, test_timestamp);
     try testing.expectEqual(@as(usize, 4), fake.calls);
+}
+
+test "storage class is a signed header on PUT and CreateMultipartUpload only when asked" {
+    const Check = struct {
+        fn send(context: *anyopaque, allocator: Allocator, request: http.Request) http.Error!Response {
+            const wanted: *const ?[]const u8 = @ptrCast(@alignCast(context));
+            var class: ?[]const u8 = null;
+            var signed = false;
+            for (request.headers) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "x-amz-storage-class")) class = h.value;
+                if (std.ascii.eqlIgnoreCase(h.name, "authorization")) signed = std.mem.indexOf(u8, h.value, ";x-amz-storage-class,") != null;
+            }
+            std.debug.assert((class == null) == (wanted.* == null));
+            if (wanted.*) |w| std.debug.assert(std.mem.eql(u8, w, class.?));
+            std.debug.assert(signed == (wanted.* != null));
+            return Response.init(allocator, 200, &.{}, if (request.method == .POST) "<InitiateMultipartUploadResult><UploadId>id</UploadId></InitiateMultipartUploadResult>" else "");
+        }
+        fn sleep(_: *anyopaque, _: u64) http.Error!void {}
+    };
+    var wanted: ?[]const u8 = "DEEP_ARCHIVE";
+    var client = try Client.init(testing.allocator, .{ .endpoint = "https://endpoint", .bucket = "bucket" }, test_credentials, .{ .context = &wanted, .send = Check.send, .sleep = Check.sleep });
+    var cold = try client.putObject("packs/a", .{ .bytes = "data" }, .{ .storage_class = "DEEP_ARCHIVE", .condition = .if_none_match }, test_timestamp);
+    cold.deinit();
+    testing.allocator.free(try client.createMultipartUpload("packs/b", .{ .storage_class = "DEEP_ARCHIVE" }, test_timestamp));
+    wanted = null;
+    var plain = try client.putObject("index/a", .{ .bytes = "data" }, .{}, test_timestamp);
+    plain.deinit();
+    testing.allocator.free(try client.createMultipartUpload("packs/c", .{}, test_timestamp));
+    try testing.expectError(error.InvalidInput, client.putObject("packs/a", .{ .bytes = "" }, .{ .storage_class = "" }, test_timestamp));
+}
+
+test "RestoreObject request XML, 409 already in progress, and x-amz-restore from HEAD" {
+    const body = "<RestoreRequest xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Days>7</Days><GlacierJobParameters><Tier>Bulk</Tier></GlacierJobParameters></RestoreRequest>";
+    const fast = "<RestoreRequest xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Days>2</Days><GlacierJobParameters><Tier>Expedited</Tier></GlacierJobParameters></RestoreRequest>";
+    var fake: Fake = .{ .steps = &.{
+        .{ .method = .POST, .url = "https://endpoint/bucket/packs/a?restore=", .status = 202, .request_body = body, .request_headers = &.{.{ .name = "content-type", .value = "application/xml" }} },
+        .{ .method = .POST, .url = "https://endpoint/bucket/packs/a?restore=", .status = 409, .request_body = fast, .body = "<Error><Code>RestoreAlreadyInProgress</Code></Error>" },
+        .{ .method = .POST, .url = "https://endpoint/bucket/packs/a?restore=", .status = 409, .body = "<Error><Code>OperationAborted</Code></Error>" },
+        .{ .method = .POST, .url = "https://endpoint/bucket/packs/a?restore=", .status = 403, .body = "<Error><Code>InvalidObjectState</Code></Error>" },
+        .{ .method = .HEAD, .url = "https://endpoint/bucket/packs/a", .response_headers = &.{ .{ .name = "Content-Length", .value = "42" }, .{ .name = "x-amz-storage-class", .value = "DEEP_ARCHIVE" } } },
+        .{ .method = .HEAD, .url = "https://endpoint/bucket/packs/a", .response_headers = &.{ .{ .name = "x-amz-storage-class", .value = "GLACIER" }, .{ .name = "x-amz-restore", .value = "ongoing-request=\"true\"" } } },
+        .{ .method = .HEAD, .url = "https://endpoint/bucket/packs/a", .response_headers = &.{.{ .name = "X-Amz-Restore", .value = "ongoing-request=\"false\", expiry-date=\"Fri, 21 Dec 2012 00:00:00 GMT\"" }} },
+    } };
+    var client = try fake.client();
+    try client.restoreObject("packs/a", .{}, test_timestamp);
+    try client.restoreObject("packs/a", .{ .days = 2, .tier = .Expedited }, test_timestamp);
+    try testing.expectError(error.Conflict, client.restoreObject("packs/a", .{}, test_timestamp));
+    try testing.expectError(error.InvalidObjectState, client.restoreObject("packs/a", .{}, test_timestamp));
+    try testing.expectError(error.InvalidInput, client.restoreObject("packs/a", .{ .days = 0 }, test_timestamp));
+    var archived = try client.headObject("packs/a", test_timestamp);
+    defer archived.deinit();
+    const cold = objectState(&archived);
+    try testing.expectEqual(@as(?u64, 42), cold.size);
+    try testing.expectEqualStrings("DEEP_ARCHIVE", cold.storage_class);
+    try testing.expect(cold.restore == .none);
+    var thawing = try client.headObject("packs/a", test_timestamp);
+    defer thawing.deinit();
+    try testing.expect(objectState(&thawing).restore == .ongoing);
+    var ready = try client.headObject("packs/a", test_timestamp);
+    defer ready.deinit();
+    const state = objectState(&ready);
+    try testing.expectEqualStrings("STANDARD", state.storage_class);
+    try testing.expectEqualStrings("Fri, 21 Dec 2012 00:00:00 GMT", state.restore.ready);
+    try testing.expectEqual(@as(usize, 0), fake.sleeps);
+}
+
+test "ListObjectsV2 LastModified is Unix seconds and malformed dates are refused" {
+    try testing.expectEqual(@as(?u64, 1255369830), parseTime("2009-10-12T17:50:30.000Z"));
+    try testing.expectEqual(@as(?u64, 1709251200), parseTime("2024-03-01T00:00:00Z"));
+    try testing.expectEqual(@as(?u64, null), parseTime("2024-02-30T00:00:00Z"));
+    var list = try parseList(testing.allocator, "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>a</Key><LastModified>2024-03-01T00:00:01.000Z</LastModified><Size>1</Size><ETag>x</ETag></Contents></ListBucketResult>");
+    defer list.deinit();
+    try testing.expectEqual(@as(u64, 1709251201), list.objects[0].last_modified);
+    try testing.expectError(error.InvalidResponse, parseList(testing.allocator, "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>a</Key><LastModified>yesterday</LastModified><Size>1</Size><ETag>x</ETag></Contents></ListBucketResult>"));
 }
 
 test "multipart embedded 200 error is retried" {
@@ -678,7 +847,7 @@ fn liveObjectChecks(client: *Client, key: []const u8, timestamp: []const u8) !vo
 }
 
 fn liveMultipartChecks(client: *Client, key: []const u8, timestamp: []const u8) !void {
-    const upload_id = try client.createMultipartUpload(key, timestamp);
+    const upload_id = try client.createMultipartUpload(key, .{}, timestamp);
     defer client.allocator.free(upload_id);
     errdefer client.abortMultipartUpload(key, upload_id, timestamp) catch {};
     var part = try client.uploadPart(key, upload_id, 1, .{ .bytes = "multipart" }, timestamp);
@@ -688,7 +857,7 @@ fn liveMultipartChecks(client: *Client, key: []const u8, timestamp: []const u8) 
     var get = try client.getObject(key, null, timestamp);
     defer get.deinit();
     try testing.expectEqualStrings("multipart", get.body);
-    const abandoned = try client.createMultipartUpload(key, timestamp);
+    const abandoned = try client.createMultipartUpload(key, .{}, timestamp);
     defer client.allocator.free(abandoned);
     try client.abortMultipartUpload(key, abandoned, timestamp);
 }

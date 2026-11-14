@@ -19,6 +19,12 @@ pub const ListOptions = client.ListOptions;
 pub const ListResult = client.ListResult;
 pub const Object = client.Object;
 pub const CompletedPart = client.CompletedPart;
+pub const MultipartOptions = client.MultipartOptions;
+pub const RestoreTier = client.RestoreTier;
+pub const RestoreOptions = client.RestoreOptions;
+pub const RestoreState = client.RestoreState;
+pub const ObjectState = client.ObjectState;
+pub const objectState = client.objectState;
 
 test {
     @import("std").testing.refAllDecls(@This());

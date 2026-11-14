@@ -41,7 +41,8 @@ fn validateSwarmKey(val: []const u8, allocator: std.mem.Allocator) ![]const u8 {
 }
 
 pub const Config = struct {
-    backup_s3: @import("backup/config.zig").Config = .{},
+    /// Offsite targets, one per `[backup.<name>]` section, in file order.
+    backup_targets: []BackupTarget = &.{},
     node: NodeConfig,
     storage: StorageConfig,
     network: NetworkConfig,
@@ -131,8 +132,34 @@ pub const Config = struct {
         quic,
     };
 
+    pub const BackupTarget = @import("backup/config.zig").Config;
+
+    /// The target called `name`; null or "s3" with no such section is the first.
+    pub fn backupTarget(self: *const Config, name: ?[]const u8) ?*const BackupTarget {
+        if (self.backup_targets.len == 0) return null;
+        const wanted = name orelse return &self.backup_targets[0];
+        for (self.backup_targets) |*target| if (std.mem.eql(u8, target.name, wanted)) return target;
+        return if (std.mem.eql(u8, wanted, "s3")) &self.backup_targets[0] else null;
+    }
+
+    /// Index of the section's target, added on first sight (a repeated section merges).
+    fn backupSection(self: *Config, allocator: std.mem.Allocator, name: []const u8) !usize {
+        for (self.backup_targets, 0..) |target, i| if (std.mem.eql(u8, target.name, name)) return i;
+        if (self.backup_targets.len >= 8) return error.TooManyBackupTargets;
+        const owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned);
+        const grown = try allocator.alloc(BackupTarget, self.backup_targets.len + 1);
+        @memcpy(grown[0..self.backup_targets.len], self.backup_targets);
+        grown[self.backup_targets.len] = .{ .name = owned };
+        if (self.backup_targets.len > 0) allocator.free(self.backup_targets);
+        self.backup_targets = grown;
+        return grown.len - 1;
+    }
+
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
-        self.backup_s3.deinit(allocator);
+        for (self.backup_targets) |*target| target.deinit(allocator);
+        if (self.backup_targets.len > 0) allocator.free(self.backup_targets);
+        self.backup_targets = &.{};
         if (self.node.nickname.len > 0) allocator.free(self.node.nickname);
         if (self.node.swarm_key.len > 0) {
             std.crypto.secureZero(u8, @constCast(self.node.swarm_key));
@@ -232,21 +259,24 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
         bootstrap_list.deinit(allocator);
     }
 
-    var backup_section = false;
+    var backup_section: ?usize = null;
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
 
         if (trimmed[0] == '[') {
-            backup_section = std.mem.eql(u8, @import("backup/config.zig").stripComment(trimmed), "[backup.s3]");
+            backup_section = null;
+            if (@import("backup/config.zig").sectionName(trimmed)) |name| {
+                backup_section = try config.backupSection(allocator, name);
+            } else if (std.mem.startsWith(u8, trimmed, "[backup.")) return error.InvalidBackupTarget;
             continue;
         }
 
         const equals = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
         const key = std.mem.trim(u8, trimmed[0..equals], " \t");
         const raw_value = std.mem.trim(u8, trimmed[equals + 1 ..], " \t");
-        const val_raw = if (backup_section) @import("backup/config.zig").stripComment(raw_value) else raw_value;
+        const val_raw = if (backup_section != null) @import("backup/config.zig").stripComment(raw_value) else raw_value;
 
         // Simple string unquoting
         const val = if (val_raw.len >= 2 and std.mem.startsWith(u8, val_raw, "\"") and std.mem.endsWith(u8, val_raw, "\""))
@@ -254,8 +284,8 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
         else
             val_raw;
 
-        if (backup_section) {
-            try config.backup_s3.apply(allocator, key, val);
+        if (backup_section) |index| {
+            try config.backup_targets[index].apply(allocator, key, val);
         } else try applyConfigEntry(allocator, &config, &bootstrap_list, key, val);
     }
 
@@ -519,11 +549,53 @@ test "config: S3 section is scoped, defaults retain forever, and credentials can
         "[backup.s3] # offsite\nendpoint = \"https://example.test\"\nregion = \"auto\"\nbucket = \"bucket\"\nprefix = \"\" # optional\ncredentials = \"~/.nomadfs/s3.credentials\" # private file\nencrypt = true\nupload_limit_kbps = 10\npack_mb = 16\n[node]\nnickname = beta\n");
     defer cfg.deinit(a);
     try std.testing.expectEqualStrings("beta", cfg.node.nickname);
-    try std.testing.expectEqualStrings("https://example.test", cfg.backup_s3.endpoint);
-    try std.testing.expectEqualStrings("~/.nomadfs/s3.credentials", cfg.backup_s3.credentials);
-    try std.testing.expectEqual(@as(u32, 30), cfg.backup_s3.retain_daily);
-    try std.testing.expectEqual(@as(u32, 0), cfg.backup_s3.retain_monthly);
-    try std.testing.expectEqual(@as(u32, 16), cfg.backup_s3.pack_mb);
+    const s3 = cfg.backupTarget(null).?;
+    try std.testing.expectEqualStrings("s3", s3.name);
+    try std.testing.expectEqualStrings("https://example.test", s3.endpoint);
+    try std.testing.expectEqualStrings("~/.nomadfs/s3.credentials", s3.credentials);
+    try std.testing.expectEqual(@as(u32, 30), s3.retain_daily);
+    try std.testing.expectEqual(@as(u32, 0), s3.retain_monthly);
+    try std.testing.expectEqual(@as(u32, 16), s3.pack_mb);
     try std.testing.expectError(error.UnknownBackupSetting, parseConfigText(a, base ++ "[backup.s3]\nsecret_access_key = inline\n"));
     try std.testing.expectError(error.InvalidPackSize, parseConfigText(a, base ++ "[backup.s3]\npack_mb = 0\n"));
+}
+
+test "config: S3 targets are named sections; a cold class changes the defaults; bad classes are refused" {
+    const a = std.testing.allocator;
+    const Class = @import("backup/config.zig").StorageClass;
+    const Schedule = @import("backup/config.zig").Schedule;
+    const base = "nickname = alpha\nswarm_key = " ++ "ab" ** 32 ++ "\nstorage_path = /tmp/a\n";
+    var cfg = try parseConfigText(a, base ++
+        "[backup.s3]\nendpoint = \"https://r2.test\"\nbucket = warm\ncredentials = /tmp/r2\n" ++
+        "[backup.archive] # deep archive\nendpoint = \"https://s3.eu-west-1.amazonaws.com\"\nregion = \"eu-west-1\"\nbucket = \"cold\"\n" ++
+        "credentials = \"/tmp/aws\"\nstorage_class = \"DEEP_ARCHIVE\"\nschedule = \"weekly\"\n" ++
+        "[backup.glacier]\npack_mb = 64\nretain_daily = 7\nstorage_class = GLACIER\n");
+    defer cfg.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), cfg.backup_targets.len);
+    const warm = cfg.backupTarget("s3").?;
+    try std.testing.expectEqualStrings("warm", warm.bucket);
+    try std.testing.expectEqual(Class.STANDARD, warm.storage_class);
+    try std.testing.expectEqual(Schedule.daily, warm.schedule);
+    try std.testing.expectEqual(@as(u32, 32), warm.pack_mb);
+    const cold = cfg.backupTarget("archive").?;
+    try std.testing.expectEqualStrings("cold", cold.bucket);
+    try std.testing.expectEqual(Class.DEEP_ARCHIVE, cold.storage_class);
+    try std.testing.expectEqual(Schedule.weekly, cold.schedule);
+    try std.testing.expectEqual(@as(u32, 256), cold.pack_mb);
+    try std.testing.expectEqual(@as(u32, 0), cold.retain_daily);
+    try std.testing.expectEqual(@as(u32, 0), cold.retain_monthly);
+    try std.testing.expectEqual(@as(u32, 180), cold.storage_class.minDays());
+    // Keys written in the file win over the cold defaults, in any order.
+    const glacier = cfg.backupTarget("glacier").?;
+    try std.testing.expectEqual(@as(u32, 64), glacier.pack_mb);
+    try std.testing.expectEqual(@as(u32, 7), glacier.retain_daily);
+    try std.testing.expect(cfg.backupTarget("missing") == null);
+    try std.testing.expectError(error.InvalidStorageClass, parseConfigText(a, base ++ "[backup.archive]\nstorage_class = \"REDUCED_REDUNDANCY\"\n"));
+    try std.testing.expectError(error.InvalidSchedule, parseConfigText(a, base ++ "[backup.archive]\nschedule = hourly\n"));
+    try std.testing.expectError(error.InvalidBackupTarget, parseConfigText(a, base ++ "[backup.Bad Name]\nbucket = x\n"));
+    // Without a section called s3, "s3" still means the first target.
+    var other = try parseConfigText(a, base ++ "[backup.r2]\nbucket = one\n[backup.archive]\nbucket = two\n");
+    defer other.deinit(a);
+    try std.testing.expectEqualStrings("one", other.backupTarget("s3").?.bucket);
+    try std.testing.expectEqualStrings("two", other.backupTarget("archive").?.bucket);
 }

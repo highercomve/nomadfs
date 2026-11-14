@@ -811,7 +811,7 @@ pub const Node = struct {
 
     pub fn runOffsite(self: *Node) !void {
         const worker = self.offsite orelse return error.BackupNotConfigured;
-        try worker.round();
+        try worker.round(true);
     }
 
     /// Binds the listener and returns. The accept and
@@ -821,9 +821,9 @@ pub const Node = struct {
         try self.connection_manager.start();
         try self.connection_manager.listen(cfg, running);
         if (self.keeper) |k| k.start() catch |err| std.debug.print("keeper: thread not started: {any}\n", .{err});
-        if (cfg.storage.swarm_backup and cfg.backup_s3.endpoint.len > 0 and self.offsite == null) {
+        if (cfg.storage.swarm_backup and cfg.backupTarget(null) != null and self.offsite == null) {
             if (self.swarm) |folder| if (self.store) |store| {
-                const host = try @import("cluster/offsite_worker.zig").Worker.create(self.allocator, cfg.backup_s3, self.device_identity, self.trust_store, .{ .folder = folder, .store = store });
+                const host = try @import("cluster/offsite_worker.zig").Worker.create(self.allocator, cfg.backup_targets, self.device_identity, self.trust_store, .{ .folder = folder, .store = store });
                 errdefer host.destroy();
                 try host.start();
                 self.offsite = host;

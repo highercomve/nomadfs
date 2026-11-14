@@ -238,7 +238,7 @@ fn printHelp() void {
         \\
         \\Usage:
         \\  nomadfs [options] [config_path]
-        \\  nomadfs backup s3 status|run|verify|restore|recovery-key|forget [options]
+        \\  nomadfs backup <target> status|run|verify|restore|recovery-key|forget [options]
         \\  nomadfs --pair [--address host:port] [config_path]
         \\  nomadfs --trust <nomadfs://pair?...> [config_path]
         \\  nomadfs --devices [config_path]

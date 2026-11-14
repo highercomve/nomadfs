@@ -2,7 +2,44 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const env = @import("../env.zig");
+/// S3 storage classes a target may ask for. Cold ones need a thaw to read.
+pub const StorageClass = enum {
+    STANDARD,
+    STANDARD_IA,
+    GLACIER_IR,
+    GLACIER,
+    DEEP_ARCHIVE,
+
+    pub fn cold(self: StorageClass) bool {
+        return self == .GLACIER or self == .DEEP_ARCHIVE;
+    }
+    /// Minimum storage duration: deleting a pack earlier is billed in full.
+    pub fn minDays(self: StorageClass) u32 {
+        return switch (self) {
+            .GLACIER => 90,
+            .DEEP_ARCHIVE => 180,
+            else => 0,
+        };
+    }
+};
+/// How often the periodic uploader writes a new snapshot to the target.
+pub const Schedule = enum {
+    daily,
+    weekly,
+    monthly,
+
+    pub fn seconds(self: Schedule) u64 {
+        return switch (self) {
+            .daily => 86400,
+            .weekly => 7 * 86400,
+            .monthly => 30 * 86400,
+        };
+    }
+};
+const text_fields = .{ "name", "endpoint", "region", "bucket", "prefix", "credentials" };
+/// One `[backup.<name>]` target: a full copy with its own bucket and lease.
 pub const Config = struct {
+    name: []const u8 = "",
     endpoint: []const u8 = "",
     region: []const u8 = "",
     bucket: []const u8 = "",
@@ -13,11 +50,31 @@ pub const Config = struct {
     pack_mb: u32 = 32,
     retain_daily: u32 = 30,
     retain_monthly: u32 = 0,
+    storage_class: StorageClass = .STANDARD,
+    schedule: Schedule = .daily,
+    /// Keys written in the file: a cold class never overrides them.
+    set_pack_mb: bool = false,
+    set_retain_daily: bool = false,
+    set_retain_monthly: bool = false,
 
     pub fn deinit(self: *Config, a: std.mem.Allocator) void {
-        inline for (.{ "endpoint", "region", "bucket", "prefix", "credentials" }) |field| {
+        inline for (text_fields) |field| {
             if (@field(self, field).len > 0) a.free(@field(self, field));
+            @field(self, field) = "";
         }
+    }
+    /// A deep copy owned by `a`.
+    pub fn clone(self: Config, a: std.mem.Allocator) !Config {
+        var copied = self;
+        inline for (text_fields) |field| @field(copied, field) = "";
+        errdefer copied.deinit(a);
+        inline for (text_fields) |field| {
+            if (@field(self, field).len > 0) @field(copied, field) = try a.dupe(u8, @field(self, field));
+        }
+        return copied;
+    }
+    pub fn configured(self: Config) bool {
+        return self.endpoint.len > 0 and self.bucket.len > 0 and self.credentials.len > 0;
     }
     pub fn apply(self: *Config, a: std.mem.Allocator, key: []const u8, value: []const u8) !void {
         inline for (.{ "endpoint", "region", "bucket", "prefix", "credentials" }) |field| {
@@ -33,6 +90,7 @@ pub const Config = struct {
                 const n = try std.fmt.parseInt(u32, value, 10);
                 if (std.mem.eql(u8, field, "pack_mb") and (n == 0 or n > 512)) return error.InvalidPackSize;
                 @field(self, field) = n;
+                if (@hasField(Config, "set_" ++ field)) @field(self, "set_" ++ field) = true;
                 return;
             }
         }
@@ -41,9 +99,34 @@ pub const Config = struct {
             self.encrypt = std.mem.eql(u8, value, "true");
             return;
         }
+        if (std.mem.eql(u8, key, "storage_class")) {
+            self.storage_class = std.meta.stringToEnum(StorageClass, value) orelse return error.InvalidStorageClass;
+            self.applyClassDefaults();
+            return;
+        }
+        if (std.mem.eql(u8, key, "schedule")) {
+            self.schedule = std.meta.stringToEnum(Schedule, value) orelse return error.InvalidSchedule;
+            return;
+        }
         return error.UnknownBackupSetting;
     }
+    /// Cold targets: big packs (fewer thaw requests), monthly snapshots forever.
+    fn applyClassDefaults(self: *Config) void {
+        const cold = self.storage_class.cold();
+        if (!self.set_pack_mb) self.pack_mb = if (cold) 256 else 32;
+        if (!self.set_retain_daily) self.retain_daily = if (cold) 0 else 30;
+        if (!self.set_retain_monthly) self.retain_monthly = 0;
+    }
 };
+/// The target name of a `[backup.<name>]` section header, or null.
+pub fn sectionName(header: []const u8) ?[]const u8 {
+    const text = stripComment(header);
+    if (!std.mem.startsWith(u8, text, "[backup.") or !std.mem.endsWith(u8, text, "]")) return null;
+    const name = text["[backup.".len .. text.len - 1];
+    if (name.len == 0 or name.len > 32) return null;
+    for (name) |c| if (!std.ascii.isLower(c) and !std.ascii.isDigit(c) and c != '-' and c != '_') return null;
+    return name;
+}
 pub const Credentials = struct {
     access_key_id: []const u8,
     secret_access_key: []const u8,

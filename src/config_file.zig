@@ -1,5 +1,5 @@
 //! Changing `nomadfs.conf` in place: the one editor the app and the command
-//! line use. Legacy settings are flat `key = value` lines; [backup.s3]
+//! line use. Legacy settings are flat `key = value` lines; [backup.<name>]
 //! is scoped and preserved. An edit drops the lines it replaces and appends the
 //! new ones, keeping comments and every other setting as they are. Writes
 //! are atomic (temp file, fsync, rename) and owner-only: the file holds the
@@ -52,7 +52,7 @@ pub fn edit(allocator: std.mem.Allocator, path: []const u8, change: Edit) !void 
     while (lines.next()) |line| {
         if (lines.index == null and line.len == 0) break; // trailing newline
         const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.startsWith(u8, trimmed, "[")) backup_section = std.mem.eql(u8, @import("backup/config.zig").stripComment(trimmed), "[backup.s3]");
+        if (std.mem.startsWith(u8, trimmed, "[")) backup_section = @import("backup/config.zig").sectionName(trimmed) != null;
         if (!backup_section and dropped(line, change)) continue;
         try out.appendSlice(allocator, line);
         try out.append(allocator, '\n');
@@ -256,5 +256,5 @@ test "config: S3 section survives edits of node settings" {
     var cfg = try config_mod.parseConfig(a, path);
     defer cfg.deinit(a);
     try std.testing.expectEqualStrings("beta", cfg.node.nickname);
-    try std.testing.expectEqualStrings("https://example.test", cfg.backup_s3.endpoint);
+    try std.testing.expectEqualStrings("https://example.test", cfg.backupTarget("s3").?.endpoint);
 }

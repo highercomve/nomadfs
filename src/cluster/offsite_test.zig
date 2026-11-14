@@ -6,7 +6,12 @@ const storage = @import("../storage/mod.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;
 const Cid = [32]u8;
-const Object = struct { bytes: []u8, version: u64 };
+const Thaw = enum { none, ongoing, ready };
+const Object = struct { bytes: []u8, version: u64, modified: u64 = 0, class: ?[]const u8 = null, thaw: Thaw = .none };
+fn isCold(class: ?[]const u8) bool {
+    const text = class orelse return false;
+    return std.mem.eql(u8, text, "GLACIER") or std.mem.eql(u8, text, "DEEP_ARCHIVE");
+}
 const Fake = struct {
     objects: std.StringHashMapUnmanaged(Object) = .empty,
     version: u64 = 0,
@@ -18,6 +23,23 @@ const Fake = struct {
     fail_segment_once: bool = false,
     fail_segment_at: usize = 0,
     segments: usize = 0,
+    multipart_class: ?[]const u8 = null,
+    restore_requests: usize = 0,
+    last_tier: []const u8 = "",
+    /// Every running thaw ends: the archived packs become readable.
+    fn finishThaws(self: *Fake) void {
+        var it = self.objects.valueIterator();
+        while (it.next()) |object| {
+            if (object.thaw == .ongoing) object.thaw = .ready;
+        }
+    }
+    fn iso(time: u64, out: *[24]u8) []const u8 {
+        const epoch: std.time.epoch.EpochSeconds = .{ .secs = time };
+        const yd = epoch.getEpochDay().calculateYearDay();
+        const md = yd.calculateMonthDay();
+        const ds = epoch.getDaySeconds();
+        return std.fmt.bufPrint(out, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z", .{ yd.year, md.month.numeric(), @as(u8, md.day_index) + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute() }) catch unreachable;
+    }
     fn deinit(self: *Fake) void {
         var it = self.objects.iterator();
         while (it.next()) |entry| {
@@ -45,7 +67,7 @@ const Fake = struct {
         const slot = try self.objects.getOrPut(a, key);
         if (slot.found_existing) a.free(slot.value_ptr.bytes) else slot.key_ptr.* = try a.dupe(u8, key);
         self.version += 1;
-        slot.value_ptr.* = .{ .bytes = owned_bytes, .version = self.version };
+        slot.value_ptr.* = .{ .bytes = owned_bytes, .version = self.version, .modified = self.time };
     }
     fn header(request: s3.transport.Request, key: []const u8) ?[]const u8 {
         for (request.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, key)) return h.value;
@@ -100,18 +122,30 @@ const Fake = struct {
             var it = self.objects.iterator();
             while (it.next()) |e| {
                 if (!std.mem.startsWith(u8, e.key_ptr.*, prefix)) continue;
-                try xml.writer.print("<Contents><Key>{s}</Key><Size>{d}</Size><ETag>&quot;{d}&quot;</ETag></Contents>", .{ e.key_ptr.*, e.value_ptr.bytes.len, e.value_ptr.version });
+                var stamp: [24]u8 = undefined;
+                try xml.writer.print("<Contents><Key>{s}</Key><LastModified>{s}</LastModified><Size>{d}</Size><ETag>&quot;{d}&quot;</ETag></Contents>", .{ e.key_ptr.*, iso(e.value_ptr.modified, &stamp), e.value_ptr.bytes.len, e.value_ptr.version });
             }
             try xml.writer.writeAll("</ListBucketResult>");
             return s3.Response.init(allocator, 200, &.{}, xml.written());
         }
         if (request.method == .POST) {
+            if (std.mem.startsWith(u8, query, "restore=")) {
+                const object = self.objects.getPtr(key) orelse return s3.Response.init(allocator, 404, &.{}, "");
+                self.restore_requests += 1;
+                self.last_tier = if (std.mem.indexOf(u8, body, "<Tier>Standard</Tier>") != null) "Standard" else if (std.mem.indexOf(u8, body, "<Tier>Bulk</Tier>") != null) "Bulk" else "other";
+                std.debug.assert(std.mem.indexOf(u8, body, "<Days>7</Days>") != null);
+                if (object.thaw == .ongoing) return s3.Response.init(allocator, 409, &.{}, "<Error><Code>RestoreAlreadyInProgress</Code></Error>");
+                if (object.thaw == .none) object.thaw = .ongoing;
+                return s3.Response.init(allocator, 202, &.{}, "");
+            }
             if (std.mem.startsWith(u8, query, "uploads=")) {
                 self.multipart.clearRetainingCapacity();
                 self.multipart_calls += 1;
+                self.multipart_class = if (header(request, "x-amz-storage-class")) |class| @tagName(std.meta.stringToEnum(Classes, class).?) else null;
                 return s3.Response.init(allocator, 200, &.{}, "<InitiateMultipartUploadResult><UploadId>test</UploadId></InitiateMultipartUploadResult>");
             }
             try self.set(key, self.multipart.items);
+            self.objects.getPtr(key).?.class = self.multipart_class;
             self.pack_puts += 1;
             return s3.Response.init(allocator, 200, &.{}, "<CompleteMultipartUploadResult/>");
         }
@@ -127,6 +161,7 @@ const Fake = struct {
                     return s3.Response.init(allocator, 403, &.{}, "");
                 }
                 try self.set(key, body);
+                if (header(request, "x-amz-storage-class")) |class| self.objects.getPtr(key).?.class = @tagName(std.meta.stringToEnum(Classes, class).?);
                 if (std.mem.indexOf(u8, key, "packs/") != null) self.pack_puts += 1;
             }
             const etag = try std.fmt.bufPrint(&etag_buf, "\"{d}\"", .{self.version});
@@ -140,6 +175,23 @@ const Fake = struct {
             return s3.Response.init(allocator, 204, &.{}, "");
         }
         const obj = existing orelse return s3.Response.init(allocator, 404, &.{}, "");
+        if (request.method == .HEAD) {
+            var length: [20]u8 = undefined;
+            var headers: [3]std.http.Header = undefined;
+            var count: usize = 1;
+            headers[0] = .{ .name = "content-length", .value = try std.fmt.bufPrint(&length, "{d}", .{obj.bytes.len}) };
+            if (obj.class) |class| {
+                headers[count] = .{ .name = "x-amz-storage-class", .value = class };
+                count += 1;
+            }
+            if (obj.thaw != .none) {
+                headers[count] = .{ .name = "x-amz-restore", .value = if (obj.thaw == .ongoing) "ongoing-request=\"true\"" else "ongoing-request=\"false\", expiry-date=\"Fri, 21 Dec 2012 00:00:00 GMT\"" };
+                count += 1;
+            }
+            return s3.Response.init(allocator, 200, headers[0..count], "");
+        }
+        // An archived object cannot be read before its thaw ends.
+        if (isCold(obj.class) and obj.thaw != .ready) return s3.Response.init(allocator, 403, &.{}, "<Error><Code>InvalidObjectState</Code></Error>");
         if (header(request, "range")) |range| {
             var parts = std.mem.splitScalar(u8, range[6..], '-');
             const start = std.fmt.parseInt(usize, parts.next().?, 10) catch return error.InvalidRequest;
@@ -150,6 +202,8 @@ const Fake = struct {
         return s3.Response.init(allocator, 200, &.{.{ .name = "etag", .value = old_etag }}, obj.bytes);
     }
 };
+/// Static names for the classes a request may carry (the request text is freed).
+const Classes = enum { STANDARD_IA, GLACIER_IR, GLACIER, DEEP_ARCHIVE };
 const Fixture = struct {
     fake: Fake = .{},
     client: s3.Client = undefined,
@@ -176,6 +230,18 @@ const Fixture = struct {
         f.service.clock_ctx = &f.fake;
         f.service.clockFn = Fake.clock;
         return f;
+    }
+    /// A deep-archive target with the cold defaults: monthly snapshots only.
+    fn createCold() !*Fixture {
+        const f = try create();
+        f.service.config.storage_class = .DEEP_ARCHIVE;
+        f.service.config.retain_daily = 0;
+        f.service.config.retain_monthly = 0;
+        return f;
+    }
+    fn packKey(f: *Fixture, cid: Cid) ![]const u8 {
+        const location = f.service.index.get(backup.index.keyedBlockId(f.service.key.?, cid)).?;
+        return std.fmt.allocPrint(f.arena.allocator(), "swarm/packs/{s}", .{backup.index.formatPackId(location.pack_id)});
     }
     fn destroy(f: *Fixture) void {
         f.service.deinit();
@@ -547,4 +613,278 @@ test "offsite: a block larger than pack target gets its own bounded pack" {
     _ = try f.add("large.bin", bytes);
     _ = try f.run();
     try std.testing.expectEqual(@as(usize, 1), try f.service.verify(null));
+}
+
+const day = 86400;
+
+test "offsite: only packs take the cold storage class; metadata stays standard" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    f.service.config.pack_mb = 8;
+    _ = try f.add("Photos/a.jpg", "photo bytes");
+    _ = try f.run();
+    const bytes = try a.alloc(u8, 6 * 1024 * 1024);
+    defer a.free(bytes);
+    @memset(bytes, 'p');
+    _ = try f.add("large.bin", bytes);
+    _ = try f.run();
+    try f.service.forget("nothing.txt");
+    try std.testing.expectEqual(@as(usize, 1), f.fake.multipart_calls);
+    var packs: usize = 0;
+    var others: usize = 0;
+    var it = f.fake.objects.iterator();
+    while (it.next()) |e| {
+        if (std.mem.startsWith(u8, e.key_ptr.*, "swarm/packs/")) {
+            try std.testing.expectEqualStrings("DEEP_ARCHIVE", e.value_ptr.class.?);
+            packs += 1;
+        } else {
+            try std.testing.expect(e.value_ptr.class == null);
+            others += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), packs);
+    // Layout, wraps, recovery entropy, catalog, index, snapshots, purge, lease.
+    try std.testing.expect(others >= 9);
+    const status = try f.service.status();
+    try std.testing.expectEqual(@TypeOf(status.storage_class).DEEP_ARCHIVE, status.storage_class);
+}
+
+test "offsite: warm target sends no storage class at all" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    _ = try f.add("a.txt", "bytes");
+    _ = try f.run();
+    var it = f.fake.objects.valueIterator();
+    while (it.next()) |object| try std.testing.expect(object.class == null);
+}
+
+test "offsite: cold target retention prunes snapshots and never deletes a young pack" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    const cid = try f.add("old.txt", "kept by the catalog");
+    const first = try f.run();
+    const pack = try f.packKey(cid);
+    f.files.clearRetainingCapacity();
+    _ = try f.run(); // same month: the monthly rule keeps the later snapshot only
+    const first_key = try std.fmt.allocPrint(f.arena.allocator(), "swarm/{s}", .{first.snapshot});
+    try std.testing.expect(!f.fake.objects.contains(first_key));
+    // An unreferenced pack (an upload cut before its index segment) and a
+    // purge that makes every run sweep: the young orphan must stay.
+    const orphan = "swarm/packs/000102030405060708090a0b0c0d0e0f";
+    try f.fake.set(orphan, "orphan pack bytes");
+    f.fake.objects.getPtr(orphan).?.class = "DEEP_ARCHIVE";
+    try f.service.forget("never-there.txt");
+    f.fake.time += 40 * day;
+    _ = try f.run();
+    try std.testing.expect(f.fake.objects.contains(pack));
+    try std.testing.expect(f.fake.objects.contains(orphan));
+    var status = try f.service.status();
+    try std.testing.expectEqual(@as(usize, 2), status.snapshots.len);
+    try std.testing.expectEqual(@as(usize, 1), status.deferred_packs);
+    try std.testing.expectEqual(f.fake.objects.get(orphan).?.modified + 180 * day, status.deferred_first);
+    // Past the 180 days the orphan goes; the referenced pack is never touched.
+    f.fake.time += 150 * day;
+    _ = try f.run();
+    try std.testing.expect(!f.fake.objects.contains(orphan));
+    try std.testing.expect(f.fake.objects.contains(pack));
+    status = try f.service.status();
+    try std.testing.expectEqual(@as(usize, 0), status.deferred_packs);
+    try std.testing.expectEqual(@as(usize, 0), f.fake.restore_requests);
+}
+
+test "offsite: purge on a cold target forgets the file at once and removes the pack bytes after the minimum storage time" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    const removed = try f.add("private.txt", "private unique bytes");
+    const kept = try f.add("keep.txt", "kept bytes");
+    _ = try f.run();
+    const old_pack = try f.packKey(removed);
+    const born = f.fake.objects.get(old_pack).?.modified;
+    try f.service.forget("private.txt");
+    // The monthly rule keeps this later snapshot; the purge filters the new one too.
+    const second = try f.run();
+    // Gone from history and index now; the pack itself waits.
+    try std.testing.expect(f.fake.objects.contains(old_pack));
+    try std.testing.expect(!f.service.index.contains(backup.index.keyedBlockId(f.service.key.?, removed)));
+    try std.testing.expect(f.service.index.contains(backup.index.keyedBlockId(f.service.key.?, kept)));
+    const snap = try f.service.snapshot(second.snapshot);
+    try std.testing.expectEqual(@as(usize, 1), snap.files.len);
+    try std.testing.expectEqualStrings("keep.txt", snap.files[0].path);
+    var status = try f.service.status();
+    try std.testing.expectEqual(@as(usize, 1), status.deferred_packs);
+    try std.testing.expectEqual(born + 180 * day, status.deferred_first);
+    try std.testing.expectEqual(born + 180 * day, status.deferred_last);
+    try std.testing.expectEqual(@as(usize, 0), f.fake.restore_requests);
+    // Still young at 179 days: nothing moves, nothing is thawed.
+    f.fake.time += 179 * day;
+    _ = try f.run();
+    try std.testing.expect(f.fake.objects.contains(old_pack));
+    try std.testing.expectEqual(@as(usize, 0), f.fake.restore_requests);
+    // Aged out: the kept block needs the pack thawed before it can be copied.
+    f.fake.time += 2 * day;
+    _ = try f.run();
+    try std.testing.expect(f.fake.objects.contains(old_pack));
+    try std.testing.expectEqual(@as(usize, 1), f.fake.restore_requests);
+    try std.testing.expectEqualStrings("Bulk", f.fake.last_tier);
+    f.fake.finishThaws();
+    _ = try f.run();
+    try std.testing.expect(!f.fake.objects.contains(old_pack));
+    const new_pack = try f.packKey(kept);
+    try std.testing.expect(!std.mem.eql(u8, old_pack, new_pack));
+    try std.testing.expectEqualStrings("DEEP_ARCHIVE", f.fake.objects.get(new_pack).?.class.?);
+    status = try f.service.status();
+    try std.testing.expectEqual(@as(usize, 0), status.deferred_packs);
+    const check = try f.service.check(null, false, .Bulk);
+    try std.testing.expectEqual(@as(usize, 1), check.packs);
+    try std.testing.expectEqual(@as(usize, 1), check.blocks);
+}
+
+test "offsite: cold restore asks for thaws first, then restores when the packs are ready" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    _ = try f.add("Photos/a.jpg", "photo bytes");
+    _ = try f.add("Notes/b.txt", "notes bytes\n");
+    const report = try f.run();
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    const first = try f.service.restoreRequest(io, report.snapshot, null, target.dir, .Standard);
+    try std.testing.expectEqual(@as(usize, 0), first.files);
+    try std.testing.expectEqual(@as(usize, 1), first.thawing_packs);
+    try std.testing.expect(first.thawing_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 1), f.fake.restore_requests);
+    try std.testing.expectEqualStrings("Standard", f.fake.last_tier);
+    try std.testing.expectError(error.FileNotFound, target.dir.statFile(io, "Notes/b.txt", .{}));
+    // The pending job is on disk: a new session (a restart) picks it up.
+    const job = try target.dir.readFileAlloc(io, ".nomadfs-restore.json", a, .limited(4096));
+    defer a.free(job);
+    try std.testing.expect(std.mem.indexOf(u8, job, report.snapshot) != null);
+    var other = try core.Service.init(a, &f.client, f.service.config, f.service.device);
+    defer other.deinit();
+    other.clock_ctx = &f.fake;
+    other.clockFn = Fake.clock;
+    try other.unlock(null);
+    // Still thawing: no second request, nothing written.
+    const waiting = try other.restoreRequest(io, report.snapshot, null, target.dir, .Standard);
+    try std.testing.expectEqual(@as(usize, 0), waiting.files);
+    try std.testing.expectEqual(@as(usize, 1), waiting.thawing_packs);
+    try std.testing.expectEqual(@as(usize, 1), f.fake.restore_requests);
+    // A different request must not reuse this directory's job.
+    try std.testing.expectError(error.RestoreJobMismatch, other.restoreRequest(io, report.snapshot, "Photos", target.dir, .Standard));
+    f.fake.finishThaws();
+    const done = try other.restoreRequest(io, report.snapshot, null, target.dir, .Standard);
+    try std.testing.expectEqual(@as(usize, 2), done.files);
+    try std.testing.expectEqual(@as(usize, 0), done.thawing_packs);
+    try std.testing.expectEqual(@as(usize, 1), f.fake.restore_requests);
+    const bytes = try target.dir.readFileAlloc(io, "Notes/b.txt", a, .limited(100));
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("notes bytes\n", bytes);
+    const photo = try target.dir.readFileAlloc(io, "Photos/a.jpg", a, .limited(100));
+    defer a.free(photo);
+    try std.testing.expectEqualStrings("photo bytes", photo);
+    try std.testing.expectError(error.FileNotFound, target.dir.statFile(io, ".nomadfs-restore.json", .{}));
+}
+
+test "offsite: cold restore writes the files of ready packs and resumes for the rest" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    _ = try f.add("a.txt", "first pack");
+    _ = try f.run();
+    const b = try f.add("b.txt", "second pack");
+    const report = try f.run();
+    var it = f.fake.objects.valueIterator();
+    while (it.next()) |object| {
+        if (isCold(object.class)) object.thaw = .ready;
+    }
+    f.fake.objects.getPtr(try f.packKey(b)).?.thaw = .none;
+    var target = std.testing.tmpDir(.{});
+    defer target.cleanup();
+    const first = try f.service.restoreRequest(io, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 1), first.files);
+    try std.testing.expectEqual(@as(usize, 1), first.thawing_packs);
+    f.fake.finishThaws();
+    const done = try f.service.restoreRequest(io, report.snapshot, null, target.dir, .Bulk);
+    try std.testing.expectEqual(@as(usize, 2), done.files);
+    try std.testing.expectEqual(@as(usize, 0), done.thawing_packs);
+    const bytes = try target.dir.readFileAlloc(io, "b.txt", a, .limited(100));
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("second pack", bytes);
+}
+
+test "offsite: cold verify checks packs by listing, finds a missing or cut pack, and downloads only when asked" {
+    const f = try Fixture.createCold();
+    defer f.destroy();
+    const cid = try f.add("a.txt", "hello");
+    _ = try f.add("b.txt", "world");
+    _ = try f.run();
+    const listed = try f.service.check(null, false, .Bulk);
+    try std.testing.expect(!listed.downloaded);
+    try std.testing.expectEqual(@as(usize, 1), listed.packs);
+    try std.testing.expectEqual(@as(usize, 2), listed.blocks);
+    try std.testing.expectEqual(@as(usize, 0), f.fake.restore_requests);
+    // --download: thaw first, read every block once the packs are ready.
+    const thawing = try f.service.check(null, true, .Bulk);
+    try std.testing.expectEqual(@as(usize, 1), thawing.thawing_packs);
+    try std.testing.expectEqual(@as(usize, 0), thawing.blocks);
+    try std.testing.expectEqual(@as(usize, 1), f.fake.restore_requests);
+    f.fake.finishThaws();
+    const read = try f.service.check(null, true, .Bulk);
+    try std.testing.expect(read.downloaded);
+    try std.testing.expectEqual(@as(usize, 2), read.blocks);
+    const pack = try f.packKey(cid);
+    const object = f.fake.objects.getPtr(pack).?;
+    const full = object.bytes;
+    object.bytes = full[0 .. full.len - 1];
+    try std.testing.expectError(error.PackTruncated, f.service.check(null, false, .Bulk));
+    object.bytes = full;
+    const removed = f.fake.objects.fetchRemove(pack).?;
+    a.free(removed.key);
+    a.free(removed.value.bytes);
+    try std.testing.expectError(error.PackMissing, f.service.check(null, false, .Bulk));
+}
+
+test "offsite: a new target reuses another target's backup key and recovery words" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    _ = try f.add("a.txt", "bytes");
+    const warm = try f.run();
+    var config = f.service.config;
+    config.prefix = "archive";
+    config.storage_class = .DEEP_ARCHIVE;
+    var cold = try core.Service.init(a, &f.client, config, f.service.device);
+    defer cold.deinit();
+    cold.clock_ctx = &f.fake;
+    cold.clockFn = Fake.clock;
+    try std.testing.expect(!(try cold.initialised()));
+    try cold.adopt(f.service.key.?, try f.service.recoveryKey());
+    const report = try cold.run(f.source(), &f.store);
+    try std.testing.expect(report.reused_key);
+    try std.testing.expectEqualStrings(warm.recovery_phrase.?, report.recovery_phrase.?);
+    try std.testing.expectEqualSlices(u8, &f.service.key.?, &cold.key.?);
+    try std.testing.expect(try cold.initialised());
+    // The one set of words opens the archive from a device with no wrap.
+    const pair = try std.crypto.dh.X25519.KeyPair.generateDeterministic([_]u8{8} ** 32);
+    var stranger = try core.Service.init(a, &f.client, config, .{ .id = [_]u8{8} ** 32, .public = pair.public_key, .secret = pair.secret_key });
+    defer stranger.deinit();
+    stranger.clock_ctx = &f.fake;
+    stranger.clockFn = Fake.clock;
+    try stranger.unlock(warm.recovery_phrase);
+    try std.testing.expectEqualStrings(warm.recovery_phrase.?, try stranger.recoveryKey());
+}
+
+test "offsite: the periodic uploader is due by the target's schedule" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    f.service.config.schedule = .weekly;
+    try std.testing.expect(try f.service.due());
+    _ = try f.add("a.txt", "bytes");
+    _ = try f.run();
+    try std.testing.expect(!(try f.service.due()));
+    f.fake.time += 6 * day;
+    try std.testing.expect(!(try f.service.due()));
+    f.fake.time += day;
+    try std.testing.expect(try f.service.due());
+    f.service.config.schedule = .monthly;
+    try std.testing.expect(!(try f.service.due()));
+    f.service.config.schedule = .daily;
+    try std.testing.expect(try f.service.due());
 }
