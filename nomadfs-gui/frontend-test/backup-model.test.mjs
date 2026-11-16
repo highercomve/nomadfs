@@ -6,15 +6,15 @@ test("deepBackupView: no archive target disables the switch with a reason", () =
   const v = deepBackupView({ deep_backup: false, archive_target: false, running: true });
   assert.equal(v.checked, false);
   assert.equal(v.disabled, true);
-  assert.match(v.text, /archive target/);
-  assert.match(v.text, /GLACIER or DEEP_ARCHIVE/);
+  assert.match(v.text, /archive bucket/);
+  assert.match(v.text, /Glacier Deep Archive bucket under Offsite backup/);
 });
 
 test("deepBackupView: on without an archive target can still be turned off, and says nothing is sent", () => {
   const v = deepBackupView({ deep_backup: true, archive_target: false, running: true });
   assert.equal(v.checked, true);
   assert.equal(v.disabled, false);
-  assert.match(v.text, /^No archive target configured/);
+  assert.match(v.text, /^No archive bucket set up/);
 });
 
 test("deepBackupView: off with an archive target is a plain enabled switch", () => {

@@ -851,6 +851,20 @@ pub fn swarmBackupStatus(gpa: std.mem.Allocator, args: ListArgs) !BackupInfo {
 /// One offsite target for the settings page. Times are Unix seconds.
 pub const OffsiteTarget = struct {
     name: []const u8,
+    /// Where it goes, as the configuration says: no secret among them.
+    endpoint: []const u8,
+    bucket: []const u8,
+    prefix: []const u8,
+    encrypt: bool,
+    /// The owner typed the recovery words back (`offsite_words_confirm`).
+    words_confirmed: bool,
+    /// Runs asked by hand that ended since the node started: the one
+    /// `offsite_run` started is over once this passed what it answered.
+    manual_runs: u64,
+    /// The last upload made the target's key (its recovery words are new),
+    /// or took another target's.
+    new_key: bool,
+    reused_key: bool,
     storage_class: []const u8,
     /// "daily", "weekly" or "monthly".
     schedule: []const u8,
@@ -914,6 +928,14 @@ pub fn offsiteStatus(gpa: std.mem.Allocator, args: ListArgs) !OffsiteInfo {
     const targets = try gpa.alloc(OffsiteTarget, all.targets.len);
     for (all.targets, targets) |t, *out| out.* = .{
         .name = try gpa.dupe(u8, t.name),
+        .endpoint = try gpa.dupe(u8, t.endpoint),
+        .bucket = try gpa.dupe(u8, t.bucket),
+        .prefix = try gpa.dupe(u8, t.prefix),
+        .encrypt = t.encrypt,
+        .words_confirmed = t.words_confirmed,
+        .manual_runs = t.manual_runs,
+        .new_key = t.new_key,
+        .reused_key = t.reused_key,
         .storage_class = @tagName(t.storage_class),
         .schedule = @tagName(t.schedule),
         .cold = t.cold,
@@ -932,6 +954,114 @@ pub fn offsiteStatus(gpa: std.mem.Allocator, args: ListArgs) !OffsiteInfo {
         .deferred_last = t.deferred_last,
     };
     return .{ .running = running, .swarm_backup = all.swarm_backup, .deep_backup = all.deep_backup, .archive_missing = all.archive_missing, .targets = targets };
+}
+
+pub const OffsiteAddArgs = struct {
+    config_path: []const u8,
+    endpoint: []const u8,
+    region: []const u8 = "",
+    bucket: []const u8,
+    prefix: []const u8 = "",
+    /// "" (STANDARD) or a storage class by name; "" (daily) or a schedule.
+    storage_class: []const u8 = "",
+    schedule: []const u8 = "",
+    encrypt: bool = true,
+    access_key_id: []const u8,
+    secret_access_key: []const u8,
+};
+
+/// What a change of the targets did: the target's name, and "live" when
+/// the running node took it, "restart" when it waits for the next start.
+pub const OffsiteChange = struct { name: []const u8, applied: []const u8 };
+
+/// `offsite_add { config_path, endpoint, region, bucket, prefix,
+/// storage_class, schedule, encrypt, access_key_id, secret_access_key }`:
+/// a new backup bucket (backup/service.zig `addTarget`, as `nomadfs backup
+/// add`): the keys go to their own owner-only file, the rest to the
+/// configuration, and the running node takes the target at once. The
+/// service names it ("s3", "archive", ...).
+pub fn offsiteAdd(gpa: std.mem.Allocator, args: OffsiteAddArgs) !OffsiteChange {
+    if (!backup_supported) return error.Unsupported;
+    // The keys came in the command's own message: wiped once written.
+    defer std.crypto.secureZero(u8, @constCast(args.secret_access_key));
+    defer std.crypto.secureZero(u8, @constCast(args.access_key_id));
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const added = try nomadfs.backup_service.addTarget(gpa, std.Io.Threaded.global_single_threaded.io(), args.config_path, runningNode(), .{
+        .endpoint = args.endpoint,
+        .region = args.region,
+        .bucket = args.bucket,
+        .prefix = args.prefix,
+        .storage_class = args.storage_class,
+        .schedule = args.schedule,
+        .encrypt = args.encrypt,
+        .access_key_id = args.access_key_id,
+        .secret_access_key = args.secret_access_key,
+    });
+    return .{ .name = added.name, .applied = if (added.applied == .live or g_node == null) "live" else "restart" };
+}
+
+pub const OffsiteNameArgs = struct { config_path: []const u8, name: []const u8 };
+
+/// `offsite_remove { config_path, name }`: forgets the target on this
+/// device (its section, and the keys file `offsite_add` wrote). The bucket
+/// and everything in it stay.
+pub fn offsiteRemove(gpa: std.mem.Allocator, args: OffsiteNameArgs) !OffsiteChange {
+    if (!backup_supported) return error.Unsupported;
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const applied = try nomadfs.backup_service.removeTarget(gpa, std.Io.Threaded.global_single_threaded.io(), args.config_path, runningNode(), args.name);
+    return .{ .name = try gpa.dupe(u8, args.name), .applied = if (applied == .live or g_node == null) "live" else "restart" };
+}
+
+pub const OffsiteRun = struct { name: []const u8, manual_runs: u64 };
+
+/// `offsite_run { config_path, name }`: "Back up now", handed to the
+/// running node's uploader. Returns at once; the upload is over, well or
+/// with a `failure`, once the target's `manual_runs` in `offsite_status`
+/// passed the number answered here.
+pub fn offsiteRun(gpa: std.mem.Allocator, args: OffsiteNameArgs) !OffsiteRun {
+    if (!backup_supported) return error.Unsupported;
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const node = runningNode() orelse return error.NotRunning;
+    const started = try node.requestBackup(gpa, args.name);
+    return .{ .name = started.name, .manual_runs = started.manual_runs };
+}
+
+pub const OffsiteCheck = struct { packs: u64, blocks: u64 };
+
+/// `offsite_check { config_path, name }`: checks the backup by listing
+/// the bucket: every pack is there with all its bytes, the index and the
+/// snapshots open with this device's key, every block they name is
+/// indexed. No pack is downloaded. Asks the bucket: it takes a while.
+pub fn offsiteCheck(gpa: std.mem.Allocator, args: OffsiteNameArgs) !OffsiteCheck {
+    if (!backup_supported) return error.Unsupported;
+    const service = nomadfs.backup_service;
+    var result = try service.execute(gpa, std.Io.Threaded.global_single_threaded.io(), .{ .action = .verify, .listing = true, .target = args.name, .config_path = args.config_path });
+    defer service.deinitResult(gpa, &result);
+    const check = result.check orelse return error.Unexpected;
+    return .{ .packs = check.packs, .blocks = check.blocks };
+}
+
+/// `offsite_words { config_path, name }`: the target's 24 recovery
+/// words, read from the bucket with this device's key. They open the
+/// backup when every device is gone: the page shows them and keeps no copy.
+pub fn offsiteWords(gpa: std.mem.Allocator, args: OffsiteNameArgs) ![]const u8 {
+    if (!backup_supported) return error.Unsupported;
+    const service = nomadfs.backup_service;
+    var result = try service.execute(gpa, std.Io.Threaded.global_single_threaded.io(), .{ .action = .@"recovery-key", .target = args.name, .config_path = args.config_path });
+    defer service.deinitResult(gpa, &result);
+    return gpa.dupe(u8, result.recovery_phrase orelse return error.Unexpected);
+}
+
+/// `offsite_words_confirm { config_path, name }`: the owner typed the
+/// words back; saved with the target so no front end warns again.
+pub fn offsiteWordsConfirm(gpa: std.mem.Allocator, args: OffsiteNameArgs) !void {
+    if (!backup_supported) return error.Unsupported;
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    try nomadfs.backup_service.confirmWords(gpa, args.config_path, runningNode(), args.name);
 }
 
 /// `swarm_backup_set { config_path, on }`: saved in the config

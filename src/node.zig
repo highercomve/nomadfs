@@ -32,6 +32,14 @@ const HashRing = cluster.ring.HashRing;
 
 pub const Node = struct {
     offsite: ?*offsite_worker.Worker = null,
+    /// Held to use or replace `offsite`: the targets change while the node
+    /// runs (`setBackupTargets`), from a command or the local API's thread.
+    offsite_mutex: sync.Mutex = .{},
+    /// `listen` ran: targets set from now on get their uploader at once.
+    offsite_hosted: bool = false,
+    /// The file this node's configuration was read from, when the host said
+    /// (`rememberConfig`): what `reloadBackupTargets` reads again.
+    config_path: ?[]u8 = null,
     /// What the offsite worker backs up: the swarm folder, described by fs.
     offsite_source: @import("fs/offsite.zig").Source = undefined,
     /// Swarm backup is on (settings change it while the node runs); deep
@@ -452,9 +460,18 @@ pub const Node = struct {
     pub fn deinit(self: *Node) void {
         // The local API's backup requests work on the uploader: none is
         // left when this returns.
-        if (self.swarm_api) |api| api.setBackup(null);
+        if (self.swarm_api) |api| {
+            api.setReload(null);
+            api.setBackup(null);
+        }
+        self.offsite_mutex.lock();
+        self.offsite_hosted = false;
         if (self.offsite) |worker| worker.destroy();
         self.offsite = null;
+        if (self.swarm_api) |api| api.setBackup(null);
+        self.offsite_mutex.unlock();
+        if (self.config_path) |path| self.allocator.free(path);
+        self.config_path = null;
         self.stopCacheThread();
         self.bootstrap_running.store(false, .release);
         if (self.bootstrap_thread) |t| {
@@ -761,6 +778,8 @@ pub const Node = struct {
         const roles = self.backupRoles();
         self.discovery_node.setRole(net.discovery.rpc.Roles.swarm_backup, roles.swarm_backup);
         self.discovery_node.setRole(net.discovery.rpc.Roles.deep_backup, roles.deep_backup);
+        self.offsite_mutex.lock();
+        defer self.offsite_mutex.unlock();
         if (self.offsite) |worker| worker.setRoles(roles);
     }
 
@@ -843,6 +862,8 @@ pub const Node = struct {
     /// Shared offsite status for settings/mobile; null when not configured on
     /// this keeper. Detailed bucket/snapshot queries use backup_service.
     pub fn offsiteStatus(self: *Node) ?offsite_worker.Status {
+        self.offsite_mutex.lock();
+        defer self.offsite_mutex.unlock();
         return if (self.offsite) |worker| worker.status() else null;
     }
 
@@ -853,6 +874,8 @@ pub const Node = struct {
     /// The archive (cold) target's state; null when none is configured: a
     /// deep backup device then has nowhere to send its backup.
     pub fn archiveStatus(self: *Node) ?offsite_worker.Status {
+        self.offsite_mutex.lock();
+        defer self.offsite_mutex.unlock();
         return if (self.offsite) |worker| worker.archiveStatus() else null;
     }
 
@@ -860,12 +883,101 @@ pub const Node = struct {
     /// `backup` lists them (backup/service.zig `overview`); the caller
     /// frees it with `backup_service.deinitOverview`.
     pub fn backupOverview(self: *Node, allocator: std.mem.Allocator) !backup_service.Overview {
+        self.offsite_mutex.lock();
+        defer self.offsite_mutex.unlock();
         return backup_service.overview(allocator, self.offsite orelse return error.BackupNotConfigured);
     }
 
     pub fn runOffsite(self: *Node) !void {
+        self.offsite_mutex.lock();
+        defer self.offsite_mutex.unlock();
         const worker = self.offsite orelse return error.BackupNotConfigured;
         try worker.round(true);
+    }
+
+    /// "Back up now" for one target: handed to the uploader, which starts
+    /// within a moment (backup/service.zig `executeLive`); `backupOverview`
+    /// shows how it went. The caller frees the answer's name.
+    pub fn requestBackup(self: *Node, allocator: std.mem.Allocator, target: []const u8) !backup_service.Started {
+        self.offsite_mutex.lock();
+        defer self.offsite_mutex.unlock();
+        const worker = self.offsite orelse return error.BackupNotConfigured;
+        const result = try backup_service.executeLive(allocator, std.Io.Threaded.global_single_threaded.io(), worker, .{ .action = .run, .target = target }, null);
+        return result.started.?;
+    }
+
+    /// The owner typed the recovery words of offsite target `name` back
+    /// (backup/service.zig `confirmWords` saved it): the status says so now.
+    pub fn confirmBackupWords(self: *Node, name: []const u8) void {
+        self.offsite_mutex.lock();
+        defer self.offsite_mutex.unlock();
+        if (self.offsite) |worker| _ = worker.setWordsConfirmed(name);
+    }
+
+    /// The file this node's configuration came from: `reloadBackupTargets`
+    /// reads it again when a front end changed the backup targets.
+    pub fn rememberConfig(self: *Node, path: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, path);
+        if (self.config_path) |old| self.allocator.free(old);
+        self.config_path = owned;
+    }
+
+    /// The backup targets as the configuration file lists them now, applied
+    /// while the node runs (`setBackupTargets`).
+    pub fn reloadBackupTargets(self: *Node) !void {
+        const path = self.config_path orelse return error.ConfigPathUnknown;
+        var cfg = try config.parseConfig(self.allocator, path);
+        defer cfg.deinit(self.allocator);
+        try self.setBackupTargets(cfg.backup_targets);
+    }
+
+    /// Replaces the offsite targets while the node runs: the uploader stops
+    /// (an upload under way ends at its next pack and is taken up again),
+    /// and one for `targets` starts, keeping what was known about the
+    /// targets that stay. No configured target: no uploader. On an error
+    /// the old targets stay.
+    pub fn setBackupTargets(self: *Node, targets: []const @import("backup/config.zig").Config) !void {
+        const api = self.swarm_api;
+        // No request of the local API is left on the old uploader.
+        if (api) |server| server.setBackup(null);
+        self.offsite_mutex.lock();
+        defer self.offsite_mutex.unlock();
+        // Handed back under the lock: `deinit` never frees an uploader the
+        // API was just given.
+        defer if (api) |server| server.setBackup(self.offsite);
+        if (!self.offsite_hosted) return;
+        const old = self.offsite;
+        const next = try self.offsiteHost(targets);
+        if (old) |worker| {
+            worker.stop();
+            if (next) |host| host.inherit(worker);
+            worker.destroy();
+        }
+        self.offsite = next;
+        if (next) |host| host.start() catch |err| {
+            host.destroy();
+            self.offsite = null;
+            return err;
+        };
+    }
+
+    /// An uploader for `targets`, not started; null when none is configured
+    /// or the node has no swarm folder or store.
+    fn offsiteHost(self: *Node, targets: []const @import("backup/config.zig").Config) !?*offsite_worker.Worker {
+        const folder = self.swarm orelse return null;
+        const store = self.store orelse return null;
+        self.offsite_source = .{ .folder = folder, .store = store };
+        const host = offsite_worker.Worker.create(self.allocator, targets, self.device_identity, self.trust_store, self.offsite_source.source(), store) catch |err| switch (err) {
+            error.BackupNotConfigured => return null,
+            else => return err,
+        };
+        host.setRoles(self.backupRoles());
+        return host;
+    }
+
+    fn reloadBackupHook(ctx: *anyopaque) anyerror!void {
+        const self: *Node = @ptrCast(@alignCast(ctx));
+        return self.reloadBackupTargets();
     }
 
     /// Binds the listener and returns. The accept and
@@ -877,16 +989,17 @@ pub const Node = struct {
         if (self.keeper) |k| k.start() catch |err| std.debug.print("keeper: thread not started: {any}\n", .{err});
         // Every node with a target hosts the worker; which targets upload
         // is its policy, from the backup roles (changed while running).
-        if (cfg.backupTarget(null) != null and self.offsite == null) {
-            if (self.swarm) |folder| if (self.store) |store| {
-                self.offsite_source = .{ .folder = folder, .store = store };
-                const host = try offsite_worker.Worker.create(self.allocator, cfg.backup_targets, self.device_identity, self.trust_store, self.offsite_source.source(), store);
+        self.offsite_mutex.lock();
+        defer self.offsite_mutex.unlock();
+        self.offsite_hosted = true;
+        if (self.swarm_api) |api| api.setReload(.{ .ctx = self, .reloadFn = reloadBackupHook });
+        if (self.offsite == null) {
+            if (try self.offsiteHost(cfg.backup_targets)) |host| {
                 errdefer host.destroy();
-                host.setRoles(self.backupRoles());
                 try host.start();
                 self.offsite = host;
                 if (self.swarm_api) |api| api.setBackup(host);
-            };
+            }
         }
         if (self.store != null and self.cache_thread == null) {
             self.cache_running.store(true, .release);
@@ -971,7 +1084,10 @@ pub const Node = struct {
     /// them. Stopping is not undone here: a later listen() fails with
     /// ManagerStopping until the connection manager can restart.
     pub fn stopListener(self: *Node) void {
+        self.offsite_mutex.lock();
+        self.offsite_hosted = false;
         if (self.offsite) |worker| worker.stop();
+        self.offsite_mutex.unlock();
         self.stopCacheThread();
         if (self.keeper) |k| k.stop();
         self.bootstrap_running.store(false, .release);

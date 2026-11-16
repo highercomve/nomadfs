@@ -155,6 +155,7 @@ fn nodeNewInternal(config_value: nomadfs.config.Config, config_path: []const u8)
     running.* = std.atomic.Value(bool).init(false);
     const self = try allocator.create(NodeHandle);
     self.* = .{ .node = node, .config = config, .config_path = path, .running = running };
+    self.node.rememberConfig(path) catch {};
     registerHandle(self);
     return self;
 }

@@ -14,8 +14,8 @@ export function deepBackupView(st) {
       checked: on,
       disabled: !on,
       text: on
-        ? "No archive target configured: nothing is sent to an archive."
-        : "Needs an archive target: add a [backup.<name>] section with storage_class GLACIER or DEEP_ARCHIVE to this device's configuration.",
+        ? "No archive bucket set up: nothing is sent to an archive. Add one under Offsite backup below."
+        : "Needs an archive bucket: add an AWS Glacier Deep Archive bucket under Offsite backup below.",
     };
   }
   let text = "";

@@ -15,6 +15,7 @@
 //!   GET    /<token>/v1/thumb/<path>    a small JPEG of the picture at <path>
 //!   GET    /<token>/v1/content/<cid>   a file's bytes by content ID, with Range
 //!   GET    /<token>/v1/backup                          the offsite targets and how their uploads go
+//!   POST   /<token>/v1/backup/reload                   read the targets of the configuration file again
 //!   GET    /<token>/v1/backup/<target>                 one target's bucket: snapshots, blocks, packs to remove
 //!   POST   /<token>/v1/backup/<target>/run             upload now: 202 {"name", "manual_runs"}
 //!   POST   /<token>/v1/backup/<target>/forget?path=    purge a path from the backup: 204
@@ -128,6 +129,12 @@ pub const Info = struct {
     url: []const u8,
 };
 
+/// The node's side of `POST backup/reload`.
+pub const Reload = struct {
+    ctx: *anyopaque,
+    reloadFn: *const fn (ctx: *anyopaque) anyerror!void,
+};
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -153,6 +160,9 @@ pub const Server = struct {
         /// False once the uploader is being taken away: a request talking
         /// to a bucket ends.
         open: std.atomic.Value(bool) = .init(false),
+        /// How the node takes the backup targets of its configuration file
+        /// again (`POST backup/reload`); null: it can't.
+        reload: ?Reload = null,
     } = .{},
     port: u16 = 0,
     listener: ?compat.Server = null,
@@ -228,6 +238,13 @@ pub const Server = struct {
         defer self.backup.mutex.unlock();
         while (self.backup.users > 0) self.backup.idle.wait(&self.backup.mutex);
         self.backup.worker = worker;
+    }
+
+    /// What `POST backup/reload` calls: the node reads its targets again.
+    pub fn setReload(self: *Server, reload: ?Reload) void {
+        self.backup.mutex.lock();
+        defer self.backup.mutex.unlock();
+        self.backup.reload = reload;
     }
 
     fn holdBackup(self: *Server) ?*offsite_worker.Worker {
@@ -404,6 +421,17 @@ pub const Server = struct {
     fn backupRoute(self: *Server, arena: std.mem.Allocator, conn: *Conn, req: *const Request, rest: []const []const u8) !void {
         const read = eql(req.method, "GET");
         if (!read and !eql(req.method, "POST")) return conn.respond(405, "Method Not Allowed", &close, "");
+        // The targets changed in the configuration file (`nomadfs backup
+        // add|remove`): the node reads them again. Nothing secret travels:
+        // the credentials are in their own file.
+        if (rest.len == 1 and !read and eql(rest[0], "reload")) {
+            self.backup.mutex.lock();
+            const reload = self.backup.reload;
+            self.backup.mutex.unlock();
+            const hook = reload orelse return answerBackupError(conn, error.ReloadUnsupported);
+            hook.reloadFn(hook.ctx) catch |err| return answerBackupError(conn, err);
+            return conn.respond(204, "No Content", &close, "");
+        }
         // Null: the list, of no one target.
         const action: ?backup.Action = if (rest.len == 0 and read)
             null
@@ -1075,9 +1103,51 @@ test "swarm api: backup lists the targets, runs one, and a purge names the versi
     // The folder still lists both pictures: only the backup forgot them.
     try testing.expect(t.folder.fileInfo("Photos/new.jpg") != null);
 
+    // `nomadfs backup add|remove` changed the configuration: the node is
+    // asked to read its targets again, when it said how.
+    const no_reload = try testSend(arena, server, "POST", &server.token, "backup/reload", "");
+    try testing.expectEqual(@as(u16, 500), no_reload.code);
+    try testing.expect(std.mem.indexOf(u8, no_reload.head, "X-NomadFS-Error: ReloadUnsupported") != null);
+    const Counter = struct {
+        calls: usize = 0,
+        fn reload(ctx: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+        }
+    };
+    var counter: Counter = .{};
+    server.setReload(.{ .ctx = &counter, .reloadFn = Counter.reload });
+    try testing.expectEqual(@as(u16, 204), (try testSend(arena, server, "POST", &server.token, "backup/reload", "")).code);
+    try testing.expectEqual(@as(usize, 1), counter.calls);
+    server.setReload(null);
+
     // The uploader taken away (the node stopping): the routes are gone.
     server.setBackup(null);
     try testing.expectEqual(@as(u16, 404), (try testGet(arena, server, "backup")).code);
+
+    // The targets changed while the node runs: the new uploader keeps what
+    // the old one knew about the target that stays, and starts the new
+    // one from nothing.
+    worker.stop();
+    const next = try offsite_worker.Worker.create(testing.allocator, &.{
+        .{ .name = "main", .endpoint = "https://endpoint", .bucket = "bucket", .credentials = credentials, .prefix = "swarm", .pack_mb = 1 },
+        .{ .name = "extra", .endpoint = "https://endpoint", .bucket = "bucket", .credentials = credentials, .prefix = "extra", .pack_mb = 1 },
+    }, try device.identity.Identity.fromSeed([_]u8{5} ** 32), &trust, source.source(), &t.store);
+    defer next.destroy();
+    next.setRoles(.{ .swarm_backup = true });
+    // The words typed back while the old uploader ran stay confirmed.
+    try testing.expect(worker.setWordsConfirmed("main") and !worker.setWordsConfirmed("nope"));
+    next.inherit(worker);
+    const kept = next.statusOf("main").?;
+    try testing.expect(kept.words_confirmed and !next.statusOf("extra").?.words_confirmed);
+    var listed_next = try backup.overview(testing.allocator, next);
+    defer backup.deinitOverview(testing.allocator, &listed_next);
+    try testing.expect(listed_next.targets[0].words_confirmed and !listed_next.targets[1].words_confirmed);
+    try testing.expect(kept.last_upload > 0 and kept.failure == null and !kept.running);
+    try testing.expectEqualStrings(worker.statusOf("main").?.snapshot(), kept.snapshot());
+    try testing.expectEqualStrings("main", kept.name);
+    try testing.expectEqual(@as(u64, 0), next.statusOf("extra").?.last_upload);
+    try testing.expect(next.statusOf("archive") == null);
 }
 
 test tokenMatches {

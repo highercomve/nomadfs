@@ -69,6 +69,9 @@ pub const Status = struct {
     /// or took another target's (`reused_key`).
     new_key: bool = false,
     reused_key: bool = false,
+    /// The owner typed the target's recovery words back (its configuration
+    /// says so, or `setWordsConfirmed` while the node runs).
+    words_confirmed: bool = false,
     /// Packs a purge left behind until their minimum storage time ends, and
     /// when the first and the last may go, as the last upload found them.
     deferred_packs: usize = 0,
@@ -174,7 +177,7 @@ pub const Worker = struct {
             copied += 1;
         }
         const states = try a.alloc(Status, wanted);
-        for (states, configs) |*state, config| state.* = .{ .name = config.name, .cold = config.storage_class.cold(), .gate = gate(config, .{}) };
+        for (states, configs) |*state, config| state.* = .{ .name = config.name, .cold = config.storage_class.cold(), .gate = gate(config, .{}), .words_confirmed = config.words_confirmed };
         self.* = .{ .allocator = a, .configs = configs, .states = states, .identity = identity, .trust = trust, .source = source, .store = store };
         return self;
     }
@@ -186,6 +189,34 @@ pub const Worker = struct {
         a.free(self.states);
         std.crypto.secureZero(u8, std.mem.asBytes(&self.identity));
         a.destroy(self);
+    }
+    /// Takes over what `old`, a worker that stopped, knew about the targets
+    /// both have (the node's targets changed while it runs): their last
+    /// upload stays on the status page. A run its stop cut short is no failure.
+    pub fn inherit(self: *Worker, old: *Worker) void {
+        for (self.states, self.configs) |*state, config| {
+            var kept = old.statusOf(config.name) orelse continue;
+            kept.name = config.name;
+            kept.cold = state.cold;
+            kept.gate = state.gate;
+            kept.running = false;
+            kept.words_confirmed = kept.words_confirmed or state.words_confirmed;
+            if (kept.failure) |err| if (err == error.Cancelled) {
+                kept.failure = null;
+            };
+            state.* = kept;
+        }
+    }
+    /// The owner typed the recovery words of target `name` back: status
+    /// pages stop warning at once. False when no target is called so.
+    pub fn setWordsConfirmed(self: *Worker, name: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.states) |*state| if (std.mem.eql(u8, state.name, name)) {
+            state.words_confirmed = true;
+            return true;
+        };
+        return false;
     }
     pub fn start(self: *Worker) !void {
         try self.worker.start(loop, .{self});
@@ -333,7 +364,8 @@ pub const Worker = struct {
         if (!force and !(try service.due())) return;
         shareKey(a, io, service, self.configs, self.identity, self.transport);
         const report = try service.run(self.source, self.store);
-        if (report.recovery_phrase) |phrase| std.debug.print("S3 backup \"{s}\" recovery words — save these:\n{s}\n", .{ config.name, phrase });
+        // Never the words themselves: the log may go to the system journal.
+        if (report.recovery_phrase != null) std.debug.print("S3 backup \"{s}\": new recovery words made; show them with `nomadfs backup {s} recovery-key` or in the app\n", .{ config.name, config.name });
         if (report.waiting_files > 0) std.debug.print("offsite: \"{s}\": {d} files waiting for blocks\n", .{ config.name, report.waiting_files });
         try enroll(service, self.trust);
         // What the run left in the session: nothing more is asked of the bucket.

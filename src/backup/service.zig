@@ -47,6 +47,8 @@ pub const Request = struct {
     tier: Tier = .Bulk,
     /// Verify a cold target by reading every block (thaws its packs).
     download: bool = false,
+    /// Verify by listing only, on any target: no pack is downloaded.
+    listing: bool = false,
 };
 /// One version of one file the backup holds. Times are Unix seconds; a
 /// seen time of 0 is unknown (uploaded before the history kept them).
@@ -75,6 +77,13 @@ pub const Started = struct { name: []const u8, manual_runs: u64 };
 /// uploader knows: the bucket is not asked. Times are Unix seconds.
 pub const TargetState = struct {
     name: []const u8,
+    /// Where it goes, as the configuration says (no secret among them).
+    endpoint: []const u8 = "",
+    bucket: []const u8 = "",
+    prefix: []const u8 = "",
+    encrypt: bool = true,
+    /// The owner typed the recovery words back (`confirmWords`).
+    words_confirmed: bool = false,
     storage_class: StorageClass,
     schedule: Schedule,
     /// A GLACIER or DEEP_ARCHIVE target.
@@ -135,16 +144,26 @@ pub fn overviewOf(a: std.mem.Allocator, targets: []const backup_cfg.Config, role
     errdefer deinitTargets(a, list.targets, filled);
     for (targets) |config| {
         if (!config.configured()) continue;
-        list.targets[filled] = try targetState(a, config, .{ .cold = config.storage_class.cold(), .gate = worker.gate(config, roles) });
+        list.targets[filled] = try targetState(a, config, .{ .cold = config.storage_class.cold(), .gate = worker.gate(config, roles), .words_confirmed = config.words_confirmed });
         filled += 1;
     }
     return list;
 }
 fn targetState(a: std.mem.Allocator, config: backup_cfg.Config, state: worker.Status) !TargetState {
-    const name = try a.dupe(u8, config.name);
-    errdefer a.free(name);
+    var copies: [5][]const u8 = undefined;
+    var copied: usize = 0;
+    errdefer for (copies[0..copied]) |text| a.free(text);
+    for ([_][]const u8{ config.name, state.snapshot(), config.endpoint, config.bucket, config.prefix }) |text| {
+        copies[copied] = try a.dupe(u8, text);
+        copied += 1;
+    }
     return .{
-        .name = name,
+        .name = copies[0],
+        .endpoint = copies[2],
+        .bucket = copies[3],
+        .prefix = copies[4],
+        .encrypt = config.encrypt,
+        .words_confirmed = state.words_confirmed,
         .storage_class = config.storage_class,
         .schedule = config.schedule,
         .cold = state.cold,
@@ -154,7 +173,7 @@ fn targetState(a: std.mem.Allocator, config: backup_cfg.Config, state: worker.St
         .requested = state.requested,
         .manual_runs = state.manual_runs,
         .last_upload = state.last_upload,
-        .snapshot = try a.dupe(u8, state.snapshot()),
+        .snapshot = copies[1],
         .uploaded_blocks = state.uploaded_blocks,
         .uploaded_bytes = state.uploaded_bytes,
         .waiting_files = state.waiting_files,
@@ -171,8 +190,7 @@ fn deinitTargets(a: std.mem.Allocator, targets: []TargetState, filled: usize) vo
     a.free(targets);
 }
 fn freeTarget(a: std.mem.Allocator, t: TargetState) void {
-    a.free(t.name);
-    a.free(t.snapshot);
+    inline for (.{ "name", "snapshot", "endpoint", "bucket", "prefix" }) |field| a.free(@field(t, field));
 }
 pub fn deinitOverview(a: std.mem.Allocator, o: *Overview) void {
     deinitTargets(a, o.targets, o.targets.len);
@@ -274,7 +292,7 @@ fn perform(a: std.mem.Allocator, io: std.Io, env: Env, request: Request) !Result
             return .{ .status = status, .gate = allowed, .archive_missing = env.roles.deep_backup and !worker.hasArchive(env.targets) };
         },
         .verify => {
-            const check = try core.check(request.snapshot, request.download, request.tier);
+            const check = if (request.listing) try core.checkListing(request.snapshot) else try core.check(request.snapshot, request.download, request.tier);
             return .{ .check = check, .count = check.blocks };
         },
         .restore => {
@@ -357,4 +375,380 @@ pub fn deinitResult(a: std.mem.Allocator, result: *Result) void {
         a.free(p);
     }
     if (result.restore) |*r| r.deinit(a);
+}
+
+// ---- Changing the targets ----
+
+const config_file = @import("../config_file.zig");
+
+/// A target a front end asks for. The two keys go into a file of their own
+/// (`<name>.credentials` beside the configuration, owner-only), never into
+/// the configuration; the caller wipes its copies.
+pub const NewTarget = struct {
+    /// "": named here (`suggestName`).
+    name: []const u8 = "",
+    endpoint: []const u8,
+    /// "": "auto".
+    region: []const u8 = "",
+    bucket: []const u8,
+    prefix: []const u8 = "",
+    /// "" (STANDARD), or a storage class by name.
+    storage_class: []const u8 = "",
+    /// "" (daily), "daily", "weekly" or "monthly".
+    schedule: []const u8 = "",
+    encrypt: bool = true,
+    access_key_id: []const u8,
+    secret_access_key: []const u8,
+};
+/// Whether a change reached the running node (`live`), or waits for the
+/// next start of a node (`saved`).
+pub const Applied = enum { live, saved };
+pub const Added = struct { name: []const u8, applied: Applied };
+
+/// Words `nomadfs backup` reads as commands: no target is called so.
+const reserved_names = [_][]const u8{ "add", "remove", "reload" };
+const max_targets = 8;
+const max_key_len = 512;
+
+fn plainText(text: []const u8) bool {
+    for (text) |c| if (c < 0x20 or c == 0x7f or c == '"' or c == '\\') return false;
+    return true;
+}
+fn noSpace(text: []const u8) bool {
+    return plainText(text) and std.mem.indexOfScalar(u8, text, ' ') == null;
+}
+/// A settings mistake, by the field it is in.
+fn validate(new: NewTarget) !void {
+    const endpoint = new.endpoint;
+    const scheme: usize = if (std.mem.startsWith(u8, endpoint, "https://")) 8 else if (std.mem.startsWith(u8, endpoint, "http://")) 7 else return error.InvalidEndpoint;
+    if (endpoint.len == scheme or endpoint.len > 256 or !noSpace(endpoint) or endpoint[scheme] == '/' or endpoint[scheme] == '.') return error.InvalidEndpoint;
+    if (new.bucket.len == 0 or new.bucket.len > 255 or !noSpace(new.bucket) or std.mem.indexOfScalar(u8, new.bucket, '/') != null) return error.InvalidBucket;
+    if (new.region.len > 64 or !noSpace(new.region)) return error.InvalidRegion;
+    if (new.prefix.len > 256 or !plainText(new.prefix) or std.mem.startsWith(u8, new.prefix, "/")) return error.InvalidPrefix;
+    if (new.access_key_id.len == 0 or new.access_key_id.len > max_key_len or !noSpace(new.access_key_id) or new.access_key_id[0] == '#') return error.InvalidAccessKey;
+    if (new.secret_access_key.len == 0 or new.secret_access_key.len > max_key_len or !noSpace(new.secret_access_key)) return error.InvalidSecretKey;
+}
+
+/// "s3" for the first warm target, "archive" for the first cold one, then
+/// "s3-2", "archive-2"... The name is in `buf`.
+pub fn suggestName(targets: []const backup_cfg.Config, cold: bool, buf: *[32]u8) ![]const u8 {
+    const base = if (cold) "archive" else "s3";
+    var n: usize = 1;
+    while (n <= max_targets + 1) : (n += 1) {
+        const name = if (n == 1) base else try std.fmt.bufPrint(buf, "{s}-{d}", .{ base, n });
+        const taken = for (targets) |t| {
+            if (std.mem.eql(u8, t.name, name)) break true;
+        } else false;
+        if (!taken) return name;
+    }
+    return error.TooManyBackupTargets;
+}
+
+/// Where `addTarget` keeps the keys of target `name`: beside the
+/// configuration file (`~/.nomadfs/<name>.credentials` for the usual one).
+/// Absolute: the node may run from another directory than this command.
+fn credentialsPath(a: std.mem.Allocator, io: std.Io, config_path: []const u8, name: []const u8) ![]u8 {
+    const expanded = try @import("../env.zig").expandHome(a, config_path);
+    defer if (expanded) |p| a.free(p);
+    const file = try std.fmt.allocPrint(a, "{s}.credentials", .{name});
+    defer a.free(file);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try std.Io.Dir.cwd().realPathFile(io, std.fs.path.dirname(expanded orelse config_path) orelse ".", &buf)];
+    return std.fs.path.join(a, &.{ dir, file });
+}
+
+/// The running node takes the targets the file lists now; with none
+/// running, or when it can't, the next start does.
+fn applyTargets(a: std.mem.Allocator, config_path: []const u8, node: ?*Node) Applied {
+    const running = node orelse return .saved;
+    var cfg = config_mod.parseConfig(a, config_path) catch return .saved;
+    defer cfg.deinit(a);
+    running.setBackupTargets(cfg.backup_targets) catch |err| {
+        std.debug.print("offsite: the new targets apply after a restart: {s}\n", .{@errorName(err)});
+        return .saved;
+    };
+    return .live;
+}
+
+/// Adds a `[backup.<name>]` target: checks the settings, writes the two
+/// keys to their owner-only file, then the section, and hands the targets
+/// to the running `node` (null: none runs here). Nothing is asked of the
+/// bucket: the first upload does that. The name returned is the caller's.
+pub fn addTarget(a: std.mem.Allocator, io: std.Io, config_path: []const u8, node: ?*Node, new: NewTarget) !Added {
+    try validate(new);
+    var cfg = try config_mod.parseConfig(a, config_path);
+    defer cfg.deinit(a);
+
+    // The settings as the configuration will read them: one validation.
+    var target: backup_cfg.Config = .{};
+    defer target.deinit(a);
+    if (new.storage_class.len > 0) try target.apply(a, "storage_class", new.storage_class);
+    if (new.schedule.len > 0) try target.apply(a, "schedule", new.schedule);
+
+    var name_buf: [32]u8 = undefined;
+    const name = if (new.name.len > 0) new.name else try suggestName(cfg.backup_targets, target.storage_class.cold(), &name_buf);
+    if (!backup_cfg.validName(name)) return error.InvalidBackupTarget;
+    for (reserved_names) |word| if (std.mem.eql(u8, word, name)) return error.InvalidBackupTarget;
+    if (cfg.backup_targets.len >= max_targets) return error.TooManyBackupTargets;
+    for (cfg.backup_targets) |t| {
+        if (std.mem.eql(u8, t.name, name)) return error.BackupTargetExists;
+        // Two targets on one place would take each other's lease.
+        if (std.mem.eql(u8, t.endpoint, new.endpoint) and std.mem.eql(u8, t.bucket, new.bucket) and std.mem.eql(u8, t.prefix, new.prefix)) return error.BackupTargetDuplicate;
+    }
+
+    const credentials = try credentialsPath(a, io, config_path, name);
+    defer a.free(credentials);
+    if (!plainText(credentials)) return error.InvalidPath;
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (lines.items) |line| a.free(line);
+        lines.deinit(a);
+    }
+    for ([_][2][]const u8{ .{ "endpoint", new.endpoint }, .{ "region", new.region }, .{ "bucket", new.bucket }, .{ "prefix", new.prefix }, .{ "credentials", credentials }, .{ "storage_class", new.storage_class }, .{ "schedule", new.schedule } }) |pair| {
+        if (pair[1].len == 0) continue;
+        try target.apply(a, pair[0], pair[1]);
+        const line = try std.fmt.allocPrint(a, "{s} = \"{s}\"", .{ pair[0], pair[1] });
+        errdefer a.free(line);
+        try lines.append(a, line);
+    }
+    {
+        const line = try std.fmt.allocPrint(a, "encrypt = {}", .{new.encrypt});
+        errdefer a.free(line);
+        try lines.append(a, line);
+    }
+
+    {
+        var text: [2 * max_key_len + 64]u8 = undefined;
+        defer std.crypto.secureZero(u8, &text);
+        const written = try std.fmt.bufPrint(&text, "access_key_id = \"{s}\"\nsecret_access_key = \"{s}\"\n", .{ new.access_key_id, new.secret_access_key });
+        try config_file.writeAtomic(a, io, credentials, written);
+    }
+    // No section names it yet: a failure below leaves no keys behind.
+    errdefer std.Io.Dir.cwd().deleteFile(io, credentials) catch {};
+    try config_file.editBackup(a, config_path, name, .{ .add = lines.items });
+
+    const owned = try a.dupe(u8, name);
+    return .{ .name = owned, .applied = applyTargets(a, config_path, node) };
+}
+
+/// Removes the `[backup.<name>]` target from the configuration, and its
+/// keys file when `addTarget` wrote it. The bucket and everything in it
+/// stay: adding the target again finds the backup as it was.
+pub fn removeTarget(a: std.mem.Allocator, io: std.Io, config_path: []const u8, node: ?*Node, name: []const u8) !Applied {
+    var cfg = try config_mod.parseConfig(a, config_path);
+    defer cfg.deinit(a);
+    const target = for (cfg.backup_targets) |t| {
+        if (std.mem.eql(u8, t.name, name)) break t;
+    } else return error.UnknownBackupTarget;
+    try config_file.editBackup(a, config_path, name, .remove);
+    const own = try credentialsPath(a, io, config_path, name);
+    defer a.free(own);
+    // Keys in a file the owner pointed at by hand are theirs to keep.
+    if (std.mem.eql(u8, own, target.credentials)) std.Io.Dir.cwd().deleteFile(io, own) catch {};
+    return applyTargets(a, config_path, node);
+}
+
+/// The owner typed the recovery words of target `name` back: saved in its
+/// section (`words_confirmed = true`) and told to the running `node`, so
+/// every front end stops warning. The uploader keeps running: nothing it
+/// uploads by changes.
+pub fn confirmWords(a: std.mem.Allocator, config_path: []const u8, node: ?*Node, name: []const u8) !void {
+    try config_file.editBackup(a, config_path, name, .{ .set = .{ .key = "words_confirmed", .line = "words_confirmed = true" } });
+    if (node) |running| running.confirmBackupWords(name);
+}
+
+const TestConfig = struct {
+    tmp: std.testing.TmpDir,
+    dir: []u8,
+    path: []u8,
+
+    fn init() !TestConfig {
+        const a = std.testing.allocator;
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = try a.dupe(u8, buf[0..try tmp.dir.realPath(io, &buf)]);
+        errdefer a.free(dir);
+        const conf = try std.fmt.allocPrint(a, "# mine\nnickname = \"desk\"\nswarm_key = \"{s}\"\nkey_path = \"{s}/device.key\"\nstorage_path = \"{s}/blocks\"\n", .{ "ab" ** 32, dir, dir });
+        defer a.free(conf);
+        try tmp.dir.writeFile(io, .{ .sub_path = "nomadfs.conf", .data = conf });
+        return .{ .tmp = tmp, .dir = dir, .path = try std.fs.path.join(a, &.{ dir, "nomadfs.conf" }) };
+    }
+    fn deinit(self: *TestConfig) void {
+        std.testing.allocator.free(self.path);
+        std.testing.allocator.free(self.dir);
+        self.tmp.cleanup();
+    }
+    fn text(self: *TestConfig) ![]u8 {
+        return self.tmp.dir.readFileAlloc(std.testing.io, "nomadfs.conf", std.testing.allocator, .limited(16384));
+    }
+};
+const test_r2: NewTarget = .{ .endpoint = "https://abc123.r2.cloudflarestorage.com", .region = "auto", .bucket = "nomadfs-swarm", .access_key_id = "AKIDEXAMPLE", .secret_access_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY" };
+
+test "offsite: adding a target writes its keys to an owner-only file and never to the configuration" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = try TestConfig.init();
+    defer t.deinit();
+
+    const added = try addTarget(a, io, t.path, null, test_r2);
+    defer a.free(added.name);
+    // The first warm target is "s3"; no node runs here.
+    try std.testing.expectEqualStrings("s3", added.name);
+    try std.testing.expectEqual(Applied.saved, added.applied);
+
+    const stat = try t.tmp.dir.statFile(io, "s3.credentials", .{});
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intFromEnum(stat.permissions)) & 0o777);
+    const text = try t.text();
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, test_r2.secret_access_key) == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, test_r2.access_key_id) == null);
+    try std.testing.expect(std.mem.startsWith(u8, text, "# mine\n"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "[backup.s3]\n") != null);
+
+    // The section reads back as asked, and the keys load from their file.
+    var cfg = try config_mod.parseConfig(a, t.path);
+    defer cfg.deinit(a);
+    const target = cfg.backupTarget("s3").?;
+    try std.testing.expect(target.configured() and target.encrypt and !target.words_confirmed);
+    try std.testing.expectEqualStrings(test_r2.endpoint, target.endpoint);
+    try std.testing.expectEqualStrings("nomadfs-swarm", target.bucket);
+    try std.testing.expectEqual(StorageClass.STANDARD, target.storage_class);
+    var keys = try backup_cfg.loadCredentials(a, io, target.credentials);
+    defer keys.deinit(a);
+    try std.testing.expectEqualStrings(test_r2.access_key_id, keys.access_key_id);
+    try std.testing.expectEqualStrings(test_r2.secret_access_key, keys.secret_access_key);
+
+    // What a status page lists, with no node: where it goes, no secret.
+    var all = try overviewOf(a, cfg.backup_targets, .{ .swarm_backup = true });
+    defer deinitOverview(a, &all);
+    try std.testing.expectEqual(@as(usize, 1), all.targets.len);
+    try std.testing.expectEqualStrings(test_r2.endpoint, all.targets[0].endpoint);
+    try std.testing.expectEqualStrings("nomadfs-swarm", all.targets[0].bucket);
+    try std.testing.expect(all.targets[0].encrypt and !all.targets[0].words_confirmed);
+}
+
+test "offsite: a cold target is named archive, later ones are numbered, and names can't clash" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = try TestConfig.init();
+    defer t.deinit();
+
+    var cold = test_r2;
+    cold.endpoint = "https://s3.eu-west-1.amazonaws.com";
+    cold.region = "eu-west-1";
+    cold.bucket = "nomadfs-archive";
+    cold.storage_class = "DEEP_ARCHIVE";
+    cold.schedule = "weekly";
+    cold.encrypt = false;
+    const archive = try addTarget(a, io, t.path, null, cold);
+    defer a.free(archive.name);
+    try std.testing.expectEqualStrings("archive", archive.name);
+
+    const first = try addTarget(a, io, t.path, null, test_r2);
+    defer a.free(first.name);
+    var other = test_r2;
+    other.bucket = "second";
+    const second = try addTarget(a, io, t.path, null, other);
+    defer a.free(second.name);
+    try std.testing.expectEqualStrings("s3-2", second.name);
+
+    // The same bucket twice, a taken name, a command word.
+    try std.testing.expectError(error.BackupTargetDuplicate, addTarget(a, io, t.path, null, test_r2));
+    other.bucket = "third";
+    other.name = "archive";
+    try std.testing.expectError(error.BackupTargetExists, addTarget(a, io, t.path, null, other));
+    other.name = "remove";
+    try std.testing.expectError(error.InvalidBackupTarget, addTarget(a, io, t.path, null, other));
+    other.name = "Has Space";
+    try std.testing.expectError(error.InvalidBackupTarget, addTarget(a, io, t.path, null, other));
+
+    var cfg = try config_mod.parseConfig(a, t.path);
+    defer cfg.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), cfg.backup_targets.len);
+    const kept = cfg.backupTarget("archive").?;
+    try std.testing.expectEqual(StorageClass.DEEP_ARCHIVE, kept.storage_class);
+    try std.testing.expectEqual(Schedule.weekly, kept.schedule);
+    try std.testing.expect(!kept.encrypt);
+    // The cold class brings its defaults, as in a section written by hand.
+    try std.testing.expectEqual(@as(u32, 256), kept.pack_mb);
+}
+
+test "offsite: settings that can't work are refused and leave nothing behind" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = try TestConfig.init();
+    defer t.deinit();
+    const before = try t.text();
+    defer a.free(before);
+
+    const Case = struct { field: []const u8, value: []const u8, err: anyerror };
+    for ([_]Case{
+        .{ .field = "endpoint", .value = "abc.r2.cloudflarestorage.com", .err = error.InvalidEndpoint },
+        .{ .field = "endpoint", .value = "https://", .err = error.InvalidEndpoint },
+        .{ .field = "endpoint", .value = "https://a b.test", .err = error.InvalidEndpoint },
+        .{ .field = "bucket", .value = "", .err = error.InvalidBucket },
+        .{ .field = "bucket", .value = "a/b", .err = error.InvalidBucket },
+        .{ .field = "bucket", .value = "a\"\n[node]", .err = error.InvalidBucket },
+        .{ .field = "region", .value = "eu west", .err = error.InvalidRegion },
+        .{ .field = "prefix", .value = "/abs", .err = error.InvalidPrefix },
+        .{ .field = "storage_class", .value = "FROZEN", .err = error.InvalidStorageClass },
+        .{ .field = "schedule", .value = "hourly", .err = error.InvalidSchedule },
+        .{ .field = "access_key_id", .value = "", .err = error.InvalidAccessKey },
+        .{ .field = "secret_access_key", .value = "", .err = error.InvalidSecretKey },
+        .{ .field = "secret_access_key", .value = "two\nlines", .err = error.InvalidSecretKey },
+        .{ .field = "secret_access_key", .value = "quo\"te", .err = error.InvalidSecretKey },
+    }) |case| {
+        var new = test_r2;
+        inline for (@typeInfo(NewTarget).@"struct".fields) |f| {
+            if (f.type == []const u8 and std.mem.eql(u8, f.name, case.field)) @field(new, f.name) = case.value;
+        }
+        try std.testing.expectError(case.err, addTarget(a, io, t.path, null, new));
+    }
+    const after = try t.text();
+    defer a.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    try std.testing.expectError(error.FileNotFound, t.tmp.dir.statFile(io, "s3.credentials", .{}));
+}
+
+test "offsite: removing a target drops its section and its keys file, and keeps keys kept elsewhere" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = try TestConfig.init();
+    defer t.deinit();
+
+    const added = try addTarget(a, io, t.path, null, test_r2);
+    defer a.free(added.name);
+    try confirmWords(a, t.path, null, "s3");
+    {
+        var cfg = try config_mod.parseConfig(a, t.path);
+        defer cfg.deinit(a);
+        try std.testing.expect(cfg.backupTarget("s3").?.words_confirmed);
+    }
+    // A section written by hand, its keys where the owner put them.
+    try t.tmp.dir.writeFile(io, .{ .sub_path = "mine.keys", .data = "access_key_id = \"id\"\nsecret_access_key = \"secret\"\n", .flags = .{ .permissions = .fromMode(0o600) } });
+    const keys = try std.fs.path.join(a, &.{ t.dir, "mine.keys" });
+    defer a.free(keys);
+    const line = try std.fmt.allocPrint(a, "credentials = \"{s}\"", .{keys});
+    defer a.free(line);
+    try config_file.editBackup(a, t.path, "hand", .{ .add = &.{ "endpoint = \"https://hand.test\"", "bucket = \"hand\"", line } });
+
+    try std.testing.expectError(error.UnknownBackupTarget, removeTarget(a, io, t.path, null, "nope"));
+    try std.testing.expectError(error.UnknownBackupTarget, confirmWords(a, t.path, null, "nope"));
+    try std.testing.expectEqual(Applied.saved, try removeTarget(a, io, t.path, null, "s3"));
+    try std.testing.expectEqual(Applied.saved, try removeTarget(a, io, t.path, null, "hand"));
+    try std.testing.expectError(error.FileNotFound, t.tmp.dir.statFile(io, "s3.credentials", .{}));
+    _ = try t.tmp.dir.statFile(io, "mine.keys", .{});
+
+    const text = try t.text();
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[backup.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "nomadfs-swarm") == null);
+    var cfg = try config_mod.parseConfig(a, t.path);
+    defer cfg.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), cfg.backup_targets.len);
+    try std.testing.expectEqualStrings("desk", cfg.node.nickname);
 }

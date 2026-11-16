@@ -245,6 +245,8 @@ fn printHelp() void {
         \\Usage:
         \\  nomadfs [options] [config_path]
         \\  nomadfs backup <target> status|run|verify|restore|recovery-key|forget [options]
+        \\  nomadfs backup add <name> --endpoint URL --bucket NAME [options]   (keys on stdin)
+        \\  nomadfs backup remove <name>
         \\  nomadfs --pair [--address host:port] [config_path]
         \\  nomadfs --trust <nomadfs://pair?...> [config_path]
         \\  nomadfs --devices [config_path]
@@ -377,6 +379,9 @@ fn runOnce(allocator: std.mem.Allocator, config: config_mod.Config, config_path:
     // Without a config file (none given, none found) there's nowhere to
     // save a rotated key.
     if (config_path) |path| try rotation.watch(&node, path);
+    // `nomadfs backup add|remove` asks the running node to read its
+    // backup targets again.
+    if (config_path) |path| try node.rememberConfig(path);
 
     std.debug.print("Node Initialized. Local ID: {x}\n", .{node.connection_manager.node_id.bytes});
     std.debug.print("Device ID: {x}\n", .{node.device_identity.deviceId().bytes});

@@ -20,7 +20,111 @@ const usage = "nomadfs backup <target> status|run|verify|restore|history|recover
     "  --recovery-words WORDS         unlock with quoted 24 words\n" ++
     "  --tier bulk|standard|expedited  thaw speed on an archive target (restore, verify --download)\n" ++
     "  --download                    verify an archive target by reading every block (thaws it)\n" ++
-    "  forget PATH                   queue permanent offsite purge for next run\n";
+    "  forget PATH                   queue permanent offsite purge for next run\n" ++
+    "nomadfs backup add <name> --endpoint URL --bucket NAME [--region R] [--prefix P]\n" ++
+    "        [--storage-class CLASS] [--schedule daily|weekly|monthly] [--no-encrypt] [--config FILE]\n" ++
+    "                                a new [backup.<name>] target; the access key id and the secret\n" ++
+    "                                access key are read from standard input, one per line\n" ++
+    "nomadfs backup remove <name> [--config FILE]\n" ++
+    "                                forget a target here; its bucket and everything in it stay\n";
+/// `backup add <name> ...` and `backup remove <name>`: a change of the
+/// configuration, not an operation on a target.
+pub const Change = struct {
+    remove: bool = false,
+    config_path: ?[]const u8 = null,
+    /// The keys are empty: `run` reads them from standard input.
+    target: service.NewTarget,
+};
+pub fn parseChange(args: []const []const u8) !Change {
+    if (args.len < 2 or args[1].len == 0 or args[1][0] == '-') return error.InvalidArguments;
+    var change: Change = .{ .remove = std.mem.eql(u8, args[0], "remove"), .target = .{ .name = args[1], .endpoint = "", .bucket = "", .access_key_id = "", .secret_access_key = "" } };
+    if (!change.remove and !std.mem.eql(u8, args[0], "add")) return error.InvalidArguments;
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (!change.remove and std.mem.eql(u8, arg, "--no-encrypt")) {
+            change.target.encrypt = false;
+            continue;
+        }
+        if (i + 1 >= args.len) return error.InvalidArguments;
+        i += 1;
+        const value = args[i];
+        if (std.mem.eql(u8, arg, "--config")) {
+            change.config_path = value;
+            continue;
+        }
+        if (change.remove) return error.InvalidArguments;
+        if (std.mem.eql(u8, arg, "--endpoint")) change.target.endpoint = value else if (std.mem.eql(u8, arg, "--bucket")) change.target.bucket = value else if (std.mem.eql(u8, arg, "--region")) change.target.region = value else if (std.mem.eql(u8, arg, "--prefix")) change.target.prefix = value else if (std.mem.eql(u8, arg, "--storage-class")) change.target.storage_class = value else if (std.mem.eql(u8, arg, "--schedule")) change.target.schedule = value else return error.InvalidArguments;
+    }
+    if (!change.remove and (change.target.endpoint.len == 0 or change.target.bucket.len == 0)) return error.InvalidArguments;
+    return change;
+}
+/// What went wrong with a change, in words; null: the error's name says it.
+fn changeFailure(name: []const u8) ?[]const u8 {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "InvalidEndpoint")) return "the endpoint must be a full address, like https://s3.eu-west-1.amazonaws.com";
+    if (eql(u8, name, "InvalidBucket")) return "the bucket name is empty or has a character a bucket can't have";
+    if (eql(u8, name, "InvalidAccessKey") or eql(u8, name, "InvalidSecretKey")) return "standard input must hold the access key id on its first line and the secret access key on its second";
+    if (eql(u8, name, "InvalidStorageClass")) return "the storage class is one of STANDARD, STANDARD_IA, GLACIER_IR, GLACIER, DEEP_ARCHIVE";
+    if (eql(u8, name, "InvalidSchedule")) return "the schedule is daily, weekly or monthly";
+    if (eql(u8, name, "InvalidBackupTarget")) return "a target name is 1 to 32 of a-z, 0-9, - and _, and not add, remove or reload";
+    if (eql(u8, name, "BackupTargetExists")) return "a target of that name is already configured";
+    if (eql(u8, name, "BackupTargetDuplicate")) return "another target already uses that bucket and prefix";
+    if (eql(u8, name, "TooManyBackupTargets")) return "8 targets are already configured";
+    if (eql(u8, name, "UnknownBackupTarget")) return "no target of that name is configured";
+    return null;
+}
+/// Asks the running node to read its targets again; false when none runs
+/// or it can't (it then takes them at its next start).
+fn reloadNode(arena: std.mem.Allocator, io: std.Io, config_path: []const u8) bool {
+    const ep = findNode(arena, io, .{ .action = .status, .config_path = config_path }) orelse return false;
+    const r = swarm_cli.request(arena, ep, "POST", "backup/reload", &.{}, "") catch return false;
+    return r.code < 300;
+}
+fn runChange(io: std.Io, a: std.mem.Allocator, args: []const []const u8) !u8 {
+    var change = parseChange(args) catch {
+        std.debug.print("{s}", .{usage});
+        return 2;
+    };
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = change.config_path orelse (nomadfs.config.findConfigPath(arena) catch {
+        std.debug.print("No configuration file found: name one with --config\n", .{});
+        return 1;
+    });
+    const name = change.target.name;
+    if (change.remove) {
+        _ = service.removeTarget(a, io, path, null, name) catch |err| {
+            std.debug.print("Backup \"{s}\" not removed: {s}\n", .{ name, changeFailure(@errorName(err)) orelse @errorName(err) });
+            return 1;
+        };
+        std.debug.print("Backup \"{s}\" removed from this device's configuration. Its bucket and everything in it are untouched.\n", .{name});
+    } else {
+        // The keys never appear among the arguments (the process list shows those).
+        var keys: [2048]u8 = undefined;
+        defer std.crypto.secureZero(u8, &keys);
+        var read_buf: [256]u8 = undefined;
+        defer std.crypto.secureZero(u8, &read_buf);
+        var stdin = std.Io.File.stdin().readerStreaming(io, &read_buf);
+        const n = stdin.interface.readSliceShort(&keys) catch 0;
+        var lines = std.mem.splitScalar(u8, keys[0..n], '\n');
+        change.target.access_key_id = std.mem.trim(u8, lines.next() orelse "", " \t\r");
+        change.target.secret_access_key = std.mem.trim(u8, lines.next() orelse "", " \t\r");
+        const added = service.addTarget(a, io, path, null, change.target) catch |err| {
+            std.debug.print("Backup \"{s}\" not added: {s}\n", .{ name, changeFailure(@errorName(err)) orelse @errorName(err) });
+            return 1;
+        };
+        defer a.free(added.name);
+        std.debug.print("Backup \"{s}\" added. Its keys are in their own owner-only file, not in the configuration.\n", .{added.name});
+        if (!change.target.encrypt) std.debug.print("Encryption is off: the provider can read every file in this bucket.\n", .{});
+    }
+    if (reloadNode(arena, io, path)) {
+        std.debug.print("The running node took the change.\n", .{});
+    } else std.debug.print("Applies when the node next starts.\n", .{});
+    if (!change.remove) std.debug.print("The first upload makes the recovery words: `nomadfs backup {s} run`, then keep them offline.\n", .{name});
+    return 0;
+}
 fn parseTier(text: []const u8) ?service.Tier {
     if (std.mem.eql(u8, text, "bulk")) return .Bulk;
     if (std.mem.eql(u8, text, "standard")) return .Standard;
@@ -232,6 +336,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const []const u8) !u8 {
         std.debug.print("{s}", .{usage});
         return 0;
     }
+    if (std.mem.eql(u8, args[0], "add") or std.mem.eql(u8, args[0], "remove")) return runChange(io, a, args);
     const request = parse(args) catch {
         std.debug.print("{s}", .{usage});
         return 2;
@@ -369,4 +474,30 @@ test "backup CLI: parse target, restore, forget, tier and download" {
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "s3", "status", "--from-history" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "status", "--config" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "--config", "status" }));
+}
+test "backup CLI: add and remove parse their target, and the keys are no argument" {
+    const t = std.testing;
+    const add = try parseChange(&.{ "add", "archive", "--endpoint", "https://s3.eu-west-1.amazonaws.com", "--bucket", "nomadfs-archive", "--region", "eu-west-1", "--prefix", "home", "--storage-class", "DEEP_ARCHIVE", "--schedule", "weekly", "--no-encrypt", "--config", "/tmp/c.conf" });
+    try t.expect(!add.remove and !add.target.encrypt);
+    try t.expectEqualStrings("archive", add.target.name);
+    try t.expectEqualStrings("https://s3.eu-west-1.amazonaws.com", add.target.endpoint);
+    try t.expectEqualStrings("nomadfs-archive", add.target.bucket);
+    try t.expectEqualStrings("eu-west-1", add.target.region);
+    try t.expectEqualStrings("home", add.target.prefix);
+    try t.expectEqualStrings("DEEP_ARCHIVE", add.target.storage_class);
+    try t.expectEqualStrings("weekly", add.target.schedule);
+    try t.expectEqualStrings("/tmp/c.conf", add.config_path.?);
+    try t.expectEqualStrings("", add.target.secret_access_key);
+    const plain = try parseChange(&.{ "add", "s3", "--endpoint", "https://x.test", "--bucket", "b" });
+    try t.expect(plain.target.encrypt and plain.config_path == null);
+    try t.expectError(error.InvalidArguments, parseChange(&.{ "add", "s3", "--bucket", "b" }));
+    try t.expectError(error.InvalidArguments, parseChange(&.{ "add", "s3", "--endpoint", "https://x.test" }));
+    try t.expectError(error.InvalidArguments, parseChange(&.{ "add", "s3", "--endpoint", "https://x.test", "--bucket", "b", "--secret", "x" }));
+    try t.expectError(error.InvalidArguments, parseChange(&.{"add"}));
+    const remove = try parseChange(&.{ "remove", "s3", "--config", "/tmp/c.conf" });
+    try t.expect(remove.remove);
+    try t.expectEqualStrings("s3", remove.target.name);
+    try t.expectError(error.InvalidArguments, parseChange(&.{ "remove", "s3", "--bucket", "b" }));
+    try t.expectError(error.InvalidArguments, parseChange(&.{ "remove", "--config" }));
+    try t.expect(changeFailure("InvalidEndpoint") != null and changeFailure("OutOfMemory") == null);
 }

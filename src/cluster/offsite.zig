@@ -1021,6 +1021,13 @@ pub const Service = struct {
             if (thaw.thawing_packs > 0) return .{ .packs = ready.count(), .thawing_packs = thaw.thawing_packs, .thawing_bytes = thaw.thawing_bytes };
             return .{ .blocks = try self.verify(name_), .packs = ready.count() };
         }
+        return self.checkListing(name_);
+    }
+    /// The check that downloads no pack, on any target: every indexed pack
+    /// is listed with all its bytes, every index segment and snapshot
+    /// decrypts, and every block a snapshot names is indexed.
+    pub fn checkListing(self: *Service, name_: ?[]const u8) !Check {
+        const names = if (name_) |n| &[_][]const u8{n} else try self.snapshotNames();
         var sizes: std.AutoHashMap([16]u8, u64) = .init(self.allocator);
         defer sizes.deinit();
         for (try self.listObjects("packs")) |object| try sizes.put(try backup.index.parsePackId(std.fs.path.basename(object.name)), object.size);

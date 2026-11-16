@@ -73,6 +73,7 @@ test {
         @import("codec/image.zig"),
         @import("codec/raw.zig"),
         @import("backup/mod.zig"),
+        @import("backup/service.zig"),
         @import("net/s3/mod.zig"),
         @import("cluster/offsite.zig"),
         @import("fs/offsite.zig"),

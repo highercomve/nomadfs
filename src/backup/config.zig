@@ -52,6 +52,8 @@ pub const Config = struct {
     retain_monthly: u32 = 0,
     storage_class: StorageClass = .STANDARD,
     schedule: Schedule = .daily,
+    /// The owner typed the recovery words back (the app's confirm step).
+    words_confirmed: bool = false,
     /// Keys written in the file: a cold class never overrides them.
     set_pack_mb: bool = false,
     set_retain_daily: bool = false,
@@ -94,10 +96,12 @@ pub const Config = struct {
                 return;
             }
         }
-        if (std.mem.eql(u8, key, "encrypt")) {
-            if (!std.mem.eql(u8, value, "true") and !std.mem.eql(u8, value, "false")) return error.InvalidBoolean;
-            self.encrypt = std.mem.eql(u8, value, "true");
-            return;
+        inline for (.{ "encrypt", "words_confirmed" }) |field| {
+            if (std.mem.eql(u8, key, field)) {
+                if (!std.mem.eql(u8, value, "true") and !std.mem.eql(u8, value, "false")) return error.InvalidBoolean;
+                @field(self, field) = std.mem.eql(u8, value, "true");
+                return;
+            }
         }
         if (std.mem.eql(u8, key, "storage_class")) {
             self.storage_class = std.meta.stringToEnum(StorageClass, value) orelse return error.InvalidStorageClass;
@@ -123,9 +127,13 @@ pub fn sectionName(header: []const u8) ?[]const u8 {
     const text = stripComment(header);
     if (!std.mem.startsWith(u8, text, "[backup.") or !std.mem.endsWith(u8, text, "]")) return null;
     const name = text["[backup.".len .. text.len - 1];
-    if (name.len == 0 or name.len > 32) return null;
-    for (name) |c| if (!std.ascii.isLower(c) and !std.ascii.isDigit(c) and c != '-' and c != '_') return null;
-    return name;
+    return if (validName(name)) name else null;
+}
+/// What a target may be called: 1 to 32 of a-z, 0-9, '-' and '_'.
+pub fn validName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 32) return false;
+    for (name) |c| if (!std.ascii.isLower(c) and !std.ascii.isDigit(c) and c != '-' and c != '_') return false;
+    return true;
 }
 pub const Credentials = struct {
     access_key_id: []const u8,

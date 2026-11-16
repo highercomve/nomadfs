@@ -912,6 +912,28 @@ test "offsite: cold restore writes the files of ready packs and resumes for the 
     try std.testing.expectEqualStrings("second pack", bytes);
 }
 
+test "offsite: a warm target is checked by listing when asked: nothing downloaded, a cut pack found" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    const cid = try f.add("a.txt", "hello");
+    _ = try f.add("b.txt", "world");
+    _ = try f.run();
+    const listed = try f.service.checkListing(null);
+    try std.testing.expect(!listed.downloaded);
+    try std.testing.expectEqual(@as(usize, 1), listed.packs);
+    try std.testing.expectEqual(@as(usize, 2), listed.blocks);
+    // The plain check of a warm target still reads every block.
+    try std.testing.expect((try f.service.check(null, false, .Bulk)).downloaded);
+    const location = f.service.index.get(backup.index.keyedBlockId(f.service.key.?, cid)).?;
+    const key = try std.fmt.allocPrint(a, "swarm/packs/{s}", .{backup.index.formatPackId(location.pack_id)});
+    defer a.free(key);
+    const object = f.fake.objects.getPtr(key).?;
+    const full = object.bytes;
+    object.bytes = full[0 .. full.len - 1];
+    try std.testing.expectError(error.PackTruncated, f.service.checkListing(null));
+    object.bytes = full;
+}
+
 test "offsite: cold verify checks packs by listing, finds a missing or cut pack, and downloads only when asked" {
     const f = try Fixture.createCold();
     defer f.destroy();

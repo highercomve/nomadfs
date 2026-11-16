@@ -12,6 +12,7 @@ import { loadJoinInfo, installConnect } from "./connect.js";
 import { loadMount, installMount } from "./mount.js";
 import { loadShares, loadBackup, storageSetup, installShares } from "./shares.js";
 import { installSettings } from "./settings.js";
+import { loadOffsite, installOffsite } from "./offsite.js";
 import { loadAbout, openDetails, installAbout } from "./about.js";
 import { loadPhotos, installPhotos } from "./photos.js";
 import { installUpdates } from "./updates.js";
@@ -51,7 +52,7 @@ export function setView(view) {
   $("bar-more").classList.toggle("active", view === "notes" || view === "settings" || view === "about" || view === "connect");
   window.scrollTo(0, 0);
   try { localStorage.setItem("view", view); } catch {}
-  if (view === "settings") { $("devices-refresh").click(); loadBackup(); }
+  if (view === "settings") { $("devices-refresh").click(); loadBackup(); loadOffsite(); }
   if (view === "swarm") { loadSwarm(); }
   if (view === "photos") { loadPhotos(); }
   if (view === "connect") { loadJoinInfo(); }
@@ -91,6 +92,7 @@ installAbout();
 installUpdates({ setView, nodeState });
 installSettings({ setView, nodeState });
 installShares();
+installOffsite();
 installMount({ setView, nodeState });
 installConnect({ setView, nodeState });
 installSwarm();

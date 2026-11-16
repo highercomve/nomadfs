@@ -33,16 +33,7 @@ pub fn edit(allocator: std.mem.Allocator, path: []const u8, change: Edit) !void 
     mutex.lock();
     defer mutex.unlock();
     const io = std.Io.Threaded.global_single_threaded.io();
-    const old = blk: {
-        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-        defer file.close(io);
-        const size = (try file.stat(io)).size;
-        if (size > max_bytes) return error.ConfigTooLarge;
-        const buf = try allocator.alloc(u8, @intCast(size));
-        errdefer allocator.free(buf);
-        if (try file.readPositionalAll(io, buf, 0) != buf.len) return error.ShortRead;
-        break :blk buf;
-    };
+    const old = try readWhole(allocator, io, path);
     defer allocator.free(old);
 
     var out: std.ArrayList(u8) = .empty;
@@ -62,6 +53,88 @@ pub fn edit(allocator: std.mem.Allocator, path: []const u8, change: Edit) !void 
     for (change.append) |line| {
         try out.appendSlice(allocator, line);
         try out.append(allocator, '\n');
+    }
+    try writeAtomic(allocator, io, path, out.items);
+}
+
+/// The whole file; the caller frees it. Held with `mutex`.
+fn readWhole(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const size = (try file.stat(io)).size;
+    if (size > max_bytes) return error.ConfigTooLarge;
+    const buf = try allocator.alloc(u8, @intCast(size));
+    errdefer allocator.free(buf);
+    if (try file.readPositionalAll(io, buf, 0) != buf.len) return error.ShortRead;
+    return buf;
+}
+
+/// A change to one `[backup.<name>]` section.
+pub const BackupEdit = union(enum) {
+    /// A new section with these `key = value` lines, at the end of the
+    /// file. error.BackupTargetExists when the file has one of that name.
+    add: []const []const u8,
+    /// The section and every line of it. error.UnknownBackupTarget when
+    /// the file has none of that name.
+    remove,
+    /// One `key = value` line of the section, replacing the key's old one.
+    set: struct { key: []const u8, line: []const u8 },
+};
+
+/// Adds, removes or changes the `[backup.<name>]` section; every other line
+/// stays as it is. Settings written after a removed section (the flat
+/// editor appends them under `[node]`) are kept.
+pub fn editBackup(allocator: std.mem.Allocator, path: []const u8, name: []const u8, change: BackupEdit) !void {
+    const backup_config = @import("backup/config.zig");
+    if (!backup_config.validName(name)) return error.InvalidBackupTarget;
+    mutex.lock();
+    defer mutex.unlock();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const old = try readWhole(allocator, io, path);
+    defer allocator.free(old);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var inside = false;
+    var found = false;
+    var lines = std.mem.splitScalar(u8, old, '\n');
+    while (lines.next()) |line| {
+        if (lines.index == null and line.len == 0) break; // trailing newline
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "[")) {
+            inside = if (backup_config.sectionName(trimmed)) |section| std.mem.eql(u8, section, name) else false;
+            if (inside) {
+                found = true;
+                if (change == .remove) continue;
+                try out.appendSlice(allocator, line);
+                try out.append(allocator, '\n');
+                if (change == .set) {
+                    try out.appendSlice(allocator, change.set.line);
+                    try out.append(allocator, '\n');
+                }
+                continue;
+            }
+        }
+        if (inside) switch (change) {
+            .remove => continue,
+            .set => |s| if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq| {
+                if (std.mem.eql(u8, std.mem.trim(u8, trimmed[0..eq], " \t"), s.key)) continue;
+            },
+            .add => {},
+        };
+        try out.appendSlice(allocator, line);
+        try out.append(allocator, '\n');
+    }
+    switch (change) {
+        .add => |added| {
+            if (found) return error.BackupTargetExists;
+            try out.print(allocator, "[backup.{s}]\n", .{name});
+            for (added) |line| {
+                try out.appendSlice(allocator, line);
+                try out.append(allocator, '\n');
+            }
+        },
+        .remove, .set => if (!found) return error.UnknownBackupTarget,
     }
     try writeAtomic(allocator, io, path, out.items);
 }
@@ -257,4 +330,46 @@ test "config: S3 section survives edits of node settings" {
     defer cfg.deinit(a);
     try std.testing.expectEqualStrings("beta", cfg.node.nickname);
     try std.testing.expectEqualStrings("https://example.test", cfg.backupTarget("s3").?.endpoint);
+}
+
+test "config: S3 sections are added, changed and removed, and the rest stays" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config", .data = "# mine\nnickname = alpha\nswarm_key = " ++ "ab" ** 32 ++ "\nstorage_path = /tmp/a\n" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    const path = try std.fs.path.join(a, &.{ dir, "config" });
+    defer a.free(path);
+
+    try editBackup(a, path, "s3", .{ .add = &.{ "endpoint = \"https://one.test\"", "bucket = \"one\"", "credentials = \"/tmp/one\"" } });
+    try std.testing.expectError(error.BackupTargetExists, editBackup(a, path, "s3", .{ .add = &.{} }));
+    // A flat setting saved after it lands under [node], outside the section.
+    try setNickname(a, path, "beta");
+    try editBackup(a, path, "archive", .{ .add = &.{ "endpoint = \"https://two.test\"", "bucket = \"two\"", "credentials = \"/tmp/two\"", "storage_class = \"DEEP_ARCHIVE\"" } });
+    try editBackup(a, path, "s3", .{ .set = .{ .key = "words_confirmed", .line = "words_confirmed = true" } });
+    try editBackup(a, path, "s3", .{ .set = .{ .key = "words_confirmed", .line = "words_confirmed = true" } });
+    try std.testing.expectError(error.UnknownBackupTarget, editBackup(a, path, "other", .{ .set = .{ .key = "words_confirmed", .line = "words_confirmed = true" } }));
+    try std.testing.expectError(error.InvalidBackupTarget, editBackup(a, path, "No Such", .remove));
+    {
+        var cfg = try config_mod.parseConfig(a, path);
+        defer cfg.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), cfg.backup_targets.len);
+        try std.testing.expect(cfg.backupTarget("s3").?.words_confirmed);
+        try std.testing.expect(!cfg.backupTarget("archive").?.words_confirmed);
+        try std.testing.expectEqualStrings("beta", cfg.node.nickname);
+    }
+    try editBackup(a, path, "s3", .remove);
+    try std.testing.expectError(error.UnknownBackupTarget, editBackup(a, path, "s3", .remove));
+    var cfg = try config_mod.parseConfig(a, path);
+    defer cfg.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), cfg.backup_targets.len);
+    try std.testing.expectEqualStrings("https://two.test", cfg.backupTarget("archive").?.endpoint);
+    try std.testing.expectEqualStrings("beta", cfg.node.nickname);
+    const text = try tmp.dir.readFileAlloc(io, "config", a, .limited(4096));
+    defer a.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "# mine\n"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "one.test") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "[backup."));
 }
