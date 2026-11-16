@@ -18,6 +18,9 @@
 //! works for what the backup still holds. Only a file purged meanwhile is
 //! left out, and the plan keeps its name for every later result.
 const std = @import("std");
+/// Owner-only on POSIX; Windows has no mode bits (the profile's ACLs apply).
+const private_dir: std.Io.File.Permissions = if (@import("builtin").os.tag == .windows) .default_dir else .fromMode(0o700);
+const private_file: std.Io.File.Permissions = if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600);
 const offsite = @import("../cluster/offsite.zig");
 const manifest = @import("manifest.zig");
 const Allocator = std.mem.Allocator;
@@ -168,7 +171,7 @@ fn openBelow(io: std.Io, root: Dir, sub: []const u8, create: bool) !?Dir {
     var parts = std.mem.splitScalar(u8, sub, '/');
     while (parts.next()) |part| {
         if (part.len == 0) continue;
-        if (create) dir.createDir(io, part, .fromMode(0o700)) catch |err| if (err != error.PathAlreadyExists) return err;
+        if (create) dir.createDir(io, part, private_dir) catch |err| if (err != error.PathAlreadyExists) return err;
         const next = dir.openDir(io, part, .{ .follow_symlinks = false }) catch |err| {
             if (err != error.FileNotFound or create) return err;
             dir.close(io);
@@ -221,7 +224,7 @@ fn writeWhole(io: std.Io, dir: Dir, prefix: []const u8, name: []const u8, bytes:
     const tmp = try tmpName(prefix, &buf);
     errdefer dir.deleteFile(io, tmp) catch {};
     {
-        const out = try dir.createFile(io, tmp, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        const out = try dir.createFile(io, tmp, .{ .exclusive = true, .permissions = private_file });
         defer out.close(io);
         try out.writePositionalAll(io, bytes, 0);
         try out.sync(io);
@@ -474,7 +477,7 @@ const Session = struct {
         const existed = try exists(io, destination, job_dir);
         // An exclusive create never follows a link; an existing entry must
         // be a real directory (opened without following a link).
-        if (!existed) try destination.createDir(io, job_dir, .fromMode(0o700));
+        if (!existed) try destination.createDir(io, job_dir, private_dir);
         errdefer if (!existed) destination.deleteTree(io, job_dir) catch {};
         var dir = try destination.openDir(io, job_dir, .{ .follow_symlinks = false, .iterate = true });
         errdefer dir.close(io);
@@ -523,7 +526,7 @@ const Session = struct {
             try writeWhole(io, dir, "done", done_file, intact);
             self.log_end = intact.len;
         }
-        self.log = dir.createFile(io, done_file, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch |err| switch (err) {
+        self.log = dir.createFile(io, done_file, .{ .exclusive = true, .permissions = private_file }) catch |err| switch (err) {
             error.PathAlreadyExists => try dir.openFile(io, done_file, .{ .mode = .read_write, .follow_symlinks = false }),
             else => return err,
         };
@@ -597,7 +600,7 @@ const Session = struct {
         errdefer self.dir.deleteFile(self.io, tmp) catch {};
         var target: Output = .{ .io = self.io, .file = undefined, .hasher = Blake3.init(.{}) };
         {
-            const out = try self.dir.createFile(self.io, tmp, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+            const out = try self.dir.createFile(self.io, tmp, .{ .exclusive = true, .permissions = private_file });
             defer out.close(self.io);
             target.file = out;
             try service.streamFile(file, self.plan.locator(), .{ .ctx = &target, .writeFn = Output.write });
