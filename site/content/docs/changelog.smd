@@ -7,6 +7,47 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.7.0 - 2026-11-16
+
+Devices on 0.4.0 and later work together. Update first the device that copies many files through
+the mounted swarm folder (a backup server): this release fixes files lost during large copies.
+
+## Added
+
+- A Photos page in the app: every photo and video in the swarm folder on one timeline, by the
+  day it was taken, with thumbnails made and kept by the device that holds the file (RAW photos
+  too) and a viewer that zooms. `nomadfs swarm photos` and `nomadfs swarm thumb` do the same from
+  the command line.
+- Offsite backup of the swarm folder to any S3-compatible bucket (Cloudflare R2, AWS S3,
+  Backblaze B2, MinIO and others), set up in a `[backup.<name>]` section with its keys in a
+  separate private file. Everything is encrypted on the device before it is uploaded; a backup
+  opens with any of your devices or with 24 recovery words when every device is gone. It keeps a
+  snapshot a day for 30 days and one a month forever, never drops a file because it was deleted
+  in the swarm folder, and lists and restores every version it holds:
+  `nomadfs backup <name> status|run|verify|restore|history|recovery-key|forget`. Restores can be
+  interrupted and resumed. The offsite backup is new: try it with a test bucket first. Setting it
+  up from the app comes in a later release.
+- Deep archive: a target with `storage_class = "DEEP_ARCHIVE"` (or `GLACIER`) keeps its data in
+  AWS's coldest storage, about $1 per TB a month. Restores from it take two steps: the first asks
+  AWS to thaw the data (12 to 48 hours), running it again finishes. Data younger than the class's
+  minimum storage time is never deleted early.
+- Deep backup: a device set as the deep backup (`deep_backup = true`, or the switch in the app's
+  settings) sends everything it keeps as swarm backup to the archive. It turns on swarm backup
+  too, and the other devices show which device it is.
+- Buckets with versioning turned on are refused: they would keep data you deleted from the backup.
+
+## Fixed
+
+- Files copied into the mounted swarm folder are no longer lost. A file was saved only after
+  `close()` had already reported success, and a failed save was only logged: a large copy (a
+  120 GB photo import) used up the open-file limit, 340 copies failed and about 50 files that had
+  been reported written were gone. Now `close()` and `fsync()` save the file and return the error
+  when the save fails, and an open file can't be cut off by a sync.
+
+## Changed
+
+- Uses Oriel 0.20.16.
+
 # 0.6.5 - 2026-11-09
 
 Devices on 0.4.0 and later work together. Nothing changes in how devices talk to each other;
