@@ -23,6 +23,7 @@ const private_dir: std.Io.File.Permissions = if (@import("builtin").os.tag == .w
 const private_file: std.Io.File.Permissions = if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600);
 const offsite = @import("../cluster/offsite.zig");
 const manifest = @import("manifest.zig");
+const filestore = @import("filestore.zig");
 const Allocator = std.mem.Allocator;
 const Cid = [32]u8;
 const Dir = std.Io.Dir;
@@ -196,7 +197,7 @@ fn exists(io: std.Io, root: Dir, path: []const u8) !bool {
 
 /// A regular file's bytes, read without following a link; null when missing.
 fn readPlain(a: Allocator, io: std.Io, dir: Dir, name: []const u8, limit: usize) !?[]u8 {
-    const file = dir.openFile(io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+    const file = filestore.openNoFollow(io, dir, name, .read_only) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -240,7 +241,7 @@ fn digestOf(io: std.Io, dir: Dir, name: []const u8, size: u64) !?Digest {
         else => return err,
     };
     if (st.kind != .file or st.size != size) return null;
-    const file = dir.openFile(io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+    const file = filestore.openNoFollow(io, dir, name, .read_only) catch |err| switch (err) {
         error.FileNotFound, error.SymLinkLoop => return null,
         else => return err,
     };
@@ -527,7 +528,7 @@ const Session = struct {
             self.log_end = intact.len;
         }
         self.log = dir.createFile(io, done_file, .{ .exclusive = true, .permissions = private_file }) catch |err| switch (err) {
-            error.PathAlreadyExists => try dir.openFile(io, done_file, .{ .mode = .read_write, .follow_symlinks = false }),
+            error.PathAlreadyExists => try filestore.openNoFollow(io, dir, done_file, .read_write),
             else => return err,
         };
         errdefer self.log.close(io);

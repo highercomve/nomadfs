@@ -136,21 +136,24 @@ pub const Identity = struct {
     }
 
     /// Writes a new identity. Never overwrites an existing one, and never
-    /// leaves a partial file under `path`: the bytes go to `<path>.tmp`,
-    /// are synced, and are renamed into place only if `path` doesn't exist.
-    /// (Not O_TMPFILE + linkat: Android's SELinux denies apps `link`.)
+    /// leaves a partial file under `path`: the bytes go to a temporary file
+    /// of its own (`<path>.<random>.tmp`, so two first runs never share
+    /// one), are synced, and are renamed into place only if `path` doesn't
+    /// exist. (Not O_TMPFILE + linkat: Android's SELinux denies apps `link`.)
     pub fn saveToFile(self: Identity, path: []const u8) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
         const cwd = std.Io.Dir.cwd();
+        var random: [8]u8 = undefined;
+        try io.randomSecure(&random);
         var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const tmp_path = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
+        const tmp_path = try std.fmt.bufPrint(&tmp_buf, "{s}.{s}.tmp", .{ path, std.fmt.bytesToHex(random, .lower) });
 
         var buf: [file_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &buf);
         @memcpy(buf[0..magic.len], magic);
         buf[magic.len..].* = self.seed();
         {
-            var file = try cwd.createFile(io, tmp_path, .{ .truncate = true, .permissions = key_file_permissions });
+            var file = try cwd.createFile(io, tmp_path, .{ .exclusive = true, .permissions = key_file_permissions });
             defer file.close(io);
             errdefer cwd.deleteFile(io, tmp_path) catch {};
             try file.setPermissions(io, key_file_permissions);
@@ -165,24 +168,78 @@ pub const Identity = struct {
 /// Renames `tmp_path` to `path`, failing with error.PathAlreadyExists when
 /// `path` exists, so a concurrent first run can't replace an identity.
 fn publishNoReplace(io: std.Io, tmp_path: []const u8, path: []const u8) !void {
-    if (builtin.os.tag == .linux) {
-        const linux = std.os.linux;
-        var from: [std.fs.max_path_bytes:0]u8 = undefined;
-        var to: [std.fs.max_path_bytes:0]u8 = undefined;
-        const from_z = try std.fmt.bufPrintZ(&from, "{s}", .{tmp_path});
-        const to_z = try std.fmt.bufPrintZ(&to, "{s}", .{path});
-        const rc = linux.renameat2(linux.AT.FDCWD, from_z.ptr, linux.AT.FDCWD, to_z.ptr, .{ .NOREPLACE = true });
-        switch (linux.errno(rc)) {
-            .SUCCESS => return,
-            .EXIST => return error.PathAlreadyExists,
-            // Old kernels and some filesystems lack renameat2: check, then rename.
-            .NOSYS, .INVAL => {},
-            else => return error.Unexpected,
-        }
+    if (builtin.os.tag != .linux) return publishPreserve(io, tmp_path, path);
+    const linux = std.os.linux;
+    var from: [std.fs.max_path_bytes:0]u8 = undefined;
+    var to: [std.fs.max_path_bytes:0]u8 = undefined;
+    const from_z = try std.fmt.bufPrintZ(&from, "{s}", .{tmp_path});
+    const to_z = try std.fmt.bufPrintZ(&to, "{s}", .{path});
+    const rc = linux.renameat2(linux.AT.FDCWD, from_z.ptr, linux.AT.FDCWD, to_z.ptr, .{ .NOREPLACE = true });
+    switch (linux.errno(rc)) {
+        .SUCCESS => return,
+        .EXIST => return error.PathAlreadyExists,
+        // Old kernels and some filesystems lack renameat2: check, then rename.
+        .NOSYS, .INVAL => return publishChecked(io, tmp_path, path),
+        else => return error.Unexpected,
     }
+}
+
+/// The systems without renameat2: std's rename that never replaces (Windows
+/// renames with replacement off; macOS and the BSDs link the new name, then
+/// drop the old one). A filesystem that can't do it gets check, then rename.
+fn publishPreserve(io: std.Io, tmp_path: []const u8, path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    cwd.renamePreserve(tmp_path, cwd, path, io) catch |err| switch (err) {
+        error.OperationUnsupported => return publishChecked(io, tmp_path, path),
+        // Windows may say this for a name that is taken.
+        error.AccessDenied => {
+            if (cwd.access(io, path, .{})) |_| return error.PathAlreadyExists else |_| {}
+            return err;
+        },
+        else => return err,
+    };
+}
+
+/// Last resort, not atomic: `path` is looked at, then renamed over.
+fn publishChecked(io: std.Io, tmp_path: []const u8, path: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     if (cwd.access(io, path, .{})) |_| return error.PathAlreadyExists else |_| {}
     try cwd.rename(tmp_path, cwd, path, io);
+}
+
+test "identity: saving never replaces an identity and leaves no temporary file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/device.key", .{dir});
+
+    const first = try Identity.fromSeed([_]u8{0x21} ** seed_len);
+    const second = try Identity.fromSeed([_]u8{0x22} ** seed_len);
+    try first.saveToFile(path);
+    try std.testing.expectError(error.PathAlreadyExists, second.saveToFile(path));
+    try std.testing.expectEqual(first.publicKey(), (try Identity.loadFromFile(path)).publicKey());
+
+    // The other systems' publish refuses the same way, and keeps both files.
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.tmp", .data = "new" });
+    var other_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const other = try std.fmt.bufPrint(&other_buf, "{s}/other.tmp", .{dir});
+    try std.testing.expectError(error.PathAlreadyExists, publishPreserve(io, other, path));
+    try std.testing.expectError(error.PathAlreadyExists, publishChecked(io, other, path));
+    try std.testing.expectEqual(first.publicKey(), (try Identity.loadFromFile(path)).publicKey());
+    var moved_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try publishPreserve(io, other, try std.fmt.bufPrint(&moved_buf, "{s}/moved", .{dir}));
+
+    // Only the identity and the moved file: no temporary file stays behind.
+    var names: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(io)) |entry| {
+        names += 1;
+        try std.testing.expect(std.mem.eql(u8, entry.name, "device.key") or std.mem.eql(u8, entry.name, "moved"));
+    }
+    try std.testing.expectEqual(@as(usize, 2), names);
 }
 
 test "identity: seed round-trips and signatures verify" {

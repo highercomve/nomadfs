@@ -765,17 +765,9 @@ pub const Store = struct {
         }
         errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
-        std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), self.path, io) catch |err| {
-            // Windows refuses to replace an existing target; removing it is the
-            // only option and is still crash-safe thanks to the temp file.
-            const target_exists = blk: {
-                _ = std.Io.Dir.cwd().statFile(io, self.path, .{}) catch break :blk false;
-                break :blk true;
-            };
-            if (builtin.os.tag != .windows or !target_exists) return err;
-            std.Io.Dir.cwd().deleteFile(io, self.path) catch {};
-            try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), self.path, io);
-        };
+        // The rename replaces the old store on every system. When it fails
+        // the old store stays as it is: only the temporary file goes.
+        try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), self.path, io);
         self.disk_stamp = stampOf(io, self.path);
     }
 
@@ -1650,6 +1642,28 @@ test "trust store: a running store merges what another process wrote, never over
     }
     try testing.expect(try node.syncFromDisk());
     try testing.expectEqual([_]u8{3} ** 32, node.lookup(@as(DeviceID, .{ .bytes = b.deviceId().bytes })).?.transport_key);
+}
+
+test "trust store: a save that cannot replace the store keeps it and removes only its temporary file" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    const path = "test_trust_failed_save.store";
+    cwd.deleteTree(io, path) catch {};
+    defer cwd.deleteTree(io, path) catch {};
+    const a = try identity_mod.Identity.fromSeed([_]u8{0x72} ** identity_mod.seed_len);
+
+    var store = try Store.load(testing.allocator, path, [_]u8{0x71} ** identity_mod.seed_len);
+    defer store.deinit();
+    _ = try store.upsert(a.publicKey(), [_]u8{1} ** 32, "Laptop", 10);
+    try store.save();
+
+    // What is at the store's path can no longer be renamed over: a
+    // directory that is not empty stands in for a store the system holds.
+    try cwd.deleteFile(io, path);
+    try cwd.createDirPath(io, path ++ "/kept");
+    if (store.save()) |_| return error.TestExpectedError else |_| {}
+    try cwd.access(io, path ++ "/kept", .{});
+    try testing.expectError(error.FileNotFound, cwd.access(io, path ++ ".tmp", .{}));
 }
 
 test "trust: membership uses pinned transport IDs across key rotation" {

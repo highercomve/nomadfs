@@ -135,9 +135,11 @@ pub const Server = struct {
     /// Stops listening, ends every connection and waits for them.
     pub fn stop(self: *Server) void {
         if (!self.running.swap(false, .acq_rel)) return;
-        if (self.listener) |*l| l.deinit();
+        // Joined before the listener closes (see compat.Server.interrupt).
+        if (self.listener) |*l| l.interrupt();
         if (self.accept_thread) |t| t.join();
         self.accept_thread = null;
+        if (self.listener) |*l| l.close();
         self.listener = null;
         {
             self.conns.mutex.lock();

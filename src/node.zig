@@ -109,6 +109,7 @@ pub const Node = struct {
     cut_off_since_ms: ?i64 = null,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !Node {
+        net.compat.initNetwork();
         // First: nothing is opened or written while another node runs here.
         const lock = try device.paths.lockNode(allocator, cfg.node.key_path);
         errdefer lock.close(std.Io.Threaded.global_single_threaded.io());

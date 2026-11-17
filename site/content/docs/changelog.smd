@@ -7,6 +7,26 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.7.1 - 2026-11-17
+
+Devices on 0.4.0 and later work together. Update every Windows computer: the app failed there from
+its second start, and connecting to other devices could fail or crash.
+
+## Fixed
+
+- Windows: the app no longer shows "AccessDenied" on every page from its second start. Making the
+  config file private needed it opened for writing; Windows keeps it private through your user
+  profile, so the step is skipped there.
+- Windows: connecting to other devices and accepting invites. The network was never initialised
+  before setting connection timeouts, and that failure aborted every handshake.
+- Windows: accepting an invite, unmounting or quitting can no longer crash the app: a listener was
+  closed while it could still be accepting a connection.
+- Windows: sharing a folder can no longer crash the app on a slow read.
+- A failed save of the trusted devices keeps the previous list instead of deleting it, so paired
+  devices aren't lost.
+- Two parts of the app creating the device key at the same moment can no longer replace one
+  another's key.
+
 # 0.7.0 - 2026-11-16
 
 Devices on 0.4.0 and later work together. Update first the device that copies many files through
