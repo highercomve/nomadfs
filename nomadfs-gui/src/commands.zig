@@ -238,10 +238,17 @@ pub fn ensureConfig(gpa: std.mem.Allocator) !ConfigResult {
         return .{ .path = path, .created = true };
     };
     // A config written before owner-only modes existed holds the swarm key
-    // world-readable: tighten it and its directory.
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    try file.setPermissions(io, private_file_perms);
+    // world-readable: tighten it and its directory. Best effort, and not on
+    // Windows: it has no mode bits (the profile's ACLs keep the file
+    // private), and changing attributes needs a writable handle, so a
+    // read-only open failed with AccessDenied and took every page that
+    // needs the config down with it.
+    if (builtin.os.tag == .windows) return .{ .path = path, .created = false };
+    if (std.Io.Dir.cwd().openFile(io, path, .{})) |file_val| {
+        var file = file_val;
+        defer file.close(io);
+        file.setPermissions(io, private_file_perms) catch {};
+    } else |_| {}
     // `.iterate`: a real descriptor (the default is O_PATH, which fchmod
     // refuses with EBADF).
     if (std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true })) |d_val| {
