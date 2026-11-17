@@ -195,17 +195,10 @@ pub const Stream = struct {
     }
 
     /// Bounds each blocking read and write to `timeout_ms`; 0 removes the
-    /// bound. Expiry surfaces as error.WouldBlock. Not wired up on Windows yet.
+    /// bound. Expiry surfaces as error.WouldBlock. Best effort on Windows
+    /// (see `winsock.setTimeouts`): a refusal there never fails the caller.
     pub fn setTimeout(self: Stream, timeout_ms: u32) !void {
-        if (builtin.os.tag == .windows) {
-            // Winsock takes a DWORD of milliseconds (0: none, as elsewhere).
-            const ws = std.os.windows.ws2_32;
-            const ms: u32 = timeout_ms;
-            const handle = self.inner.socket.handle;
-            if (winsock.setsockopt(handle, ws.SOL.SOCKET, ws.SO.RCVTIMEO, std.mem.asBytes(&ms), @sizeOf(u32)) != 0) return error.Unexpected;
-            if (winsock.setsockopt(handle, ws.SOL.SOCKET, ws.SO.SNDTIMEO, std.mem.asBytes(&ms), @sizeOf(u32)) != 0) return error.Unexpected;
-            return;
-        }
+        if (builtin.os.tag == .windows) return winsock.setTimeouts(self.inner.socket.handle, timeout_ms, .both);
         const tv = std.posix.timeval{
             .sec = @intCast(timeout_ms / std.time.ms_per_s),
             .usec = @intCast((timeout_ms % std.time.ms_per_s) * std.time.us_per_ms),
@@ -216,15 +209,10 @@ pub const Stream = struct {
     }
 
     /// Bounds how long a single write may wait for room in the send buffer
-    /// (0: forever); reads are left as they are.
+    /// (0: forever); reads are left as they are. Best effort on Windows.
     pub fn setSendTimeout(self: Stream, timeout_ms: u32) !void {
         const handle = self.inner.socket.handle;
-        if (builtin.os.tag == .windows) {
-            const ws = std.os.windows.ws2_32;
-            const ms: u32 = timeout_ms;
-            if (winsock.setsockopt(handle, ws.SOL.SOCKET, ws.SO.SNDTIMEO, std.mem.asBytes(&ms), @sizeOf(u32)) != 0) return error.Unexpected;
-            return;
-        }
+        if (builtin.os.tag == .windows) return winsock.setTimeouts(handle, timeout_ms, .send);
         const tv = std.posix.timeval{
             .sec = @intCast(timeout_ms / std.time.ms_per_s),
             .usec = @intCast((timeout_ms % std.time.ms_per_s) * std.time.us_per_ms),
@@ -285,18 +273,31 @@ pub const Server = struct {
         };
     }
 
-    /// Stop listening. The accept loop must stop first (its `running`
-    /// cleared): on Linux the shutdown makes a blocked accept fail; on
-    /// Windows closing the socket under one is fatal (std's AFD wait treats
-    /// the cancellation as unreachable), so a connection from here wakes it
-    /// and the loop, seeing `running` false, ends before the socket closes.
+    /// Stops listening when no thread is in `accept` (a listener that never
+    /// got its accept loop, or whose loop has ended). With an accept thread
+    /// the order is: clear its `running`, `interrupt`, join it, `close`.
     pub fn deinit(self: *Server) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        self.interrupt();
+        self.close();
+    }
+
+    /// Makes a blocked `accept` return without releasing the socket, so the
+    /// accept thread can be joined before `close`. The loop's `running`
+    /// must be cleared first. Linux: the shutdown fails the accept. Windows:
+    /// closing the socket under an accept is fatal (std's AFD wait treats
+    /// the cancellation as unreachable), so a connection from here wakes it
+    /// and the loop, seeing `running` false, ends. Elsewhere both: a
+    /// shutdown alone does not wake every system's accept.
+    pub fn interrupt(self: *Server) void {
         if (builtin.os.tag != .windows) {
             _ = std.posix.system.shutdown(@intCast(self.inner.socket.handle), std.posix.SHUT.RDWR);
-        } else {
-            self.wake();
         }
+        if (builtin.os.tag != .linux) self.wake();
+    }
+
+    /// Releases the socket. No thread may be in `accept`.
+    pub fn close(self: *Server) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
         self.inner.deinit(io);
     }
 
@@ -320,6 +321,7 @@ pub fn listenLoopback(port: u16) !Server {
 }
 
 fn listenOn(ip: []const u8, port: u16) !Server {
+    initNetwork();
     const io = std.Io.Threaded.global_single_threaded.io();
     const addr = try std.Io.net.IpAddress.parse(ip, port);
     const s = try addr.listen(io, .{ .reuse_address = true });
@@ -327,6 +329,7 @@ fn listenOn(ip: []const u8, port: u16) !Server {
 }
 
 pub fn tcpConnectToAddress(address: Address) !Stream {
+    initNetwork();
     const io = std.Io.Threaded.global_single_threaded.io();
     const s = try address.ip.connect(io, .{ .mode = .stream });
     return .{ .inner = s };
@@ -438,6 +441,88 @@ test "bad socket descriptor is an error rather than EOF" {
     try std.testing.expectError(error.FileDescriptorClosed, stream.read(&byte));
 }
 
+/// Starts Winsock (2.2) once per process; a no-op elsewhere and on later
+/// calls. std opens its sockets straight on the AFD driver and never calls
+/// WSAStartup, which every ws2_32 call (the socket timeouts here) needs.
+/// Called wherever a socket is made; safe from any thread.
+pub fn initNetwork() void {
+    if (builtin.os.tag != .windows) return;
+    winsock.start();
+}
+
 const winsock = struct {
-    extern "ws2_32" fn setsockopt(s: @TypeOf(@as(std.Io.net.Socket, undefined).handle), level: i32, optname: i32, optval: [*]const u8, optlen: i32) callconv(.winapi) i32;
+    const Handle = @TypeOf(@as(std.Io.net.Socket, undefined).handle);
+    const Which = enum { both, send };
+
+    extern "ws2_32" fn WSAStartup(version: u16, data: *anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+    extern "ws2_32" fn setsockopt(s: Handle, level: i32, optname: i32, optval: [*]const u8, optlen: i32) callconv(.winapi) i32;
+
+    /// 0: not started, 1: started, 2: refused (not retried).
+    var state: std.atomic.Value(u8) = .init(0);
+    var warned: std.atomic.Value(bool) = .init(false);
+
+    fn start() void {
+        if (state.load(.acquire) != 0) return;
+        // WSADATA is at most 408 bytes; Winsock only writes to it. Two
+        // threads racing here both start it, which Winsock counts and allows.
+        var data: [512]u8 align(16) = undefined;
+        const rc = WSAStartup(0x0202, &data);
+        state.store(if (rc == 0) 1 else 2, .release);
+        if (rc != 0) std.debug.print("network: WSAStartup failed ({d}); socket timeouts are off\n", .{rc});
+    }
+
+    /// Winsock takes a DWORD of milliseconds (0: none, as elsewhere). The
+    /// handle is std's AFD socket, the kernel object a SOCKET names; when
+    /// Winsock still refuses it the connection goes on without the bound
+    /// (the handshake deadline and keepalive still end a dead one), said
+    /// once with the Winsock error.
+    fn setTimeouts(handle: Handle, timeout_ms: u32, which: Which) void {
+        start();
+        const ws = std.os.windows.ws2_32;
+        const ms: u32 = timeout_ms;
+        var failed = false;
+        if (which == .both) failed = setsockopt(handle, ws.SOL.SOCKET, ws.SO.RCVTIMEO, std.mem.asBytes(&ms), @sizeOf(u32)) != 0;
+        if (!failed) failed = setsockopt(handle, ws.SOL.SOCKET, ws.SO.SNDTIMEO, std.mem.asBytes(&ms), @sizeOf(u32)) != 0;
+        if (!failed or warned.swap(true, .acq_rel)) return;
+        std.debug.print("network: can't set socket timeouts (Winsock error {d}); carrying on without them\n", .{WSAGetLastError()});
+    }
 };
+
+test "initNetwork can be called any number of times" {
+    initNetwork();
+    initNetwork();
+}
+
+test "interrupt ends a blocked accept before the listener closes" {
+    const Loop = struct {
+        server: Server,
+        running: std.atomic.Value(bool) = .init(true),
+        ended: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            defer self.ended.store(true, .release);
+            while (self.running.load(.acquire)) {
+                const conn = self.server.accept() catch {
+                    if (!self.running.load(.acquire)) return;
+                    continue;
+                };
+                conn.stream.close();
+            }
+        }
+    };
+    var loop: Loop = .{ .server = try listenLoopback(0) };
+    const port = loop.server.inner.socket.address.getPort();
+    const thread = try std.Thread.spawn(.{}, Loop.run, .{&loop});
+
+    // The listener serves, and keeps serving after a first connection.
+    (try tcpConnectToAddress(Address.initIp4(.{ 127, 0, 0, 1 }, port))).close();
+
+    loop.running.store(false, .release);
+    loop.server.interrupt();
+    thread.join();
+    // Joined with the socket still open: nothing was closed under accept.
+    try std.testing.expect(loop.ended.load(.acquire));
+    loop.server.close();
+    try std.testing.expectError(error.ConnectionRefused, tcpConnectToAddress(Address.initIp4(.{ 127, 0, 0, 1 }, port)));
+}

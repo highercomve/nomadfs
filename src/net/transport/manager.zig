@@ -245,14 +245,16 @@ pub const ConnectionManager = struct {
         if (self.mdns) |*m| {
             m.stop();
         }
-        if (self.tcp_server) |*s| {
-            s.deinit();
-            self.tcp_server = null;
-        }
-
+        // The accept thread ends before the listener closes: closing a
+        // socket under a blocked accept is fatal on Windows.
+        if (self.tcp_server) |*s| s.interrupt();
         if (self.accept_thread) |t| {
             t.join();
             self.accept_thread = null;
+        }
+        if (self.tcp_server) |*s| {
+            s.close();
+            self.tcp_server = null;
         }
 
         // Wait for all handshake threads to finish without holding the lock

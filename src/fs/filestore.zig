@@ -202,7 +202,7 @@ pub const Filestore = struct {
 /// Do not follow a swapped-in symlink or wait for a FIFO writer.
 pub fn openRegular(io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
     var file: std.Io.File = if (@import("builtin").os.tag == .windows)
-        try dir.openFile(io, path, .{ .follow_symlinks = false })
+        try openChecked(io, dir, path, .read_only)
     else
         .{
             .handle = try std.posix.openat(dir.handle, path, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0),
@@ -211,4 +211,43 @@ pub fn openRegular(io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
     errdefer file.close(io);
     if ((try file.stat(io)).kind != .file) return error.NotRegularFile;
     return file;
+}
+
+/// Opens `path` without following a link: error.SymLinkLoop when it is one.
+/// Windows goes through `openChecked`: std's no-follow open there hands out
+/// an overlapped handle marked blocking, and a positional read or write on
+/// it that has to wait is a crash.
+pub fn openNoFollow(io: std.Io, dir: std.Io.Dir, path: []const u8, mode: std.Io.File.OpenMode) !std.Io.File {
+    if (@import("builtin").os.tag != .windows) return dir.openFile(io, path, .{ .mode = mode, .follow_symlinks = false });
+    return openChecked(io, dir, path, mode);
+}
+
+/// Looks at `path` without following it, refuses a link (or any other
+/// reparse point), opens it the ordinary way, and refuses again when what
+/// was opened is not what was looked at (a link swapped in between).
+pub fn openChecked(io: std.Io, dir: std.Io.Dir, path: []const u8, mode: std.Io.File.OpenMode) !std.Io.File {
+    const seen = try dir.statFile(io, path, .{ .follow_symlinks = false });
+    if (seen.kind == .sym_link or seen.kind == .unknown) return error.SymLinkLoop;
+    const file = try dir.openFile(io, path, .{ .mode = mode });
+    errdefer file.close(io);
+    const opened = try file.stat(io);
+    if (opened.inode != seen.inode or opened.kind != seen.kind) return error.SymLinkLoop;
+    return file;
+}
+
+test "openChecked opens a file and refuses a link to one" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "real.txt", .data = "bytes" });
+    try tmp.dir.symLink(io, "real.txt", "link.txt", .{});
+
+    const file = try openChecked(io, tmp.dir, "real.txt", .read_only);
+    defer file.close(io);
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("bytes", buf[0..try file.readPositionalAll(io, &buf, 0)]);
+
+    try std.testing.expectError(error.SymLinkLoop, openChecked(io, tmp.dir, "link.txt", .read_only));
+    try std.testing.expectError(error.SymLinkLoop, openNoFollow(io, tmp.dir, "link.txt", .read_only));
+    try std.testing.expectError(error.FileNotFound, openChecked(io, tmp.dir, "missing.txt", .read_only));
 }

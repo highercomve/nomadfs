@@ -204,8 +204,10 @@ pub const Server = struct {
     /// api.json and frees the server.
     pub fn stop(self: *Server) void {
         if (self.running.swap(false, .acq_rel)) {
-            if (self.listener) |*l| l.deinit();
+            // Joined before the listener closes (see compat.Server.interrupt).
+            if (self.listener) |*l| l.interrupt();
             if (self.accept_thread) |t| t.join();
+            if (self.listener) |*l| l.close();
             self.listener = null;
             self.conns.mutex.lock();
             for (self.conns.list.items) |c| c.shutdown();
