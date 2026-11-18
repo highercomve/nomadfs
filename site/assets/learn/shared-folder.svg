@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 1450" role="img" aria-labelledby="t">
+<title id="t">A shared folder: the phone shares its Camera folder and the photos stay on the phone. Every device sees the list; a backup server keeps a copy; the laptop opens a photo and pulls it from the phone and the backup at once, then keeps it in its read cache.</title>
+<defs>
+<style>
+text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; fill: #f2e8d8; }
+.h { font-size: 18px; font-weight: 600; fill: #f5efe6; }
+.f { font-size: 15px; }
+.fd { font-size: 15px; fill: #a99f8f; }
+.s { font-size: 12.5px; fill: #a99f8f; }
+.b { font-size: 13px; }
+.t { font-size: 15px; font-weight: 600; fill: #f5efe6; }
+.k { font-size: 13px; letter-spacing: 1.6px; fill: #f6b042; }
+.tag { font-size: 11.5px; font-weight: 600; letter-spacing: .6px; }
+.cp { fill: #5ce1e6; } .or { fill: #f6b042; } .ca { fill: #f2e8d8; }
+.n { font-size: 14px; font-weight: 700; fill: #0b0e16; }
+.box { fill: #1a2131; stroke: #f2e8d8; stroke-opacity: .22; stroke-width: 1.5; }
+.boxo { fill: #2ec4b6; fill-opacity: .08; stroke: #5ce1e6; stroke-width: 1.8; }
+.boxa { fill: #f6b042; fill-opacity: .07; stroke: #f6b042; stroke-width: 1.8; }
+.boxd { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .16; stroke-width: 1.3; }
+.ic { fill: none; stroke: #f2e8d8; stroke-width: 2.2; stroke-linejoin: round; }
+.sync { stroke: #a99f8f; stroke-width: 2; stroke-dasharray: 6 6; fill: none; }
+.copy { stroke: #5ce1e6; stroke-width: 3; fill: none; }
+.pull { stroke: #e8833a; stroke-width: 3; fill: none; }
+.rule { stroke: #f2e8d8; stroke-opacity: .12; stroke-width: 1.2; }
+</style>
+<marker id="mc" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5ce1e6"/></marker>
+<marker id="mp" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#e8833a"/></marker>
+<g id="on"><circle r="8" fill="#2ec4b6"/><path d="M-3.6,0 L-1,2.8 L3.8,-2.8" stroke="#0b0e16" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g id="off"><circle r="7" fill="none" stroke="#a99f8f" stroke-width="2" stroke-dasharray="2.6 2.6"/></g>
+<g id="ph"><rect x="-9" y="-7.5" width="18" height="15" rx="2.5" fill="none" stroke="#5ce1e6" stroke-width="1.6"/><path d="M-6,5 L-2,0 L1,3 L3.5,1 L6.5,5 z" fill="#5ce1e6"/></g>
+<g id="vi"><rect x="-9" y="-7.5" width="18" height="15" rx="2.5" fill="none" stroke="#e8833a" stroke-width="1.6"/><path d="M-2.5,-3.5 L3.5,0 L-2.5,3.5 z" fill="#e8833a"/></g>
+<g id="no"><path d="M-7,-8.5 H3 L7,-4.5 V8.5 H-7 z" fill="none" stroke="#f6b042" stroke-width="1.6" stroke-linejoin="round"/><path d="M-3.5,-1 H4 M-3.5,2.5 H4 M-3.5,6 H1.5" stroke="#f6b042" stroke-width="1.3"/></g>
+</defs>
+<!-- the list reaches every device -->
+<path class="sync" d="M250,252 V298 M510,252 V298 M250,572 V618 M510,572 V618"/>
+
+<!-- (2) the backup server copies the phone's folder -->
+<path class="copy" d="M352,135 H404" marker-end="url(#mc)"/>
+<circle cx="380" cy="108" r="13" fill="#5ce1e6"/><text class="n" x="380" y="113" text-anchor="middle">2</text>
+
+<!-- (3) the laptop opens beach.jpg: pieces from the phone and the backup at once -->
+<path class="pull" d="M710,252 V614" marker-end="url(#mp)"/>
+<path class="pull" d="M110,252 V596 H650 V614" marker-end="url(#mp)"/>
+<circle cx="680" cy="436" r="13" fill="#e8833a"/><text class="n" x="680" y="441" text-anchor="middle">3</text>
+
+<!-- Phone: the device that shares -->
+<rect class="boxa" x="20" y="20" width="330" height="230" rx="8"/>
+<rect class="ic" x="36" y="38" width="20" height="34" rx="4"/><circle cx="46" cy="66" r="1.8" fill="#f2e8d8"/>
+<text class="h" x="70" y="56">Phone</text>
+<text class="s" x="70" y="78" style="fill:#f6b042">shares its Camera folder</text>
+<use href="#on" x="44" y="128"/><use href="#ph" x="72" y="128"/><text class="f" x="92" y="133">beach.jpg</text><text class="tag or" x="334" y="132" text-anchor="end">ORIGINAL</text>
+<use href="#on" x="44" y="170"/><use href="#ph" x="72" y="170"/><text class="f" x="92" y="175">dog.jpg</text><text class="tag or" x="334" y="174" text-anchor="end">ORIGINAL</text>
+<use href="#on" x="44" y="212"/><use href="#vi" x="72" y="212"/><text class="f" x="92" y="217">party.mp4</text><text class="tag or" x="334" y="216" text-anchor="end">ORIGINAL</text>
+
+<!-- Backup server -->
+<rect class="boxo" x="410" y="20" width="330" height="230" rx="8"/>
+<rect class="ic" x="428" y="38" width="32" height="13" rx="2"/><rect class="ic" x="428" y="55" width="32" height="13" rx="2"/>
+<circle cx="453" cy="44.5" r="1.8" fill="#5ce1e6"/><circle cx="453" cy="61.5" r="1.8" fill="#5ce1e6"/>
+<text class="h" x="476" y="56">Backup server</text>
+<text class="s" x="476" y="78" style="fill:#5ce1e6">keeps a copy of the folder</text>
+<use href="#on" x="434" y="128"/><use href="#ph" x="462" y="128"/><text class="f" x="482" y="133">beach.jpg</text><text class="tag cp" x="724" y="132" text-anchor="end">COPY</text>
+<use href="#on" x="434" y="170"/><use href="#ph" x="462" y="170"/><text class="f" x="482" y="175">dog.jpg</text><text class="tag cp" x="724" y="174" text-anchor="end">COPY</text>
+<use href="#on" x="434" y="212"/><use href="#vi" x="462" y="212"/><text class="f" x="482" y="217">party.mp4</text><text class="tag cp" x="724" y="216" text-anchor="end">COPY</text>
+
+<!-- The share, as every device sees it -->
+<rect class="box" x="150" y="300" width="460" height="270" rx="8"/>
+<path d="M172,324 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="h" x="230" y="340">Phone · Camera</text>
+<rect x="232" y="352" width="10" height="8" rx="1.5" fill="#a99f8f"/><path d="M234,352 v-2.5 a3,3 0 0 1 6,0 v2.5" stroke="#a99f8f" stroke-width="1.5" fill="none"/>
+<text class="s" x="250" y="362">read-only for other devices</text>
+<line class="rule" x1="170" y1="384" x2="590" y2="384"/>
+<use href="#ph" x="182" y="414"/><text class="f" x="202" y="419">beach.jpg</text><text class="s" x="590" y="418" text-anchor="end">2.4 MB</text>
+<use href="#ph" x="182" y="456"/><text class="f" x="202" y="461">dog.jpg</text><text class="s" x="590" y="460" text-anchor="end">3.1 MB</text>
+<use href="#vi" x="182" y="498"/><text class="f" x="202" y="503">party.mp4</text><text class="s" x="590" y="502" text-anchor="end">48 MB</text>
+<line class="rule" x1="170" y1="524" x2="590" y2="524"/>
+<circle cx="184" cy="547" r="11" fill="#f6b042"/><text class="n" x="184" y="552" text-anchor="middle" style="font-size:12.5px">1</text>
+<text class="s" x="204" y="551" style="fill:#f2e8d8">every device sees the list, not the files</text>
+
+<!-- Desktop -->
+<rect class="box" x="20" y="620" width="330" height="230" rx="8"/>
+<rect class="ic" x="34" y="640" width="30" height="22" rx="3"/><path d="M49,662 v6 M41,670 h16" class="ic"/>
+<text class="h" x="80" y="656">Desktop</text>
+<text class="s" x="80" y="678">only browses the list</text>
+<use href="#off" x="44" y="728"/><use href="#ph" x="72" y="728"/><text class="fd" x="92" y="733">beach.jpg</text>
+<use href="#off" x="44" y="770"/><use href="#ph" x="72" y="770"/><text class="fd" x="92" y="775">dog.jpg</text>
+<use href="#off" x="44" y="812"/><use href="#vi" x="72" y="812"/><text class="fd" x="92" y="817">party.mp4</text>
+
+<!-- Laptop -->
+<rect class="box" x="410" y="620" width="330" height="230" rx="8"/>
+<rect class="ic" x="430" y="642" width="30" height="21" rx="3"/><path d="M424,668 H466 L462,673 H428 z" fill="#f2e8d8"/>
+<text class="h" x="480" y="656">Laptop</text>
+<text class="s" x="480" y="678">opened one photo</text>
+<use href="#on" x="434" y="728"/><use href="#ph" x="462" y="728"/><text class="f" x="482" y="733">beach.jpg</text><text class="tag ca" x="724" y="732" text-anchor="end">CACHED</text>
+<use href="#off" x="434" y="770"/><use href="#ph" x="462" y="770"/><text class="fd" x="482" y="775">dog.jpg</text>
+<use href="#off" x="434" y="812"/><use href="#vi" x="462" y="812"/><text class="fd" x="482" y="817">party.mp4</text>
+
+<!-- Step by step -->
+<text class="k" x="20" y="900">STEP BY STEP</text>
+<rect class="boxd" x="20" y="916" width="355" height="122" rx="6"/>
+<circle cx="44" cy="942" r="13" fill="#f6b042"/><text class="n" x="44" y="947" text-anchor="middle">1</text>
+<text class="t" x="66" y="947">Share a folder</text>
+<text class="b" x="36" y="980">The phone shares Camera. The</text>
+<text class="b" x="36" y="1001">photos stay where they are;</text>
+<text class="b" x="36" y="1022">every device sees the list.</text>
+
+<rect class="boxd" x="385" y="916" width="355" height="122" rx="6"/>
+<circle cx="409" cy="942" r="13" fill="#5ce1e6"/><text class="n" x="409" y="947" text-anchor="middle">2</text>
+<text class="t" x="431" y="947">A backup keeps a copy</text>
+<text class="b" x="401" y="980">A backup server copies the</text>
+<text class="b" x="401" y="1001">folder, even photos you</text>
+<text class="b" x="401" y="1022">later delete on the phone.</text>
+
+<rect class="boxd" x="20" y="1048" width="355" height="122" rx="6"/>
+<circle cx="44" cy="1074" r="13" fill="#e8833a"/><text class="n" x="44" y="1079" text-anchor="middle">3</text>
+<text class="t" x="66" y="1079">Open from anywhere</text>
+<text class="b" x="36" y="1112">The laptop opens beach.jpg:</text>
+<text class="b" x="36" y="1133">pieces come from the phone</text>
+<text class="b" x="36" y="1154">and the backup at once.</text>
+
+<rect class="boxd" x="385" y="1048" width="355" height="122" rx="6"/>
+<circle cx="409" cy="1074" r="13" fill="#f2e8d8"/><text class="n" x="409" y="1079" text-anchor="middle">4</text>
+<text class="t" x="431" y="1079">Phone off? Still there</text>
+<text class="b" x="401" y="1112">With the phone off or lost,</text>
+<text class="b" x="401" y="1133">the photos still open from</text>
+<text class="b" x="401" y="1154">the backup server.</text>
+
+<!-- Legend -->
+<text class="k" x="20" y="1218">LEGEND</text>
+<rect class="boxd" x="20" y="1234" width="720" height="200" rx="6"/>
+<use href="#on" x="44" y="1264"/><text class="b" x="64" y="1269">stored on this device</text>
+<use href="#off" x="44" y="1294"/><text class="b" x="64" y="1299">only in the list</text>
+<path class="sync" d="M34,1324 H56"/><text class="b" x="64" y="1329">the list reaches all</text>
+<text class="tag or" x="36" y="1358">ORIGINAL</text><text class="b" x="108" y="1359">the file itself</text>
+<text class="tag cp" x="36" y="1388">COPY</text><text class="b" x="78" y="1389">kept by the backup</text>
+<text class="tag ca" x="36" y="1418">CACHED</text><text class="b" x="94" y="1419">opened, kept to reopen</text>
+
+<path class="copy" d="M300,1264 H332" marker-end="url(#mc)"/><text class="b" x="344" y="1269">backup copy of the folder</text>
+<path class="pull" d="M300,1294 H332" marker-end="url(#mp)"/><text class="b" x="344" y="1299">pulled when opened, from all</text>
+<rect x="308" y="1322" width="14" height="11" rx="2" fill="#f2e8d8"/><path d="M311,1322 v-3.5 a4,4 0 0 1 8,0 v3.5" stroke="#f2e8d8" stroke-width="2" fill="none"/>
+<text class="b" x="344" y="1329">only the owner can change it</text>
+<path d="M315,1347 l8,3 v5 c0,5 -4,8 -8,9 c-4,-1 -8,-4 -8,-9 v-5 z" fill="none" stroke="#f2e8d8" stroke-width="2" stroke-linejoin="round"/>
+<text class="b" x="344" y="1359">encrypted between devices</text>
+<path d="M306,1380 h6 l2.5,3 h9.5 v11 h-18 z" fill="none" stroke="#f6b042" stroke-width="2" stroke-linejoin="round"/>
+<text class="b" x="344" y="1389">files stay in their folder</text>
+<circle cx="315" cy="1413" r="8" fill="none" stroke="#f2e8d8" stroke-width="2"/><path d="M309.5,1407.5 l11,11" stroke="#f2e8d8" stroke-width="2"/>
+<text class="b" x="344" y="1419">no central server, no cloud</text>
+</svg>

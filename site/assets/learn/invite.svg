@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 722" role="img" aria-labelledby="t">
+<title id="t">Joining a device with a one-time invite: the laptop shows a QR code that works once for 10 minutes; the new phone scans it or pastes the code. Only that code opens an encrypted channel, in which the two swap identities and addresses and the laptop sends the swarm key, which is never shown. Afterwards each trusts the other.</title>
+<defs>
+<style>
+text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; fill: #f2e8d8; }
+.h { font-size: 18px; font-weight: 600; fill: #f5efe6; }
+.f { font-size: 15px; }
+.fd { font-size: 15px; fill: #a99f8f; }
+.s { font-size: 12.5px; fill: #a99f8f; }
+.b { font-size: 13px; }
+.t { font-size: 15px; font-weight: 600; fill: #f5efe6; }
+.k { font-size: 13px; letter-spacing: 1.6px; fill: #f6b042; }
+.tag { font-size: 11.5px; font-weight: 600; letter-spacing: .6px; }
+.cp { fill: #5ce1e6; } .or { fill: #f6b042; } .ca { fill: #f2e8d8; } .te { fill: #e8833a; } .di { fill: #a99f8f; }
+.dim { opacity: .38; }
+.lock { stroke: #5ce1e6; stroke-width: 2.4; fill: none; }
+.chip { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .2; stroke-width: 1.2; }
+.big { font-size: 22px; font-weight: 600; fill: #f5efe6; }
+.m { font-size: 14px; }
+
+.n { font-size: 14px; font-weight: 700; fill: #0b0e16; }
+.box { fill: #1a2131; stroke: #f2e8d8; stroke-opacity: .22; stroke-width: 1.5; }
+.boxo { fill: #2ec4b6; fill-opacity: .08; stroke: #5ce1e6; stroke-width: 1.8; }
+.boxa { fill: #f6b042; fill-opacity: .07; stroke: #f6b042; stroke-width: 1.8; }
+.boxd { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .16; stroke-width: 1.3; }
+.ic { fill: none; stroke: #f2e8d8; stroke-width: 2.2; stroke-linejoin: round; }
+.sync { stroke: #a99f8f; stroke-width: 2; stroke-dasharray: 6 6; fill: none; }
+.copy { stroke: #5ce1e6; stroke-width: 3; fill: none; }
+.pull { stroke: #e8833a; stroke-width: 3; fill: none; }
+.rule { stroke: #f2e8d8; stroke-opacity: .12; stroke-width: 1.2; }
+</style>
+<marker id="mc" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5ce1e6"/></marker>
+<marker id="mp" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#e8833a"/></marker>
+<g id="on"><circle r="8" fill="#2ec4b6"/><path d="M-3.6,0 L-1,2.8 L3.8,-2.8" stroke="#0b0e16" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g id="off"><circle r="7" fill="none" stroke="#a99f8f" stroke-width="2" stroke-dasharray="2.6 2.6"/></g>
+<g id="ph"><rect x="-9" y="-7.5" width="18" height="15" rx="2.5" fill="none" stroke="#5ce1e6" stroke-width="1.6"/><path d="M-6,5 L-2,0 L1,3 L3.5,1 L6.5,5 z" fill="#5ce1e6"/></g>
+<g id="vi"><rect x="-9" y="-7.5" width="18" height="15" rx="2.5" fill="none" stroke="#e8833a" stroke-width="1.6"/><path d="M-2.5,-3.5 L3.5,0 L-2.5,3.5 z" fill="#e8833a"/></g>
+<g id="no"><path d="M-7,-8.5 H3 L7,-4.5 V8.5 H-7 z" fill="none" stroke="#f6b042" stroke-width="1.6" stroke-linejoin="round"/><path d="M-3.5,-1 H4 M-3.5,2.5 H4 M-3.5,6 H1.5" stroke="#f6b042" stroke-width="1.3"/></g>
+<marker id="mcs" viewBox="0 0 10 10" refX="1.5" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5ce1e6"/></marker>
+</defs>
+<g><rect class="box" x="20" y="20" width="300" height="300" rx="8"/><rect class="ic" x="40" y="43" width="30" height="21" rx="3"/><path d="M34,69 H76 L72,74 H38 z" fill="#f2e8d8"/><text class="h" x="86" y="56">Laptop</text><text class="s" x="86" y="78">already in the swarm</text></g>
+<g><rect class="boxa" x="440" y="20" width="300" height="300" rx="8"/><rect class="ic" x="464" y="38" width="20" height="34" rx="4"/><circle cx="474" cy="66" r="1.8" fill="#f2e8d8"/><text class="h" x="506" y="56">New phone</text><text class="s" x="506" y="78" style="fill:#f6b042">wants to join</text></g>
+<rect x="46" y="114" width="116" height="116" rx="4" fill="#f2e8d8"/>
+<rect x="50" y="154" width="9" height="9" fill="#0b0e16"/>
+<rect x="50" y="163" width="9" height="9" fill="#0b0e16"/>
+<rect x="50" y="181" width="9" height="9" fill="#0b0e16"/>
+<rect x="59" y="163" width="9" height="9" fill="#0b0e16"/>
+<rect x="59" y="172" width="9" height="9" fill="#0b0e16"/>
+<rect x="68" y="154" width="9" height="9" fill="#0b0e16"/>
+<rect x="68" y="163" width="9" height="9" fill="#0b0e16"/>
+<rect x="68" y="172" width="9" height="9" fill="#0b0e16"/>
+<rect x="68" y="181" width="9" height="9" fill="#0b0e16"/>
+<rect x="77" y="154" width="9" height="9" fill="#0b0e16"/>
+<rect x="77" y="172" width="9" height="9" fill="#0b0e16"/>
+<rect x="77" y="181" width="9" height="9" fill="#0b0e16"/>
+<rect x="86" y="145" width="9" height="9" fill="#0b0e16"/>
+<rect x="86" y="163" width="9" height="9" fill="#0b0e16"/>
+<rect x="86" y="181" width="9" height="9" fill="#0b0e16"/>
+<rect x="86" y="190" width="9" height="9" fill="#0b0e16"/>
+<rect x="86" y="199" width="9" height="9" fill="#0b0e16"/>
+<rect x="86" y="208" width="9" height="9" fill="#0b0e16"/>
+<rect x="95" y="118" width="9" height="9" fill="#0b0e16"/>
+<rect x="95" y="145" width="9" height="9" fill="#0b0e16"/>
+<rect x="95" y="163" width="9" height="9" fill="#0b0e16"/>
+<rect x="95" y="172" width="9" height="9" fill="#0b0e16"/>
+<rect x="95" y="181" width="9" height="9" fill="#0b0e16"/>
+<rect x="95" y="199" width="9" height="9" fill="#0b0e16"/>
+<rect x="95" y="208" width="9" height="9" fill="#0b0e16"/>
+<rect x="104" y="127" width="9" height="9" fill="#0b0e16"/>
+<rect x="104" y="154" width="9" height="9" fill="#0b0e16"/>
+<rect x="104" y="199" width="9" height="9" fill="#0b0e16"/>
+<rect x="104" y="217" width="9" height="9" fill="#0b0e16"/>
+<rect x="113" y="118" width="9" height="9" fill="#0b0e16"/>
+<rect x="113" y="136" width="9" height="9" fill="#0b0e16"/>
+<rect x="113" y="154" width="9" height="9" fill="#0b0e16"/>
+<rect x="113" y="199" width="9" height="9" fill="#0b0e16"/>
+<rect x="122" y="208" width="9" height="9" fill="#0b0e16"/>
+<rect x="131" y="181" width="9" height="9" fill="#0b0e16"/>
+<rect x="131" y="190" width="9" height="9" fill="#0b0e16"/>
+<rect x="131" y="208" width="9" height="9" fill="#0b0e16"/>
+<rect x="140" y="154" width="9" height="9" fill="#0b0e16"/>
+<rect x="140" y="163" width="9" height="9" fill="#0b0e16"/>
+<rect x="140" y="172" width="9" height="9" fill="#0b0e16"/>
+<rect x="140" y="190" width="9" height="9" fill="#0b0e16"/>
+<rect x="140" y="199" width="9" height="9" fill="#0b0e16"/>
+<rect x="140" y="208" width="9" height="9" fill="#0b0e16"/>
+<rect x="149" y="154" width="9" height="9" fill="#0b0e16"/>
+<rect x="149" y="163" width="9" height="9" fill="#0b0e16"/>
+<rect x="149" y="208" width="9" height="9" fill="#0b0e16"/>
+<rect x="149" y="217" width="9" height="9" fill="#0b0e16"/>
+<rect x="52" y="120" width="32" height="32" fill="none" stroke="#0b0e16" stroke-width="5"/><rect x="61" y="129" width="14" height="14" fill="#0b0e16"/>
+<rect x="124" y="120" width="32" height="32" fill="none" stroke="#0b0e16" stroke-width="5"/><rect x="133" y="129" width="14" height="14" fill="#0b0e16"/>
+<rect x="52" y="192" width="32" height="32" fill="none" stroke="#0b0e16" stroke-width="5"/><rect x="61" y="201" width="14" height="14" fill="#0b0e16"/>
+<text class="t" x="180" y="134">Invite</text>
+<text class="s" x="180" y="160">works once</text>
+<text class="s" x="180" y="182">for 10 minutes</text>
+<text class="big" x="180" y="218" style="fill:#f6b042">09:41</text>
+<rect class="chip" x="40" y="252" width="260" height="44" rx="6"/>
+<text class="s" x="54" y="279">nomadfs://invite?addr=…</text>
+<path d="M532,140 V114 H558 M622,114 H648 V140 M648,204 V230 H622 M558,230 H532 V204" stroke="#f6b042" stroke-width="4" fill="none" stroke-linecap="round"/>
+<line x1="542" y1="172.0" x2="638" y2="172.0" stroke="#e8833a" stroke-width="2.5"/>
+<text class="s" x="590.0" y="264" text-anchor="middle">scan the QR code</text>
+<text class="s" x="590.0" y="286" text-anchor="middle">or paste the code</text>
+<path class="pull" style="stroke-dasharray:7 6" d="M326,172.0 H434" marker-end="url(#mp)"/>
+<circle cx="380.0" cy="146.0" r="13" fill="#e8833a"/><text class="n" x="380.0" y="151.0" text-anchor="middle">1</text>
+<circle cx="33" cy="368" r="13" fill="#5ce1e6"/><text class="n" x="33" y="373" text-anchor="middle">2</text>
+<text class="k" x="56" y="373">AN ENCRYPTED CHANNEL ONLY THE CODE OPENS</text>
+<rect x="20" y="396" width="720" height="120" rx="60" fill="#2ec4b6" fill-opacity=".07" stroke="#5ce1e6" stroke-width="1.8"/>
+<rect x="63" y="453" width="14" height="11" rx="2" fill="#5ce1e6"/><path d="M66,453 v-3.5 a4,4 0 0 1 8,0 v3.5" stroke="#5ce1e6" stroke-width="2" fill="none"/>
+<rect class="chip" x="110" y="424" width="196" height="64" rx="6"/>
+<text class="m" x="124" y="452">identity + addresses</text>
+<text class="s" x="124" y="474">both ways</text>
+<rect class="chip" x="315" y="424" width="196" height="64" rx="6"/>
+<text class="m" x="329" y="452">the swarm key</text>
+<text class="s" x="329" y="474">never on screen</text>
+<rect class="chip" x="520" y="424" width="196" height="64" rx="6"/>
+<text class="m" x="534" y="452">trust each other</text>
+<text class="s" x="534" y="474">signed tickets</text>
+<circle cx="33" cy="554" r="13" fill="#f6b042"/><text class="n" x="33" y="559" text-anchor="middle">3</text>
+<text class="k" x="56" y="559">DONE: ONE SWARM</text>
+<g><rect class="box" x="20" y="580" width="300" height="92" rx="8"/><rect class="ic" x="40" y="603" width="30" height="21" rx="3"/><path d="M34,629 H76 L72,634 H38 z" fill="#f2e8d8"/><text class="h" x="86" y="616">Laptop</text><text class="s" x="86" y="638">trusts New phone</text></g>
+<g><rect class="boxo" x="440" y="580" width="300" height="92" rx="8"/><rect class="ic" x="464" y="598" width="20" height="34" rx="4"/><circle cx="474" cy="626" r="1.8" fill="#f2e8d8"/><text class="h" x="506" y="616">New phone</text><text class="s" x="506" y="638" style="fill:#5ce1e6">trusts Laptop, has the key</text></g>
+<path class="copy" d="M326,626.0 H434"/><rect x="373.0" y="621.0" width="14" height="11" rx="2" fill="#5ce1e6"/><path d="M376.0,621.0 v-3.5 a4,4 0 0 1 8,0 v3.5" stroke="#5ce1e6" stroke-width="2" fill="none"/>
+<use href="#on" x="294" y="608"/><use href="#on" x="714" y="608"/>
+<text class="s" x="380.0" y="702" text-anchor="middle">a used or expired code opens nothing</text>
+</svg>

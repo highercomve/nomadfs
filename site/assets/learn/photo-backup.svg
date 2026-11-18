@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 900" role="img" aria-labelledby="t">
+<title id="t">Backing up a phone's photos: on Wi-Fi the home server copies the phone's Camera folder. Photos deleted on the phone stay on the server. With the phone off or lost, a laptop or a new phone opens them from the server.</title>
+<defs>
+<style>
+text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; fill: #f2e8d8; }
+.h { font-size: 18px; font-weight: 600; fill: #f5efe6; }
+.f { font-size: 15px; }
+.fd { font-size: 15px; fill: #a99f8f; }
+.s { font-size: 12.5px; fill: #a99f8f; }
+.b { font-size: 13px; }
+.t { font-size: 15px; font-weight: 600; fill: #f5efe6; }
+.k { font-size: 13px; letter-spacing: 1.6px; fill: #f6b042; }
+.tag { font-size: 11.5px; font-weight: 600; letter-spacing: .6px; }
+.cp { fill: #5ce1e6; } .or { fill: #f6b042; } .ca { fill: #f2e8d8; } .te { fill: #e8833a; } .di { fill: #a99f8f; }
+.dim { opacity: .38; }
+.lock { stroke: #5ce1e6; stroke-width: 2.4; fill: none; }
+.chip { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .2; stroke-width: 1.2; }
+.big { font-size: 22px; font-weight: 600; fill: #f5efe6; }
+.m { font-size: 14px; }
+
+.n { font-size: 14px; font-weight: 700; fill: #0b0e16; }
+.box { fill: #1a2131; stroke: #f2e8d8; stroke-opacity: .22; stroke-width: 1.5; }
+.boxo { fill: #2ec4b6; fill-opacity: .08; stroke: #5ce1e6; stroke-width: 1.8; }
+.boxa { fill: #f6b042; fill-opacity: .07; stroke: #f6b042; stroke-width: 1.8; }
+.boxd { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .16; stroke-width: 1.3; }
+.ic { fill: none; stroke: #f2e8d8; stroke-width: 2.2; stroke-linejoin: round; }
+.sync { stroke: #a99f8f; stroke-width: 2; stroke-dasharray: 6 6; fill: none; }
+.copy { stroke: #5ce1e6; stroke-width: 3; fill: none; }
+.pull { stroke: #e8833a; stroke-width: 3; fill: none; }
+.rule { stroke: #f2e8d8; stroke-opacity: .12; stroke-width: 1.2; }
+</style>
+<marker id="mc" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5ce1e6"/></marker>
+<marker id="mp" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#e8833a"/></marker>
+<g id="on"><circle r="8" fill="#2ec4b6"/><path d="M-3.6,0 L-1,2.8 L3.8,-2.8" stroke="#0b0e16" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g id="off"><circle r="7" fill="none" stroke="#a99f8f" stroke-width="2" stroke-dasharray="2.6 2.6"/></g>
+<g id="ph"><rect x="-9" y="-7.5" width="18" height="15" rx="2.5" fill="none" stroke="#5ce1e6" stroke-width="1.6"/><path d="M-6,5 L-2,0 L1,3 L3.5,1 L6.5,5 z" fill="#5ce1e6"/></g>
+<g id="vi"><rect x="-9" y="-7.5" width="18" height="15" rx="2.5" fill="none" stroke="#e8833a" stroke-width="1.6"/><path d="M-2.5,-3.5 L3.5,0 L-2.5,3.5 z" fill="#e8833a"/></g>
+<g id="no"><path d="M-7,-8.5 H3 L7,-4.5 V8.5 H-7 z" fill="none" stroke="#f6b042" stroke-width="1.6" stroke-linejoin="round"/><path d="M-3.5,-1 H4 M-3.5,2.5 H4 M-3.5,6 H1.5" stroke="#f6b042" stroke-width="1.3"/></g>
+<marker id="mcs" viewBox="0 0 10 10" refX="1.5" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5ce1e6"/></marker>
+</defs>
+<circle cx="33" cy="24" r="13" fill="#5ce1e6"/><text class="n" x="33" y="29" text-anchor="middle">1</text>
+<text class="k" x="56" y="29">ON WI-FI, NEW PHOTOS ARE COPIED</text>
+<g><rect class="boxa" x="20" y="50" width="280" height="196" rx="8"/><rect class="ic" x="44" y="68" width="20" height="34" rx="4"/><circle cx="54" cy="96" r="1.8" fill="#f2e8d8"/><text class="h" x="86" y="86">Phone</text><text class="s" x="86" y="108" style="fill:#f6b042">Camera folder</text></g>
+<g><rect class="boxo" x="460" y="50" width="280" height="196" rx="8"/><rect class="ic" x="478" y="70" width="32" height="13" rx="2"/><rect class="ic" x="478" y="87" width="32" height="13" rx="2"/><circle cx="503" cy="76.5" r="1.8" fill="#5ce1e6"/><circle cx="503" cy="93.5" r="1.8" fill="#5ce1e6"/><text class="h" x="526" y="86">Home server</text><text class="s" x="526" y="108" style="fill:#5ce1e6">Phone · Camera (backup)</text></g>
+<use href="#on" x="44" y="146"/><use href="#ph" x="72" y="146"/><text class="f" x="92" y="151">beach.jpg</text>
+<use href="#on" x="484" y="146"/><use href="#ph" x="512" y="146"/><text class="f" x="532" y="151">beach.jpg</text><text class="tag cp" x="724" y="150" text-anchor="end">COPY</text>
+<use href="#on" x="44" y="180"/><use href="#ph" x="72" y="180"/><text class="f" x="92" y="185">dog.jpg</text>
+<use href="#on" x="484" y="180"/><use href="#ph" x="512" y="180"/><text class="f" x="532" y="185">dog.jpg</text><text class="tag cp" x="724" y="184" text-anchor="end">COPY</text>
+<use href="#on" x="44" y="214"/><use href="#ph" x="72" y="214"/><text class="f" x="92" y="219">cake.jpg</text>
+<use href="#on" x="484" y="214"/><use href="#ph" x="512" y="214"/><text class="f" x="532" y="219">cake.jpg</text><text class="tag cp" x="724" y="218" text-anchor="end">COPY</text>
+<path class="copy" d="M308,148.0 H452" marker-end="url(#mc)"/>
+<text class="s" x="380.0" y="136.0" text-anchor="middle" style="fill:#5ce1e6">copies</text>
+<circle cx="33" cy="294" r="13" fill="#f6b042"/><text class="n" x="33" y="299" text-anchor="middle">2</text>
+<text class="k" x="56" y="299">FREE UP THE PHONE: THE BACKUP KEEPS THEM</text>
+<g><rect class="boxa" x="20" y="320" width="280" height="196" rx="8"/><rect class="ic" x="44" y="338" width="20" height="34" rx="4"/><circle cx="54" cy="366" r="1.8" fill="#f2e8d8"/><text class="h" x="86" y="356">Phone</text><text class="s" x="86" y="378" style="fill:#f6b042">deleted two photos</text></g>
+<g><rect class="boxo" x="460" y="320" width="280" height="196" rx="8"/><rect class="ic" x="478" y="340" width="32" height="13" rx="2"/><rect class="ic" x="478" y="357" width="32" height="13" rx="2"/><circle cx="503" cy="346.5" r="1.8" fill="#5ce1e6"/><circle cx="503" cy="363.5" r="1.8" fill="#5ce1e6"/><text class="h" x="526" y="356">Home server</text><text class="s" x="526" y="378" style="fill:#5ce1e6">still has all three</text></g>
+<g class="dim"><use href="#off" x="44" y="416"/><use href="#ph" x="72" y="416"/><text class="fd" x="92" y="421">beach.jpg</text></g><path d="M90,416 H177.7" stroke="#e8833a" stroke-width="2"/>
+<use href="#on" x="484" y="416"/><use href="#ph" x="512" y="416"/><text class="f" x="532" y="421">beach.jpg</text><text class="tag or" x="724" y="420" text-anchor="end">KEPT</text>
+<g class="dim"><use href="#off" x="44" y="450"/><use href="#ph" x="72" y="450"/><text class="fd" x="92" y="455">dog.jpg</text></g><path d="M90,450 H159.10000000000002" stroke="#e8833a" stroke-width="2"/>
+<use href="#on" x="484" y="450"/><use href="#ph" x="512" y="450"/><text class="f" x="532" y="455">dog.jpg</text><text class="tag or" x="724" y="454" text-anchor="end">KEPT</text>
+<use href="#on" x="44" y="484"/><use href="#ph" x="72" y="484"/><text class="f" x="92" y="489">cake.jpg</text>
+<use href="#on" x="484" y="484"/><use href="#ph" x="512" y="484"/><text class="f" x="532" y="489">cake.jpg</text><text class="tag cp" x="724" y="488" text-anchor="end">COPY</text>
+<circle cx="33" cy="564" r="13" fill="#e8833a"/><text class="n" x="33" y="569" text-anchor="middle">3</text>
+<text class="k" x="56" y="569">PHONE OFF OR LOST? OPEN THEM ANYWHERE</text>
+<g class="dim"><g><rect class="box" x="20" y="590" width="210" height="196" rx="8"/><rect class="ic" x="44" y="608" width="20" height="34" rx="4"/><circle cx="54" cy="636" r="1.8" fill="#f2e8d8"/><text class="h" x="86" y="626">Phone</text><text class="s" x="86" y="648">off</text></g><path d="M170,680 l40,40 M210,680 l-40,40" stroke="#e8833a" stroke-width="3"/></g>
+<g><rect class="boxo" x="275.0" y="590" width="210" height="196" rx="8"/><rect class="ic" x="293.0" y="610" width="32" height="13" rx="2"/><rect class="ic" x="293.0" y="627" width="32" height="13" rx="2"/><circle cx="318.0" cy="616.5" r="1.8" fill="#5ce1e6"/><circle cx="318.0" cy="633.5" r="1.8" fill="#5ce1e6"/><text class="h" x="341.0" y="626">Home server</text><text class="s" x="341.0" y="648" style="fill:#5ce1e6">serves the copy</text></g>
+<g><rect class="box" x="530" y="590" width="210" height="196" rx="8"/><rect class="ic" x="550" y="613" width="30" height="21" rx="3"/><path d="M544,639 H586 L582,644 H548 z" fill="#f2e8d8"/><text class="h" x="596" y="626">Laptop</text><text class="s" x="596" y="648">or a new phone</text></g>
+<use href="#on" x="299.0" y="686"/><use href="#ph" x="327.0" y="686"/><text class="f" x="347.0" y="691">beach.jpg</text>
+<use href="#on" x="554" y="686"/><use href="#ph" x="582" y="686"/><text class="f" x="602" y="691">beach.jpg</text>
+<use href="#on" x="299.0" y="720"/><use href="#ph" x="327.0" y="720"/><text class="f" x="347.0" y="725">dog.jpg</text>
+<use href="#off" x="554" y="720"/><use href="#ph" x="582" y="720"/><text class="fd" x="602" y="725">dog.jpg</text>
+<use href="#on" x="299.0" y="754"/><use href="#ph" x="327.0" y="754"/><text class="f" x="347.0" y="759">cake.jpg</text>
+<use href="#off" x="554" y="754"/><use href="#ph" x="582" y="754"/><text class="fd" x="602" y="759">cake.jpg</text>
+<path class="pull" d="M489.0,688.0 H524" marker-end="url(#mp)"/>
+<rect class="boxd" x="20" y="816" width="720" height="64" rx="6"/>
+<use href="#on" x="44" y="848"/><text class="b" x="62" y="853">on this device</text>
+<path class="copy" d="M220,848 H252" marker-end="url(#mc)"/><text class="b" x="262" y="853">backup copy</text>
+<path class="pull" d="M410,848 H442" marker-end="url(#mp)"/><text class="b" x="452" y="853">opened from the backup</text>
+</svg>

@@ -11,6 +11,8 @@ A share is a folder on one device, under a name. The device that shares it
 keeps the files where they are; the rest of the swarm sees the share's listing
 and fetches file contents on request.
 
+[A share stays on the device that shares it; the others see its list and fetch a file only when someone opens it, from that device and from any backup device at once.](<$image.siteAsset('learn/shared-folder.svg').alt('The phone shares its Camera folder: beach.jpg, dog.jpg and party.mp4 stay on the phone. Every device sees the list of Phone · Camera, read-only. A backup server copies the folder and keeps photos even after they are deleted on the phone. The desktop only browses the list and has none of the files. The laptop opens beach.jpg: its pieces come from the phone and the backup server at once, and it stays in the laptop read cache. With the phone off or lost, the photos still open from the backup server.')>)
+
 # [Sharing a folder]($heading.id('sharing'))
 
 From the command line, add `share = "Name:/path"` to the configuration
@@ -108,6 +110,9 @@ it:
 - Under the folder on the phone, the app shows where it is backed up and
   whether the copy is up to date.
 
+
+[The home server copies the phone photos on Wi-Fi, keeps the ones you delete on the phone, and serves them when the phone is off.](<$image.siteAsset('learn/photo-backup.svg').alt('Three stages. On Wi-Fi, the home server copies beach.jpg, dog.jpg and cake.jpg from the phone Camera folder. The phone then deletes two photos to free space; the server still has all three. With the phone off or lost, a laptop or a new phone opens the photos from the server.')>)
+
 Only devices of your swarm are backed up. On the command line, mark a share
 with `backup = "Camera"` in `nomadfs.conf`, and turn backup on with
 `swarm_backup = true` or `--swarm-backup`.
@@ -129,6 +134,8 @@ Windows) that any program can open:
 - `<mount>/<device>/<share>/…` is read-only.
 - `<mount>/Swarm` is the [swarm folder]($link.page('docs/swarm-folder')) and is
   writable: copy files in, rename, delete, make folders.
+
+[One folder per device with its shares, read-only and read from that device when opened, and Swarm, writable from any program.](<$image.siteAsset('learn/mount.svg').alt('The mount at ~/NomadFS: folders Laptop, Phone and Home server hold the shares of each device, read-only, read from that device when a file is opened. Swarm is the swarm folder, which any app can write. It is a folder on Linux (FUSE) and macOS (Finder) and a drive such as Z: on Windows.')>)
 
 From the command line:
 
