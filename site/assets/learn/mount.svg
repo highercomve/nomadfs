@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 590" role="img" aria-labelledby="t">
+<title id="t">The mount: ~/NomadFS holds a folder per device with its shares, read-only and read from that device when opened, and Swarm, the swarm folder, which any program can write. It is a folder on Linux and macOS and a drive letter on Windows.</title>
+<defs>
+<style>
+text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; fill: #f2e8d8; }
+.h { font-size: 18px; font-weight: 600; fill: #f5efe6; }
+.f { font-size: 15px; }
+.fd { font-size: 15px; fill: #a99f8f; }
+.s { font-size: 12.5px; fill: #a99f8f; }
+.b { font-size: 13px; }
+.t { font-size: 15px; font-weight: 600; fill: #f5efe6; }
+.k { font-size: 13px; letter-spacing: 1.6px; fill: #f6b042; }
+.tag { font-size: 11.5px; font-weight: 600; letter-spacing: .6px; }
+.cp { fill: #5ce1e6; } .or { fill: #f6b042; } .ca { fill: #f2e8d8; } .te { fill: #e8833a; } .di { fill: #a99f8f; }
+.dim { opacity: .38; }
+.lock { stroke: #5ce1e6; stroke-width: 2.4; fill: none; }
+.chip { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .2; stroke-width: 1.2; }
+.big { font-size: 22px; font-weight: 600; fill: #f5efe6; }
+.m { font-size: 14px; }
+
+.n { font-size: 14px; font-weight: 700; fill: #0b0e16; }
+.box { fill: #1a2131; stroke: #f2e8d8; stroke-opacity: .22; stroke-width: 1.5; }
+.boxo { fill: #2ec4b6; fill-opacity: .08; stroke: #5ce1e6; stroke-width: 1.8; }
+.boxa { fill: #f6b042; fill-opacity: .07; stroke: #f6b042; stroke-width: 1.8; }
+.boxd { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .16; stroke-width: 1.3; }
+.ic { fill: none; stroke: #f2e8d8; stroke-width: 2.2; stroke-linejoin: round; }
+.sync { stroke: #a99f8f; stroke-width: 2; stroke-dasharray: 6 6; fill: none; }
+.copy { stroke: #5ce1e6; stroke-width: 3; fill: none; }
+.pull { stroke: #e8833a; stroke-width: 3; fill: none; }
+.rule { stroke: #f2e8d8; stroke-opacity: .12; stroke-width: 1.2; }
+</style>
+<marker id="mc" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5ce1e6"/></marker>
+<marker id="mp" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#e8833a"/></marker>
+<g id="on"><circle r="8" fill="#2ec4b6"/><path d="M-3.6,0 L-1,2.8 L3.8,-2.8" stroke="#0b0e16" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g id="off"><circle r="7" fill="none" stroke="#a99f8f" stroke-width="2" stroke-dasharray="2.6 2.6"/></g>
+<g id="ph"><rect x="-9" y="-7.5" width="18" height="15" rx="2.5" fill="none" stroke="#5ce1e6" stroke-width="1.6"/><path d="M-6,5 L-2,0 L1,3 L3.5,1 L6.5,5 z" fill="#5ce1e6"/></g>
+<g id="vi"><rect x="-9" y="-7.5" width="18" height="15" rx="2.5" fill="none" stroke="#e8833a" stroke-width="1.6"/><path d="M-2.5,-3.5 L3.5,0 L-2.5,3.5 z" fill="#e8833a"/></g>
+<g id="no"><path d="M-7,-8.5 H3 L7,-4.5 V8.5 H-7 z" fill="none" stroke="#f6b042" stroke-width="1.6" stroke-linejoin="round"/><path d="M-3.5,-1 H4 M-3.5,2.5 H4 M-3.5,6 H1.5" stroke="#f6b042" stroke-width="1.3"/></g>
+<marker id="mcs" viewBox="0 0 10 10" refX="1.5" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5ce1e6"/></marker>
+</defs>
+<rect class="box" x="20" y="20" width="400" height="400" rx="8"/>
+<rect x="20" y="20" width="400" height="44" rx="8" fill="#10141f"/><rect x="20" y="56" width="400" height="8" fill="#10141f"/>
+<circle cx="42" cy="42" r="5.5" fill="#e8833a" opacity=".8"/>
+<circle cx="62" cy="42" r="5.5" fill="#f6b042" opacity=".8"/>
+<circle cx="82" cy="42" r="5.5" fill="#2ec4b6" opacity=".8"/>
+<text class="m" x="112" y="47" style="fill:#a99f8f">~/NomadFS</text>
+<path transform="translate(44,93) scale(0.62)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="f" x="84" y="109">Laptop/</text>
+<text class="tag or" x="404" y="108" text-anchor="end">READ-ONLY</text>
+<path d="M58,118 V144 H72" stroke="#f2e8d8" stroke-opacity=".2" stroke-width="1.3" fill="none"/>
+<path transform="translate(78,133) scale(0.62)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="f" x="118" y="149">Documents/</text>
+<path transform="translate(44,173) scale(0.62)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="f" x="84" y="189">Phone/</text>
+<text class="tag or" x="404" y="188" text-anchor="end">READ-ONLY</text>
+<path d="M58,198 V224 H72" stroke="#f2e8d8" stroke-opacity=".2" stroke-width="1.3" fill="none"/>
+<path transform="translate(78,213) scale(0.62)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="f" x="118" y="229">Camera/</text>
+<path d="M58,238 V264 H72" stroke="#f2e8d8" stroke-opacity=".2" stroke-width="1.3" fill="none"/>
+<path transform="translate(78,253) scale(0.62)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="f" x="118" y="269">WhatsApp/</text>
+<path transform="translate(44,293) scale(0.62)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="f" x="84" y="309">Home server/</text>
+<text class="tag or" x="404" y="308" text-anchor="end">READ-ONLY</text>
+<path d="M58,318 V344 H72" stroke="#f2e8d8" stroke-opacity=".2" stroke-width="1.3" fill="none"/>
+<path transform="translate(78,333) scale(0.62)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="f" x="118" y="349">Movies/</text>
+<path transform="translate(44,373) scale(0.62)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#5ce1e6"/>
+<text class="f" x="84" y="389">Swarm/</text>
+<text class="tag cp" x="404" y="388" text-anchor="end">WRITABLE</text>
+<rect class="box" x="500" y="72.0" width="240" height="64" rx="8"/><rect class="ic" x="518" y="92.0" width="30" height="21" rx="3"/><path d="M512,118.0 H554 L550,123.0 H516 z" fill="#f2e8d8"/><text class="t" x="564" y="102.0">Laptop</text><text class="s" x="564" y="122.0">its shares</text>
+<path class="pull" d="M496,104 H428" marker-end="url(#mp)"/>
+<rect class="box" x="500" y="152.0" width="240" height="64" rx="8"/><rect class="ic" x="522" y="167.0" width="20" height="34" rx="4"/><circle cx="532" cy="195.0" r="1.8" fill="#f2e8d8"/><text class="t" x="564" y="182.0">Phone</text><text class="s" x="564" y="202.0">its shares</text>
+<path class="pull" d="M496,184 H428" marker-end="url(#mp)"/>
+<rect class="box" x="500" y="272.0" width="240" height="64" rx="8"/><rect class="ic" x="516" y="289.0" width="32" height="13" rx="2"/><rect class="ic" x="516" y="306.0" width="32" height="13" rx="2"/><circle cx="541" cy="295.5" r="1.8" fill="#5ce1e6"/><circle cx="541" cy="312.5" r="1.8" fill="#5ce1e6"/><text class="t" x="564" y="302.0">Home server</text><text class="s" x="564" y="322.0">its shares</text>
+<path class="pull" d="M496,304 H428" marker-end="url(#mp)"/>
+<rect class="boxa" x="500" y="352.0" width="240" height="64" rx="8"/><path transform="translate(516,369.0) scale(0.8)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/><text class="t" x="564" y="382.0">Swarm folder</text><text class="s" x="564" y="402.0">every device</text>
+<path class="copy" d="M428,384 H496" marker-end="url(#mc)" marker-start="url(#mcs)"/>
+<text class="k" x="20" y="450">ON EVERY DESKTOP</text>
+<rect class="boxd" x="20.0" y="466" width="229.33333333333334" height="74" rx="6"/><text class="t" x="38.0" y="496">Linux</text><text class="s" x="38.0" y="520">a folder (FUSE)</text>
+<rect class="boxd" x="265.33333333333337" y="466" width="229.33333333333334" height="74" rx="6"/><text class="t" x="283.33333333333337" y="496">macOS</text><text class="s" x="283.33333333333337" y="520">a folder in Finder</text>
+<rect class="boxd" x="510.6666666666667" y="466" width="229.33333333333334" height="74" rx="6"/><text class="t" x="528.6666666666667" y="496">Windows</text><text class="s" x="528.6666666666667" y="520">a drive, like Z:</text>
+<path class="pull" d="M20,566 H52" marker-end="url(#mp)"/><text class="b" x="62" y="571">read from that device when opened</text>
+<path class="copy" d="M440,566 H472" marker-end="url(#mc)"/><text class="b" x="482" y="571">any app can write</text>
+</svg>

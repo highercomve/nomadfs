@@ -39,6 +39,9 @@
 				<h2>Everything you share, from every device</h2>
 				<p>Not a cloud and not a full mirror. Your devices keep their own files and lend them to each other on request.</p>
 			</div>
+			<figure class="plate net-figure overview-figure">
+				<img src="$site.asset('learn/overview.svg').link()" alt="Four devices in one swarm: a phone sharing Camera and WhatsApp, a laptop sharing Documents, a desktop sharing Music and Projects, and a home server sharing Movies and backing up the swarm. They connect directly, encrypted. Every device can browse the folders of the others, read-only, and all of them read and write one swarm folder whose edits merge on every device." width="1180" height="582" loading="lazy">
+			</figure>
 			<div class="feature-grid">
 				<article class="feature plate">
 					<div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/><path d="M12 11v5M9.5 13.5 12 16l2.5-2.5"/></svg></div>

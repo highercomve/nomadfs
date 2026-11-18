@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 582" role="img" aria-labelledby="t">
+<title id="t">Four devices in one swarm: a phone sharing Camera and WhatsApp, a laptop sharing Documents, a desktop sharing Music and Projects and a home server sharing Movies, connected directly and encrypted. Every device can browse the others' folders, read-only, and all of them read and write one swarm folder whose edits merge everywhere.</title>
+<defs>
+<style>
+text { font-family: 'Martian Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace; fill: #f2e8d8; }
+.h { font-size: 18px; font-weight: 600; fill: #f5efe6; }
+.f { font-size: 15px; }
+.fd { font-size: 15px; fill: #a99f8f; }
+.s { font-size: 12.5px; fill: #a99f8f; }
+.b { font-size: 13px; }
+.t { font-size: 15px; font-weight: 600; fill: #f5efe6; }
+.k { font-size: 13px; letter-spacing: 1.6px; fill: #f6b042; }
+.tag { font-size: 11.5px; font-weight: 600; letter-spacing: .6px; }
+.cp { fill: #5ce1e6; } .or { fill: #f6b042; } .ca { fill: #f2e8d8; } .te { fill: #e8833a; } .di { fill: #a99f8f; }
+.dim { opacity: .38; }
+.lock { stroke: #5ce1e6; stroke-width: 2.4; fill: none; }
+.chip { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .2; stroke-width: 1.2; }
+.big { font-size: 22px; font-weight: 600; fill: #f5efe6; }
+.m { font-size: 14px; }
+
+.n { font-size: 14px; font-weight: 700; fill: #0b0e16; }
+.box { fill: #1a2131; stroke: #f2e8d8; stroke-opacity: .22; stroke-width: 1.5; }
+.boxo { fill: #2ec4b6; fill-opacity: .08; stroke: #5ce1e6; stroke-width: 1.8; }
+.boxa { fill: #f6b042; fill-opacity: .07; stroke: #f6b042; stroke-width: 1.8; }
+.boxd { fill: #10141f; stroke: #f2e8d8; stroke-opacity: .16; stroke-width: 1.3; }
+.ic { fill: none; stroke: #f2e8d8; stroke-width: 2.2; stroke-linejoin: round; }
+.sync { stroke: #a99f8f; stroke-width: 2; stroke-dasharray: 6 6; fill: none; }
+.copy { stroke: #5ce1e6; stroke-width: 3; fill: none; }
+.pull { stroke: #e8833a; stroke-width: 3; fill: none; }
+.rule { stroke: #f2e8d8; stroke-opacity: .12; stroke-width: 1.2; }
+</style>
+<marker id="mc" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5ce1e6"/></marker>
+<marker id="mp" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#e8833a"/></marker>
+<g id="on"><circle r="8" fill="#2ec4b6"/><path d="M-3.6,0 L-1,2.8 L3.8,-2.8" stroke="#0b0e16" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g id="off"><circle r="7" fill="none" stroke="#a99f8f" stroke-width="2" stroke-dasharray="2.6 2.6"/></g>
+<g id="ph"><rect x="-9" y="-7.5" width="18" height="15" rx="2.5" fill="none" stroke="#5ce1e6" stroke-width="1.6"/><path d="M-6,5 L-2,0 L1,3 L3.5,1 L6.5,5 z" fill="#5ce1e6"/></g>
+<g id="vi"><rect x="-9" y="-7.5" width="18" height="15" rx="2.5" fill="none" stroke="#e8833a" stroke-width="1.6"/><path d="M-2.5,-3.5 L3.5,0 L-2.5,3.5 z" fill="#e8833a"/></g>
+<g id="no"><path d="M-7,-8.5 H3 L7,-4.5 V8.5 H-7 z" fill="none" stroke="#f6b042" stroke-width="1.6" stroke-linejoin="round"/><path d="M-3.5,-1 H4 M-3.5,2.5 H4 M-3.5,6 H1.5" stroke="#f6b042" stroke-width="1.3"/></g>
+<marker id="mcs" viewBox="0 0 10 10" refX="1.5" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5ce1e6"/></marker>
+</defs>
+<path class="copy" style="stroke-width:2.4" d="M276,120 H314"/>
+<rect x="288.0" y="115" width="14" height="11" rx="2" fill="#5ce1e6"/><path d="M291.0,115 v-3.5 a4,4 0 0 1 8,0 v3.5" stroke="#5ce1e6" stroke-width="2" fill="none"/>
+<path class="copy" style="stroke-width:2.4" d="M572,120 H610"/>
+<rect x="584.0" y="115" width="14" height="11" rx="2" fill="#5ce1e6"/><path d="M587.0,115 v-3.5 a4,4 0 0 1 8,0 v3.5" stroke="#5ce1e6" stroke-width="2" fill="none"/>
+<path class="copy" style="stroke-width:2.4" d="M868,120 H906"/>
+<rect x="880.0" y="115" width="14" height="11" rx="2" fill="#5ce1e6"/><path d="M883.0,115 v-3.5 a4,4 0 0 1 8,0 v3.5" stroke="#5ce1e6" stroke-width="2" fill="none"/>
+<path class="copy" style="stroke-width:2;stroke-dasharray:2 6;stroke-linecap:round" d="M147.0,20 C147.0,6 1035.0,6 1035.0,20" opacity="0"/>
+<g><rect class="box" x="20" y="20" width="254" height="210" rx="8"/><rect class="ic" x="44" y="38" width="20" height="34" rx="4"/><circle cx="54" cy="66" r="1.8" fill="#f2e8d8"/><text class="h" x="86" y="56">Phone</text><text class="s" x="86" y="78" style="fill:#f6b042">SHARES</text></g>
+<path transform="translate(42,111) scale(0.72)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="f" x="86" y="129">Camera</text>
+<text class="tag or" x="258" y="128" text-anchor="end">READ-ONLY</text>
+<path transform="translate(42,153) scale(0.72)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="f" x="86" y="171">WhatsApp</text>
+<text class="tag or" x="258" y="170" text-anchor="end">READ-ONLY</text>
+<g><rect class="box" x="316" y="20" width="254" height="210" rx="8"/><rect class="ic" x="336" y="43" width="30" height="21" rx="3"/><path d="M330,69 H372 L368,74 H334 z" fill="#f2e8d8"/><text class="h" x="382" y="56">Laptop</text><text class="s" x="382" y="78" style="fill:#f6b042">SHARES</text></g>
+<path transform="translate(338,111) scale(0.72)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="f" x="382" y="129">Documents</text>
+<text class="tag or" x="554" y="128" text-anchor="end">READ-ONLY</text>
+<g><rect class="box" x="612" y="20" width="254" height="210" rx="8"/><rect class="ic" x="630" y="40" width="32" height="23" rx="3"/><path class="ic" d="M646,63 v6 M638,71 h16"/><text class="h" x="678" y="56">Desktop</text><text class="s" x="678" y="78" style="fill:#f6b042">SHARES</text></g>
+<path transform="translate(634,111) scale(0.72)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="f" x="678" y="129">Music</text>
+<text class="tag or" x="850" y="128" text-anchor="end">READ-ONLY</text>
+<path transform="translate(634,153) scale(0.72)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="f" x="678" y="171">Projects</text>
+<text class="tag or" x="850" y="170" text-anchor="end">READ-ONLY</text>
+<g><rect class="boxo" x="908" y="20" width="254" height="210" rx="8"/><rect class="ic" x="926" y="40" width="32" height="13" rx="2"/><rect class="ic" x="926" y="57" width="32" height="13" rx="2"/><circle cx="951" cy="46.5" r="1.8" fill="#5ce1e6"/><circle cx="951" cy="63.5" r="1.8" fill="#5ce1e6"/><text class="h" x="974" y="56">Home server</text><text class="s" x="974" y="78" style="fill:#f6b042">SHARES + BACKS UP</text></g>
+<path transform="translate(930,111) scale(0.72)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="f" x="974" y="129">Movies</text>
+<text class="tag or" x="1146" y="128" text-anchor="end">READ-ONLY</text>
+<path class="sync" d="M147.0,232 V288"/>
+<path class="sync" d="M443.0,232 V288"/>
+<path class="sync" d="M739.0,232 V288"/>
+<path class="sync" d="M1035.0,232 V288"/>
+<rect class="boxa" x="20" y="290" width="1140" height="112" rx="8"/>
+<path transform="translate(44,314) scale(1.0)" d="M3,0 h15 l5,6 h22 a3,3 0 0 1 3,3 v19 a3,3 0 0 1 -3,3 h-42 a3,3 0 0 1 -3,-3 v-25 a3,3 0 0 1 3,-3 z" fill="#f6b042"/>
+<text class="big" x="104" y="334">Swarm folder</text>
+<text class="s" x="104" y="358">one folder every device reads and writes</text>
+<use href="#no" x="560" y="330"/><text class="m" x="576" y="335">notes.md</text>
+<use href="#ph" x="710" y="330"/><text class="m" x="726" y="335">holiday.jpg</text>
+<use href="#vi" x="860" y="330"/><text class="m" x="876" y="335">birthday.mp4</text>
+<use href="#no" x="1010" y="330"/><text class="m" x="1026" y="335">budget.ods</text>
+<text class="tag cp" x="554" y="374">WRITABLE</text><text class="s" x="632" y="375">edits merge on every device; two at once keep both</text>
+<rect class="boxd" x="20.0" y="450" width="366.6666666666667" height="112" rx="6"/>
+<circle cx="46.0" cy="480" r="7" fill="#f6b042"/>
+<text class="t" x="64.0" y="485">Browse every device</text>
+<text class="b" x="42.0" y="518">Each device lends its folders.</text>
+<text class="b" x="42.0" y="540">The others see them at once.</text>
+<rect class="boxd" x="406.6666666666667" y="450" width="366.6666666666667" height="112" rx="6"/>
+<circle cx="432.6666666666667" cy="480" r="7" fill="#e8833a"/>
+<text class="t" x="450.6666666666667" y="485">Bytes move on demand</text>
+<text class="b" x="428.6666666666667" y="518">Only the list travels ahead;</text>
+<text class="b" x="428.6666666666667" y="540">a file comes when you open it.</text>
+<rect class="boxd" x="793.3333333333334" y="450" width="366.6666666666667" height="112" rx="6"/>
+<circle cx="819.3333333333334" cy="480" r="7" fill="#5ce1e6"/>
+<text class="t" x="837.3333333333334" y="485">No cloud in between</text>
+<text class="b" x="815.3333333333334" y="518">Devices talk directly, encrypted,</text>
+<text class="b" x="815.3333333333334" y="540">and relay for each other.</text>
+</svg>

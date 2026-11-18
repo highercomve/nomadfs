@@ -47,6 +47,8 @@ When the join completes, each device has the other as a trusted device, the
 new device has the swarm key, and it has saved the inviter's address, so either
 side can reconnect after a restart.
 
+[The phone scans the invite; only that code opens the encrypted channel in which the swarm key travels.](<$image.siteAsset('learn/invite.svg').alt('The laptop, already in the swarm, shows an invite QR code that works once for 10 minutes. The new phone scans it or pastes the code. Only that code opens an encrypted channel, in which the devices swap identities and addresses and the laptop sends the swarm key, which is never shown on screen. Afterwards each trusts the other and the phone is in the swarm. A used or expired code opens nothing.')>)
+
 # [What happens on the wire]($heading.id('wire'))
 
 The inviting device opens a short-lived listener on its node port + 1. The
