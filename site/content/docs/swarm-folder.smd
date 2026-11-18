@@ -12,6 +12,8 @@ read-only for the others. The swarm folder belongs to the whole swarm: any
 device can add files and folders, rename them and delete them, and every other
 device sees the change.
 
+[Every device sees the same list. A file is stored where it was added, on as many other devices as you choose and on the backup device; opening it elsewhere pulls it from all of them at once.](<$image.siteAsset('learn/swarm-folder.svg').alt('Four devices around the swarm folder: Phone, Laptop, Desktop and Backup server. All four hold the same list: holiday.jpg added from the phone, birthday.mp4 from the desktop and notes.md from the laptop. Each file is stored on the device that added it, on one more device and on the backup server: the photo is copied from the phone to the laptop. The phone keeps only its own files, so when it opens birthday.mp4 it pulls the video from the desktop and the backup server at the same time. If a device is off or lost, its files are still on the others.')>)
+
 # [Using it]($heading.id('using'))
 
 In the app, open **Swarm folder** (on phones, **Swarm** in the navigation
