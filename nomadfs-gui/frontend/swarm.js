@@ -3,7 +3,7 @@
 import { $, snack, svg, ICONS, drawCrumbs, listLoading, listLoaded } from "./core.js";
 import { formatSize, formatDate, timeAgo } from "./format.js";
 import { fileType, iconFor } from "./file-types.js";
-import { row, askDialog } from "./overlays.js";
+import { row, askDialog, showMenu } from "./overlays.js";
 import { FileTable } from "./file-table.js";
 import { syncBack, registerUp } from "./back.js";
 import { isRunning } from "./state.js";
@@ -122,6 +122,11 @@ function swarmRow(it, files) {
   const li = row({
     // While selecting, a tap picks the row: no menu, nothing opens.
     menu: swarmSel.active ? null : swarmMenu(it, true),
+    // Touch: a long press selects, as Android's Photos does.
+    onLongPress: () => {
+      swarmPressed = { path: it.path, at: Date.now() };
+      if (!swarmSel.has(it.path)) swarmSel.toggle(it.path, it);
+    },
     icon: it.dir ? "folder" : iconFor(it.name, false),
     iconClass: it.dir ? "folder" : "",
     headline: it.name,
@@ -173,6 +178,7 @@ function swarmSelBar() {
   swarmBar.el.hidden = !swarmSel.active;
   swarmBar.update({
     count: swarmSel.size,
+    more: swarmSel.size === 1,
     all: swarmSel.hasAll(swarmTable.shown.map((e) => e.path)),
     busy: swarmSelBusy,
   });
@@ -193,8 +199,17 @@ function swarmSelChanged() {
   syncBack(); // Back leaves select mode first
 }
 
+// The long press that selected a row: the tap that ends it lands on the row
+// redrawn with its checkbox, and must not unselect it.
+let swarmPressed = null;
+
 function swarmSelectClick(it, e) {
   if (swarmSelBusy) return;
+  if (swarmPressed && swarmPressed.path === it.path && Date.now() - swarmPressed.at < 1500) {
+    swarmPressed = null;
+    return;
+  }
+  swarmPressed = null;
   if (e.shiftKey) {
     getSelection()?.removeAllRanges(); // Shift-click also selects the page's text
     const shown = swarmTable.shown;
@@ -318,6 +333,14 @@ export function installSwarm() {
     onAll: swarmSelectAll,
     onDelete: swarmDeleteSelected,
     onCancel: () => swarmSel.leave(),
+    // One selected: its own actions (Rename, Move, Details...), which on a
+    // phone the long press no longer opens.
+    onMore: (btn) => {
+      const [it] = swarmSel.values();
+      if (!it) return;
+      const r = btn.getBoundingClientRect();
+      showMenu(r.left, r.top, swarmItemMenu(it).map((m) => (m === "-" ? m : { ...m, run: () => { swarmSel.leave(); m.run(); } })));
+    },
   });
   $("swarm-section").appendChild(swarmBar.el);
   $("swarm-select").addEventListener("click", () => {

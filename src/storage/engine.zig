@@ -218,6 +218,7 @@ pub const StorageEngine = struct {
         // Keeping it counts against the quota, like a put.
         if (self.quota) |limit| if (self.used_bytes > limit or stat.size > limit - self.used_bytes) return error.StorageFull;
         try self.cache_dir.rename(&hex_cid, self.root_dir, &hex_cid, io);
+        self.touchLocked(self.root_dir, &hex_cid); // kept from now: fresh (see collect)
         self.cache_bytes -|= stat.size;
         self.cache_blocks -|= 1;
         if (self.quota != null) self.used_bytes += stat.size;
@@ -283,6 +284,51 @@ pub const StorageEngine = struct {
         return .{ .blocks = moved, .bytes = bytes };
     }
 
+    fn touchLocked(_: *StorageEngine, dir: std.Io.Dir, hex_cid: []const u8) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const f = dir.openFile(io, hex_cid, .{}) catch return;
+        defer f.close(io);
+        f.setTimestampsNow(io) catch {};
+    }
+
+    pub const Freed = struct { blocks: u64 = 0, bytes: u64 = 0 };
+
+    /// Deletes every block file, kept or cached, that is not in `keep` and
+    /// was not written, pinned or rewritten in the last `min_age_s` seconds:
+    /// the blocks of deleted files and replaced versions. The age spares
+    /// blocks of a file still being written, whose entry isn't recorded yet.
+    pub fn collect(self: *StorageEngine, keep: *const std.AutoHashMapUnmanaged([32]u8, void), min_age_s: i64) !Freed {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const now_s: i64 = std.Io.Clock.real.now(io).toSeconds();
+        var freed: Freed = .{};
+        for ([_]std.Io.Dir{ self.root_dir, self.cache_dir }, [_]bool{ false, true }) |dir, cached| {
+            var names: std.ArrayList([hex_cid_len]u8) = .empty;
+            defer names.deinit(self.allocator);
+            var it = dir.iterate();
+            while (try it.next(io)) |entry| {
+                if (entry.kind != .file or !isHexCid(entry.name)) continue;
+                var cid: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&cid, entry.name) catch continue;
+                if (keep.contains(cid)) continue;
+                try names.append(self.allocator, entry.name[0..hex_cid_len].*);
+            }
+            for (names.items) |*name| {
+                const stat = dir.statFile(io, name, .{}) catch continue;
+                if (now_s - stat.mtime.toSeconds() < min_age_s) continue;
+                dir.deleteFile(io, name) catch continue;
+                freed.blocks += 1;
+                freed.bytes += stat.size;
+                if (cached) {
+                    self.cache_bytes -|= stat.size;
+                    self.cache_blocks -|= 1;
+                } else if (self.quota != null) self.used_bytes -|= stat.size;
+            }
+        }
+        return freed;
+    }
+
     /// Deletes the least recently read cache blocks until the cache holds at
     /// most `target` bytes. A read refreshes a block's mtime, so mtime order
     /// is recency order. Caller holds the lock.
@@ -344,7 +390,12 @@ pub const StorageEngine = struct {
         defer self.mutex.unlock();
 
         const hex_cid = std.fmt.bytesToHex(block.cid, .lower);
-        if (self.rootHasLocked(&hex_cid)) return;
+        if (self.rootHasLocked(&hex_cid)) {
+            // Written again (a new file sharing it): fresh again, so a
+            // collection that started before its file was recorded spares it.
+            self.touchLocked(self.root_dir, &hex_cid);
+            return;
+        }
 
         const size: u64 = block.data.len;
         if (self.quota) |limit| {
@@ -406,6 +457,35 @@ pub const StorageEngine = struct {
     pub fn getLocal(self: *StorageEngine, cid: *const [32]u8, allocator: std.mem.Allocator) !?[]u8 {
         const hex_cid = std.fmt.bytesToHex(cid.*, .lower);
         return self.readStored(&hex_cid, allocator);
+    }
+
+    pub const LocalNode = union(enum) { missing, leaf, node: []u8 };
+
+    /// What a block stored here is, reading a leaf's first byte only: a
+    /// parent's or dir's bytes (caller-owned), `.leaf`, or `.missing`. For
+    /// walking what the store keeps without reading every file's data. A
+    /// cached block's read time is left alone.
+    pub fn getLocalNode(self: *StorageEngine, cid: *const [32]u8, allocator: std.mem.Allocator) !LocalNode {
+        const hex_cid = std.fmt.bytesToHex(cid.*, .lower);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var file = self.root_dir.openFile(io, &hex_cid, .{}) catch |err| switch (err) {
+            error.FileNotFound => self.cache_dir.openFile(io, &hex_cid, .{}) catch |e| switch (e) {
+                error.FileNotFound => return .missing,
+                else => return e,
+            },
+            else => return err,
+        };
+        defer file.close(io);
+        var tag: [1]u8 = undefined;
+        if (try file.readPositionalAll(io, &tag, 0) != 1) return .leaf;
+        if (tag[0] == 0) return .leaf; // dag codec: a leaf's tag
+        const size = (try file.stat(io)).size;
+        const buffer = try allocator.alloc(u8, size);
+        errdefer allocator.free(buffer);
+        if (try file.readPositionalAll(io, buffer, 0) != size) return error.ReadError;
+        return .{ .node = buffer };
     }
 
     /// Returns the block, or null if it is not stored. The data is verified
@@ -652,4 +732,57 @@ test "demoteExcept moves only blocks outside the keep set into the cache" {
     _ = try engine.clearCache();
     try std.testing.expect(engine.has(&mine.cid));
     try std.testing.expect(!engine.has(&old_read.cid));
+}
+
+test "collect deletes kept and cached blocks outside the keep set, sparing young ones" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const test_path = "test_storage_engine_collect";
+    std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+
+    var engine = try StorageEngine.init(allocator, test_path);
+    defer engine.deinit();
+    const live = Block.new("a live file");
+    const gone = Block.new("a deleted one");
+    const read = Block.new("read, then deleted");
+    try engine.put(live);
+    try engine.put(gone);
+    try engine.putCached(read);
+
+    var keep: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer keep.deinit(allocator);
+    try keep.put(allocator, live.cid, {});
+    // Just written: too young to go.
+    const spared = try engine.collect(&keep, 3600);
+    try std.testing.expectEqual(@as(u64, 0), spared.blocks);
+    try std.testing.expect(engine.has(&gone.cid));
+
+    const freed = try engine.collect(&keep, 0);
+    try std.testing.expectEqual(@as(u64, 2), freed.blocks);
+    try std.testing.expectEqual(@as(u64, gone.data.len + read.data.len), freed.bytes);
+    try std.testing.expect(engine.has(&live.cid));
+    try std.testing.expect(!engine.has(&gone.cid));
+    try std.testing.expect(!engine.has(&read.cid));
+    try std.testing.expectEqual(@as(u64, 0), engine.cacheStats().blocks);
+}
+
+test "getLocalNode tells a leaf without reading it and returns a parent's bytes" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const test_path = "test_storage_engine_local_node";
+    std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+
+    var engine = try StorageEngine.init(allocator, test_path);
+    defer engine.deinit();
+    const leaf = Block.new(&.{ 0, 'h', 'i' });
+    const parent = Block.new(&.{ 1, 0, 0 });
+    try engine.put(leaf);
+    try engine.putCached(parent);
+    try std.testing.expect(try engine.getLocalNode(&leaf.cid, allocator) == .leaf);
+    const got = try engine.getLocalNode(&parent.cid, allocator);
+    defer allocator.free(got.node);
+    try std.testing.expectEqualSlices(u8, parent.data, got.node);
+    try std.testing.expect(try engine.getLocalNode(&[_]u8{7} ** 32, allocator) == .missing);
 }

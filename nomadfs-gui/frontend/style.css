@@ -2033,7 +2033,12 @@ body.pv-open #snackbar { top: calc(12px + env(safe-area-inset-top)); bottom: aut
 .list.rows li.selected { background: rgb(246 176 66 / .08); border-radius: 12px; }
 .list.rows li.selected .row-check { background: var(--md-primary); border-color: var(--md-primary); }
 .list.rows li.selected .row-check svg { opacity: 1; }
-#swarm-section.selecting .list.rows li { user-select: none; -webkit-user-select: none; }
+/* A long press selects rows: no text selection or callout from it. */
+#swarm-section .list.rows li { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+@media (max-width: 480px) {
+  .select-bar { gap: 4px; }
+  .select-bar .btn, .select-bar .btn.text { padding: 0 8px; }
+}
 /* The row buttons act on one item: out of the way (the columns keep their place). */
 #swarm-section.selecting .row-actions { visibility: hidden; }
 #swarm-section.selecting .table-head:not([hidden]) { padding-left: 88px; } /* + checkbox (24) and gap (12) */

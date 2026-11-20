@@ -124,6 +124,27 @@ pub fn addStoredReachable(allocator: std.mem.Allocator, store: *StorageEngine, r
     }
 }
 
+/// Like addStoredReachable, but a leaf's data is never read (only its first
+/// byte, to tell it from a parent): for collecting what the store keeps,
+/// which walks every file the device holds.
+pub fn addStoredLinks(allocator: std.mem.Allocator, store: *StorageEngine, root: *const Cid, set: *CidSet) !void {
+    var stack: std.ArrayList(Cid) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, root.*);
+    while (stack.pop()) |cid| {
+        if ((try set.getOrPut(allocator, cid)).found_existing) continue;
+        const bytes = switch (try store.getLocalNode(&cid, allocator)) {
+            .missing, .leaf => continue,
+            .node => |b| b,
+        };
+        defer allocator.free(bytes);
+        switch (codec.decode(bytes) catch continue) {
+            .leaf => {},
+            inline .parent, .dir => |links| try pushChildren(allocator, &stack, links),
+        }
+    }
+}
+
 /// Bounds and payload policy for a local DAG enumeration.
 pub const CollectOptions = struct {
     max_blocks: usize = default_max_blocks,

@@ -1004,7 +1004,7 @@ pub const Node = struct {
         }
         if (self.store != null and self.cache_thread == null) {
             self.cache_running.store(true, .release);
-            self.cache_thread = std.Thread.spawn(.{}, runCacheSort, .{self}) catch null;
+            self.cache_thread = std.Thread.spawn(.{}, runCacheThread, .{self}) catch null;
         }
     }
 
@@ -1018,6 +1018,79 @@ pub const Node = struct {
     const cache_sorted_marker = ".sorted-v1";
     /// Longest wait for a share that has no root and isn't being scanned.
     const cache_sort_wait_ns: u64 = 30 * std.time.ns_per_min;
+
+    /// First collection after the start, then one every gc_interval_ms.
+    const gc_first_ms: i64 = 60 * 1000;
+    const gc_interval_ms: i64 = 5 * 60 * 1000;
+    /// Blocks written more recently than this are never collected: their
+    /// file may still be on its way into the folder's list.
+    const gc_min_age_s: i64 = 10 * 60;
+
+    /// The store's thread: sorts old blocks once, then collects the blocks
+    /// of deleted files from time to time, until the node stops.
+    fn runCacheThread(self: *Node) void {
+        self.runCacheSort();
+        var next = sync.monotonicMillis() + gc_first_ms;
+        // A round walks every file held: only after a change (or an hour,
+        // for blocks that were too young the last time).
+        var last_gen: ?u64 = null;
+        var last_run: i64 = 0;
+        while (self.cache_running.load(.acquire)) {
+            const now = sync.monotonicMillis();
+            if (now >= next) {
+                next = now + gc_interval_ms;
+                const gen = if (self.swarm) |f| f.changeGeneration() else 0;
+                if (last_gen == null or last_gen.? != gen or now - last_run >= 60 * 60 * 1000) {
+                    if (self.collectGarbage()) |ran| {
+                        if (ran) {
+                            last_gen = gen;
+                            last_run = now;
+                        }
+                    } else |err| std.debug.print("store: collecting deleted files' blocks failed: {any}\n", .{err});
+                }
+            }
+            sync.sleep(500 * std.time.ns_per_ms);
+        }
+    }
+
+    /// Deletes the blocks no file needs any more: those of files deleted
+    /// from the swarm folder (here or on another device) and of replaced
+    /// versions, kept or cached, and their kept thumbnails. Keeps every live
+    /// swarm file's blocks this device holds (whoever wrote it), files
+    /// deleted here a moment ago (undo), and the shares' blocks. Skipped
+    /// while a share is being indexed or the folder hasn't pulled yet: a
+    /// partial list would delete blocks that are still wanted.
+    /// Answers whether it ran (false: skipped, try again later).
+    pub fn collectGarbage(self: *Node) !bool {
+        const store = self.store orelse return false;
+        const swarm = self.swarm orelse return false;
+        if (self.sharesState() != .scanned) return false;
+        const roots = (try swarm.liveRoots(self.allocator)) orelse return false;
+        defer self.allocator.free(roots);
+
+        var keep: storage.dag.walk.CidSet = .empty;
+        defer keep.deinit(self.allocator);
+        var live: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+        defer live.deinit(self.allocator);
+        if (self.shares) |shares| {
+            const snap = try shares.snapshot(self.allocator);
+            defer fs.ShareIndex.freeSnapshot(self.allocator, snap);
+            for (snap) |sh| {
+                if (sh.indexing) return false; // started meanwhile
+                if (sh.root) |r| try storage.dag.walk.addStoredLinks(self.allocator, store, &r, &keep);
+            }
+        }
+        for (roots) |*r| {
+            try live.put(self.allocator, r.*, {});
+            try storage.dag.walk.addStoredLinks(self.allocator, store, r, &keep);
+        }
+        if (!self.cache_running.load(.acquire)) return false;
+        const freed = try store.collect(&keep, gc_min_age_s);
+        const thumbs_gone = if (self.thumbs) |t| t.store.sweepKept(&live) catch 0 else 0;
+        if (freed.blocks > 0 or thumbs_gone > 0)
+            std.debug.print("store: freed {d} blocks ({d} bytes) and {d} thumbnails of deleted files\n", .{ freed.blocks, freed.bytes, thumbs_gone });
+        return true;
+    }
 
     fn runCacheSort(self: *Node) void {
         const store = self.store orelse return;

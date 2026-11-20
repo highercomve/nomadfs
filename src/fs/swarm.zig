@@ -89,6 +89,10 @@ pub const SwarmFolder = struct {
     keeper: ?*cluster.keeper.Keeper = null,
     /// Who keeps which file besides backup devices (cluster/placement.zig).
     placement: ?Placement = null,
+    /// Content of files deleted here lately, with when (monotonic ms): kept
+    /// through a collection for `undo_grace_ms`, so a delete can still be
+    /// undone (a note's Undo reads it back). Guarded by `mutex`.
+    recent_deletes: std.ArrayList(RecentDelete) = .empty,
     /// Guards `backed_up` and the backup counters.
     backup_mutex: sync.Mutex = .{},
     /// Root CIDs of files copied here in full, kept in `<manifest>.backup`
@@ -195,6 +199,7 @@ pub const SwarmFolder = struct {
         self.writeIfDirty(true); // an edit still unwritten
         self.backup_enabled.store(false, .release);
         self.backed_up.deinit(self.allocator);
+        self.recent_deletes.deinit(self.allocator);
         self.manifest.deinit();
         self.allocator.free(self.self_name);
         self.allocator.free(self.file_path);
@@ -484,6 +489,46 @@ pub const SwarmFolder = struct {
         return roots.toOwnedSlice(allocator);
     }
 
+    pub const RecentDelete = struct { cid: [32]u8, at_ms: i64 };
+    /// How long a deleted file's content outlives a collection.
+    pub const undo_grace_ms: i64 = 10 * 60 * 1000;
+
+    /// Caller holds `mutex`. Remembers the content of a live file about to
+    /// be deleted (see `recent_deletes`). Best effort: a failed append only
+    /// shortens the undo window to the next collection.
+    fn noteDeleteLocked(self: *SwarmFolder, path: []const u8) void {
+        const e = self.manifest.get(path) orelse return;
+        if (e.deleted or e.kind != .file) return;
+        const now_ms = sync.monotonicMillis();
+        var i: usize = 0;
+        while (i < self.recent_deletes.items.len) {
+            if (now_ms - self.recent_deletes.items[i].at_ms > undo_grace_ms) _ = self.recent_deletes.swapRemove(i) else i += 1;
+        }
+        self.recent_deletes.append(self.allocator, .{ .cid = e.cid, .at_ms = now_ms }) catch {};
+    }
+
+    /// Root CIDs whose blocks must stay on this device: every live file's
+    /// (whoever wrote it: a file moved or renamed elsewhere is still the
+    /// one this device holds), and files deleted here in the last
+    /// `undo_grace_ms`. Null until the folder has pulled from another device
+    /// once: before that its list may be missing files it holds. Caller frees.
+    pub fn liveRoots(self: *SwarmFolder, allocator: std.mem.Allocator) !?[][32]u8 {
+        var roots: std.ArrayList([32]u8) = .empty;
+        errdefer roots.deinit(allocator);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.awaitingLocked()) return null;
+        for (self.manifest.entries.values()) |e| {
+            if (e.deleted or e.kind != .file) continue;
+            try roots.append(allocator, e.cid);
+        }
+        const now_ms = sync.monotonicMillis();
+        for (self.recent_deletes.items) |r| {
+            if (now_ms - r.at_ms <= undo_grace_ms) try roots.append(allocator, r.cid);
+        }
+        return try roots.toOwnedSlice(allocator);
+    }
+
     pub fn makeDir(self: *SwarmFolder, dir: []const u8, name: []const u8) !void {
         const path = try join(self.allocator, dir, name);
         defer self.allocator.free(path);
@@ -504,7 +549,10 @@ pub const SwarmFolder = struct {
         const doomed = try self.liveUnderLocked(path);
         defer freePaths(self.allocator, doomed);
         if (doomed.len == 0) return error.FileNotFound;
-        for (doomed) |p| _ = try self.manifest.edit(p, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+        for (doomed) |p| {
+            self.noteDeleteLocked(p);
+            _ = try self.manifest.edit(p, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+        }
         try self.saveLocked();
     }
 
@@ -523,7 +571,10 @@ pub const SwarmFolder = struct {
             const doomed = try self.liveUnderLocked(path);
             defer freePaths(self.allocator, doomed);
             if (doomed.len == 0) continue;
-            for (doomed) |p| _ = try self.manifest.edit(p, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+            for (doomed) |p| {
+                self.noteDeleteLocked(p);
+                _ = try self.manifest.edit(p, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+            }
             removed += 1;
         }
         if (removed > 0) try self.saveLocked();
@@ -544,6 +595,7 @@ pub const SwarmFolder = struct {
         const entry = self.manifest.get(path) orelse return error.FileNotFound;
         if (entry.deleted or entry.kind != .file) return error.FileNotFound;
         if (base) |expected| if (!std.mem.eql(u8, &entry.cid, &expected)) return error.Changed;
+        self.noteDeleteLocked(path);
         _ = try self.manifest.edit(path, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
         try self.saveLocked();
     }
@@ -1632,6 +1684,33 @@ test "swarm: removeMany deletes files and folders at once and skips what is gone
     try std.testing.expect(folder.fileInfo("Old/deep/y.txt") == null);
     try std.testing.expectError(error.InvalidPath, folder.removeMany(&.{ "Camera/b.jpg", "../etc" }));
     try std.testing.expect(folder.fileInfo("Camera/b.jpg") != null);
+}
+
+test "swarm: liveRoots has every live file and what was deleted a moment ago" {
+    var t: TestFolder = undefined;
+    try t.open(0x25, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    const a = (try folder.putBytes("a.txt", "a", null)).cid;
+    const b = (try folder.putBytes("b.txt", "b", null)).cid;
+    const c = (try folder.putBytes("c.txt", "c", null)).cid;
+    try folder.remove("b.txt");
+    try folder.remove("c.txt");
+    // c was deleted long ago: past the undo grace.
+    folder.recent_deletes.items[1].at_ms -= SwarmFolder.undo_grace_ms + 1;
+
+    const roots = (try folder.liveRoots(std.testing.allocator)).?;
+    defer std.testing.allocator.free(roots);
+    var has_a = false;
+    var has_b = false;
+    var has_c = false;
+    for (roots) |r| {
+        if (std.mem.eql(u8, &r, &a)) has_a = true;
+        if (std.mem.eql(u8, &r, &b)) has_b = true;
+        if (std.mem.eql(u8, &r, &c)) has_c = true;
+    }
+    try std.testing.expect(has_a and has_b and !has_c);
 }
 
 test "swarm: removeFile removes one file, only from its base, never a folder" {

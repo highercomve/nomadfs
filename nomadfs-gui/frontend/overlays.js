@@ -4,7 +4,7 @@ import { $, svg, ICONS } from "./core.js";
 import { syncBack, registerUp } from "./back.js";
 
 /** A Material list row: leading icon, headline + meta, optional trailing button. */
-export function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = false, onClick, action, actions, cols, menu }) {
+export function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = false, onClick, action, actions, cols, menu, onLongPress }) {
   if (action && !actions) actions = [action];
   const li = document.createElement("li");
   const lead = document.createElement("span");
@@ -66,7 +66,7 @@ export function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = fa
     li.classList.add("clickable");
     li.addEventListener("click", (e) => { if (!li.dataset.menuOpened) onClick(e); delete li.dataset.menuOpened; });
   }
-  if (menu?.length) attachMenu(li, menu);
+  if (menu?.length || onLongPress) attachMenu(li, menu || [], onLongPress);
   return li;
 }
 
@@ -74,12 +74,16 @@ export function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = fa
 
 let menuEl = null;
 
-/** `items`: { icon, label, run, danger } or "-" (a separator). */
-export function attachMenu(li, items) {
+/** `items`: { icon, label, run, danger } or "-" (a separator). With
+ *  `onLongPress`, a long press on a touch screen runs it instead of opening
+ *  the menu (selecting, as Android's Photos does); right-click still opens it. */
+export function attachMenu(li, items, onLongPress = null) {
   li.addEventListener("contextmenu", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    showMenu(e.clientX, e.clientY, items);
+    // A touch's long press also fires contextmenu: the timer below owns it.
+    if (onLongPress && e.pointerType === "touch") return;
+    if (items.length) showMenu(e.clientX, e.clientY, items);
   });
   // Touch: a long press opens it, and the click that ends it doesn't open the row.
   let timer = 0;
@@ -89,7 +93,10 @@ export function attachMenu(li, items) {
     start = { x: e.clientX, y: e.clientY };
     timer = setTimeout(() => {
       li.dataset.menuOpened = "1";
-      showMenu(start.x, start.y, items);
+      if (onLongPress) {
+        navigator.vibrate?.(20);
+        onLongPress();
+      } else showMenu(start.x, start.y, items);
     }, 550);
   });
   const cancel = () => clearTimeout(timer);

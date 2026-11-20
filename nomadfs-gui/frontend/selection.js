@@ -129,7 +129,7 @@ export function deletedText({ deleted, error }) {
  *  `onAll` is optional (no "All" button without it). Returns
  *  { el, update({ count, all, busy }) }; `busy` is a text shown instead of
  *  the count while the delete runs. */
-export function selectionBar({ label, onAll = null, onDelete, onCancel }) {
+export function selectionBar({ label, onAll = null, onDelete, onCancel, onMore = null }) {
   const el = document.createElement("div");
   el.className = "select-bar";
   el.hidden = true;
@@ -155,15 +155,19 @@ export function selectionBar({ label, onAll = null, onDelete, onCancel }) {
   count.setAttribute("role", "status");
   count.setAttribute("aria-live", "polite");
   const cancel = button("btn text", "Cancel", onCancel);
+  const more = onMore ? button("btn text select-more", "More", (e) => onMore(e.currentTarget)) : null;
+  if (more) more.hidden = true;
   const del = button("btn filled danger", "Delete", onDelete);
   if (all) el.appendChild(all);
   el.appendChild(count);
   el.appendChild(cancel);
+  if (more) el.appendChild(more);
   el.appendChild(del);
 
   return {
     el,
-    update({ count: n = 0, all: allOn = false, busy = "" }) {
+    update({ count: n = 0, all: allOn = false, busy = "", more: moreOn = false }) {
+      if (more) more.hidden = !moreOn || !!busy;
       count.textContent = busy || `${n} selected`;
       del.disabled = !!busy || n === 0;
       cancel.disabled = !!busy;
