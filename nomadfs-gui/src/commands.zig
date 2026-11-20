@@ -1155,6 +1155,16 @@ pub fn swarmDelete(args: SwarmPathArgs) !void {
     try (try swarmFolder()).remove(args.path);
 }
 
+pub const SwarmPathsArgs = struct { paths: []const []const u8 };
+
+/// `swarm_delete_many { paths }`: files and folders, in one manifest write.
+/// Answers how many were deleted (paths already gone are skipped).
+pub fn swarmDeleteMany(args: SwarmPathsArgs) !usize {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    return (try swarmFolder()).removeMany(args.paths);
+}
+
 pub const SwarmRenameArgs = struct { path: []const u8, name: []const u8 };
 
 /// `swarm_rename { path, name }`: in place, same parent folder.

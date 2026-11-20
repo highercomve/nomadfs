@@ -155,7 +155,7 @@ pub fn build(b: *std.Build) void {
 
     // zig build test-frontend: the page's own logic (the Markdown renderer,
     // what the notes list decides), in Node. Needs `node` (22 or newer).
-    const frontend_test = b.addSystemCommand(&.{ "node", "--test", "frontend-test/markdown.test.mjs", "frontend-test/notes-model.test.mjs", "frontend-test/app-fixes.test.mjs", "frontend-test/photos-model.test.mjs", "frontend-test/zoom.test.mjs", "frontend-test/thumb-loader.test.mjs", "frontend-test/backup-model.test.mjs", "frontend-test/offsite-model.test.mjs" });
+    const frontend_test = b.addSystemCommand(&.{ "node", "--test", "frontend-test/markdown.test.mjs", "frontend-test/notes-model.test.mjs", "frontend-test/app-fixes.test.mjs", "frontend-test/photos-model.test.mjs", "frontend-test/zoom.test.mjs", "frontend-test/thumb-loader.test.mjs", "frontend-test/backup-model.test.mjs", "frontend-test/offsite-model.test.mjs", "frontend-test/selection.test.mjs" });
     frontend_test.setCwd(b.path("."));
     // Plus the full-entry smoke: imports app.js with fake DOM/Oriel and bootes it.
     const smoke_test = b.addSystemCommand(&.{ "node", "frontend-test/smoke-imports.mjs" });

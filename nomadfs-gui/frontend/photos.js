@@ -1,7 +1,10 @@
 // ---- Photos: virtualised grid timeline with day grouping and year scrubber ----
 
-import { $, svg, ICONS } from "./core.js";
+import { $, svg, ICONS, snack } from "./core.js";
 import { errText } from "./format.js";
+import { askDialog } from "./overlays.js";
+import { syncBack, registerUp } from "./back.js";
+import { Selection, selectionBar, longPress, deleteCopy, deleteMany, deletedText } from "./selection.js";
 import { fileMenu } from "./file-actions.js";
 import { startDownload } from "./downloads.js";
 import { openPreview } from "./preview.js";
@@ -52,11 +55,17 @@ function createTileNode() {
   badge.hidden = true;
   badge.appendChild(svg("M8 5v14l11-7z")); // Play glyph
 
+  // The tick shown on a selected tile (CSS shows it only while selecting).
+  const check = document.createElement("div");
+  check.className = "photo-check";
+  check.appendChild(svg(ICONS.check));
+
   tile.appendChild(img);
   tile.appendChild(placeholder);
   tile.appendChild(badge);
+  tile.appendChild(check);
 
-  return { el: tile, img, placeholder, badge };
+  return { el: tile, img, placeholder, badge, path: null };
 }
 
 function acquireTile() {
@@ -66,6 +75,8 @@ function acquireTile() {
 function releaseTile(tileObj) {
   if (tileObj.key) thumbs.drop(tileObj.key);
   tileObj.key = null;
+  tileObj.path = null;
+  markTile(tileObj);
   tileObj.el.onclick = null;
   tileObj.img.onload = null;
   tileObj.img.onerror = null;
@@ -167,6 +178,9 @@ async function fetchPage(pIdx, gen, folder) {
 }
 
 function updateTile(tileObj, item) {
+  // Rows come and go as the grid scrolls: a tile is selected by its path.
+  tileObj.path = item ? item.path : null;
+  markTile(tileObj);
   if (!item) {
     tileObj.img.hidden = true;
     tileObj.img.removeAttribute("src");
@@ -240,6 +254,161 @@ function updateVisibleTilesForPage(pIdx, items) {
   }
 }
 
+// ---- Selecting several photos, to delete them at once ----
+
+// Selected photos by swarm path: it outlives the rows, which unmount as they
+// scroll away, and the pages, which are fetched again after a change.
+const sel = new Selection(() => selectionChanged());
+let selAnchor = -1; // the index last tapped: where a shift-click range starts
+let selBusy = ""; // what the bar says while the delete runs
+let selBar = null; // built when the screen installs
+let press = null; // the grid's long press
+
+function markTile(tileObj) {
+  const on = sel.active && !!tileObj.path && sel.has(tileObj.path);
+  tileObj.el.classList.toggle("selected", on);
+  if (sel.active) {
+    tileObj.el.setAttribute("role", "checkbox");
+    tileObj.el.setAttribute("aria-checked", on ? "true" : "false");
+  } else {
+    tileObj.el.removeAttribute("role");
+    tileObj.el.removeAttribute("aria-checked");
+  }
+}
+
+/** While selecting, a day's date is a button: it picks the whole day. */
+function markDayHead(el) {
+  el.classList.toggle("selectable", sel.active);
+  if (sel.active) {
+    el.setAttribute("role", "button");
+    el.setAttribute("aria-label", `Select all of ${el.textContent}`);
+  } else {
+    el.removeAttribute("role");
+    el.removeAttribute("aria-label");
+  }
+}
+
+function drawSelectionBar() {
+  if (!selBar) return;
+  selBar.el.hidden = !sel.active;
+  selBar.update({ count: sel.size, busy: selBusy });
+}
+
+function selectionChanged() {
+  $("photos-section").classList.toggle("selecting", sel.active);
+  $("photos-select").setAttribute("aria-pressed", sel.active ? "true" : "false");
+  for (const mounted of mountedRows.values()) {
+    if (mounted.type === "header") markDayHead(mounted.el);
+    else if (mounted.tiles) for (const t of mounted.tiles) markTile(t);
+  }
+  drawSelectionBar();
+  if (!sel.active) selAnchor = -1;
+  syncBack(); // Back leaves select mode first
+}
+
+function tileClick(tileObj, itemIdx, e) {
+  // The tap that ends a long press already selected the tile.
+  if (press?.wasLongPress()) return;
+  // Ctrl/Cmd-click picks one, Shift-click everything up to it.
+  if (!sel.active && !e.ctrlKey && !e.metaKey && !e.shiftKey) return openPreviewAt(itemIdx);
+  if (selBusy) return;
+  if (e.shiftKey && selAnchor >= 0 && selAnchor !== itemIdx) {
+    const from = Math.min(selAnchor, itemIdx);
+    selectRange(from, Math.abs(selAnchor - itemIdx) + 1, true);
+    selAnchor = itemIdx;
+    return;
+  }
+  if (!tileObj.path) return; // not loaded yet: nothing to pick
+  sel.toggle(tileObj.path);
+  selAnchor = itemIdx;
+}
+
+/** Selects or unselects `count` photos from `start` (`on` null: unselects
+ *  them when all are selected, else selects them). Their pages may still
+ *  have to load. */
+async function selectRange(start, count, on = null) {
+  const gen = currentGeneration;
+  const folder = currentFolder;
+  const paths = [];
+  try {
+    for (let i = start; i < start + count; i++) {
+      const item = await getItemAsync(i);
+      if (gen !== currentGeneration || folder !== currentFolder || !sel.active) return;
+      if (item?.path) paths.push(item.path);
+    }
+  } catch (err) {
+    snack(`Couldn't select them: ${errText(err)}`);
+    return;
+  }
+  if (!paths.length) return;
+  sel.setMany(paths.map((p) => [p, true]), on ?? !sel.hasAll(paths));
+}
+
+function toggleDay(sectionIndex) {
+  const sec = sections[sectionIndex];
+  if (!sec || selBusy) return;
+  selectRange(sec.start, sec.count);
+}
+
+async function deleteSelected() {
+  if (selBusy || !sel.size) return;
+  const ok = await askDialog({
+    ...deleteCopy(sel.size, { noun: ["photo or video", "photos and videos"] }),
+    confirm: "Delete",
+    danger: true,
+  });
+  if (!ok || !sel.size) return;
+  const paths = sel.keys();
+  selBusy = "Deleting…";
+  drawSelectionBar();
+  const res = await deleteMany(invoke, paths, {
+    size: 500,
+    onProgress: (sent, total) => {
+      if (!sent) return;
+      selBusy = `Deleting ${sent} of ${total}…`;
+      drawSelectionBar();
+    },
+  });
+  selBusy = "";
+  snack(deletedText(res));
+  sel.leave();
+  // A new index and new pages (loadPhotos empties the page cache): the
+  // deleted ones are gone from the grid, which stays where it was.
+  loadPhotos({ folder: currentFolder, keepScroll: true });
+}
+
+function installSelection() {
+  selBar = selectionBar({
+    label: "Selected photos",
+    onDelete: deleteSelected,
+    onCancel: () => sel.leave(),
+  });
+  $("photos-section").appendChild(selBar.el);
+  $("photos-select").addEventListener("click", () => {
+    if (sel.active) sel.leave();
+    else sel.enter();
+  });
+  // Touch: a long press on a photo starts selecting, with that photo.
+  press = longPress($("photos-window"), (e) => {
+    const el = e.target.closest?.(".photo-tile");
+    return el && !sel.active ? el : null;
+  }, (el) => {
+    const item = getCachedItem(Number(el.dataset.index));
+    if (!item?.path || selBusy) return;
+    sel.toggle(item.path);
+    selAnchor = Number(el.dataset.index);
+  }, { onRelease: syncBack }); // the history step is added on the tap's end
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || !sel.active || selBusy) return;
+    if (document.body.dataset.view !== "photos" || !$("ask").hidden) return;
+    sel.leave();
+  });
+  registerUp({
+    depth: () => (document.body.dataset.view === "photos" && sel.active ? 1 : 0),
+    up: () => sel.leave(),
+  });
+}
+
 function renderFolderChips(folders, total) {
   const chipsEl = $("photos-chips");
   if (!chipsEl) return;
@@ -251,6 +420,7 @@ function renderFolderChips(folders, total) {
   allChip.textContent = `All (${total})`;
   allChip.addEventListener("click", () => {
     if (currentFolder === "") return;
+    sel.leave();
     currentFolder = "";
     loadPhotos({ folder: "", keepScroll: false });
   });
@@ -267,6 +437,7 @@ function renderFolderChips(folders, total) {
     chip.textContent = `${name} (${f.count})`;
     chip.addEventListener("click", () => {
       if (currentFolder === f.path) return;
+      sel.leave();
       currentFolder = f.path;
       loadPhotos({ folder: f.path, keepScroll: false });
     });
@@ -339,6 +510,8 @@ function updateVisibleWindow() {
       headEl.style.top = `${r.top}px`;
       headEl.style.height = `${r.h}px`;
       headEl.textContent = r.label;
+      headEl.onclick = () => { if (sel.active) toggleDay(r.sectionIndex); };
+      markDayHead(headEl);
       windowEl.appendChild(headEl);
       mountedRows.set(rIdx, { el: headEl, type: "header" });
     } else if (r.type === "tiles") {
@@ -355,7 +528,7 @@ function updateVisibleWindow() {
         tileObj.el.style.width = `${r.tileSize}px`;
         tileObj.el.style.height = `${r.tileSize}px`;
         tileObj.el.dataset.index = itemIdx;
-        tileObj.el.onclick = () => openPreviewAt(itemIdx);
+        tileObj.el.onclick = (e) => tileClick(tileObj, itemIdx, e);
 
         const item = getCachedItem(itemIdx);
         updateTile(tileObj, item);
@@ -520,6 +693,7 @@ export async function loadPhotos(opts = {}) {
     thumbBase = index.thumb_base || "";
 
     pageCache.clear();
+    selAnchor = -1; // the photos have new positions
 
     renderFolderChips(index.folders, index.total);
 
@@ -569,6 +743,7 @@ export function installPhotos() {
   }
 
   setupScrubberEvents();
+  installSelection();
 
   window.oriel?.listen?.("photos://changed", () => {
     if (document.body.dataset.view === "photos") {

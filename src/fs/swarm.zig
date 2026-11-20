@@ -508,6 +508,28 @@ pub const SwarmFolder = struct {
         try self.saveLocked();
     }
 
+    /// Deletes many files and folders (each with everything in it) under
+    /// one lock and one manifest write. A path that is already gone (another
+    /// device deleted it first) is skipped, not an error. Answers how many
+    /// of `paths` were deleted.
+    pub fn removeMany(self: *SwarmFolder, paths: []const []const u8) !usize {
+        for (paths) |p| if (!manifest_mod.validPath(p)) return error.InvalidPath;
+        defer self.flushSave(); // after the unlock: writes outside the lock
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.editAllowedLocked();
+        var removed: usize = 0;
+        for (paths) |path| {
+            const doomed = try self.liveUnderLocked(path);
+            defer freePaths(self.allocator, doomed);
+            if (doomed.len == 0) continue;
+            for (doomed) |p| _ = try self.manifest.edit(p, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+            removed += 1;
+        }
+        if (removed > 0) try self.saveLocked();
+        return removed;
+    }
+
     /// Removes one file, and only while its content is still `base` (null:
     /// whatever it is), all under one lock: an edit that lands between a
     /// caller's check and the removal is never deleted. A folder is
@@ -1587,6 +1609,29 @@ test "swarm: putBytes with no base refuses an existing path but not a deleted on
     try folder.remove("Notes/one.md");
     _ = try folder.putBytes("Notes/one.md", "again", null);
     try std.testing.expect(folder.fileInfo("Notes/one.md") != null);
+}
+
+test "swarm: removeMany deletes files and folders at once and skips what is gone" {
+    var t: TestFolder = undefined;
+    try t.open(0x24, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    _ = try folder.putBytes("Camera/a.jpg", "a", null);
+    _ = try folder.putBytes("Camera/b.jpg", "b", null);
+    _ = try folder.putBytes("Camera/c.jpg", "c", null);
+    _ = try folder.putBytes("Old/x.txt", "x", null);
+    _ = try folder.putBytes("Old/deep/y.txt", "y", null);
+    try folder.remove("Camera/c.jpg");
+
+    const n = try folder.removeMany(&.{ "Camera/a.jpg", "Camera/c.jpg", "Old", "Nope/z.txt" });
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expect(folder.fileInfo("Camera/a.jpg") == null);
+    try std.testing.expect(folder.fileInfo("Camera/b.jpg") != null);
+    try std.testing.expect(folder.fileInfo("Old/x.txt") == null);
+    try std.testing.expect(folder.fileInfo("Old/deep/y.txt") == null);
+    try std.testing.expectError(error.InvalidPath, folder.removeMany(&.{ "Camera/b.jpg", "../etc" }));
+    try std.testing.expect(folder.fileInfo("Camera/b.jpg") != null);
 }
 
 test "swarm: removeFile removes one file, only from its base, never a folder" {

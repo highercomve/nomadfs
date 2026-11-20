@@ -40,7 +40,7 @@ function $(id){return el(id)}
 }
 {
  elements.clear();const dirs=[];
- const c=context({swarmCrumbs(){},isRunning:()=>true,running:true,listLoading(){},listLoaded(){},snack(){},swarmStatusText(){return 'ok'},swarmTable:{dir:null,show(){},render(){}},invoke:async(cmd,args)=>{dirs.push(args.dir);return {items:[]}}});
+ const c=context({swarmCrumbs(){},isRunning:()=>true,running:true,listLoading(){},listLoaded(){},snack(){},swarmStatusText(){return 'ok'},swarmTable:{dir:null,show(){},render(){}},swarmSel:{leave(){},retain(){}},swarmSelBar(){},invoke:async(cmd,args)=>{dirs.push(args.dir);return {items:[]}}});
  vm.runInContext(`let swarmDir='New folder',swarmNav=0;`+fn('async function loadSwarm(', 'let swarmTable = null;')+`const pending=loadSwarm();`,c);
  await vm.runInContext('pending',c);assert.deepEqual(dirs,['New folder']);assert.equal(vm.runInContext('swarmDir',c),'New folder');
 }
