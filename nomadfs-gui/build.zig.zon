@@ -8,8 +8,8 @@
         // Oriel v0.20.16. To build against a local checkout instead:
         // zig build --fork=../../oriel
         .oriel = .{
-            .url = "https://github.com/highercomve/Oriel/archive/refs/tags/v0.20.16.tar.gz",
-            .hash = "oriel-0.20.16-K1NO5fDCAAE4UrZbUP98Z0UCazS9QcAmIuswY9LR00BR",
+            .url = "https://github.com/highercomve/Oriel/archive/refs/tags/v0.20.20.tar.gz",
+            .hash = "oriel-0.20.20-K1NO5cJjAQGOo-6YNY7OaMPZvZ850lxqc8hsEXGitypP",
         },
         // The NomadFS core: same sources the CLI, the C ABI and the mobile
         // bindings build from.
