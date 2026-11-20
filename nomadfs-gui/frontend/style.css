@@ -2059,7 +2059,8 @@ body.pv-open #snackbar { top: calc(12px + env(safe-area-inset-top)); bottom: aut
 }
 
 /* Photos: a tick on each tile while selecting; a day's date picks the day. */
-.photo-tile { -webkit-touch-callout: none; }
+.photo-tile { -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; }
+.photo-tile img { -webkit-user-drag: none; }
 .photo-check {
   position: absolute;
   top: 6px;

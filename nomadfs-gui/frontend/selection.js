@@ -192,6 +192,7 @@ export function longPress(root, pick, fire, { ms = 500, onRelease = null } = {})
   let timer = 0;
   let start = null;
   let fired = false;
+  let started = null; // what this press picked, at pointerdown
   const cancel = () => { clearTimeout(timer); timer = 0; start = null; };
   root.addEventListener("pointerdown", (e) => {
     cancel();
@@ -199,14 +200,42 @@ export function longPress(root, pick, fire, { ms = 500, onRelease = null } = {})
     if (e.pointerType !== "touch") return;
     const picked = pick(e);
     if (picked === null || picked === undefined) return;
+    started = picked;
     start = { x: e.clientX, y: e.clientY };
-    timer = setTimeout(() => { timer = 0; fired = true; fire(picked); }, ms);
+    timer = setTimeout(() => {
+      timer = 0;
+      if (fired) return;
+      fired = true;
+      fire(picked);
+    }, ms);
   });
   root.addEventListener("pointermove", (e) => {
     if (start && Math.hypot(e.clientX - start.x, e.clientY - start.y) > 10) cancel();
   });
   root.addEventListener("pointerup", () => { cancel(); if (fired) onRelease?.(); });
-  root.addEventListener("pointercancel", cancel);
+  // The WebView cancels the pointer when its own long press starts (an
+  // image's drag or menu), before our timer: its contextmenu, which comes
+  // right after, is the long press then.
+  let cancelled = null;
+  root.addEventListener("pointercancel", (e) => {
+    cancelled = e.pointerType === "touch" && start ? pick(e) : null;
+    cancel();
+  });
+  root.addEventListener("contextmenu", (e) => {
+    if (e.pointerType !== "touch" && !cancelled) return;
+    // The press's own pick, from pointerdown, when the timer is still due.
+    const pending = timer ? started : null;
+    const picked = cancelled ?? pending ?? pick(e);
+    cancelled = null;
+    clearTimeout(timer);
+    timer = 0;
+    if (picked === null || picked === undefined) return;
+    e.preventDefault();
+    if (fired) return;
+    fired = true;
+    fire(picked);
+  });
+  root.addEventListener("touchend", () => { if (fired) onRelease?.(); });
   return {
     wasLongPress() {
       const was = fired;

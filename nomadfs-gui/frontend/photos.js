@@ -45,6 +45,7 @@ function createTileNode() {
   img.loading = "lazy";
   img.decoding = "async";
   img.alt = "";
+  img.draggable = false; // a long press selects; it doesn't drag the picture
 
   const placeholder = document.createElement("div");
   placeholder.className = "photo-placeholder";
@@ -391,12 +392,15 @@ function installSelection() {
   // Touch: a long press on a photo starts selecting, with that photo.
   press = longPress($("photos-window"), (e) => {
     const el = e.target.closest?.(".photo-tile");
-    return el && !sel.active ? el : null;
-  }, (el) => {
-    const item = getCachedItem(Number(el.dataset.index));
-    if (!item?.path || selBusy) return;
-    sel.toggle(item.path);
-    selAnchor = Number(el.dataset.index);
+    if (!el || sel.active) return null;
+    // The photo, not the tile: tiles are reused as the grid scrolls.
+    const index = Number(el.dataset.index);
+    const path = getCachedItem(index)?.path;
+    return path ? { index, path } : null;
+  }, (picked) => {
+    if (selBusy || sel.has(picked.path)) return;
+    sel.toggle(picked.path);
+    selAnchor = picked.index;
   }, { onRelease: syncBack }); // the history step is added on the tap's end
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape" || !sel.active || selBusy) return;
