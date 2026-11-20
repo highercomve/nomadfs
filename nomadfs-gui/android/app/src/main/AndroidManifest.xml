@@ -39,7 +39,12 @@
         android:theme="@style/Theme.Oriel"
         android:networkSecurityConfig="@xml/network_security_config"
         android:resizeableActivity="true"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        android:allowBackup="false"
+        android:fullBackupContent="false">
+        <!-- No Android backup: the store is far over its limit (the backup
+             fails, then Android kills the app), and the device key must
+             never leave the phone. -->
 
         <!-- GPU/NPU drivers ggml may use (src/modules/ggml_gpu.zig): optional,
              Android 12+ only lets apps open vendor libraries they declare. -->
