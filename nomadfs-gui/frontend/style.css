@@ -1894,7 +1894,8 @@ body.pv-open #snackbar { top: calc(12px + env(safe-area-inset-top)); bottom: aut
 /* ---- Offsite backup (settings): the buckets, the add form, the recovery words ---- */
 :root { --offsite-error: #ff8a7a; --offsite-warn: var(--amber); }
 @media (prefers-color-scheme: light) { :root { --offsite-error: #b3261e; } }
-#offsite-section { display: flex; flex-direction: column; gap: 12px; }
+/* Its display comes from the view rules (shown only in Settings). */
+#offsite-section { flex-direction: column; gap: 12px; }
 #offsite-section[hidden] { display: none; }
 .offsite-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
 .offsite-list:empty { display: none; }
@@ -1982,3 +1983,169 @@ body.pv-open #snackbar { top: calc(12px + env(safe-area-inset-top)); bottom: aut
   .offsite-target .btn.text.danger { margin-right: 0; }
 }
 #offsite-add-row[hidden] { display: none; }
+
+/* ---- Selecting several items to delete them (Swarm folder rows, Photos tiles) ---- */
+.btn[aria-pressed="true"] { background: var(--md-secondary-container); color: var(--md-on-secondary-container); }
+.swarm-toolbar .actions #swarm-select { flex: none; }
+#photos-select { flex: none; height: 36px; padding: 0 16px; }
+
+/* The bar: "N selected", Cancel, Delete. The last thing in its card. */
+.select-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px 6px 6px;
+  background: var(--md-surface-container-high);
+  border: 1px solid var(--rule-strong);
+  border-radius: 8px;
+  box-shadow: 0 10px 24px -12px rgb(0 0 0 / .7);
+}
+.select-bar[hidden] { display: none; }
+.select-bar .select-count {
+  flex: 1;
+  min-width: 0;
+  padding: 0 8px;
+  font: 600 14px var(--font);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.select-bar .btn { flex: none; height: 36px; padding: 0 14px; }
+.select-bar .btn.text { padding: 0 10px; }
+.photos-view .select-bar { margin-bottom: 8px; }
+
+/* Swarm folder: a checkbox leads each row while selecting. */
+.row-check {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 1.5px solid var(--md-outline);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+.row-check svg { width: 16px; height: 16px; fill: var(--md-on-primary); opacity: 0; }
+.row-check:focus-visible { outline: 1.5px solid rgb(246 176 66 / .5); outline-offset: 2px; }
+.list.rows li.selected { background: rgb(246 176 66 / .08); border-radius: 12px; }
+.list.rows li.selected .row-check { background: var(--md-primary); border-color: var(--md-primary); }
+.list.rows li.selected .row-check svg { opacity: 1; }
+/* A long press selects rows: no text selection or callout from it. */
+#swarm-section .list.rows li { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+@media (max-width: 480px) {
+  .select-bar { gap: 4px; }
+  .select-bar .btn, .select-bar .btn.text { padding: 0 8px; }
+}
+/* The row buttons act on one item: out of the way (the columns keep their place). */
+#swarm-section.selecting .row-actions { visibility: hidden; }
+#swarm-section.selecting .table-head:not([hidden]) { padding-left: 88px; } /* + checkbox (24) and gap (12) */
+
+@media (max-width: 839.98px) {
+  #swarm-section.selecting .list.rows li { gap: 12px; }
+  #swarm-section.selecting .row-actions { display: none; }
+  /* Phones: the page scrolls, so the bar floats above the navigation bar
+     and the card leaves room for it under its last row. */
+  #swarm-section .select-bar {
+    position: fixed;
+    left: 12px;
+    right: 12px;
+    bottom: calc(88px + env(safe-area-inset-bottom));
+    z-index: 4;
+  }
+  #swarm-section.selecting { padding-bottom: 72px; }
+}
+
+/* Photos: a tick on each tile while selecting; a day's date picks the day. */
+.photo-tile { -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; }
+.photo-tile img { -webkit-user-drag: none; }
+.photo-check {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 1;
+  width: 22px;
+  height: 22px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid rgb(255 255 255 / .85);
+  border-radius: 50%;
+  background: rgb(0 0 0 / .35);
+  pointer-events: none;
+}
+.photos-view.selecting .photo-check { display: flex; }
+.photo-check svg { width: 14px; height: 14px; fill: var(--md-on-primary); opacity: 0; }
+.photo-tile.selected .photo-check { background: var(--md-primary); border-color: var(--md-primary); }
+.photo-tile.selected .photo-check svg { opacity: 1; }
+.photo-tile.selected::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 3px solid var(--md-primary);
+  border-radius: 4px;
+  background: rgb(246 176 66 / .16);
+  pointer-events: none;
+}
+.photos-day-head.selectable { cursor: pointer; }
+.photos-day-head.selectable::after {
+  content: "Select day";
+  margin-left: 10px;
+  padding: 2px 8px;
+  border: 1px solid rgb(246 176 66 / .4);
+  border-radius: 6px;
+  color: var(--md-primary);
+  font: 500 11px var(--font);
+  letter-spacing: .2px;
+}
+
+/* Photos: placeholder tiles while the node starts or the first index loads. */
+.photos-skeleton { padding: 12px 0; }
+.photos-skeleton[hidden] { display: none; }
+.photos-skeleton .sk-day { width: 120px; height: 13px; margin-bottom: 12px; background: var(--md-outline-variant); animation: pulse 1s ease-in-out infinite alternate; }
+.photos-skeleton .sk-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 4px; }
+.photos-skeleton .sk-tiles span {
+  aspect-ratio: 1;
+  border-radius: 4px;
+  background: var(--md-outline-variant);
+  animation: pulse 1s ease-in-out infinite alternate;
+}
+.photos-skeleton .sk-tiles span:nth-child(3n+2) { animation-delay: .15s; }
+.photos-skeleton .sk-tiles span:nth-child(3n) { animation-delay: .3s; }
+@media (max-width: 600px) { .photos-skeleton .sk-tiles { grid-template-columns: repeat(3, 1fr); } }
+
+/* Swarm folder: an upload in progress, and the drop target. */
+.upload-bar {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px 12px;
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: var(--md-surface-container-high);
+}
+.upload-bar[hidden] { display: none; }
+.upload-text { font-size: 14px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-bar .progress { grid-column: 1 / -1; background: var(--md-surface-container); }
+.upload-bar .progress.determinate::after { animation: none; width: var(--p, 0%); transition: width .2s; }
+#swarm-section { position: relative; }
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--md-primary);
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--md-surface) 82%, transparent);
+  pointer-events: none;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--md-primary);
+}
+.drop-overlay[hidden] { display: none; }

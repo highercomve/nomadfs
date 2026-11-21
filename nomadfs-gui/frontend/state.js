@@ -4,10 +4,39 @@
 export function isRunning() {
   return running;
 }
-export function setRunning(v) {
+/** `session` (node_state's) moves on every node open and close: a restart
+ *  the page missed still fires the listeners, though `running` stays true. */
+export function setRunning(v, session = nodeSessionId) {
+  const changed = v !== running || session !== nodeSessionId;
   running = v;
+  nodeSessionId = session;
+  if (changed) for (const cb of nodeListeners) cb();
 }
 let running = false;
+
+/** The node session the page last saw (null before the first node_state). */
+export function nodeSession() {
+  return nodeSessionId;
+}
+let nodeSessionId = null;
+
+// The app starts the node itself at boot: until that settles, a screen
+// that needs it shows that it's loading, not that the node is stopped.
+let starting = true;
+export function isStarting() {
+  return starting && !running;
+}
+export function setStarting(v) {
+  const was = isStarting();
+  starting = v;
+  if (isStarting() !== was) for (const cb of nodeListeners) cb();
+}
+const nodeListeners = new Set();
+/** `cb()` whenever the node starts, stops, restarts, or stops starting. */
+export function onNodeChange(cb) {
+  nodeListeners.add(cb);
+  return () => nodeListeners.delete(cb);
+}
 
 export function devices() {
   return deviceList;

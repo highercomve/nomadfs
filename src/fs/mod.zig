@@ -13,6 +13,8 @@ pub const remote = @import("remote.zig");
 pub const filestore = @import("filestore.zig");
 pub const manifest = @import("manifest.zig");
 pub const swarm = @import("swarm.zig");
+/// Which roots this device must keep (what the collection may not delete).
+pub const live_set = @import("live_set.zig");
 pub const notes = @import("notes.zig");
 /// What kind of picture or film a file is, and the timeline of them all.
 pub const media = @import("media.zig");
@@ -24,6 +26,8 @@ pub const raw_preview = @import("raw_preview.zig");
 pub const readahead = @import("readahead.zig");
 pub const device_names = @import("device_names.zig");
 pub const backup_import = @import("backup_import.zig");
+/// Files a front end sends in pieces, staged until they go into the swarm folder.
+pub const uploads = @import("uploads.zig");
 pub const inspect = @import("inspect.zig");
 /// The devices a mount shows (FUSE and WebDAV).
 pub const devices = @import("devices.zig");
@@ -47,6 +51,7 @@ test {
     _ = filestore;
     _ = manifest;
     _ = swarm;
+    _ = live_set;
     _ = notes;
     _ = media;
     _ = photos;
@@ -54,6 +59,7 @@ test {
     _ = thumbs;
     _ = raw_preview;
     _ = backup_import;
+    _ = uploads;
     _ = device_names;
     _ = devices;
     std.testing.refAllDecls(fuse);

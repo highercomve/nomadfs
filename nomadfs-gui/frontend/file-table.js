@@ -21,6 +21,7 @@ class FileTable {
   constructor({ view, tools, head, list, columns, storageKey, actions, placeholder = "Search this folder", renderRow, emptyText, setEmpty }) {
     Object.assign(this, { view, tools, head, list, columns, storageKey, renderRow, emptyText, setEmpty });
     this.entries = null;
+    this.shown = [];
     this.sort = { key: "name", dir: 1 };
     this.filterType = "all";
     try { Object.assign(this.sort, JSON.parse(localStorage.getItem(storageKey) || "{}")); } catch {}
@@ -205,6 +206,7 @@ class FileTable {
 
     this.updateFilterChips();
 
+    this.shown = shown; // what the list shows, in order (a selection's "all" and ranges)
     this.list.replaceChildren();
     if (!shown.length) {
       if (filter !== "all") {

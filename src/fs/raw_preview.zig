@@ -23,12 +23,17 @@ pub fn preview(allocator: std.mem.Allocator, swarm: *SwarmFolder, cid: [32]u8, a
     } else {
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(allocator);
-        var chunk: [1024 * 1024]u8 = undefined;
+        // Read straight into the list's spare room: a chunk on the stack
+        // overflowed the WebView's media thread on Android (its stack is
+        // well under the 1 MiB a chunk took).
+        const chunk_len = 1024 * 1024;
         var offset: u64 = 0;
         while (offset < max_raw_file_len) {
-            const n = try swarm.readAt(allocator, cid, author, offset, &chunk);
+            try list.ensureUnusedCapacity(allocator, chunk_len);
+            const room = list.unusedCapacitySlice();
+            const n = try swarm.readAt(allocator, cid, author, offset, room[0..@min(room.len, chunk_len)]);
             if (n == 0) break;
-            try list.appendSlice(allocator, chunk[0..n]);
+            list.items.len += n;
             offset += n;
         }
         if (offset >= max_raw_file_len) return error.TooLarge;

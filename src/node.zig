@@ -83,6 +83,10 @@ pub const Node = struct {
     /// folder, or when that folder couldn't be opened (the node runs
     /// without thumbnails).
     thumbs: ?*fs.Thumbs,
+    /// Files front ends send in pieces (the app's page), staged in
+    /// `<storage_path>.uploads` until they go into the swarm folder. Null
+    /// with the swarm folder.
+    uploads: ?*fs.uploads.Uploads = null,
     /// The local swarm API other programs of this user use (Locket,
     /// `nomadfs swarm`): swarm_api.zig. Null without the swarm folder, or
     /// when it couldn't start (the node runs without it).
@@ -94,6 +98,8 @@ pub const Node = struct {
     /// Sorts blocks stored before the read cache existed, once (sortLegacyCache).
     cache_thread: ?std.Thread = null,
     cache_running: std.atomic.Value(bool) = .init(false),
+    gc_missing_share_roots: std.atomic.Value(bool) = .init(false),
+    gc_waiting_for_sync: std.atomic.Value(bool) = .init(false),
     bootstrap_running: *std.atomic.Value(bool),
     /// Devices met before, with all their addresses; re-dialed to rejoin
     /// the swarm from any network (Tailscale away from home). Used only by
@@ -277,6 +283,12 @@ pub const Node = struct {
             discovery_node.derived_source = null;
             t.destroy();
         };
+        // Adds to the folder: freed before it.
+        const uploads: ?*fs.uploads.Uploads = if (swarm) |folder|
+            try fs.uploads.Uploads.create(allocator, std.Io.Threaded.global_single_threaded.io(), folder, cfg.storage.storage_path)
+        else
+            null;
+        errdefer if (uploads) |u| u.destroy();
 
         const ring = try allocator.create(HashRing);
         ring.* = HashRing.init(allocator);
@@ -446,6 +458,7 @@ pub const Node = struct {
             .notes = notes,
             .photos = photos,
             .thumbs = thumbs,
+            .uploads = uploads,
             .read_ahead = read_ahead,
             .policy = policy,
             .membership = membership,
@@ -501,6 +514,7 @@ pub const Node = struct {
         if (self.read_ahead) |ra| ra.destroy(); // joins its workers
         // Then freed, users before what they use.
         if (self.photos) |p| p.destroy(); // its readers (the API, the handlers) are gone
+        if (self.uploads) |u| u.destroy(); // its pieces go with it; before the folder it adds to
         // After the timeline that asks it and the handlers that answer
         // other devices from it (drained above), before the folder and the
         // store it reads.
@@ -1004,7 +1018,7 @@ pub const Node = struct {
         }
         if (self.store != null and self.cache_thread == null) {
             self.cache_running.store(true, .release);
-            self.cache_thread = std.Thread.spawn(.{}, runCacheSort, .{self}) catch null;
+            self.cache_thread = std.Thread.spawn(.{}, runCacheThread, .{self}) catch null;
         }
     }
 
@@ -1018,6 +1032,136 @@ pub const Node = struct {
     const cache_sorted_marker = ".sorted-v1";
     /// Longest wait for a share that has no root and isn't being scanned.
     const cache_sort_wait_ns: u64 = 30 * std.time.ns_per_min;
+
+    /// First collection after the start, then one every gc_interval_ms.
+    const gc_first_ms: i64 = 60 * 1000;
+    const gc_interval_ms: i64 = 5 * 60 * 1000;
+    const gc_busy_retry_ms: i64 = 30 * 1000;
+    const gc_busy_log_rounds = 10;
+    /// Blocks this recent at the start of the round are spared.
+    const gc_min_age_s: i64 = 10 * 60;
+
+    /// The store's thread: sorts old blocks once, then collects the blocks
+    /// of deleted files from time to time, until the node stops.
+    fn runCacheThread(self: *Node) void {
+        self.runCacheSort();
+        var next = sync.monotonicMillis() + gc_first_ms;
+        // A round walks every file held: only after a change (or an hour,
+        // for blocks that were too young the last time).
+        var last_gen: ?u64 = null;
+        var last_run: i64 = 0;
+        var busy_rounds: usize = 0;
+        while (self.cache_running.load(.acquire)) {
+            const now = sync.monotonicMillis();
+            if (now >= next) {
+                next = now + gc_interval_ms;
+                const gen = if (self.swarm) |f| f.changeGeneration() else 0;
+                if (last_gen == null or last_gen.? != gen or now - last_run >= 60 * 60 * 1000) {
+                    const result: ?CollectionResult = self.collectGarbage() catch |err| blk: {
+                        if (err != error.Stopped and err != error.CorruptBlock)
+                            std.debug.print("store: collecting deleted files' blocks failed: {any}\n", .{err});
+                        break :blk null;
+                    };
+                    // Put off (a write open, or the folder or shares changed
+                    // during the mark) round after round: say so once.
+                    if (result == .busy or result == .skipped) {
+                        if (busy_rounds < gc_busy_log_rounds) {
+                            busy_rounds += 1;
+                            if (busy_rounds == gc_busy_log_rounds)
+                                std.debug.print("store: collection keeps being put off by writes or changes\n", .{});
+                        }
+                    } else if (result == .ran or result == .ran_retry_soon) { // ran: the streak is over
+                        if (busy_rounds == gc_busy_log_rounds)
+                            std.debug.print("store: collection runs again\n", .{});
+                        busy_rounds = 0;
+                    }
+                    if (result) |completed| {
+                        switch (completed) {
+                            .ran => {
+                                last_gen = gen;
+                                last_run = now;
+                            },
+                            .busy => next = now + gc_busy_retry_ms,
+                            .skipped, .not_ready => {
+                                last_gen = null;
+                                next = now + gc_busy_retry_ms;
+                            },
+                            .ran_retry_soon => {},
+                        }
+                    }
+                }
+            }
+            sync.sleep(500 * std.time.ns_per_ms);
+        }
+    }
+
+    /// skipped: the roots moved during the mark; not_ready: the roots can't
+    /// be told yet (a sync or a share's first scan is awaited, logged apart).
+    pub const CollectionResult = enum { skipped, not_ready, busy, ran, ran_retry_soon };
+
+    /// Deletes the blocks no file needs any more: those of files deleted
+    /// from the swarm folder (here or on another device) and of replaced
+    /// versions, kept or cached, and their kept thumbnails. Keeps every live
+    /// swarm file's blocks this device holds (whoever wrote it), files
+    /// deleted here a moment ago (undo), and the shares' blocks. Skipped
+    /// while a share is being indexed or the folder hasn't pulled yet: a
+    /// partial list would delete blocks that are still wanted.
+    pub fn collectGarbage(self: *Node) !CollectionResult {
+        return self.collectGarbageBeforeClaim(null);
+    }
+
+    fn collectGarbageBeforeClaim(self: *Node, comptime beforeClaim: ?fn (*Node) anyerror!void) !CollectionResult {
+        const store = self.store orelse return .skipped;
+        const swarm = self.swarm orelse return .skipped;
+        const cutoff_s = sync.timestamp() - gc_min_age_s;
+        if (store.hasWriters()) return .busy;
+        var taken = try fs.live_set.LiveSet.take(self.allocator, swarm, self.shares, cutoff_s);
+        const reason: ?fs.live_set.LiveSet.Reason = switch (taken) {
+            .not_ready => |r| r,
+            .ready => null,
+        };
+        const missing = reason == .share_without_root;
+        if (missing != self.gc_missing_share_roots.swap(missing, .monotonic)) {
+            std.debug.print("store: {s}\n", .{if (missing)
+                "collection paused because a share has no root"
+            else
+                "all shares have roots"});
+        }
+        // The swarm folder is only asked once the shares are ready.
+        if (reason != .share_without_root and reason != .share_indexing) {
+            const waiting = reason == .waiting_for_sync;
+            if (waiting != self.gc_waiting_for_sync.swap(waiting, .monotonic)) {
+                std.debug.print("store: {s}\n", .{if (waiting)
+                    "collection waits for a sync with another device"
+                else
+                    "collection can resume after sync"});
+            }
+        }
+        if (reason != null) return .not_ready;
+        const live = &taken.ready;
+        defer live.deinit();
+
+        var keep: storage.dag.walk.CidSet = .empty;
+        defer keep.deinit(self.allocator);
+        for (live.share_roots) |*r| {
+            try storage.dag.walk.addStoredLinks(self.allocator, store, r, &keep, &self.cache_running);
+        }
+        for (live.swarm_roots) |*r| {
+            try storage.dag.walk.addStoredLinks(self.allocator, store, r, &keep, &self.cache_running);
+        }
+        var candidates = try store.collectCandidates(&keep, &self.cache_running);
+        defer candidates.deinit(store.allocator);
+        if (beforeClaim) |hook| try hook(self);
+        if (!store.tryBeginCollect()) return .busy;
+        defer store.endCollect();
+        const sweep_cutoff_s = live.sweepCutoff() orelse return .skipped;
+        const freed = try store.sweepCandidates(&candidates, sweep_cutoff_s, &self.cache_running);
+        if (!self.cache_running.load(.acquire)) return error.Stopped;
+        const thumbs_gone = if (self.thumbs) |t| t.store.sweepKept(&live.file_roots) catch 0 else 0;
+        if (freed.blocks > 0 or thumbs_gone > 0)
+            std.debug.print("store: freed {d} blocks ({d} bytes) and {d} thumbnails of deleted files\n", .{ freed.blocks, freed.bytes, thumbs_gone });
+        return if (live.sparing_recent) .ran_retry_soon else .ran;
+    }
 
     fn runCacheSort(self: *Node) void {
         const store = self.store orelse return;
@@ -1531,6 +1675,168 @@ test "Node.pruneRedial keeps state only for remembered devices" {
 test "Node.rotateSwarmKey compiles" {
     std.testing.refAllDecls(Node);
     _ = &Node.rotateSwarmKey;
+}
+
+test "Node.collectGarbage skips open writes and retries recently deleted roots" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    const manifest_path = try std.fs.path.join(allocator, &.{ path, "manifest.json" });
+    defer allocator.free(manifest_path);
+    var store = try storage.engine.StorageEngine.init(allocator, path);
+    defer store.deinit();
+    const swarm = try fs.SwarmFolder.create(allocator, testing.io, &store, .{ .bytes = [_]u8{1} ** 32 }, "Test", manifest_path);
+    defer swarm.destroy();
+    const live = (try swarm.putBytes("keep.txt", "keep", null)).cid;
+    const deleted = (try swarm.putBytes("delete.txt", "delete", null)).cid;
+    try swarm.remove("delete.txt");
+    for ([_][32]u8{ live, deleted }) |cid| {
+        try store.root_dir.setTimestamps(testing.io, &std.fmt.bytesToHex(cid, .lower), .{
+            .modify_timestamp = .{ .new = .fromNanoseconds(0) },
+        });
+    }
+
+    var node: Node = undefined;
+    node.allocator = allocator;
+    node.store = &store;
+    node.swarm = swarm;
+    node.shares = null;
+    node.thumbs = null;
+    node.cache_running = .init(true);
+    node.gc_missing_share_roots = .init(false);
+    node.gc_waiting_for_sync = .init(false);
+    try testing.expectEqual(.not_ready, try node.collectGarbage());
+    try testing.expect(node.gc_waiting_for_sync.load(.monotonic));
+    try testing.expectEqual(.not_ready, try node.collectGarbage());
+    swarm.reclaim_ready = true;
+    {
+        // If this enters the mark it will return Stopped.
+        node.cache_running.store(false, .release);
+        defer node.cache_running.store(true, .release);
+        store.beginWrite();
+        defer store.endWrite();
+        try testing.expectEqual(.busy, try node.collectGarbage());
+    }
+    try testing.expectEqual(.ran_retry_soon, try node.collectGarbage());
+    try testing.expect(!node.gc_waiting_for_sync.load(.monotonic));
+    try testing.expect(store.has(&deleted));
+    swarm.recent_deletes.items[0].at_ms -= fs.SwarmFolder.undo_grace_ms + 1;
+    try testing.expectEqual(.ran, try node.collectGarbage());
+    try testing.expect(!store.has(&deleted));
+    try testing.expect(store.has(&live));
+}
+
+test "Node.collectGarbage rechecks shares and peer merges, and pins the scan cutoff" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "share", .default_dir);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const share_path = try std.fs.path.join(allocator, &.{ path, "share" });
+    defer allocator.free(share_path);
+    const manifest_path = try std.fs.path.join(allocator, &.{ path, "manifest.json" });
+    defer allocator.free(manifest_path);
+    var store = try storage.engine.StorageEngine.init(allocator, path);
+    defer store.deinit();
+    const swarm = try fs.SwarmFolder.create(allocator, io, &store, .{ .bytes = @splat(1) }, "Test", manifest_path);
+    defer swarm.destroy();
+    swarm.reclaim_ready = true;
+    const shares = try fs.ShareIndex.create(allocator, io, &store);
+    defer shares.destroy();
+    try shares.add("share", share_path);
+
+    var node: Node = undefined;
+    node.allocator = allocator;
+    node.store = &store;
+    node.swarm = swarm;
+    node.shares = shares;
+    node.thumbs = null;
+    node.cache_running = .init(true);
+    node.gc_missing_share_roots = .init(false);
+    node.gc_waiting_for_sync = .init(false);
+
+    const old = storage.block.Block.new("before the scan");
+    const during = storage.block.Block.new("written during the scan");
+    const published = storage.block.Block.new("written by a scan that published after the snapshot");
+    // `during` is 30 s older than the scan's start: within the filesystem clock slack.
+    for ([_]storage.block.Block{ old, during, published }, [_]i64{ 1, 10_000, 20_000 }) |block, mtime_s| {
+        try store.put(block);
+        try store.root_dir.setTimestamps(io, &std.fmt.bytesToHex(block.cid, .lower), .{
+            .modify_timestamp = .{ .new = .fromNanoseconds(@as(i96, mtime_s) * std.time.ns_per_s) },
+        });
+    }
+
+    const Interleave = struct {
+        fn readdShare(n: *Node) !void {
+            const index = n.shares.?;
+            const snapshot = try index.snapshot(n.allocator);
+            defer fs.ShareIndex.freeSnapshot(n.allocator, snapshot);
+            try testing.expect(index.remove("share"));
+            try index.add("share", snapshot[0].path);
+        }
+
+        fn mergePeer(n: *Node) !void {
+            const peer: net.id.NodeID = .{ .bytes = @splat(2) };
+            var manifest = fs.manifest.Manifest.init(n.allocator);
+            defer manifest.deinit();
+            _ = try manifest.edit("from-peer.txt", .{}, peer.bytes, "Peer");
+            const bytes = try manifest.encode(n.allocator);
+            defer n.allocator.free(bytes);
+            try testing.expectEqual(@as(?usize, 1), n.swarm.?.mergePeerBytesForTest(bytes, peer));
+        }
+
+        fn startScan(n: *Node) !void {
+            // Model a long-running scan whose first write is already old.
+            const index = n.shares.?;
+            index.mutex.lock();
+            defer index.mutex.unlock();
+            index.scan_started_s = 10_030;
+        }
+
+        fn finishLongScan(n: *Node) !void {
+            // A rescan that started at 20_030 and publishes a new root
+            // between the snapshot and the claim.
+            const index = n.shares.?;
+            const snapshot = try index.snapshot(n.allocator);
+            defer fs.ShareIndex.freeSnapshot(n.allocator, snapshot);
+            var dir = try std.Io.Dir.cwd().openDir(testing.io, snapshot[0].path, .{});
+            defer dir.close(testing.io);
+            try dir.writeFile(testing.io, .{ .sub_path = "new.txt", .data = "changed" });
+            index.scanner.progress = .{ .ctx = index, .reportFn = pinStart, .first_ns = 0, .interval_ns = 0 };
+            index.rescanAll();
+            const after = try index.snapshot(n.allocator);
+            defer fs.ShareIndex.freeSnapshot(n.allocator, after);
+            try testing.expect(!std.mem.eql(u8, &snapshot[0].root.?, &after[0].root.?));
+        }
+
+        fn pinStart(ctx: *anyopaque, _: fs.scan.Result) anyerror!void {
+            const index: *fs.ShareIndex = @ptrCast(@alignCast(ctx));
+            index.mutex.lock();
+            defer index.mutex.unlock();
+            index.scan_started_s = 20_030;
+        }
+    };
+    try testing.expectEqual(.skipped, try node.collectGarbageBeforeClaim(Interleave.readdShare));
+    try testing.expect(store.has(&old.cid));
+    try testing.expectEqual(.skipped, try node.collectGarbageBeforeClaim(Interleave.mergePeer));
+    try testing.expect(store.has(&old.cid));
+
+    try testing.expectEqual(.ran, try node.collectGarbageBeforeClaim(Interleave.startScan));
+    try testing.expect(!store.has(&old.cid));
+    try testing.expect(store.has(&during.cid));
+    shares.scan_started_s = null;
+    // A new root no longer skips the round; the scan's blocks survive.
+    try testing.expectEqual(.ran, try node.collectGarbageBeforeClaim(Interleave.finishLongScan));
+    try testing.expect(!store.has(&during.cid));
+    try testing.expect(store.has(&published.cid));
+    try testing.expectEqual(.ran, try node.collectGarbage());
+    try testing.expect(!store.has(&published.cid));
 }
 
 test "trust revocation queues only the pinned transport node" {

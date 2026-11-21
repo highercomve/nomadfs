@@ -64,6 +64,15 @@ pub const SwarmFolder = struct {
     /// manifest, or `alone_grace_ms` passed (a device truly on its own).
     awaiting_pull: bool = false,
     awaiting_since_ms: i64 = 0,
+    /// Whether the manifest can be trusted to list every file this device
+    /// holds, so blocks it doesn't reach may be collected (liveRoots). Set
+    /// after a successful peer pull if the manifest was loaded at startup,
+    /// or if the pull merged entries. At open, a manifest with its saved
+    /// `<manifest>.reclaim` marker is already trusted. Guarded by `mutex`.
+    reclaim_ready: bool = false,
+    /// Set after a reclaim-ready manifest is saved and the marker is written.
+    /// Guarded by `save_mutex`.
+    reclaim_marker_written: bool = false,
     alone_grace_ms: i64 = 60 * 1000,
     last_sync: u64 = 0,
     peers_synced: u32 = 0,
@@ -89,6 +98,10 @@ pub const SwarmFolder = struct {
     keeper: ?*cluster.keeper.Keeper = null,
     /// Who keeps which file besides backup devices (cluster/placement.zig).
     placement: ?Placement = null,
+    /// Content of files deleted here lately, with when (monotonic ms): kept
+    /// through a collection for `undo_grace_ms`, so a delete can still be
+    /// undone (a note's Undo reads it back). Guarded by `mutex`.
+    recent_deletes: std.ArrayList(RecentDelete) = .empty,
     /// Guards `backed_up` and the backup counters.
     backup_mutex: sync.Mutex = .{},
     /// Root CIDs of files copied here in full, kept in `<manifest>.backup`
@@ -195,6 +208,7 @@ pub const SwarmFolder = struct {
         self.writeIfDirty(true); // an edit still unwritten
         self.backup_enabled.store(false, .release);
         self.backed_up.deinit(self.allocator);
+        self.recent_deletes.deinit(self.allocator);
         self.manifest.deinit();
         self.allocator.free(self.self_name);
         self.allocator.free(self.file_path);
@@ -205,6 +219,9 @@ pub const SwarmFolder = struct {
         var file = std.Io.Dir.cwd().openFile(self.io, self.file_path, .{}) catch |err| switch (err) {
             error.FileNotFound => {
                 self.manifest_missing = true;
+                // A manifest written later this run (edits made alone) must
+                // not pass for a synced one at the next start.
+                self.deleteReclaimMarker();
                 return;
             },
             else => return err,
@@ -221,16 +238,50 @@ pub const SwarmFolder = struct {
             self.moveCorruptAside();
             return error.InvalidManifest;
         }
-        _ = self.manifest.mergeEncoded(bytes) catch |err| {
-            self.moveCorruptAside();
-            return err;
-        };
+        {
+            // Entries recorded here make roots live: no collection sweeps meanwhile.
+            self.store.beginWrite();
+            defer self.store.endWrite();
+            _ = self.manifest.mergeEncoded(bytes) catch |err| {
+                self.moveCorruptAside();
+                return err;
+            };
+        }
+        self.reclaim_marker_written = self.reclaimMarkerExists();
+        self.reclaim_ready = self.reclaim_marker_written;
     }
 
     fn moveCorruptAside(self: *SwarmFolder) void {
+        self.deleteReclaimMarker();
         const corrupt_path = std.fmt.allocPrint(self.allocator, "{s}.corrupt-{d}", .{ self.file_path, self.now() }) catch return;
         defer self.allocator.free(corrupt_path);
         std.Io.Dir.cwd().rename(self.file_path, std.Io.Dir.cwd(), corrupt_path, self.io) catch {};
+    }
+
+    fn reclaimMarkerPath(self: *SwarmFolder) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}.reclaim", .{self.file_path});
+    }
+
+    fn reclaimMarkerExists(self: *SwarmFolder) bool {
+        const path = self.reclaimMarkerPath() catch return false;
+        defer self.allocator.free(path);
+        var file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch return false;
+        file.close(self.io);
+        return true;
+    }
+
+    /// Best effort: without it the next start waits for a merge again.
+    fn writeReclaimMarker(self: *SwarmFolder) !void {
+        const path = try self.reclaimMarkerPath();
+        defer self.allocator.free(path);
+        var file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
+        file.close(self.io);
+    }
+
+    fn deleteReclaimMarker(self: *SwarmFolder) void {
+        const path = self.reclaimMarkerPath() catch return;
+        defer self.allocator.free(path);
+        std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
     }
 
     /// Caller holds `mutex`. Marks the manifest for writing; flushSave,
@@ -252,6 +303,12 @@ pub const SwarmFolder = struct {
     fn editAllowedLocked(self: *SwarmFolder) !void {
         if (self.awaitingLocked()) return error.NotSynced;
         try self.reserveClockLocked();
+    }
+
+    pub fn editReady(self: *SwarmFolder) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return !self.awaitingLocked();
     }
 
     /// Caller holds `mutex`. Whether local edits must still wait for the
@@ -291,6 +348,7 @@ pub const SwarmFolder = struct {
         self.save_mutex.lock();
         defer self.save_mutex.unlock();
         const at = sync.monotonicMillis();
+        var mark_after_save = false;
         const bytes = blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -302,6 +360,8 @@ pub const SwarmFolder = struct {
                 return;
             };
             self.dirty = false;
+            // A round may open the gate after this snapshot was encoded.
+            mark_after_save = self.reclaim_ready and !self.reclaim_marker_written;
             break :blk b;
         };
         defer self.allocator.free(bytes);
@@ -315,7 +375,12 @@ pub const SwarmFolder = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             self.dirty = true; // try again with the next write
+            return;
         };
+        if (mark_after_save) {
+            self.writeReclaimMarker() catch return;
+            self.reclaim_marker_written = true;
+        }
     }
 
     fn writeManifest(self: *SwarmFolder, bytes: []const u8) !void {
@@ -389,6 +454,10 @@ pub const SwarmFolder = struct {
         defer file.close(self.io);
         const modified = mtime orelse secondsOf((try file.stat(self.io)).mtime);
         var reader = FileReader{ .io = self.io, .file = file };
+        // Held until the entry is recorded (runs after the unlock below): the
+        // blocks are reachable from no root until then.
+        self.store.beginWrite();
+        defer self.store.endWrite();
         var builder = storage.dag.DagBuilder{ .allocator = self.allocator, .store = self.store, .layout = .Balanced };
         const root = try builder.build(&reader);
         defer self.allocator.free(root);
@@ -403,6 +472,133 @@ pub const SwarmFolder = struct {
         try self.saveLocked();
         // The devices that keep copies pull it (their keepers), once their
         // manifest has it: nothing is pushed from here.
+    }
+
+    pub const TreeAdded = struct {
+        files: usize = 0,
+        folders: usize = 0,
+        skipped: usize = 0,
+        /// Stopped by the caller's flag: the counts are what was added before.
+        cancelled: bool = false,
+        /// Why it stopped early: the counts are what was added before.
+        /// `failed`: another error once the add had begun (logged).
+        stopped_by: enum { none, storage_full, not_synced, no_space, failed } = .none,
+    };
+
+    /// Folders nested deeper than this inside an added folder are skipped
+    /// (the manifest holds no deeper path anyway).
+    pub const max_tree_depth = manifest_mod.max_depth;
+
+    /// Adds the local folder at `local_dir` as `dir/<its name>`, with every
+    /// file and folder in it (empty folders too). Files replace what has
+    /// their path, as `addFile` does. Symlinks, special files, names the
+    /// swarm folder can't hold and folders past `max_tree_depth` are
+    /// skipped and counted; a file that can't be read, or whose swarm path
+    /// would be too deep or too long, is skipped too, so one bad file
+    /// doesn't lose the rest. A full store or disk, or waiting for sync,
+    /// stops the add. `cancel` is checked between entries. A stopped add
+    /// returns the counts so far.
+    pub fn addTree(self: *SwarmFolder, dir: []const u8, local_dir: []const u8, cancel: ?*const std.atomic.Value(bool)) !TreeAdded {
+        var added: TreeAdded = .{};
+        self.addTreeRoot(dir, local_dir, cancel, &added) catch |err| {
+            added.stopped_by = switch (err) {
+                error.StorageFull => .storage_full,
+                error.NotSynced => .not_synced,
+                error.NoSpaceLeft => .no_space,
+                error.OutOfMemory => return err,
+                // Before the folder was made nothing was added: the error
+                // says it all. After, keep what went in and say it stopped.
+                else => if (added.folders == 0) return err else blk: {
+                    std.log.warn("swarm: adding {s} stopped: {t}", .{ local_dir, err });
+                    break :blk .failed;
+                },
+            };
+        };
+        return added;
+    }
+
+    fn addTreeRoot(self: *SwarmFolder, dir: []const u8, local_dir: []const u8, cancel: ?*const std.atomic.Value(bool), added: *TreeAdded) !void {
+        const trimmed = std.mem.trimEnd(u8, local_dir, "/\\");
+        const name = std.fs.path.basename(trimmed);
+        if (!storage.dag.codec.isValidName(name)) return error.InvalidName;
+        var src = try std.Io.Dir.cwd().openDir(self.io, local_dir, .{ .iterate = true });
+        defer src.close(self.io);
+        const path = try join(self.allocator, dir, name);
+        defer self.allocator.free(path);
+        if (!manifest_mod.validPath(path)) return error.InvalidPath;
+        if (cancel) |c| if (c.load(.acquire)) {
+            added.cancelled = true;
+            return;
+        };
+        try self.makeDir(dir, name);
+        added.folders = 1;
+        try self.addTreeAt(src, local_dir, path, 0, cancel, added);
+    }
+
+    /// Adds what is in `src` under the folder `path`, which exists already.
+    fn addTreeAt(self: *SwarmFolder, src: std.Io.Dir, local_path: []const u8, path: []const u8, depth: usize, cancel: ?*const std.atomic.Value(bool), added: *TreeAdded) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var it = src.iterate();
+        while (try it.next(self.io)) |entry| {
+            defer _ = arena_state.reset(.retain_capacity);
+            if (cancel) |c| if (c.load(.acquire)) {
+                added.cancelled = true;
+                return;
+            };
+            if (!storage.dag.codec.isValidName(entry.name)) {
+                added.skipped += 1;
+                continue;
+            }
+            var kind = entry.kind;
+            if (kind == .unknown) {
+                const st = src.statFile(self.io, entry.name, .{ .follow_symlinks = false }) catch null;
+                if (st) |s| kind = s.kind;
+            }
+            const child_local = try std.fs.path.join(arena, &.{ local_path, entry.name });
+            const child = try join(arena, path, entry.name);
+            if (!manifest_mod.validPath(child)) { // too deep or too long here
+                added.skipped += 1;
+                continue;
+            }
+            switch (kind) {
+                .file => {
+                    const parent = splitParent(child);
+                    self.addFile(parent.dir, parent.name, child_local) catch |err| switch (err) {
+                        error.OutOfMemory, error.NotSynced, error.NoSpaceLeft, error.StorageFull => return err,
+                        else => {
+                            std.log.warn("swarm: skipping {s}: {t}", .{ child_local, err });
+                            added.skipped += 1;
+                            continue;
+                        },
+                    };
+                    added.files += 1;
+                },
+                .directory => {
+                    if (depth + 1 >= max_tree_depth) {
+                        added.skipped += 1;
+                        continue;
+                    }
+                    var sub = src.openDir(self.io, entry.name, .{ .iterate = true, .follow_symlinks = false }) catch {
+                        added.skipped += 1;
+                        continue;
+                    };
+                    defer sub.close(self.io);
+                    self.makeDir(path, entry.name) catch |err| switch (err) {
+                        error.NotADirectory => { // a file has its path
+                            added.skipped += 1;
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    added.folders += 1;
+                    try self.addTreeAt(sub, child_local, child, depth + 1, cancel, added);
+                    if (added.cancelled) return;
+                },
+                else => added.skipped += 1,
+            }
+        }
     }
 
     pub const PutResult = struct { cid: [32]u8, size: u64, mtime: u64 };
@@ -423,6 +619,8 @@ pub const SwarmFolder = struct {
             try self.checkBaseLocked(path, base);
         }
         var reader = storage.chunker.SliceReader{ .buffer = bytes };
+        self.store.beginWrite(); // until the entry is recorded (see addFileAt)
+        defer self.store.endWrite();
         var builder = storage.dag.DagBuilder{ .allocator = self.allocator, .store = self.store, .layout = .Balanced };
         const root = try builder.build(&reader);
         defer self.allocator.free(root);
@@ -484,12 +682,73 @@ pub const SwarmFolder = struct {
         return roots.toOwnedSlice(allocator);
     }
 
+    pub const RecentDelete = struct { cid: [32]u8, at_ms: i64 };
+    /// How long a deleted file's content outlives a collection.
+    pub const undo_grace_ms: i64 = 10 * 60 * 1000;
+
+    fn pruneRecentDeletesLocked(self: *SwarmFolder, now_ms: i64) void {
+        var i: usize = 0;
+        while (i < self.recent_deletes.items.len) {
+            if (now_ms - self.recent_deletes.items[i].at_ms > undo_grace_ms) _ = self.recent_deletes.swapRemove(i) else i += 1;
+        }
+    }
+
+    /// Caller holds `mutex`. Remembers the content of a live file about to
+    /// be deleted (see `recent_deletes`). Best effort: a failed append only
+    /// shortens the undo window to the next collection.
+    fn noteDeleteLocked(self: *SwarmFolder, path: []const u8, now_ms: i64) void {
+        const e = self.manifest.get(path) orelse return;
+        if (e.deleted or e.kind != .file) return;
+        self.recent_deletes.append(self.allocator, .{ .cid = e.cid, .at_ms = now_ms }) catch {};
+    }
+
+    pub const LiveRoots = struct {
+        roots: [][32]u8,
+        /// `changeGeneration` of the entries the roots came from.
+        generation: u64,
+        /// A delete still inside `undo_grace_ms` was spared: collect again soon.
+        sparing_recent: bool,
+    };
+
+    /// Root CIDs whose blocks must stay on this device: every live file's
+    /// (whoever wrote it: a file moved or renamed elsewhere is still the
+    /// one this device holds), and files deleted here in the last
+    /// `undo_grace_ms`. Null while it isn't safe to collect (see
+    /// `reclaim_ready`): the list may be missing files this device holds.
+    /// Caller frees `.roots`.
+    pub fn liveRoots(self: *SwarmFolder, allocator: std.mem.Allocator) !?LiveRoots {
+        var roots: std.ArrayList([32]u8) = .empty;
+        errdefer roots.deinit(allocator);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.reclaim_ready) return null;
+        for (self.manifest.entries.values()) |e| {
+            if (e.deleted or e.kind != .file) continue;
+            try roots.append(allocator, e.cid);
+        }
+        const now_ms = sync.monotonicMillis();
+        var sparing = false;
+        for (self.recent_deletes.items) |r| {
+            if (now_ms - r.at_ms > undo_grace_ms) continue;
+            try roots.append(allocator, r.cid);
+            sparing = true;
+        }
+        // Under the same hold as the entries read.
+        const generation = self.changeGeneration();
+        return .{ .roots = try roots.toOwnedSlice(allocator), .generation = generation, .sparing_recent = sparing };
+    }
+
+    /// Makes the folder `dir/name`. A folder already there is left as it
+    /// is; a file there is never replaced (error.NotADirectory). Checked
+    /// under the lock that edits, so a file added meanwhile isn't lost.
     pub fn makeDir(self: *SwarmFolder, dir: []const u8, name: []const u8) !void {
         const path = try join(self.allocator, dir, name);
         defer self.allocator.free(path);
         defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.manifest.get(path)) |e| if (!e.deleted and e.kind == .file) return error.NotADirectory;
+        if (self.folderAtLocked(path)) return;
         try self.editAllowedLocked();
         _ = try self.manifest.edit(path, .{ .kind = .dir, .mtime = self.now() }, self.self_id.bytes, self.self_name);
         try self.saveLocked();
@@ -504,8 +763,68 @@ pub const SwarmFolder = struct {
         const doomed = try self.liveUnderLocked(path);
         defer freePaths(self.allocator, doomed);
         if (doomed.len == 0) return error.FileNotFound;
-        for (doomed) |p| _ = try self.manifest.edit(p, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+        // Tombstones written before a failed edit are in memory: mark them
+        // for the disk too.
+        errdefer self.saveLocked() catch {};
+        const now_ms = sync.monotonicMillis();
+        self.pruneRecentDeletesLocked(now_ms);
+        for (doomed) |p| {
+            self.noteDeleteLocked(p, now_ms);
+            _ = try self.manifest.edit(p, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+        }
         try self.saveLocked();
+    }
+
+    /// Deletes many files and folders (each with everything in it) under
+    /// one lock, one pass over the manifest and one manifest write. A path
+    /// that is already gone (another device deleted it first) is skipped,
+    /// not an error. Answers how many of `paths` matched something live.
+    pub fn removeMany(self: *SwarmFolder, paths: []const []const u8) !usize {
+        for (paths) |p| if (!manifest_mod.validPath(p)) return error.InvalidPath;
+        // Requested path -> whether it matched a live entry.
+        var wanted: std.StringHashMapUnmanaged(bool) = .empty;
+        defer wanted.deinit(self.allocator);
+        for (paths) |p| try wanted.put(self.allocator, p, false);
+        defer self.flushSave(); // after the unlock: writes outside the lock
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.editAllowedLocked();
+        // Collected first: editing while iterating the entries isn't safe.
+        var doomed: std.ArrayList([]u8) = .empty;
+        defer {
+            for (doomed.items) |p| self.allocator.free(p);
+            doomed.deinit(self.allocator);
+        }
+        for (self.manifest.entries.values()) |e| {
+            if (e.deleted) continue;
+            // The entry itself and each folder above it: at most max_depth lookups.
+            var hit = false;
+            var end: usize = 0;
+            while (end <= e.path.len) : (end += 1) {
+                if (end < e.path.len and e.path[end] != '/') continue;
+                if (wanted.getPtr(e.path[0..end])) |matched| {
+                    matched.* = true;
+                    hit = true;
+                }
+            }
+            if (hit) {
+                const copy = try self.allocator.dupe(u8, e.path);
+                errdefer self.allocator.free(copy);
+                try doomed.append(self.allocator, copy);
+            }
+        }
+        errdefer if (doomed.items.len > 0) self.saveLocked() catch {}; // see `remove`
+        const now_ms = sync.monotonicMillis();
+        if (doomed.items.len > 0) self.pruneRecentDeletesLocked(now_ms);
+        for (doomed.items) |p| {
+            self.noteDeleteLocked(p, now_ms);
+            _ = try self.manifest.edit(p, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
+        }
+        var removed: usize = 0;
+        var it = wanted.valueIterator();
+        while (it.next()) |matched| removed += @intFromBool(matched.*);
+        if (removed > 0) try self.saveLocked();
+        return removed;
     }
 
     /// Removes one file, and only while its content is still `base` (null:
@@ -522,6 +841,9 @@ pub const SwarmFolder = struct {
         const entry = self.manifest.get(path) orelse return error.FileNotFound;
         if (entry.deleted or entry.kind != .file) return error.FileNotFound;
         if (base) |expected| if (!std.mem.eql(u8, &entry.cid, &expected)) return error.Changed;
+        const now_ms = sync.monotonicMillis();
+        self.pruneRecentDeletesLocked(now_ms);
+        self.noteDeleteLocked(path, now_ms);
         _ = try self.manifest.edit(path, .{ .deleted = true, .mtime = self.now() }, self.self_id.bytes, self.self_name);
         try self.saveLocked();
     }
@@ -697,7 +1019,9 @@ pub const SwarmFolder = struct {
             const under = std.mem.eql(u8, e.path, path) or
                 (std.mem.startsWith(u8, e.path, path) and e.path.len > path.len and e.path[path.len] == '/');
             if (!under) continue;
-            try out.append(self.allocator, try self.allocator.dupe(u8, e.path));
+            const copy = try self.allocator.dupe(u8, e.path);
+            errdefer self.allocator.free(copy);
+            try out.append(self.allocator, copy);
         }
         return out.toOwnedSlice(self.allocator);
     }
@@ -893,9 +1217,7 @@ pub const SwarmFolder = struct {
     /// (error.NotSynced), so an empty folder on a waking device never
     /// overwrites the swarm's.
     pub fn awaitingFirstSync(self: *SwarmFolder) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.awaitingLocked();
+        return !self.editReady();
     }
 
     pub const Status = struct { entries: usize, peers_synced: u32, peers_failed: u32, last_sync: u64 };
@@ -966,7 +1288,7 @@ pub const SwarmFolder = struct {
             self.peers_synced = reached;
             self.peers_failed = failed;
             self.last_sync = self.now();
-            self.roundDoneLocked(merged_from);
+            self.roundDoneLocked(merged_from, changed);
             if (changed > 0) {
                 self.saveLocked() catch |err| std.debug.print("swarm: saving the manifest failed: {any}\n", .{err});
                 // New files may be ones this device keeps.
@@ -981,8 +1303,14 @@ pub const SwarmFolder = struct {
 
     /// Caller holds `mutex`. A round that merged no reached peer's manifest
     /// (none known yet, offline, or unreadable) doesn't lift `awaiting_pull`.
-    fn roundDoneLocked(self: *SwarmFolder, merged_from: u32) void {
-        if (merged_from > 0) self.awaiting_pull = false;
+    /// A missing manifest needs actual entries from a peer before collection.
+    fn roundDoneLocked(self: *SwarmFolder, merged_from: u32, changed: usize) void {
+        if (merged_from == 0) return;
+        self.awaiting_pull = false;
+        if (!self.reclaim_ready and (!self.manifest_missing or changed > 0)) {
+            self.reclaim_ready = true;
+            self.dirty = true; // persist this state before writing the marker
+        }
     }
 
     /// Parses a peer's manifest outside the lock (reads through the mount
@@ -994,6 +1322,10 @@ pub const SwarmFolder = struct {
             return null;
         };
         defer parsed.deinit();
+        // Taken before `mutex` (the store's lock order): no sweep while
+        // merged entries make new roots live.
+        self.store.beginWrite();
+        defer self.store.endWrite();
         self.mutex.lock();
         defer self.mutex.unlock();
         const changed = self.manifest.mergeParsed(&parsed);
@@ -1002,6 +1334,8 @@ pub const SwarmFolder = struct {
         if (changed > 0) _ = self.generation.fetchAdd(1, .release);
         return changed;
     }
+
+    pub const mergePeerBytesForTest = if (@import("builtin").is_test) mergePeerBytes else @compileError("mergePeerBytesForTest is only available in tests");
 
     /// A callback of the folder's thread. Hooks run outside the folder's
     /// locks (they may read it), one after the other, never concurrently.
@@ -1103,6 +1437,8 @@ pub const SwarmFolder = struct {
     /// scanned into the store), in one edit and one save. A path that holds
     /// the same content already is left alone. Returns how many were added.
     pub fn importFiles(self: *SwarmFolder, files: []const Import) !usize {
+        self.store.beginWrite(); // before `mutex`: entries make roots live
+        defer self.store.endWrite();
         defer self.flushSave(); // after the unlock: writes outside the lock
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1589,6 +1925,62 @@ test "swarm: putBytes with no base refuses an existing path but not a deleted on
     try std.testing.expect(folder.fileInfo("Notes/one.md") != null);
 }
 
+test "swarm: removeMany deletes files and folders at once and skips what is gone" {
+    var t: TestFolder = undefined;
+    try t.open(0x24, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    _ = try folder.putBytes("Camera/a.jpg", "a", null);
+    _ = try folder.putBytes("Camera/b.jpg", "b", null);
+    _ = try folder.putBytes("Camera/c.jpg", "c", null);
+    _ = try folder.putBytes("Old/x.txt", "x", null);
+    _ = try folder.putBytes("Old/deep/y.txt", "y", null);
+    try folder.remove("Camera/c.jpg");
+
+    const n = try folder.removeMany(&.{ "Camera/a.jpg", "Camera/c.jpg", "Old", "Nope/z.txt" });
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expect(folder.fileInfo("Camera/a.jpg") == null);
+    try std.testing.expect(folder.fileInfo("Camera/b.jpg") != null);
+    try std.testing.expect(folder.fileInfo("Old/x.txt") == null);
+    try std.testing.expect(folder.fileInfo("Old/deep/y.txt") == null);
+    try std.testing.expectError(error.InvalidPath, folder.removeMany(&.{ "Camera/b.jpg", "../etc" }));
+    try std.testing.expect(folder.fileInfo("Camera/b.jpg") != null);
+}
+
+test "swarm: liveRoots has every live file and what was deleted a moment ago" {
+    var t: TestFolder = undefined;
+    try t.open(0x25, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    const a = (try folder.putBytes("a.txt", "a", null)).cid;
+    const b = (try folder.putBytes("b.txt", "b", null)).cid;
+    const c = (try folder.putBytes("c.txt", "c", null)).cid;
+    try folder.remove("b.txt");
+    try folder.remove("c.txt");
+    // c was deleted long ago: past the undo grace.
+    folder.recent_deletes.items[1].at_ms -= SwarmFolder.undo_grace_ms + 1;
+    folder.mutex.lock();
+    folder.roundDoneLocked(1, 1); // merged a peer: safe to collect
+    folder.mutex.unlock();
+
+    const live = (try folder.liveRoots(std.testing.allocator)).?;
+    const roots = live.roots;
+    defer std.testing.allocator.free(roots);
+    try std.testing.expect(live.sparing_recent); // b
+    try std.testing.expectEqual(folder.changeGeneration(), live.generation);
+    var has_a = false;
+    var has_b = false;
+    var has_c = false;
+    for (roots) |r| {
+        if (std.mem.eql(u8, &r, &a)) has_a = true;
+        if (std.mem.eql(u8, &r, &b)) has_b = true;
+        if (std.mem.eql(u8, &r, &c)) has_c = true;
+    }
+    try std.testing.expect(has_a and has_b and !has_c);
+}
+
 test "swarm: removeFile removes one file, only from its base, never a folder" {
     var t: TestFolder = undefined;
     try t.open(0x23, "Desk");
@@ -1732,6 +2124,7 @@ test "swarm: a folder whose manifest was missing takes no local edit before its 
     _ = try folder.putBytes("Notes/a.md", "a", null);
     folder.awaiting_pull = folder.manifest_missing;
     folder.awaiting_since_ms = sync.monotonicMillis();
+    try std.testing.expect(!folder.editReady());
     try std.testing.expectError(error.NotSynced, folder.putBytes("Notes/b.md", "b", null));
     try std.testing.expectError(error.NotSynced, folder.makeDir("Notes", "d"));
     try std.testing.expectError(error.NotSynced, folder.remove("Notes/a.md"));
@@ -1741,9 +2134,9 @@ test "swarm: a folder whose manifest was missing takes no local edit before its 
     try std.testing.expect(folder.fileInfo("Notes/a.md") != null);
     // A sync round that merged a reached peer's manifest lifts it.
     folder.mutex.lock();
-    folder.roundDoneLocked(1);
+    folder.roundDoneLocked(1, 0);
     folder.mutex.unlock();
-    try std.testing.expect(!folder.awaiting_pull);
+    try std.testing.expect(folder.editReady());
     _ = try folder.putBytes("Notes/b.md", "b", null);
 }
 
@@ -1757,7 +2150,7 @@ test "swarm: the first round with no peers known yet, or an unreadable peer mani
 
     // No peer in the routing table yet: nothing merged.
     folder.mutex.lock();
-    folder.roundDoneLocked(0);
+    folder.roundDoneLocked(0, 0);
     folder.mutex.unlock();
     try std.testing.expect(folder.awaiting_pull);
     try std.testing.expectError(error.NotSynced, folder.putBytes("Notes/a.md", "a", null));
@@ -1774,9 +2167,10 @@ test "swarm: the first round with no peers known yet, or an unreadable peer mani
     _ = try other.folder.putBytes("Notes/theirs.md", "t", null);
     const bytes = try other.folder.manifest.encode(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
-    try std.testing.expectEqual(@as(usize, 1), folder.mergePeerBytes(bytes, peer).?);
+    const changed = folder.mergePeerBytes(bytes, peer).?;
+    try std.testing.expectEqual(@as(usize, 1), changed);
     folder.mutex.lock();
-    folder.roundDoneLocked(1);
+    folder.roundDoneLocked(1, changed);
     folder.mutex.unlock();
     _ = try folder.putBytes("Notes/a.md", "a", null);
 }
@@ -2206,4 +2600,353 @@ test "swarm: a read whose only holder is a gone author reports NoHolders" {
     var dest: [16]u8 = undefined;
     // The app shows NoHolders as "no device is known to keep it yet".
     try std.testing.expectError(error.NoHolders, t.folder.readAt(allocator, [_]u8{0x44} ** 32, gone.bytes, 0, &dest));
+}
+
+test "swarm: addTree adds a folder with its files, subfolders and empty folders" {
+    const testing = std.testing;
+    const io = testing.io;
+    var t: TestFolder = undefined;
+    try t.open(0x26, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "Trip/day 1");
+    try tmp.dir.createDirPath(io, "Trip/empty");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Trip/notes.txt", .data = "hello" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Trip/day 1/a.jpg", .data = "jpeg" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const trip = try std.fs.path.join(testing.allocator, &.{ tmp_path, "Trip" });
+    defer testing.allocator.free(trip);
+
+    const added = try folder.addTree("Photos", trip, null);
+    try testing.expectEqual(@as(usize, 2), added.files);
+    try testing.expectEqual(@as(usize, 3), added.folders);
+    try testing.expectEqual(@as(usize, 0), added.skipped);
+    try testing.expectEqual(@as(u64, 5), folder.fileInfo("Photos/Trip/notes.txt").?.size);
+    try testing.expect(folder.fileInfo("Photos/Trip/day 1/a.jpg") != null);
+    try testing.expect(try folder.isEmptyDir("Photos/Trip/empty"));
+
+    // Again: the same files, nothing doubled, and a file is never made a folder.
+    const again = try folder.addTree("Photos", trip, null);
+    try testing.expectEqual(@as(usize, 2), again.files);
+    _ = try folder.putBytes("Clash", "x", null);
+    try tmp.dir.createDirPath(io, "Clash");
+    const clash = try std.fs.path.join(testing.allocator, &.{ tmp_path, "Clash" });
+    defer testing.allocator.free(clash);
+    try testing.expectError(error.NotADirectory, folder.addTree("", clash, null));
+}
+
+test "swarm: addTree returns partial counts when the store is full or sync is pending" {
+    const testing = std.testing;
+    const io = testing.io;
+    var t: TestFolder = undefined;
+    try t.open(0x58, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "Trip/day");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Trip/day/photo.jpg", .data = "photo bytes" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const trip = try std.fs.path.join(testing.allocator, &.{ tmp_path, "Trip" });
+    defer testing.allocator.free(trip);
+
+    try folder.store.setQuota(0);
+    const full = try folder.addTree("", trip, null);
+    try testing.expectEqual(SwarmFolder.TreeAdded{ .folders = 2, .stopped_by = .storage_full }, full);
+    try testing.expectEqual(null, folder.fileInfo("Trip/day/photo.jpg"));
+
+    try folder.store.setQuota(null);
+    folder.awaiting_pull = true;
+    folder.awaiting_since_ms = sync.monotonicMillis();
+    // The existing directories are visited before the file edit is refused.
+    const waiting = try folder.addTree("", trip, null);
+    try testing.expectEqual(SwarmFolder.TreeAdded{ .folders = 2, .stopped_by = .not_synced }, waiting);
+    const refused = try folder.addTree("Different", trip, null);
+    try testing.expectEqual(SwarmFolder.TreeAdded{ .stopped_by = .not_synced }, refused);
+}
+
+test "swarm: a full store stops addTree after the files that fit, and counts them" {
+    const testing = std.testing;
+    const io = testing.io;
+    var t: TestFolder = undefined;
+    try t.open(0x5a, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "Trip");
+    // Same size, distinct bytes: each takes the same room in the store.
+    const names = [_][]const u8{ "probe.bin", "Trip/a.bin", "Trip/b.bin", "Trip/c.bin" };
+    for (names, 0..) |name, i| {
+        var data: [1000]u8 = undefined;
+        @memset(&data, @intCast('a' + i));
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = &data });
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const probe = try std.fs.path.join(testing.allocator, &.{ tmp_path, "probe.bin" });
+    defer testing.allocator.free(probe);
+    const trip = try std.fs.path.join(testing.allocator, &.{ tmp_path, "Trip" });
+    defer testing.allocator.free(trip);
+
+    // Room for two of the three files, whichever the folder lists first.
+    try folder.store.setQuota(1 << 30);
+    const before = folder.store.used_bytes;
+    try folder.addFile("", "probe.bin", probe);
+    const per_file = folder.store.used_bytes - before;
+    try folder.store.setQuota(folder.store.used_bytes + 2 * per_file);
+
+    const added = try folder.addTree("", trip, null);
+    try testing.expectEqual(SwarmFolder.TreeAdded{ .files = 2, .folders = 1, .stopped_by = .storage_full }, added);
+    var present: usize = 0;
+    for ([_][]const u8{ "Trip/a.bin", "Trip/b.bin", "Trip/c.bin" }) |p| {
+        if (folder.fileInfo(p) != null) present += 1;
+    }
+    try testing.expectEqual(added.files, present);
+}
+
+test "swarm: addTree reuses scratch space across entries" {
+    const testing = std.testing;
+    const io = testing.io;
+    var t: TestFolder = undefined;
+    try t.open(0x59, "Desk");
+    defer t.close();
+    const folder = t.folder;
+    const parent = ("a" ** 250 ++ "/") ** 4;
+    try folder.makeDir(parent[0 .. parent.len - 1], "Trip");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "Trip", .default_dir);
+    const entry_count = 32;
+    for (0..entry_count) |i| {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "Trip/" ++ "b" ** 32 ++ "{d}", .{i});
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const trip = try std.fs.path.join(testing.allocator, &.{ tmp_path, "Trip" });
+    defer testing.allocator.free(trip);
+
+    // All children exceed the manifest path limit, so only their scratch
+    // paths need memory. The buffer cannot hold the paths for every child.
+    var scratch: [8192]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+    folder.allocator = fixed.allocator();
+    defer folder.allocator = testing.allocator;
+    const added = try folder.addTree(parent[0 .. parent.len - 1], trip, null);
+    try testing.expectEqual(SwarmFolder.TreeAdded{ .folders = 1, .skipped = entry_count }, added);
+
+    var exhausted = std.heap.FixedBufferAllocator.init(&.{});
+    folder.allocator = exhausted.allocator();
+    try testing.expectError(error.OutOfMemory, folder.addTree("", trip, null));
+}
+
+test "swarm: no collection without a merge, even past the grace period or with the clock found" {
+    var t: TestFolder = undefined;
+    try t.open(0x51, "Desk");
+    defer t.close();
+    const folder = t.folder;
+    _ = try folder.putBytes("a.txt", "a", null);
+    // A device alone past alone_grace edits, but never collects.
+    folder.awaiting_pull = true;
+    folder.awaiting_since_ms = sync.monotonicMillis() - folder.alone_grace_ms - 1;
+    _ = try folder.putBytes("b.txt", "b", null);
+    try std.testing.expect(try folder.liveRoots(std.testing.allocator) == null);
+
+    // The manifest lost, the clock file found (no pull is awaited): still no.
+    try t.reopen(true);
+    try std.testing.expect(t.folder.clock_found and t.folder.manifest_missing);
+    try std.testing.expect(try t.folder.liveRoots(std.testing.allocator) == null);
+}
+
+test "swarm: collection after manifest loss needs merged entries and leaves a marker only after save" {
+    const testing = std.testing;
+    const dir = std.Io.Dir.cwd();
+    var t: TestFolder = undefined;
+    try t.open(0x52, "Desk");
+    defer t.close();
+    _ = try t.folder.putBytes("a.txt", "a", null);
+    try t.reopen(true);
+    _ = try t.folder.putBytes("local.txt", "local", null);
+    const marker = try t.folder.reclaimMarkerPath();
+    defer testing.allocator.free(marker);
+
+    var peer: TestFolder = undefined;
+    try peer.open(0x57, "Phone");
+    defer peer.close();
+    const empty = t.folder.mergePeerBytes("[]", peer.folder.self_id).?;
+    try testing.expectEqual(@as(usize, 0), empty);
+    t.folder.roundDoneLocked(1, empty);
+    try testing.expect(try t.folder.liveRoots(testing.allocator) == null);
+
+    _ = try peer.folder.putBytes("peer.txt", "peer", null);
+    const bytes = try peer.folder.manifest.encode(testing.allocator);
+    defer testing.allocator.free(bytes);
+    const changed = t.folder.mergePeerBytes(bytes, peer.folder.self_id).?;
+    try testing.expectEqual(@as(usize, 1), changed);
+    t.folder.roundDoneLocked(1, changed);
+    const live = (try t.folder.liveRoots(testing.allocator)).?;
+    defer testing.allocator.free(live.roots);
+    try testing.expectEqual(@as(usize, 2), live.roots.len);
+    try testing.expectError(error.FileNotFound, dir.access(testing.io, marker, .{}));
+
+    // Force a failed write to the temporary path, then retry the save.
+    try t.tmp.dir.createDir(testing.io, "manifest.json.tmp", .default_dir);
+    t.folder.written_ms = 0;
+    t.folder.flushSave();
+    try testing.expectError(error.FileNotFound, dir.access(testing.io, marker, .{}));
+    try t.tmp.dir.deleteDir(testing.io, "manifest.json.tmp");
+    t.folder.written_ms = 0;
+    t.folder.flushSave();
+    try dir.access(testing.io, marker, .{});
+
+    // Loaded from disk with the marker: ready at once.
+    try t.reopen(false);
+    try testing.expect(!t.folder.manifest_missing);
+    const again = (try t.folder.liveRoots(testing.allocator)).?;
+    defer testing.allocator.free(again.roots);
+    try testing.expectEqual(@as(usize, 2), again.roots.len);
+    try testing.expect(t.folder.fileInfo("peer.txt") != null);
+
+    // Lost manifest, edits made alone, restart: the stale marker is gone.
+    try t.reopen(true);
+    try testing.expectError(error.FileNotFound, dir.access(testing.io, marker, .{}));
+    _ = try t.folder.putBytes("b.txt", "b", null);
+    try t.reopen(false);
+    try testing.expect(try t.folder.liveRoots(testing.allocator) == null);
+}
+
+test "swarm: a loaded manifest without the marker waits for a merge" {
+    var t: TestFolder = undefined;
+    try t.open(0x53, "Desk");
+    defer t.close();
+    _ = try t.folder.putBytes("a.txt", "a", null);
+    try t.reopen(false);
+    try std.testing.expect(!t.folder.manifest_missing);
+    try std.testing.expect(try t.folder.liveRoots(std.testing.allocator) == null);
+    t.folder.roundDoneLocked(1, 0);
+    const live = (try t.folder.liveRoots(std.testing.allocator)).?;
+    defer std.testing.allocator.free(live.roots);
+    try std.testing.expectEqual(@as(usize, 1), live.roots.len);
+    t.folder.flushSave();
+    try std.testing.expect(t.folder.reclaimMarkerExists());
+}
+
+test "swarm: makeDir keeps a folder there and never replaces a file" {
+    var t: TestFolder = undefined;
+    try t.open(0x54, "Desk");
+    defer t.close();
+    const folder = t.folder;
+    _ = try folder.putBytes("Docs/report", "r", null);
+    try std.testing.expectError(error.NotADirectory, folder.makeDir("Docs", "report"));
+    try std.testing.expect(folder.fileInfo("Docs/report") != null);
+
+    try folder.makeDir("", "Pics");
+    const gen = folder.changeGeneration();
+    try folder.makeDir("", "Pics"); // already there: no edit
+    try folder.makeDir("", "Docs"); // implied by its file: no edit either
+    try std.testing.expectEqual(gen, folder.changeGeneration());
+}
+
+test "swarm: removeMany matches nested and repeated paths in one pass" {
+    var t: TestFolder = undefined;
+    try t.open(0x55, "Desk");
+    defer t.close();
+    const folder = t.folder;
+    _ = try folder.putBytes("Old/x.txt", "x", null);
+    _ = try folder.putBytes("Old/deep/y.txt", "y", null);
+    _ = try folder.putBytes("Oldish/z.txt", "z", null);
+    _ = try folder.putBytes("Keep/k.txt", "k", null);
+    _ = try folder.putBytes("Expired/p.txt", "p", null);
+    try folder.remove("Expired/p.txt");
+    folder.recent_deletes.items[0].at_ms -= SwarmFolder.undo_grace_ms + 1;
+
+    // A folder and a file inside it both count; a repeat counts once; a
+    // sibling sharing a prefix of the name is untouched.
+    const n = try folder.removeMany(&.{ "Old", "Old/deep/y.txt", "Old", "Gone" });
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expect(folder.fileInfo("Old/x.txt") == null);
+    try std.testing.expect(folder.fileInfo("Old/deep/y.txt") == null);
+    try std.testing.expect(folder.fileInfo("Oldish/z.txt") != null);
+    try std.testing.expect(folder.fileInfo("Keep/k.txt") != null);
+    const recent = folder.recent_deletes.items;
+    try std.testing.expectEqual(@as(usize, 2), recent.len);
+    try std.testing.expectEqual(recent[0].at_ms, recent[1].at_ms);
+    try std.testing.expectEqual(@as(usize, 0), try folder.removeMany(&.{"Old"}));
+}
+
+test "swarm: failed delete list append frees the copied path" {
+    const testing = std.testing;
+    var t: TestFolder = undefined;
+    try t.open(0x58, "Desk");
+    defer t.close();
+    const folder = t.folder;
+    _ = try folder.putBytes("Old/x.txt", "x", null);
+    folder.writeIfDirty(true);
+
+    for ([_]bool{ false, true }) |many| {
+        // Fail after the path is copied, with one extra allocation for the
+        // requested paths map in removeMany.
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = if (many) 2 else 1 });
+        const allocator = folder.allocator;
+        folder.allocator = failing.allocator();
+        defer folder.allocator = allocator;
+        if (many) {
+            try testing.expectError(error.OutOfMemory, folder.removeMany(&.{"Old"}));
+        } else {
+            try testing.expectError(error.OutOfMemory, folder.remove("Old"));
+        }
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        try testing.expect(folder.fileInfo("Old/x.txt") != null);
+    }
+}
+
+test "swarm: addTree skips what is too deep for the swarm and stops on the flag" {
+    const testing = std.testing;
+    const io = testing.io;
+    var t: TestFolder = undefined;
+    try t.open(0x56, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Deep/d1/.../d31/f.txt: the folders fit under "X" up to max_depth, the
+    // file and the last folder don't.
+    var rel: std.ArrayList(u8) = .empty;
+    defer rel.deinit(testing.allocator);
+    try rel.appendSlice(testing.allocator, "Deep");
+    for (1..manifest_mod.max_depth) |i| try rel.print(testing.allocator, "/d{d}", .{i});
+    try tmp.dir.createDirPath(io, rel.items);
+    try rel.appendSlice(testing.allocator, "/f.txt");
+    try tmp.dir.writeFile(io, .{ .sub_path = rel.items, .data = "f" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Deep/top.txt", .data = "t" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const deep = try std.fs.path.join(testing.allocator, &.{ tmp_path, "Deep" });
+    defer testing.allocator.free(deep);
+
+    const added = try folder.addTree("X", deep, null);
+    try testing.expect(!added.cancelled);
+    try testing.expectEqual(@as(usize, 1), added.files); // top.txt
+    try testing.expect(added.skipped >= 1);
+    try testing.expect(folder.fileInfo("X/Deep/top.txt") != null);
+
+    // Stopped before creating the root.
+    const gen = folder.changeGeneration();
+    var stop: std.atomic.Value(bool) = .init(true);
+    const stopped = try folder.addTree("Y", deep, &stop);
+    try testing.expect(stopped.cancelled);
+    try testing.expectEqual(@as(usize, 0), stopped.files);
+    try testing.expectEqual(@as(usize, 0), stopped.folders);
+    try testing.expectEqual(gen, folder.changeGeneration());
 }

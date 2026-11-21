@@ -2,6 +2,9 @@ import {readdirSync, readFileSync} from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
+import { longPress } from '../frontend/selection.js';
+import { isRunning, setRunning, onNodeChange, nodeSession } from '../frontend/state.js';
+import { planUpload, sendUpload, progressText, uploadedText, folderAddedText } from '../frontend/uploads.js';
 // The app is split into ES modules; the tested functions are extracted from
 // whichever module holds them, in alphabetical file order.
 const dir = new URL('../frontend/', import.meta.url);
@@ -40,7 +43,7 @@ function $(id){return el(id)}
 }
 {
  elements.clear();const dirs=[];
- const c=context({swarmCrumbs(){},isRunning:()=>true,running:true,listLoading(){},listLoaded(){},snack(){},swarmStatusText(){return 'ok'},swarmTable:{dir:null,show(){},render(){}},invoke:async(cmd,args)=>{dirs.push(args.dir);return {items:[]}}});
+ const c=context({swarmCrumbs(){},isRunning:()=>true,running:true,listLoading(){},listLoaded(){},snack(){},swarmStatusText(){return 'ok'},swarmTable:{dir:null,show(){},render(){}},swarmSel:{leave(){},retain(){}},swarmSelBar(){},invoke:async(cmd,args)=>{dirs.push(args.dir);return {items:[]}}});
  vm.runInContext(`let swarmDir='New folder',swarmNav=0;`+fn('async function loadSwarm(', 'let swarmTable = null;')+`const pending=loadSwarm();`,c);
  await vm.runInContext('pending',c);assert.deepEqual(dirs,['New folder']);assert.equal(vm.runInContext('swarmDir',c),'New folder');
 }
@@ -176,4 +179,294 @@ test('codex-r2-1 downloads rows: the bar follows the download state, not the nod
       assert.equal(bars.length, state === 'running' ? 1 : 0, `state=${state} nodeOn=${NODE_ON}`);
     }
   }
+});
+
+test('J6 overlays attachMenu: touch pointercancel->contextmenu uses longPress and one-shot click suppression', () => {
+  const makeTarget = () => {
+    const listeners = new Map();
+    return {
+      dataset: {},
+      classList: { add(){}, toggle(){} },
+      addEventListener(type, fn) {
+        if (!listeners.has(type)) listeners.set(type, []);
+        listeners.get(type).push(fn);
+      },
+      emit(type, ev = {}) {
+        const e = {
+          pointerType: 'touch',
+          clientX: 12,
+          clientY: 34,
+          defaultPrevented: false,
+          stopped: false,
+          preventDefault() { this.defaultPrevented = true; },
+          stopPropagation() { this.stopped = true; },
+          ...ev,
+        };
+        for (const fn of listeners.get(type) || []) fn(e);
+        return e;
+      },
+    };
+  };
+  const menus = [];
+  const c = context({
+    longPress,
+    navigator: {},
+    showMenu: (x, y, items) => menus.push({ x, y, items }),
+  });
+  vm.runInContext(fn('export function attachMenu(', 'export function showMenu('), c);
+
+  // 1. Swarm-style row (items + onLongPress): pointercancel -> MouseEvent contextmenu runs onLongPress, not showMenu.
+  const li = makeTarget();
+  let pressed = 0;
+  let clicked = 0;
+  c.LI = li;
+  c.ITEMS = [{ icon: 'trash', label: 'Delete', run() {} }];
+  c.ON_LP = () => { pressed++; };
+  const press = vm.runInContext('attachMenu(LI, ITEMS, ON_LP)', c);
+  li.addEventListener('click', () => { if (!press.wasLongPress()) clicked++; });
+
+  li.emit('pointerdown', { pointerType: 'touch', clientX: 5, clientY: 6 });
+  li.emit('pointercancel', { pointerType: 'touch', clientX: 5, clientY: 6 });
+  const cm = li.emit('contextmenu', { pointerType: undefined, clientX: 5, clientY: 6 });
+  assert.equal(cm.defaultPrevented, true);
+  assert.equal(cm.stopped, true);
+  assert.equal(pressed, 1);
+  assert.equal(menus.length, 0);
+
+  // No click followed the cancelled pointer; the NEXT normal tap must NOT be swallowed.
+  li.emit('pointerdown', { pointerType: 'touch' });
+  li.emit('pointerup', { pointerType: 'touch' });
+  li.emit('click', { pointerType: 'touch' });
+  assert.equal(clicked, 1);
+
+  // Desktop mouse right-click still opens showMenu and does not invoke onLongPress.
+  li.emit('pointerdown', { pointerType: 'mouse' });
+  const rcm = li.emit('contextmenu', { pointerType: 'mouse', clientX: 90, clientY: 40 });
+  assert.equal(rcm.defaultPrevented, true);
+  assert.equal(pressed, 1);
+  assert.equal(menus.length, 1);
+  assert.equal(menus[0].x, 90);
+
+  // 2. Menu-only row (onLongPress = null): pointercancel -> contextmenu opens showMenu ONCE.
+  menus.length = 0;
+  const li2 = makeTarget();
+  c.LI2 = li2;
+  vm.runInContext('attachMenu(LI2, ITEMS, null)', c);
+  li2.emit('pointerdown', { pointerType: 'touch', clientX: 20, clientY: 30 });
+  li2.emit('pointercancel', { pointerType: 'touch', clientX: 20, clientY: 30 });
+  li2.emit('contextmenu', { pointerType: undefined, clientX: 20, clientY: 30 });
+  assert.equal(menus.length, 1);
+  assert.deepEqual([menus[0].x, menus[0].y], [20, 30]);
+});
+
+test('U7 swarm New folder dialog trims typed name and skips whitespace-only input', async () => {
+  elements.clear();
+  const clicks = new Map();
+  const calls = [];
+  let dialogAnswer = '  My Trip  ';
+  const makeBtn = (id) => {
+    const n = node();
+    n.addEventListener = (type, fn) => { if (type === 'click') clicks.set(id, fn); };
+    elements.set(id, n);
+    return n;
+  };
+  makeBtn('swarm-mkdir');
+  const c = context({
+    isRunning: () => true,
+    askDialog: async () => dialogAnswer,
+    invoke: async (cmd, args) => { calls.push([cmd, args.dir, args.name]); },
+    snack() {},
+    loadSwarm() {},
+  });
+  const mkdirSnippet = raw('$("swarm-mkdir").addEventListener("click",', '$("swarm-sync").addEventListener');
+  vm.runInContext(`let swarmDir = 'Photos';\n${mkdirSnippet}`, c);
+
+  await clicks.get('swarm-mkdir')();
+  assert.deepEqual(calls, [['swarm_mkdir', 'Photos', 'My Trip']]);
+
+  dialogAnswer = '   \t  ';
+  await clicks.get('swarm-mkdir')();
+  assert.equal(calls.length, 1, 'whitespace-only folder name is not sent');
+});
+
+test('J8 photos loadPhotos leaves select mode, clears stale grid on stop, and ignores late index', async () => {
+  elements.clear();
+  let running = true;
+  let starting = false;
+  let selLeft = 0;
+  let unmounted = 0;
+  let chipsCleared = 0;
+  el('photos-chips').replaceChildren = () => { chipsCleared++; };
+  const pendingIndex = deferred();
+  const c = context({
+    window: { oriel: { invoke: () => pendingIndex.promise } },
+    invoke: () => pendingIndex.promise,
+    isRunning: () => running,
+    isStarting: () => starting,
+    errText: String,
+    sel: { leave() { selLeft++; } },
+    unmountAllRows() { unmounted++; },
+    renderFolderChips() {},
+    groupByDay: () => [{ key: '2026-01-01', label: 'Jan 1', start: 0, count: 1 }],
+    computeLayout() { vm.runInContext('rows = [{ type: "tiles" }]', c); },
+    onScroll() {},
+  });
+  vm.runInContext(
+    `let currentFolder = ""; let currentIndex = { total: 5, generation: 2 }; let currentGeneration = 2; let thumbBase = "http://t/"; let sections = [1]; let rows = [1]; let selAnchor = 3; const pageCache = new Map([[0, { items: [{}] }]]);\n` +
+    fn('let loadSeq = 0;', 'export function installPhotos('),
+    c,
+  );
+
+  // Start a load while running, then stop the node before photos_index resolves.
+  const inFlight = vm.runInContext('loadPhotos()', c);
+  running = false;
+  await vm.runInContext('loadPhotos()', c);
+
+  assert.equal(selLeft, 1, 'sel.leave() called when node stops');
+  assert.equal(unmounted, 1, 'unmountAllRows() called when node stops');
+  assert.equal(chipsCleared, 1, 'folder chips cleared when node stops');
+  assert.equal(vm.runInContext('currentIndex', c), null);
+  assert.equal(vm.runInContext('rows.length', c), 0);
+  assert.equal(vm.runInContext('sections.length', c), 0);
+  assert.equal(vm.runInContext('pageCache.size', c), 0);
+  assert.equal(el('photos-spacer').style.height, '0px');
+  assert.equal(el('photos-sticky').hidden, true);
+  assert.equal(el('photos-scrubber').hidden, true);
+  assert.equal(el('photos-empty').hidden, false);
+  assert.equal(el('photos-empty').textContent, 'Start NomadFS to see your photos.');
+
+  // Late photos_index response from before the stop must not repopulate the grid.
+  pendingIndex.resolve({ generation: 3, total: 1, mtimes: [1700000000], folders: [], thumb_base: 'http://t/' });
+  await inFlight;
+  assert.equal(vm.runInContext('currentIndex', c), null);
+  assert.equal(vm.runInContext('rows.length', c), 0);
+});
+
+test('H6 swarm uploadInto stops batch across node restart during NotSynced wait', async () => {
+  elements.clear();
+  setRunning(true);
+  const snacks = [];
+  const calls = [];
+  let session = 'A';
+  let waitHook = null;
+  const fakeFile = (name, size) => ({
+    name,
+    size,
+    lastModified: 1700000000000,
+    slice: (a, b) => ({ arrayBuffer: async () => new Uint8Array(Math.max(0, Math.min(b, size) - a)).buffer }),
+  });
+  const c = context({
+    isRunning,
+    onNodeChange,
+    nodeSession,
+    planUpload,
+    progressText,
+    uploadedText,
+    sendUpload: (inv, plan, opts) => sendUpload(inv, plan, { ...opts, wait: async () => { if (waitHook) waitHook(); } }),
+    invoke: async (cmd, args) => {
+      calls.push([session, cmd, args]);
+      if (cmd === 'swarm_mkdir' && args.name === 'Trip') throw new Error('NotSynced');
+      if (cmd === 'swarm_upload_begin') {
+        if (args.name === 'second.jpg') throw new Error('NotSynced');
+        return 1;
+      }
+      return null;
+    },
+    snack: (msg, ms) => snacks.push([msg, ms]),
+    showUpload() {},
+    hideUpload() {},
+    loadSwarm() {},
+  });
+  vm.runInContext(
+    'let uploading = false; let uploadCancelled = false;\n' +
+    fn('async function uploadInto(', 'function installSwarmDrop('),
+    c,
+  );
+
+  // 1. Node stops and restarts (A -> B) during mkdir NotSynced wait:
+  // retry must not invoke anything on session B, and snack reports the restart.
+  waitHook = () => {
+    setRunning(false);
+    session = 'B';
+    setRunning(true);
+  };
+  c.FILES1 = [{ file: fakeFile('a.jpg', 4), rel: 'Trip/a.jpg' }];
+  await vm.runInContext('uploadInto("", FILES1, ["Trip"])', c);
+  assert.deepEqual(calls, [['A', 'swarm_mkdir', { dir: '', name: 'Trip' }]]);
+  assert.deepEqual(snacks.at(-1), ['Stopped: NomadFS restarted', 8000]);
+  assert.equal(vm.runInContext('uploading', c), false);
+
+  // 2. Node stops during begin NotSynced retry after one file already landed.
+  calls.length = 0;
+  snacks.length = 0;
+  waitHook = () => { setRunning(false); };
+  c.FILES2 = [
+    { file: fakeFile('first.jpg', 4), rel: 'first.jpg' },
+    { file: fakeFile('second.jpg', 4), rel: 'second.jpg' },
+  ];
+  await vm.runInContext('uploadInto("", FILES2, [])', c);
+  assert.deepEqual(
+    calls.map(([, cmd]) => cmd),
+    ['swarm_upload_begin', 'swarm_upload_chunk', 'swarm_upload_finish', 'swarm_upload_begin'],
+  );
+  assert.deepEqual(snacks.at(-1), ['Added 1 file · Stopped: NomadFS restarted', 8000]);
+
+  // 3. After completion, the listener is unsubscribed: a later restart does not affect a new upload.
+  setRunning(true);
+  calls.length = 0;
+  snacks.length = 0;
+  waitHook = null;
+  c.FILES3 = [{ file: fakeFile('ok.jpg', 2), rel: 'ok.jpg' }];
+  await vm.runInContext('uploadInto("", FILES3, [])', c);
+  assert.deepEqual(snacks.at(-1), ['Added 1 file', 4000]);
+  setRunning(false);
+  setRunning(true);
+  await vm.runInContext('uploadInto("", FILES3, [])', c);
+  assert.deepEqual(snacks.at(-1), ['Added 1 file', 4000]);
+  setRunning(false);
+});
+
+test('H8 swarm add-folder shows stopped_by reason with partial counts', async () => {
+  elements.clear();
+  const clicks = new Map();
+  const snacks = [];
+  const btn = node();
+  btn.addEventListener = (type, fn) => { if (type === 'click') clicks.set(type, fn); };
+  elements.set('swarm-add-folder', btn);
+  let reply = { files: 12, folders: 3, skipped: 0, cancelled: false, stopped_by: 'storage_full' };
+  const c = context({
+    isRunning: () => true,
+    invoke: async () => reply,
+    folderAddedText,
+    snack: (msg, ms) => snacks.push([msg, ms]),
+    showUpload() {},
+    hideUpload() {},
+    loadSwarm() {},
+  });
+  const addFolderSnippet = raw('$("swarm-add-folder").addEventListener("click",', 'installSwarmDrop();');
+  vm.runInContext(`let swarmDir = ''; let uploading = false;\n${addFolderSnippet}`, c);
+
+  await clicks.get('click')();
+  assert.deepEqual(snacks.at(-1), ['Stopped: the store is full · Added 12 files in 3 folders', 8000]);
+
+  reply = { files: 4, folders: 1, skipped: 0, cancelled: false, stopped_by: 'none' };
+  await clicks.get('click')();
+  assert.deepEqual(snacks.at(-1), ['Added 4 files in 1 folder', 5000]);
+});
+
+test('K3 a node restart the page missed (new session, still running) fires onNodeChange', () => {
+  setRunning(true, 7);
+  let fired = 0;
+  const unsub = onNodeChange(() => { fired++; });
+  setRunning(true, 7);
+  assert.equal(fired, 0);
+  setRunning(true, 8);
+  assert.equal(fired, 1);
+  assert.equal(nodeSession(), 8);
+  // A call without a session keeps the one it had.
+  setRunning(true);
+  assert.equal(fired, 1);
+  assert.equal(nodeSession(), 8);
+  unsub();
+  setRunning(false, 9);
 });

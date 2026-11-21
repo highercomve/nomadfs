@@ -264,13 +264,22 @@
         <div class="swarm-toolbar">
           <div id="swarm-tools" class="browse-tools"></div>
           <div class="actions">
+            <button id="swarm-select" type="button" class="btn outlined" aria-pressed="false">Select</button>
             <button id="swarm-mkdir" type="button" class="btn outlined">New folder</button>
+            <button id="swarm-add-folder" type="button" class="btn outlined" hidden>Add folder…</button>
             <button id="swarm-add" type="button" class="btn filled with-icon">
               <svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
-              Add file…
+              Add files…
             </button>
+            <input id="swarm-file-input" type="file" multiple hidden>
           </div>
         </div>
+        <div id="swarm-upload" class="upload-bar" hidden role="status">
+          <span id="swarm-upload-text" class="upload-text"></span>
+          <button id="swarm-upload-cancel" type="button" class="btn text">Cancel</button>
+          <div id="swarm-upload-progress" class="progress determinate"></div>
+        </div>
+        <div id="swarm-drop" class="drop-overlay" hidden><span id="swarm-drop-text">Drop to add here</span></div>
         <p id="swarm-empty" class="empty-state" hidden></p>
         <div class="table-scroll" id="swarm-scroll">
           <div id="swarm-head" class="table-head"></div>
@@ -286,6 +295,7 @@
             <h2>Photos</h2>
             <p class="supporting">Photos and videos across your devices, ordered by day. Tap any photo to browse full-screen.</p>
           </div>
+          <button id="photos-select" type="button" class="btn outlined" aria-pressed="false">Select</button>
         </div>
         <div class="photos-toolbar">
           <div id="photos-chips" class="chips-row"></div>
@@ -293,6 +303,7 @@
         <p id="photos-empty" class="empty-state" hidden></p>
         <p id="photos-error" class="empty-state error-msg" hidden></p>
         <div id="photos-loading" class="progress indeterminate" hidden></div>
+        <div id="photos-skeleton" class="photos-skeleton" hidden aria-hidden="true"><span class="sk-bar sk-day"></span><div class="sk-tiles"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div></div>
         <div class="photos-body">
           <div class="photos-scroll" id="photos-scroll">
             <div id="photos-sticky" class="photos-sticky" hidden></div>
