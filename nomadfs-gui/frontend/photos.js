@@ -10,6 +10,7 @@ import { startDownload } from "./downloads.js";
 import { openPreview } from "./preview.js";
 import { groupByDay, layout, rowAt, yearMarks } from "./photos-model.js";
 import { createThumbLoader, loadImage } from "./thumb-loader.js";
+import { isRunning, isStarting } from "./state.js";
 
 // Thumbnails load in the background, a few at a time: the app sends at
 // most 6 thumbnail asks to other devices at once (cluster/block_manager).
@@ -670,9 +671,23 @@ export async function loadPhotos(opts = {}) {
 
   const prevScroll = keepScroll && scrollEl ? scrollEl.scrollTop : 0;
 
-  if (loadingEl) loadingEl.hidden = false;
+  const skeletonEl = $("photos-skeleton");
   if (emptyEl) emptyEl.hidden = true;
   if (errorEl) errorEl.hidden = true;
+  // Placeholder tiles while nothing is on screen yet (the first load, or
+  // the node still starting); a refresh keeps the photos shown meanwhile.
+  const showSkeleton = (on) => { if (skeletonEl) skeletonEl.hidden = !on; };
+  if (!isRunning()) {
+    showSkeleton(isStarting());
+    if (loadingEl) loadingEl.hidden = !isStarting();
+    if (!isStarting() && emptyEl) {
+      emptyEl.hidden = false;
+      emptyEl.textContent = "Start NomadFS to see your photos.";
+    }
+    return;
+  }
+  if (loadingEl) loadingEl.hidden = false;
+  showSkeleton(!currentIndex || !rows.length);
 
   try {
     if (!window.oriel || typeof window.oriel.invoke !== "function") {
@@ -684,6 +699,7 @@ export async function loadPhotos(opts = {}) {
       index = await invoke("photos_index", { folder, kinds: "all" });
     } catch (invokeErr) {
       if (loadingEl) loadingEl.hidden = true;
+      showSkeleton(false);
       if (errorEl) {
         errorEl.hidden = false;
         errorEl.textContent = `Photos unavailable: ${errText(invokeErr)}`;
@@ -692,6 +708,7 @@ export async function loadPhotos(opts = {}) {
     }
 
     if (loadingEl) loadingEl.hidden = true;
+    showSkeleton(false);
     currentIndex = index;
     currentGeneration = index.generation;
     thumbBase = index.thumb_base || "";
@@ -725,6 +742,7 @@ export async function loadPhotos(opts = {}) {
     onScroll();
   } catch (err) {
     if (loadingEl) loadingEl.hidden = true;
+    showSkeleton(false);
     if (errorEl) {
       errorEl.hidden = false;
       errorEl.textContent = `Error loading photos: ${errText(err)}`;

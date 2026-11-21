@@ -51,7 +51,7 @@ pub const Commands = struct {
     /// worker thread: they share one lock, and a command waiting on it on
     /// the UI thread would freeze the window (node_open behind a share scan
     /// did, for 20 s on a phone). Only quick config-file reads stay inline.
-    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_mkdir", "swarm_delete", "swarm_delete_many", "swarm_rename", "swarm_move", "swarm_read_range", "swarm_download", "downloads_list", "download_cancel", "download_remove", "downloads_clear", "downloads_dir", "download_open", "downloads_open_folder", "download_read_range", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "offsite_status", "offsite_add", "offsite_remove", "offsite_run", "offsite_check", "offsite_words", "offsite_words_confirm", "swarm_backup_set", "swarm_copies_set", "accept_copies_set", "media_url", "about_info", "update_info", "notes_list", "note_read", "note_create", "note_from_share", "note_keep_both", "note_resolve_copy", "note_save", "note_rename", "note_move", "note_delete", "note_restore", "note_pin", "notes_search", "note_export", "cache_info", "cache_clear", "cache_set_limit", "share_backup_set", "backup_status", "file_details", "device_info", "photos_index", "photos_page" } ++ updates.Updater.async_commands;
+    pub const async_commands = .{ "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_add_folder", "swarm_upload_begin", "swarm_upload_chunk", "swarm_upload_finish", "swarm_upload_cancel", "swarm_mkdir", "swarm_delete", "swarm_delete_many", "swarm_rename", "swarm_move", "swarm_read_range", "swarm_download", "downloads_list", "download_cancel", "download_remove", "downloads_clear", "downloads_dir", "download_open", "downloads_open_folder", "download_read_range", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "offsite_status", "offsite_add", "offsite_remove", "offsite_run", "offsite_check", "offsite_words", "offsite_words_confirm", "swarm_backup_set", "swarm_copies_set", "accept_copies_set", "media_url", "about_info", "update_info", "notes_list", "note_read", "note_create", "note_from_share", "note_keep_both", "note_resolve_copy", "note_save", "note_rename", "note_move", "note_delete", "note_restore", "note_pin", "notes_search", "note_export", "cache_info", "cache_clear", "cache_set_limit", "share_backup_set", "backup_status", "file_details", "device_info", "photos_index", "photos_page" } ++ updates.Updater.async_commands;
 
     /// The Photos page (fs/photos.zig through photos_commands.zig).
     pub fn photos_index(gpa: std.mem.Allocator, args: photos.PhotosArgs) !photos.IndexView {
@@ -153,6 +153,37 @@ pub const Commands = struct {
     pub fn swarm_add_file(gpa: std.mem.Allocator, args: commands.SwarmDirArgs) !?[]const u8 {
         const path = try oriel.dialog.openFile(gpa, .{ .title = "Add a file to the swarm folder" }) orelse return null;
         return try commands.swarmAddFile(gpa, args.dir, path);
+    }
+
+    /// `invoke("swarm_add_folder", { dir })`: pick a folder and add it with
+    /// everything in it. Null when the picker was cancelled. Desktops only:
+    /// Android's picker answers a tree URI, not a folder to read.
+    pub fn swarm_add_folder(gpa: std.mem.Allocator, args: commands.SwarmDirArgs) !?nomadfs.fs.SwarmFolder.TreeAdded {
+        if (builtin.abi.isAndroid()) return error.Unsupported;
+        const folder = try oriel.dialog.openFolder(gpa, .{ .title = "Add a folder to the swarm folder" }) orelse return null;
+        defer folder.deinit(gpa);
+        return try commands.swarmAddFolder(args.dir, folder.id);
+    }
+
+    /// `invoke("swarm_upload_begin", { dir, name, size, mtime_ms })`: an id
+    /// for a file the page sends in pieces (picked or dropped).
+    pub fn swarm_upload_begin(args: commands.UploadBeginArgs) !u64 {
+        return commands.swarmUploadBegin(args);
+    }
+
+    /// `invoke("swarm_upload_chunk", { id, offset, data })`: base64, in order.
+    pub fn swarm_upload_chunk(gpa: std.mem.Allocator, args: commands.UploadChunkArgs) !void {
+        return commands.swarmUploadChunk(gpa, args);
+    }
+
+    /// `invoke("swarm_upload_finish", { id })`: into the swarm folder; its name.
+    pub fn swarm_upload_finish(gpa: std.mem.Allocator, args: commands.UploadIdArgs) ![]const u8 {
+        return commands.swarmUploadFinish(gpa, args);
+    }
+
+    /// `invoke("swarm_upload_cancel", { id })`.
+    pub fn swarm_upload_cancel(args: commands.UploadIdArgs) void {
+        commands.swarmUploadCancel(args);
     }
 
     /// `invoke("swarm_mkdir", { dir, name })`.

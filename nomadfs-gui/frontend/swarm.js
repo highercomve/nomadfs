@@ -6,7 +6,8 @@ import { fileType, iconFor } from "./file-types.js";
 import { row, askDialog, showMenu } from "./overlays.js";
 import { FileTable } from "./file-table.js";
 import { syncBack, registerUp } from "./back.js";
-import { isRunning } from "./state.js";
+import { isRunning, isStarting } from "./state.js";
+import { planUpload, readDrop, sendUpload, progressText, uploadedText } from "./uploads.js";
 import { fileMenu } from "./file-actions.js";
 import { startDownload } from "./downloads.js";
 import { openPreview } from "./preview.js";
@@ -45,8 +46,17 @@ async function loadSwarm() {
   swarmCrumbs();
   const nav = ++swarmNav;
   const list = $("swarm-list");
+  if (!isRunning() && isStarting()) {
+    swarmSel.leave();
+    $("swarm-empty").hidden = true;
+    $("swarm-status").textContent = "Starting NomadFS…";
+    listLoading(list);
+    swarmTable.dir = null;
+    return;
+  }
   if (!isRunning()) {
     swarmSel.leave();
+    listLoaded(list);
     list.replaceChildren();
     $("swarm-empty").hidden = false;
     $("swarm-empty").textContent = "Start the node to see the swarm folder.";
@@ -361,16 +371,42 @@ export function installSwarm() {
     depth: () => ((document.body.dataset.view || "browse") === "swarm" && swarmDir ? swarmDir.split("/").length : 0),
     up: () => { swarmDir = swarmDir.split("/").slice(0, -1).join("/"); loadSwarm(); },
   });
-  $("swarm-add").addEventListener("click", async () => {
+  // Add files: the page's own picker (several at once, on the phones too),
+  // sent in pieces like a drop.
+  const input = $("swarm-file-input");
+  $("swarm-add").addEventListener("click", () => {
     if (!isRunning()) return snack("Start the node first");
+    input.value = "";
+    input.click();
+  });
+  input.addEventListener("change", () => {
+    const files = [...input.files].map((file) => ({ file, rel: file.name }));
+    input.value = "";
+    if (files.length) uploadInto(swarmDir, files, []);
+  });
+
+  // Add folder: the desktops read it from disk themselves. Android's folder
+  // picker gives no folder to read, so the phones don't offer it.
+  const os = window.oriel.platform?.os;
+  $("swarm-add-folder").hidden = os === "android" || os === "ios";
+  $("swarm-add-folder").addEventListener("click", async () => {
+    if (!isRunning()) return snack("Start the node first");
+    if (uploading) return snack("Wait for the upload to finish");
+    const btn = $("swarm-add-folder");
+    btn.disabled = true;
+    showUpload("Adding the folder…", null);
     try {
-      const name = await invoke("swarm_add_file", { dir: swarmDir });
-      if (name) snack(`Added ${name}: every device can see it now`);
+      const added = await invoke("swarm_add_folder", { dir: swarmDir });
+      if (added) snack(folderAddedText(added), 5000);
     } catch (err) {
-      snack(`Add failed: ${err}`);
+      snack(`Couldn't add the folder: ${err}`);
     }
+    hideUpload();
+    btn.disabled = false;
     loadSwarm();
   });
+
+  installSwarmDrop();
 
   $("swarm-mkdir").addEventListener("click", async () => {
     if (!isRunning()) return snack("Start the node first");
@@ -399,6 +435,90 @@ export function installSwarm() {
 
   // While the view is open, pick up other devices' changes.
   setInterval(() => { if (document.body.dataset.view === "swarm" && !document.hidden && isRunning()) loadSwarm(); }, 10000);
+}
+
+// ---- Uploads: picked files and drops ----
+
+let uploading = false;
+let uploadCancelled = false;
+
+function showUpload(text, fraction) {
+  $("swarm-upload").hidden = false;
+  $("swarm-upload-text").textContent = text;
+  const bar = $("swarm-upload-progress");
+  bar.classList.toggle("determinate", fraction !== null);
+  bar.classList.toggle("indeterminate", fraction === null);
+  if (fraction !== null) bar.style.setProperty("--p", `${Math.round(fraction * 100)}%`);
+  $("swarm-upload-cancel").hidden = fraction === null;
+}
+
+function hideUpload() {
+  $("swarm-upload").hidden = true;
+}
+
+function folderAddedText(a) {
+  const n = (k, w) => `${k} ${w}${k === 1 ? "" : "s"}`;
+  const skipped = a.skipped ? ` · ${n(a.skipped, "item")} skipped` : "";
+  return `Added ${n(a.files, "file")} in ${n(a.folders, "folder")}${skipped}`;
+}
+
+/** Sends files (and the folders of a drop) into `dir`, one upload at a time. */
+async function uploadInto(dir, files, dirs) {
+  if (!isRunning()) return snack("Start the node first");
+  if (uploading) return snack("Wait for the upload to finish");
+  const plan = planUpload(dir, files, dirs);
+  if (!plan.files.length && !plan.folders.length) return snack("Nothing to add");
+  uploading = true;
+  uploadCancelled = false;
+  showUpload("Uploading…", 0);
+  let last = 0;
+  const res = await sendUpload(invoke, plan, {
+    cancelled: () => uploadCancelled,
+    onProgress: (p) => {
+      showUpload(progressText(p), p.bytes ? p.sent / p.bytes : 1);
+      // A long upload: what is in shows up as it goes.
+      if (Date.now() - last > 5000 && p.index > 0) { last = Date.now(); loadSwarm(); }
+    },
+  });
+  uploading = false;
+  hideUpload();
+  snack(uploadedText(res.done, res.failed, res.cancelled), res.failed.length ? 8000 : 4000);
+  loadSwarm();
+}
+
+function installSwarmDrop() {
+  $("swarm-upload-cancel").addEventListener("click", () => { uploadCancelled = true; });
+  const section = $("swarm-section");
+  const overlay = $("swarm-drop");
+  const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
+  let depth = 0;
+  const hide = () => { depth = 0; overlay.hidden = true; };
+  section.addEventListener("dragenter", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    depth++;
+    const where = swarmDir ? swarmDir.split("/").pop() : "the swarm folder";
+    $("swarm-drop-text").textContent = isRunning() ? `Drop to add to ${where}` : "Start the node to add files";
+    overlay.hidden = false;
+  });
+  section.addEventListener("dragover", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = isRunning() ? "copy" : "none";
+  });
+  section.addEventListener("dragleave", (e) => {
+    if (!hasFiles(e)) return;
+    if (--depth <= 0) hide();
+  });
+  section.addEventListener("drop", async (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    hide();
+    const dir = swarmDir;
+    // Read the drop now: its items are gone once this handler returns a turn.
+    const { files, dirs } = await readDrop(e.dataTransfer);
+    uploadInto(dir, files, dirs);
+  });
 }
 
 export { loadSwarm };

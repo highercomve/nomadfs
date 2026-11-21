@@ -17,7 +17,7 @@ import { loadAbout, openDetails, installAbout } from "./about.js";
 import { loadPhotos, installPhotos } from "./photos.js";
 import { installUpdates } from "./updates.js";
 import { renderNavDevices, showDevices, installBrowse, browsePath, resetDeviceRetries } from "./browse.js";
-import { isRunning, setRunning, ensureConfig } from "./state.js";
+import { isRunning, setRunning, setStarting, onNodeChange, ensureConfig } from "./state.js";
 const { invoke } = window.oriel;
 
 let notesApi = null; // the Notes screen (notes.js), set once the page is wired
@@ -134,6 +134,11 @@ export async function nodeState() {
 }
 
 async function startNode() {
+  setStarting(true);
+  try { await openNode(); } finally { setStarting(false); }
+}
+
+async function openNode() {
   $("node-state").textContent = "Opening…";
   setChip("busy", "Starting");
   $("open-node").disabled = true;
@@ -202,10 +207,20 @@ async function boot() {
   }
   if (!isRunning()) await startNode();
   else {
+    setStarting(false);
     loadShares();
     showDevices();
   }
 }
 
-boot();
+// The open screen follows the node: it fills in once the node is up, and
+// says so when it stops.
+onNodeChange(() => {
+  const view = document.body.dataset.view;
+  if (view === "swarm") loadSwarm();
+  if (view === "photos") loadPhotos();
+});
+
+// However boot ends, nothing waits on a start any more.
+boot().finally(() => setStarting(false));
 

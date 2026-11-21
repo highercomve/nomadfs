@@ -1137,6 +1137,169 @@ pub fn swarmAddFile(gpa: std.mem.Allocator, dir: []const u8, picked_path: []cons
     return gpa.dupe(u8, name);
 }
 
+/// `swarm_add_folder { dir }` (after the folder picker): the local folder
+/// at `local_dir`, with everything in it, into `dir`. Holds the node, not
+/// `g_mutex`, while it reads: a big folder takes a while, and the listing
+/// keeps refreshing meanwhile.
+pub fn swarmAddFolder(dir: []const u8, local_dir: []const u8) !fs.SwarmFolder.TreeAdded {
+    const handle = mediaAcquire() orelse return error.NotRunning;
+    defer mediaRelease();
+    const swarm = handle.node.swarm orelse return error.StorageDisabled;
+    return swarm.addTree(dir, local_dir);
+}
+
+// ---- Uploads: files the page reads (picked or dropped) sent in pieces ----
+
+/// The bytes of one piece, before base64 (under the 32 MiB request limit).
+pub const upload_chunk_len: u64 = 4 * 1024 * 1024;
+/// Uploads open at once; the oldest goes when a new one needs its slot
+/// (a page that reloaded mid-upload never finishes it).
+const max_uploads = 4;
+
+const Upload = struct {
+    id: u64,
+    dir: []u8,
+    name: []u8,
+    size: u64,
+    written: u64 = 0,
+    mtime: ?u64,
+    part_path: []u8,
+
+    fn free(self: Upload) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        std.Io.Dir.cwd().deleteFile(io, self.part_path) catch {};
+        std.heap.page_allocator.free(self.dir);
+        std.heap.page_allocator.free(self.name);
+        std.heap.page_allocator.free(self.part_path);
+    }
+};
+
+var g_uploads: [max_uploads]?Upload = @splat(null);
+var g_upload_next: u64 = 1;
+var g_upload_mutex: nomadfs.sync.Mutex = .{};
+
+pub const UploadBeginArgs = struct {
+    dir: []const u8,
+    name: []const u8,
+    size: u64,
+    /// The file's own modified time (File.lastModified), ms since 1970.
+    mtime_ms: ?u64 = null,
+};
+
+/// `swarm_upload_begin { dir, name, size, mtime_ms }`: an upload's id, for
+/// its pieces. The pieces wait in `<store>.uploads`, beside the store
+/// (not /tmp, which is memory on many desktops).
+pub fn swarmUploadBegin(args: UploadBeginArgs) !u64 {
+    if (!nomadfs.storage.dag.codec.isValidName(args.name)) return error.InvalidName;
+    const staging = blk: {
+        g_mutex.lock();
+        defer g_mutex.unlock();
+        const handle = g_node orelse return error.NotRunning;
+        break :blk try std.fmt.allocPrint(std.heap.page_allocator, "{s}.uploads", .{handle.config.storage.storage_path});
+    };
+    defer std.heap.page_allocator.free(staging);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try std.Io.Dir.cwd().createDirPath(io, staging);
+
+    g_upload_mutex.lock();
+    defer g_upload_mutex.unlock();
+    var slot: usize = 0;
+    for (g_uploads, 0..) |u, i| {
+        const up = u orelse {
+            slot = i;
+            break;
+        };
+        if (up.id < g_uploads[slot].?.id) slot = i;
+    } else if (g_uploads[slot]) |old| old.free();
+    g_uploads[slot] = null;
+
+    const id = g_upload_next;
+    g_upload_next += 1;
+    const gpa = std.heap.page_allocator;
+    const part_path = try std.fmt.allocPrint(gpa, "{s}/{d}.part", .{ staging, id });
+    errdefer gpa.free(part_path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, part_path, .{ .truncate = true });
+        file.close(io);
+    }
+    const dir = try gpa.dupe(u8, args.dir);
+    errdefer gpa.free(dir);
+    const name = try gpa.dupe(u8, args.name);
+    g_uploads[slot] = .{
+        .id = id,
+        .dir = dir,
+        .name = name,
+        .size = args.size,
+        .mtime = if (args.mtime_ms) |ms| ms / 1000 else null,
+        .part_path = part_path,
+    };
+    return id;
+}
+
+fn uploadSlot(id: u64) ?*Upload {
+    for (&g_uploads) |*u| if (u.*) |*up| if (up.id == id) return up;
+    return null;
+}
+
+pub const UploadChunkArgs = struct { id: u64, offset: u64, data: []const u8 };
+
+/// `swarm_upload_chunk { id, offset, data }`: the next piece, base64.
+/// Pieces come in order; one at `offset` already written is ignored (a
+/// retry), any other offset is error.BadOffset.
+pub fn swarmUploadChunk(gpa: std.mem.Allocator, args: UploadChunkArgs) !void {
+    const decoder = std.base64.standard.Decoder;
+    const len = decoder.calcSizeForSlice(args.data) catch return error.InvalidArgument;
+    if (len > upload_chunk_len) return error.InvalidArgument;
+    const bytes = try gpa.alloc(u8, len);
+    defer gpa.free(bytes);
+    decoder.decode(bytes, args.data) catch return error.InvalidArgument;
+
+    g_upload_mutex.lock();
+    defer g_upload_mutex.unlock();
+    const up = uploadSlot(args.id) orelse return error.UploadNotFound;
+    if (args.offset + bytes.len <= up.written) return; // a retry of a piece we have
+    if (args.offset != up.written) return error.BadOffset;
+    if (up.written + bytes.len > up.size) return error.InvalidArgument;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try std.Io.Dir.cwd().openFile(io, up.part_path, .{ .mode = .write_only });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, up.written);
+    up.written += bytes.len;
+}
+
+pub const UploadIdArgs = struct { id: u64 };
+
+/// `swarm_upload_finish { id }`: every piece is in; the file goes into the
+/// swarm folder (replacing what has its path, as Add does). Its name.
+pub fn swarmUploadFinish(gpa: std.mem.Allocator, args: UploadIdArgs) ![]const u8 {
+    const up = blk: {
+        g_upload_mutex.lock();
+        defer g_upload_mutex.unlock();
+        for (&g_uploads) |*u| if (u.*) |found| if (found.id == args.id) {
+            u.* = null;
+            break :blk found;
+        };
+        return error.UploadNotFound;
+    };
+    defer up.free();
+    if (up.written != up.size) return error.UploadIncomplete;
+    const handle = mediaAcquire() orelse return error.NotRunning;
+    defer mediaRelease();
+    const swarm = handle.node.swarm orelse return error.StorageDisabled;
+    try swarm.addFileAt(up.dir, up.name, up.part_path, up.mtime);
+    return gpa.dupe(u8, up.name);
+}
+
+/// `swarm_upload_cancel { id }`: drops an upload and its pieces.
+pub fn swarmUploadCancel(args: UploadIdArgs) void {
+    g_upload_mutex.lock();
+    defer g_upload_mutex.unlock();
+    for (&g_uploads) |*u| if (u.*) |found| if (found.id == args.id) {
+        found.free();
+        u.* = null;
+    };
+}
+
 pub const SwarmNameArgs = struct { dir: []const u8, name: []const u8 };
 
 /// `swarm_mkdir { dir, name }`.

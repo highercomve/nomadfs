@@ -5,9 +5,29 @@ export function isRunning() {
   return running;
 }
 export function setRunning(v) {
+  const was = running;
   running = v;
+  if (v !== was) for (const cb of nodeListeners) cb();
 }
 let running = false;
+
+// The app starts the node itself at boot: until that settles, a screen
+// that needs it shows that it's loading, not that the node is stopped.
+let starting = true;
+export function isStarting() {
+  return starting && !running;
+}
+export function setStarting(v) {
+  const was = isStarting();
+  starting = v;
+  if (isStarting() !== was) for (const cb of nodeListeners) cb();
+}
+const nodeListeners = new Set();
+/** `cb()` whenever the node starts, stops, or stops starting. */
+export function onNodeChange(cb) {
+  nodeListeners.add(cb);
+  return () => nodeListeners.delete(cb);
+}
 
 export function devices() {
   return deviceList;

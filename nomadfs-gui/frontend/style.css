@@ -1894,7 +1894,8 @@ body.pv-open #snackbar { top: calc(12px + env(safe-area-inset-top)); bottom: aut
 /* ---- Offsite backup (settings): the buckets, the add form, the recovery words ---- */
 :root { --offsite-error: #ff8a7a; --offsite-warn: var(--amber); }
 @media (prefers-color-scheme: light) { :root { --offsite-error: #b3261e; } }
-#offsite-section { display: flex; flex-direction: column; gap: 12px; }
+/* Its display comes from the view rules (shown only in Settings). */
+#offsite-section { flex-direction: column; gap: 12px; }
 #offsite-section[hidden] { display: none; }
 .offsite-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
 .offsite-list:empty { display: none; }
@@ -2100,3 +2101,51 @@ body.pv-open #snackbar { top: calc(12px + env(safe-area-inset-top)); bottom: aut
   font: 500 11px var(--font);
   letter-spacing: .2px;
 }
+
+/* Photos: placeholder tiles while the node starts or the first index loads. */
+.photos-skeleton { padding: 12px 0; }
+.photos-skeleton[hidden] { display: none; }
+.photos-skeleton .sk-day { width: 120px; height: 13px; margin-bottom: 12px; background: var(--md-outline-variant); animation: pulse 1s ease-in-out infinite alternate; }
+.photos-skeleton .sk-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 4px; }
+.photos-skeleton .sk-tiles span {
+  aspect-ratio: 1;
+  border-radius: 4px;
+  background: var(--md-outline-variant);
+  animation: pulse 1s ease-in-out infinite alternate;
+}
+.photos-skeleton .sk-tiles span:nth-child(3n+2) { animation-delay: .15s; }
+.photos-skeleton .sk-tiles span:nth-child(3n) { animation-delay: .3s; }
+@media (max-width: 600px) { .photos-skeleton .sk-tiles { grid-template-columns: repeat(3, 1fr); } }
+
+/* Swarm folder: an upload in progress, and the drop target. */
+.upload-bar {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px 12px;
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: var(--md-surface-container-high);
+}
+.upload-bar[hidden] { display: none; }
+.upload-text { font-size: 14px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-bar .progress { grid-column: 1 / -1; background: var(--md-surface-container); }
+.upload-bar .progress.determinate::after { animation: none; width: var(--p, 0%); transition: width .2s; }
+#swarm-section { position: relative; }
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--md-primary);
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--md-surface) 82%, transparent);
+  pointer-events: none;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--md-primary);
+}
+.drop-overlay[hidden] { display: none; }

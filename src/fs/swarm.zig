@@ -410,6 +410,94 @@ pub const SwarmFolder = struct {
         // manifest has it: nothing is pushed from here.
     }
 
+    pub const TreeAdded = struct { files: usize = 0, folders: usize = 0, skipped: usize = 0 };
+
+    /// Folders nested deeper than this inside an added folder are skipped.
+    pub const max_tree_depth = 64;
+
+    /// Adds the local folder at `local_dir` as `dir/<its name>`, with every
+    /// file and folder in it (empty folders too). Files replace what has
+    /// their path, as `addFile` does. Symlinks, special files, names the
+    /// swarm folder can't hold and folders past `max_tree_depth` are
+    /// skipped and counted; a file that can't be read is skipped too, so
+    /// one bad file doesn't lose the rest.
+    pub fn addTree(self: *SwarmFolder, dir: []const u8, local_dir: []const u8) !TreeAdded {
+        const trimmed = std.mem.trimEnd(u8, local_dir, "/\\");
+        const name = std.fs.path.basename(trimmed);
+        if (!storage.dag.codec.isValidName(name)) return error.InvalidName;
+        var src = try std.Io.Dir.cwd().openDir(self.io, local_dir, .{ .iterate = true });
+        defer src.close(self.io);
+        const path = try join(self.allocator, dir, name);
+        defer self.allocator.free(path);
+        if (!manifest_mod.validPath(path)) return error.InvalidPath;
+        var added: TreeAdded = .{};
+        try self.addTreeAt(src, local_dir, path, 0, &added);
+        return added;
+    }
+
+    fn addTreeAt(self: *SwarmFolder, src: std.Io.Dir, local_path: []const u8, path: []const u8, depth: usize, added: *TreeAdded) !void {
+        try self.makeDirPath(path);
+        added.folders += 1;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var it = src.iterate();
+        while (try it.next(self.io)) |entry| {
+            if (!storage.dag.codec.isValidName(entry.name)) {
+                added.skipped += 1;
+                continue;
+            }
+            var kind = entry.kind;
+            if (kind == .unknown) {
+                const st = src.statFile(self.io, entry.name, .{ .follow_symlinks = false }) catch null;
+                if (st) |s| kind = s.kind;
+            }
+            const child_local = try std.fs.path.join(arena, &.{ local_path, entry.name });
+            const child = try join(arena, path, entry.name);
+            switch (kind) {
+                .file => {
+                    const parent = splitParent(child);
+                    self.addFile(parent.dir, parent.name, child_local) catch |err| switch (err) {
+                        error.OutOfMemory, error.NotSynced, error.NoSpaceLeft => return err,
+                        else => {
+                            std.log.warn("swarm: skipping {s}: {t}", .{ child_local, err });
+                            added.skipped += 1;
+                            continue;
+                        },
+                    };
+                    added.files += 1;
+                },
+                .directory => {
+                    if (depth + 1 >= max_tree_depth) {
+                        added.skipped += 1;
+                        continue;
+                    }
+                    var sub = src.openDir(self.io, entry.name, .{ .iterate = true, .follow_symlinks = false }) catch {
+                        added.skipped += 1;
+                        continue;
+                    };
+                    defer sub.close(self.io);
+                    try self.addTreeAt(sub, child_local, child, depth + 1, added);
+                },
+                else => added.skipped += 1,
+            }
+        }
+    }
+
+    /// `makeDir` by full path; nothing when a folder is already there.
+    fn makeDirPath(self: *SwarmFolder, path: []const u8) !void {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.manifest.get(path)) |e| if (!e.deleted) {
+                if (e.kind == .dir) return;
+                return error.NotADirectory; // a file there: never replaced by a folder
+            };
+        }
+        const parts = splitParent(path);
+        try self.makeDir(parts.dir, parts.name);
+    }
+
     pub const PutResult = struct { cid: [32]u8, size: u64, mtime: u64 };
 
     /// Writes bytes at `path` if its current content still matches `base`
@@ -2330,4 +2418,41 @@ test "swarm: a read whose only holder is a gone author reports NoHolders" {
     var dest: [16]u8 = undefined;
     // The app shows NoHolders as "no device is known to keep it yet".
     try std.testing.expectError(error.NoHolders, t.folder.readAt(allocator, [_]u8{0x44} ** 32, gone.bytes, 0, &dest));
+}
+
+test "swarm: addTree adds a folder with its files, subfolders and empty folders" {
+    const testing = std.testing;
+    const io = testing.io;
+    var t: TestFolder = undefined;
+    try t.open(0x26, "Desk");
+    defer t.close();
+    const folder = t.folder;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "Trip/day 1");
+    try tmp.dir.createDirPath(io, "Trip/empty");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Trip/notes.txt", .data = "hello" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Trip/day 1/a.jpg", .data = "jpeg" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const trip = try std.fs.path.join(testing.allocator, &.{ tmp_path, "Trip" });
+    defer testing.allocator.free(trip);
+
+    const added = try folder.addTree("Photos", trip);
+    try testing.expectEqual(@as(usize, 2), added.files);
+    try testing.expectEqual(@as(usize, 3), added.folders);
+    try testing.expectEqual(@as(usize, 0), added.skipped);
+    try testing.expectEqual(@as(u64, 5), folder.fileInfo("Photos/Trip/notes.txt").?.size);
+    try testing.expect(folder.fileInfo("Photos/Trip/day 1/a.jpg") != null);
+    try testing.expect(try folder.isEmptyDir("Photos/Trip/empty"));
+
+    // Again: the same files, nothing doubled, and a file is never made a folder.
+    const again = try folder.addTree("Photos", trip);
+    try testing.expectEqual(@as(usize, 2), again.files);
+    _ = try folder.putBytes("Clash", "x", null);
+    try tmp.dir.createDirPath(io, "Clash");
+    const clash = try std.fs.path.join(testing.allocator, &.{ tmp_path, "Clash" });
+    defer testing.allocator.free(clash);
+    try testing.expectError(error.NotADirectory, folder.addTree("", clash));
 }
