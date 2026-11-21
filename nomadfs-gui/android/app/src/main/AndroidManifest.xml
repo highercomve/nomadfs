@@ -41,7 +41,8 @@
         android:resizeableActivity="true"
         android:supportsRtl="true"
         android:allowBackup="false"
-        android:fullBackupContent="false">
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules">
         <!-- No Android backup: the store is far over its limit (the backup
              fails, then Android kills the app), and the device key must
              never leave the phone. -->

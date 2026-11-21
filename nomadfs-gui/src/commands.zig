@@ -105,6 +105,9 @@ pub fn nodeOpen(gpa: std.mem.Allocator, args: NodeOpenArgs) !void {
         return error.NodeFailedToStart;
     }
     g_node = node;
+    g_adds.allow();
+    // A page's batch begun on an earlier node never lands on this one.
+    _ = g_node_session.fetchAdd(1, .acq_rel);
     if (after_node_open) |wire| wire(node);
 
     // Reach the devices this one joined (config bootstrap_peers), and keep
@@ -153,6 +156,8 @@ pub fn nodeClose() void {
     webdav = stopMountLocked(); // the mount reads through this node
     // No new media reads can start (they need g_mutex); let current ones end.
     while (g_media_users.load(.acquire) > 0) nomadfs.sync.sleep(10 * std.time.ns_per_ms);
+    // Freeing the node drops its uploads and their pieces: the page starts over.
+    _ = g_node_session.fetchAdd(1, .acq_rel);
     if (g_node) |node| {
         mobile.nomadfs_node_free(node);
         g_node = null;
@@ -208,13 +213,15 @@ pub fn nodeState(gpa: std.mem.Allocator) !NodeStateResult {
             device_id = try gpa.dupe(u8, buf[0..64]);
         }
     }
-    return .{ .running = g_node != null, .device_id = device_id };
+    return .{ .running = g_node != null, .device_id = device_id, .session = g_node_session.load(.acquire) };
 }
 
 pub const ConfigResult = struct { path: []const u8, created: bool };
 
 pub const PairTicketResult = struct { uri: []const u8, fingerprint: []const u8, nickname: []const u8 };
-pub const NodeStateResult = struct { running: bool, device_id: []const u8 };
+/// `session` changes whenever the node opens or closes: the page drops
+/// work begun on an earlier node even when `running` stays true.
+pub const NodeStateResult = struct { running: bool, device_id: []const u8, session: u64 };
 pub const PutTextArgs = struct { text: []const u8 };
 pub const GetTextArgs = struct { cid: []const u8 };
 pub const TrustDeviceArgs = struct { config_path: []const u8, uri: []const u8 };
@@ -1137,46 +1144,154 @@ pub fn swarmAddFile(gpa: std.mem.Allocator, dir: []const u8, picked_path: []cons
     return gpa.dupe(u8, name);
 }
 
+/// A folder add as the page reads it: `stopped_by` is "none",
+/// "storage_full", "not_synced", "no_space" or "failed".
+pub const FolderAdded = struct {
+    files: usize,
+    folders: usize,
+    skipped: usize,
+    cancelled: bool,
+    stopped_by: []const u8,
+
+    fn of(t: fs.SwarmFolder.TreeAdded) FolderAdded {
+        return .{
+            .files = t.files,
+            .folders = t.folders,
+            .skipped = t.skipped,
+            .cancelled = t.cancelled,
+            .stopped_by = @tagName(t.stopped_by),
+        };
+    }
+};
+
+test "FolderAdded: stopped_by is the reason's name" {
+    const a = FolderAdded.of(.{ .files = 2, .stopped_by = .storage_full });
+    try std.testing.expectEqual(@as(usize, 2), a.files);
+    try std.testing.expectEqualStrings("storage_full", a.stopped_by);
+    try std.testing.expectEqualStrings("none", FolderAdded.of(.{}).stopped_by);
+}
+
 /// `swarm_add_folder { dir }` (after the folder picker): the local folder
 /// at `local_dir`, with everything in it, into `dir`. Holds the node, not
 /// `g_mutex`, while it reads: a big folder takes a while, and the listing
 /// keeps refreshing meanwhile.
-pub fn swarmAddFolder(dir: []const u8, local_dir: []const u8) !fs.SwarmFolder.TreeAdded {
+pub fn swarmAddFolder(dir: []const u8, local_dir: []const u8) !FolderAdded {
+    var stop: std.atomic.Value(bool) = .init(false);
+    // Registered before the node is held: a close that started refuses it
+    // here, or its stopAdds reaches this add's own flag.
+    try g_adds.register(&stop);
+    defer g_adds.unregister(&stop);
     const handle = mediaAcquire() orelse return error.NotRunning;
     defer mediaRelease();
     const swarm = handle.node.swarm orelse return error.StorageDisabled;
-    return swarm.addTree(dir, local_dir);
+    return .of(try swarm.addTree(dir, local_dir, &stop));
 }
 
-// ---- Uploads: files the page reads (picked or dropped) sent in pieces ----
+/// Folder adds in progress, each with its own stop flag: stopping one never
+/// touches another's, and none can clear a close's stop.
+const AddSet = struct {
+    const max = 16;
+    mutex: nomadfs.sync.Mutex = .{},
+    flags: [max]?*std.atomic.Value(bool) = @splat(null),
+    /// Set by stopAll (the node is closing), cleared by allow when a node
+    /// opens: no folder add starts in between.
+    closing: bool = false,
 
-/// The bytes of one piece, before base64 (under the 32 MiB request limit).
-pub const upload_chunk_len: u64 = 4 * 1024 * 1024;
-/// Uploads open at once; the oldest goes when a new one needs its slot
-/// (a page that reloaded mid-upload never finishes it).
-const max_uploads = 4;
+    fn register(self: *AddSet, flag: *std.atomic.Value(bool)) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.closing) return error.NotRunning;
+        for (&self.flags) |*f| if (f.* == null) {
+            f.* = flag;
+            return;
+        };
+        return error.Busy;
+    }
 
-const Upload = struct {
-    id: u64,
-    dir: []u8,
-    name: []u8,
-    size: u64,
-    written: u64 = 0,
-    mtime: ?u64,
-    part_path: []u8,
+    fn unregister(self: *AddSet, flag: *std.atomic.Value(bool)) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.flags) |*f| if (f.* == flag) {
+            f.* = null;
+        };
+    }
 
-    fn free(self: Upload) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        std.Io.Dir.cwd().deleteFile(io, self.part_path) catch {};
-        std.heap.page_allocator.free(self.dir);
-        std.heap.page_allocator.free(self.name);
-        std.heap.page_allocator.free(self.part_path);
+    fn stopAll(self: *AddSet) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.closing = true;
+        for (self.flags) |f| if (f) |flag| flag.store(true, .release);
+    }
+
+    fn allow(self: *AddSet) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.closing = false;
     }
 };
 
-var g_uploads: [max_uploads]?Upload = @splat(null);
-var g_upload_next: u64 = 1;
-var g_upload_mutex: nomadfs.sync.Mutex = .{};
+var g_adds: AddSet = .{};
+
+/// Stops folder adds in progress (they answer what they added so far,
+/// `cancelled`) and refuses new ones until a node opens; part of
+/// before_node_close.
+pub fn stopAdds() void {
+    g_adds.stopAll();
+}
+
+test "AddSet: close stops every add, refuses new ones, open allows them" {
+    var set: AddSet = .{};
+    var a: std.atomic.Value(bool) = .init(false);
+    var b: std.atomic.Value(bool) = .init(false);
+    try set.register(&a);
+    try set.register(&b);
+    set.unregister(&b);
+    set.stopAll();
+    try std.testing.expect(a.load(.acquire));
+    try std.testing.expect(!b.load(.acquire));
+    var c: std.atomic.Value(bool) = .init(false);
+    try std.testing.expectError(error.NotRunning, set.register(&c));
+    set.allow();
+    try set.register(&c);
+    try std.testing.expect(!c.load(.acquire));
+}
+
+// ---- Uploads: files the page reads (picked or dropped) sent in pieces ----
+// The node's upload service (fs/uploads.zig) keeps them; these only decode
+// the page's arguments and forward. Closing the node drops its uploads.
+
+/// Moves on every nodeOpen and nodeClose: a page's batch belongs to the
+/// node it began on.
+var g_node_session: std.atomic.Value(u64) = .init(0);
+
+/// Whether work begun in `session` may still go on (the node it began on
+/// is the one running).
+fn sessionCurrent(session: u64) bool {
+    return session == g_node_session.load(.acquire);
+}
+
+/// A page command given the `session` its batch began in is refused once
+/// the node restarted: the batch never lands half on the next node.
+fn checkSession(session: ?u64) !void {
+    if (session) |s| if (!sessionCurrent(s)) return error.NotRunning;
+}
+
+test "checkSession: no session passes, a stale one is refused" {
+    const now = g_node_session.load(.acquire);
+    try checkSession(null);
+    try checkSession(now);
+    _ = g_node_session.fetchAdd(1, .acq_rel);
+    defer _ = g_node_session.fetchSub(1, .acq_rel);
+    try std.testing.expectError(error.NotRunning, checkSession(now));
+    try checkSession(null);
+}
+
+/// The running node's upload service, held (pair with mediaRelease).
+fn acquireUploads() !*fs.uploads.Uploads {
+    const handle = mediaAcquire() orelse return error.NotRunning;
+    errdefer mediaRelease();
+    return handle.node.uploads orelse error.StorageDisabled;
+}
 
 pub const UploadBeginArgs = struct {
     dir: []const u8,
@@ -1184,61 +1299,18 @@ pub const UploadBeginArgs = struct {
     size: u64,
     /// The file's own modified time (File.lastModified), ms since 1970.
     mtime_ms: ?u64 = null,
+    /// node_state's session when the page's batch began; refused if stale.
+    session: ?u64 = null,
 };
 
-/// `swarm_upload_begin { dir, name, size, mtime_ms }`: an upload's id, for
-/// its pieces. The pieces wait in `<store>.uploads`, beside the store
-/// (not /tmp, which is memory on many desktops).
+/// `swarm_upload_begin { dir, name, size, mtime_ms, session? }`: an upload's id, for
+/// its pieces.
 pub fn swarmUploadBegin(args: UploadBeginArgs) !u64 {
-    if (!nomadfs.storage.dag.codec.isValidName(args.name)) return error.InvalidName;
-    const staging = blk: {
-        g_mutex.lock();
-        defer g_mutex.unlock();
-        const handle = g_node orelse return error.NotRunning;
-        break :blk try std.fmt.allocPrint(std.heap.page_allocator, "{s}.uploads", .{handle.config.storage.storage_path});
-    };
-    defer std.heap.page_allocator.free(staging);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    try std.Io.Dir.cwd().createDirPath(io, staging);
-
-    g_upload_mutex.lock();
-    defer g_upload_mutex.unlock();
-    var slot: usize = 0;
-    for (g_uploads, 0..) |u, i| {
-        const up = u orelse {
-            slot = i;
-            break;
-        };
-        if (up.id < g_uploads[slot].?.id) slot = i;
-    } else if (g_uploads[slot]) |old| old.free();
-    g_uploads[slot] = null;
-
-    const id = g_upload_next;
-    g_upload_next += 1;
-    const gpa = std.heap.page_allocator;
-    const part_path = try std.fmt.allocPrint(gpa, "{s}/{d}.part", .{ staging, id });
-    errdefer gpa.free(part_path);
-    {
-        var file = try std.Io.Dir.cwd().createFile(io, part_path, .{ .truncate = true });
-        file.close(io);
-    }
-    const dir = try gpa.dupe(u8, args.dir);
-    errdefer gpa.free(dir);
-    const name = try gpa.dupe(u8, args.name);
-    g_uploads[slot] = .{
-        .id = id,
-        .dir = dir,
-        .name = name,
-        .size = args.size,
-        .mtime = if (args.mtime_ms) |ms| ms / 1000 else null,
-        .part_path = part_path,
-    };
-    return id;
-}
-
-fn uploadSlot(id: u64) ?*Upload {
-    for (&g_uploads) |*u| if (u.*) |*up| if (up.id == id) return up;
-    return null;
+    const uploads = try acquireUploads();
+    defer mediaRelease();
+    // Held: the session can't move until the node is released.
+    try checkSession(args.session);
+    return uploads.begin(args.dir, args.name, args.size, if (args.mtime_ms) |ms| ms / 1000 else null);
 }
 
 pub const UploadChunkArgs = struct { id: u64, offset: u64, data: []const u8 };
@@ -1249,22 +1321,14 @@ pub const UploadChunkArgs = struct { id: u64, offset: u64, data: []const u8 };
 pub fn swarmUploadChunk(gpa: std.mem.Allocator, args: UploadChunkArgs) !void {
     const decoder = std.base64.standard.Decoder;
     const len = decoder.calcSizeForSlice(args.data) catch return error.InvalidArgument;
-    if (len > upload_chunk_len) return error.InvalidArgument;
+    if (len > fs.uploads.Uploads.max_chunk_len) return error.InvalidArgument;
     const bytes = try gpa.alloc(u8, len);
     defer gpa.free(bytes);
     decoder.decode(bytes, args.data) catch return error.InvalidArgument;
 
-    g_upload_mutex.lock();
-    defer g_upload_mutex.unlock();
-    const up = uploadSlot(args.id) orelse return error.UploadNotFound;
-    if (args.offset + bytes.len <= up.written) return; // a retry of a piece we have
-    if (args.offset != up.written) return error.BadOffset;
-    if (up.written + bytes.len > up.size) return error.InvalidArgument;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var file = try std.Io.Dir.cwd().openFile(io, up.part_path, .{ .mode = .write_only });
-    defer file.close(io);
-    try file.writePositionalAll(io, bytes, up.written);
-    up.written += bytes.len;
+    const uploads = try acquireUploads();
+    defer mediaRelease();
+    return uploads.chunk(args.id, args.offset, bytes);
 }
 
 pub const UploadIdArgs = struct { id: u64 };
@@ -1272,41 +1336,33 @@ pub const UploadIdArgs = struct { id: u64 };
 /// `swarm_upload_finish { id }`: every piece is in; the file goes into the
 /// swarm folder (replacing what has its path, as Add does). Its name.
 pub fn swarmUploadFinish(gpa: std.mem.Allocator, args: UploadIdArgs) ![]const u8 {
-    const up = blk: {
-        g_upload_mutex.lock();
-        defer g_upload_mutex.unlock();
-        for (&g_uploads) |*u| if (u.*) |found| if (found.id == args.id) {
-            u.* = null;
-            break :blk found;
-        };
-        return error.UploadNotFound;
-    };
-    defer up.free();
-    if (up.written != up.size) return error.UploadIncomplete;
-    const handle = mediaAcquire() orelse return error.NotRunning;
+    const uploads = try acquireUploads();
     defer mediaRelease();
-    const swarm = handle.node.swarm orelse return error.StorageDisabled;
-    try swarm.addFileAt(up.dir, up.name, up.part_path, up.mtime);
-    return gpa.dupe(u8, up.name);
+    return uploads.finish(gpa, args.id);
 }
 
 /// `swarm_upload_cancel { id }`: drops an upload and its pieces.
 pub fn swarmUploadCancel(args: UploadIdArgs) void {
-    g_upload_mutex.lock();
-    defer g_upload_mutex.unlock();
-    for (&g_uploads) |*u| if (u.*) |found| if (found.id == args.id) {
-        found.free();
-        u.* = null;
-    };
+    const uploads = acquireUploads() catch return; // no node: no uploads
+    defer mediaRelease();
+    uploads.cancel(args.id);
 }
 
 pub const SwarmNameArgs = struct { dir: []const u8, name: []const u8 };
 
-/// `swarm_mkdir { dir, name }`.
-pub fn swarmMkdir(args: SwarmNameArgs) !void {
+pub const SwarmMkdirArgs = struct {
+    dir: []const u8,
+    name: []const u8,
+    /// node_state's session when the page's batch began; refused if stale.
+    session: ?u64 = null,
+};
+
+/// `swarm_mkdir { dir, name, session? }`.
+pub fn swarmMkdir(args: SwarmMkdirArgs) !void {
     g_mutex.lock();
     defer g_mutex.unlock();
-    try (try swarmFolder()).makeDir(args.dir, std.mem.trim(u8, args.name, " \t"));
+    try checkSession(args.session);
+    try (try swarmFolder()).makeDir(args.dir, args.name); // exact: the page trims what it types
 }
 
 pub const SwarmPathArgs = struct { path: []const u8 };
@@ -1322,10 +1378,12 @@ pub const SwarmPathsArgs = struct { paths: []const []const u8 };
 
 /// `swarm_delete_many { paths }`: files and folders, in one manifest write.
 /// Answers how many were deleted (paths already gone are skipped).
+/// Holds the node, not g_mutex: a big delete takes a while.
 pub fn swarmDeleteMany(args: SwarmPathsArgs) !usize {
-    g_mutex.lock();
-    defer g_mutex.unlock();
-    return (try swarmFolder()).removeMany(args.paths);
+    const handle = mediaAcquire() orelse return error.NotRunning;
+    defer mediaRelease();
+    const swarm = handle.node.swarm orelse return error.StorageDisabled;
+    return swarm.removeMany(args.paths);
 }
 
 pub const SwarmRenameArgs = struct { path: []const u8, name: []const u8 };

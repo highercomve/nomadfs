@@ -118,7 +118,7 @@ export async function nodeState() {
   try {
     const state = await invoke("node_state", null);
     const started = state.running && !isRunning();
-    setRunning(state.running);
+    setRunning(state.running, state.session ?? null);
     // The swarm's notes (the first listing also renames this device's old ones).
     if (started) notesApi?.refresh();
     $("node-state").textContent = state.running

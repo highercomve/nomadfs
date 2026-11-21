@@ -36,6 +36,10 @@ pub const StorageEngine = struct {
     root_dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     mutex: sync.Mutex = .{},
+    collect_mutex: sync.Mutex = .{},
+    collect_done: sync.Condition = .{},
+    writers: usize = 0,
+    collecting: bool = false,
     /// Blocks held outside the store (shared folders' file bytes). Asked
     /// only when no block file exists; what it returns is verified like any
     /// stored block.
@@ -293,30 +297,95 @@ pub const StorageEngine = struct {
 
     pub const Freed = struct { blocks: u64 = 0, bytes: u64 = 0 };
 
-    /// Deletes every block file, kept or cached, that is not in `keep` and
-    /// was not written, pinned or rewritten in the last `min_age_s` seconds:
-    /// the blocks of deleted files and replaced versions. The age spares
-    /// blocks of a file still being written, whose entry isn't recorded yet.
-    pub fn collect(self: *StorageEngine, keep: *const std.AutoHashMapUnmanaged([32]u8, void), min_age_s: i64) !Freed {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    /// Guards a kept write until root publication. Take this before any
+    /// caller or store mutex, since it waits for an active sweep.
+    pub fn beginWrite(self: *StorageEngine) void {
+        self.collect_mutex.lock();
+        defer self.collect_mutex.unlock();
+        while (self.collecting) self.collect_done.wait(&self.collect_mutex);
+        self.writers += 1;
+    }
+
+    pub fn endWrite(self: *StorageEngine) void {
+        self.collect_mutex.lock();
+        defer self.collect_mutex.unlock();
+        std.debug.assert(self.writers > 0);
+        self.writers -= 1;
+    }
+
+    pub fn hasWriters(self: *StorageEngine) bool {
+        self.collect_mutex.lock();
+        defer self.collect_mutex.unlock();
+        return self.writers != 0;
+    }
+
+    /// Claims the sweep only when there are no active writers or collector.
+    pub fn tryBeginCollect(self: *StorageEngine) bool {
+        self.collect_mutex.lock();
+        defer self.collect_mutex.unlock();
+        if (self.collecting or self.writers != 0) return false;
+        self.collecting = true;
+        return true;
+    }
+
+    pub fn endCollect(self: *StorageEngine) void {
+        self.collect_mutex.lock();
+        defer self.collect_mutex.unlock();
+        std.debug.assert(self.collecting and self.writers == 0);
+        self.collecting = false;
+        self.collect_done.broadcast();
+    }
+
+    pub const CollectCandidates = struct {
+        kept: std.ArrayList([hex_cid_len]u8) = .empty,
+        cached: std.ArrayList([hex_cid_len]u8) = .empty,
+
+        pub fn deinit(self: *CollectCandidates, allocator: std.mem.Allocator) void {
+            self.kept.deinit(allocator);
+            self.cached.deinit(allocator);
+        }
+    };
+
+    /// Collects unmarked names before the caller claims the sweep.
+    pub fn collectCandidates(self: *StorageEngine, keep: *const std.AutoHashMapUnmanaged([32]u8, void), running: *const std.atomic.Value(bool)) !CollectCandidates {
         const io = std.Io.Threaded.global_single_threaded.io();
-        const now_s: i64 = std.Io.Clock.real.now(io).toSeconds();
-        var freed: Freed = .{};
-        for ([_]std.Io.Dir{ self.root_dir, self.cache_dir }, [_]bool{ false, true }) |dir, cached| {
-            var names: std.ArrayList([hex_cid_len]u8) = .empty;
-            defer names.deinit(self.allocator);
-            var it = dir.iterate();
-            while (try it.next(io)) |entry| {
+        var candidates: CollectCandidates = .{};
+        errdefer candidates.deinit(self.allocator);
+        const lists = [_]*std.ArrayList([hex_cid_len]u8){ &candidates.kept, &candidates.cached };
+        for ([_]std.Io.Dir{ self.root_dir, self.cache_dir }, lists) |dir, names| {
+            if (!running.load(.acquire)) return error.Stopped;
+            // Other store operations can iterate concurrently with their own cursor.
+            const listing = try dir.openDir(io, ".", .{ .iterate = true });
+            defer listing.close(io);
+            var it = listing.iterateAssumeFirstIteration();
+            var i: usize = 0;
+            while (try it.next(io)) |entry| : (i += 1) {
+                if (i % 256 == 0 and !running.load(.acquire)) return error.Stopped;
                 if (entry.kind != .file or !isHexCid(entry.name)) continue;
                 var cid: [32]u8 = undefined;
-                _ = std.fmt.hexToBytes(&cid, entry.name) catch continue;
+                _ = std.fmt.hexToBytes(&cid, entry.name) catch unreachable;
                 if (keep.contains(cid)) continue;
                 try names.append(self.allocator, entry.name[0..hex_cid_len].*);
             }
-            for (names.items) |*name| {
+        }
+        return candidates;
+    }
+
+    /// Deletes candidates older than `cutoff_s`. Caller holds the collection
+    /// guard and has confirmed that the root snapshot is still current.
+    pub fn sweepCandidates(self: *StorageEngine, candidates: *const CollectCandidates, cutoff_s: i64, running: *const std.atomic.Value(bool)) !Freed {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var freed: Freed = .{};
+        const lists = [_][]const [hex_cid_len]u8{ candidates.kept.items, candidates.cached.items };
+        for ([_]std.Io.Dir{ self.root_dir, self.cache_dir }, lists, [_]bool{ false, true }) |dir, names, cached| {
+            if (!running.load(.acquire)) return error.Stopped;
+            for (names, 0..) |*name, i| {
+                if (i % 256 == 0 and !running.load(.acquire)) return error.Stopped;
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                // Re-puts and reads can refresh the mtime after listing.
                 const stat = dir.statFile(io, name, .{}) catch continue;
-                if (now_s - stat.mtime.toSeconds() < min_age_s) continue;
+                if (stat.mtime.toSeconds() >= cutoff_s) continue;
                 dir.deleteFile(io, name) catch continue;
                 freed.blocks += 1;
                 freed.bytes += stat.size;
@@ -327,6 +396,21 @@ pub const StorageEngine = struct {
             }
         }
         return freed;
+    }
+
+    /// Lists and deletes unmarked kept and cached blocks older than `cutoff_s`.
+    /// The caller supplies a stable keep set. For a changing root snapshot,
+    /// claim the guard and validate the snapshot before calling sweepCandidates.
+    /// Writers of kept blocks hold `beginWrite` until their roots are
+    /// reachable from the collected root set. Share scans instead rely on
+    /// the caller validating share roots and capping the cutoff at scan start.
+    /// CID-only puts (`put_text` and `nomadfs_put_file`) are eligible for collection.
+    pub fn collect(self: *StorageEngine, keep: *const std.AutoHashMapUnmanaged([32]u8, void), cutoff_s: i64, running: *const std.atomic.Value(bool)) !Freed {
+        if (!self.tryBeginCollect()) return error.Busy;
+        defer self.endCollect();
+        var candidates = try self.collectCandidates(keep, running);
+        defer candidates.deinit(self.allocator);
+        return self.sweepCandidates(&candidates, cutoff_s, running);
     }
 
     /// Deletes the least recently read cache blocks until the cache holds at
@@ -479,7 +563,7 @@ pub const StorageEngine = struct {
         };
         defer file.close(io);
         var tag: [1]u8 = undefined;
-        if (try file.readPositionalAll(io, &tag, 0) != 1) return .leaf;
+        if (try file.readPositionalAll(io, &tag, 0) != 1) return error.CorruptBlock;
         if (tag[0] == 0) return .leaf; // dag codec: a leaf's tag
         const size = (try file.stat(io)).size;
         const buffer = try allocator.alloc(u8, size);
@@ -746,25 +830,100 @@ test "collect deletes kept and cached blocks outside the keep set, sparing young
     const live = Block.new("a live file");
     const gone = Block.new("a deleted one");
     const read = Block.new("read, then deleted");
+    const touched = Block.new("rewritten after listing");
+    try engine.setQuota(1024);
     try engine.put(live);
     try engine.put(gone);
     try engine.putCached(read);
+    try engine.put(touched);
+
+    const cutoff_s: i64 = 1_700_000_000;
+    const at_cutoff = std.Io.Timestamp.fromNanoseconds(@as(i96, cutoff_s) * std.time.ns_per_s);
+    const before_cutoff = std.Io.Timestamp.fromNanoseconds(at_cutoff.nanoseconds - std.time.ns_per_s);
+    try engine.root_dir.setTimestamps(io, &std.fmt.bytesToHex(live.cid, .lower), .{ .modify_timestamp = .{ .new = before_cutoff } });
+    try engine.root_dir.setTimestamps(io, &std.fmt.bytesToHex(gone.cid, .lower), .{ .modify_timestamp = .{ .new = at_cutoff } });
+    try engine.cache_dir.setTimestamps(io, &std.fmt.bytesToHex(read.cid, .lower), .{ .modify_timestamp = .{ .new = before_cutoff } });
+    try engine.root_dir.setTimestamps(io, &std.fmt.bytesToHex(touched.cid, .lower), .{ .modify_timestamp = .{ .new = before_cutoff } });
 
     var keep: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer keep.deinit(allocator);
     try keep.put(allocator, live.cid, {});
-    // Just written: too young to go.
-    const spared = try engine.collect(&keep, 3600);
-    try std.testing.expectEqual(@as(u64, 0), spared.blocks);
-    try std.testing.expect(engine.has(&gone.cid));
+    var running: std.atomic.Value(bool) = .init(true);
+    var candidates = try engine.collectCandidates(&keep, &running);
+    defer candidates.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), candidates.kept.items.len);
+    try engine.put(touched);
 
-    const freed = try engine.collect(&keep, 0);
-    try std.testing.expectEqual(@as(u64, 2), freed.blocks);
-    try std.testing.expectEqual(@as(u64, gone.data.len + read.data.len), freed.bytes);
+    const freed = blk: {
+        try std.testing.expect(engine.tryBeginCollect());
+        defer engine.endCollect();
+        try std.testing.expectError(error.Busy, engine.collect(&keep, cutoff_s, &running));
+        break :blk try engine.sweepCandidates(&candidates, cutoff_s, &running);
+    };
+    try std.testing.expectEqual(@as(u64, 1), freed.blocks);
+    try std.testing.expectEqual(@as(u64, read.data.len), freed.bytes);
     try std.testing.expect(engine.has(&live.cid));
-    try std.testing.expect(!engine.has(&gone.cid));
+    try std.testing.expect(engine.has(&gone.cid));
+    try std.testing.expect(engine.has(&touched.cid));
     try std.testing.expect(!engine.has(&read.cid));
     try std.testing.expectEqual(@as(u64, 0), engine.cacheStats().blocks);
+    try std.testing.expectEqual(@as(u64, live.data.len + gone.data.len + touched.data.len), engine.used_bytes);
+
+    {
+        engine.beginWrite();
+        defer engine.endWrite();
+        try std.testing.expectError(error.Busy, engine.collect(&keep, cutoff_s + 1, &running));
+        try std.testing.expect(engine.has(&gone.cid));
+    }
+    const later = try engine.collect(&keep, cutoff_s + 1, &running);
+    try std.testing.expectEqual(@as(u64, 1), later.blocks);
+    try std.testing.expect(!engine.has(&gone.cid));
+    try std.testing.expectEqual(@as(u64, live.data.len + touched.data.len), engine.used_bytes);
+    running.store(false, .release);
+    try std.testing.expectError(error.Stopped, engine.collect(&keep, cutoff_s, &running));
+}
+
+test "collection excludes writers until the sweep ends" {
+    var engine: StorageEngine = .{ .root_dir = undefined, .cache_dir = undefined, .allocator = std.testing.allocator };
+    engine.beginWrite();
+    engine.beginWrite();
+    try std.testing.expect(engine.hasWriters());
+    try std.testing.expect(!engine.tryBeginCollect());
+    engine.endWrite();
+    try std.testing.expect(!engine.tryBeginCollect());
+    engine.endWrite();
+    try std.testing.expect(!engine.hasWriters());
+
+    const Writer = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        entered: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This(), store: *StorageEngine) void {
+            self.started.store(true, .release);
+            store.beginWrite();
+            defer store.endWrite();
+            self.entered.store(true, .release);
+        }
+    };
+    try std.testing.expect(engine.tryBeginCollect());
+    try std.testing.expect(!engine.tryBeginCollect());
+    var writer: Writer = .{};
+    const thread = std.Thread.spawn(.{}, Writer.run, .{ &writer, &engine }) catch |err| {
+        engine.endCollect();
+        return err;
+    };
+    for (0..1000) |_| {
+        if (writer.started.load(.acquire)) break;
+        sync.sleep(std.time.ns_per_ms);
+    }
+    const started = writer.started.load(.acquire);
+    sync.sleep(20 * std.time.ns_per_ms);
+    const entered_early = writer.entered.load(.acquire);
+    engine.endCollect();
+    thread.join();
+    try std.testing.expect(started);
+    try std.testing.expect(!entered_early);
+    try std.testing.expect(writer.entered.load(.acquire));
 }
 
 test "getLocalNode tells a leaf without reading it and returns a parent's bytes" {

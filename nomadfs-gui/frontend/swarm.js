@@ -6,8 +6,8 @@ import { fileType, iconFor } from "./file-types.js";
 import { row, askDialog, showMenu } from "./overlays.js";
 import { FileTable } from "./file-table.js";
 import { syncBack, registerUp } from "./back.js";
-import { isRunning, isStarting } from "./state.js";
-import { planUpload, readDrop, sendUpload, progressText, uploadedText } from "./uploads.js";
+import { isRunning, isStarting, onNodeChange, nodeSession } from "./state.js";
+import { planUpload, readDrop, sendUpload, progressText, uploadedText, folderAddedText } from "./uploads.js";
 import { fileMenu } from "./file-actions.js";
 import { startDownload } from "./downloads.js";
 import { openPreview } from "./preview.js";
@@ -134,7 +134,7 @@ function swarmRow(it, files) {
     menu: swarmSel.active ? null : swarmMenu(it, true),
     // Touch: a long press selects, as Android's Photos does.
     onLongPress: () => {
-      swarmPressed = { path: it.path, at: Date.now() };
+      swarmPressed = it.path;
       if (!swarmSel.has(it.path)) swarmSel.toggle(it.path, it);
     },
     icon: it.dir ? "folder" : iconFor(it.name, false),
@@ -196,6 +196,7 @@ function swarmSelBar() {
 
 function swarmSelChanged() {
   const on = swarmSel.active;
+  if (!on) swarmPressed = null;
   if (on !== swarmSelDrawn) {
     // Into or out of select mode: the rows gain or lose their checkboxes.
     swarmSelDrawn = on;
@@ -210,12 +211,13 @@ function swarmSelChanged() {
 }
 
 // The long press that selected a row: the tap that ends it lands on the row
-// redrawn with its checkbox, and must not unselect it.
+// redrawn with its checkbox, and must not unselect it. Consumed by that click
+// or cleared on the next pointerdown.
 let swarmPressed = null;
 
 function swarmSelectClick(it, e) {
   if (swarmSelBusy) return;
-  if (swarmPressed && swarmPressed.path === it.path && Date.now() - swarmPressed.at < 1500) {
+  if (swarmPressed === it.path) {
     swarmPressed = null;
     return;
   }
@@ -239,14 +241,14 @@ function swarmSelectAll() {
 
 async function swarmDeleteSelected() {
   if (swarmSelBusy || !swarmSel.size) return;
+  const paths = swarmSel.keys();
   const items = swarmSel.values();
   const ok = await askDialog({
-    ...deleteCopy(items.length, { folders: items.filter((it) => it.dir).length }),
+    ...deleteCopy(paths.length, { folders: items.filter((it) => it.dir).length }),
     confirm: "Delete",
     danger: true,
   });
-  if (!ok || !swarmSel.size) return;
-  const paths = swarmSel.keys();
+  if (!ok || swarmSelBusy) return;
   swarmSelBusy = "Deleting…";
   swarmSelBar();
   const res = await deleteMany(invoke, paths, {
@@ -353,6 +355,7 @@ export function installSwarm() {
     },
   });
   $("swarm-section").appendChild(swarmBar.el);
+  $("swarm-list").addEventListener("pointerdown", () => { swarmPressed = null; }, { capture: true });
   $("swarm-select").addEventListener("click", () => {
     if (swarmSel.active) swarmSel.leave();
     else swarmSel.enter();
@@ -393,16 +396,22 @@ export function installSwarm() {
     if (!isRunning()) return snack("Start the node first");
     if (uploading) return snack("Wait for the upload to finish");
     const btn = $("swarm-add-folder");
+    uploading = true;
     btn.disabled = true;
     showUpload("Adding the folder…", null);
     try {
       const added = await invoke("swarm_add_folder", { dir: swarmDir });
-      if (added) snack(folderAddedText(added), 5000);
+      if (added) {
+        const stopped = (added.stopped_by && added.stopped_by !== "none") || added.cancelled || added.skipped;
+        snack(folderAddedText(added), stopped ? 8000 : 5000);
+      }
     } catch (err) {
       snack(`Couldn't add the folder: ${err}`);
+    } finally {
+      uploading = false;
+      hideUpload();
+      btn.disabled = false;
     }
-    hideUpload();
-    btn.disabled = false;
     loadSwarm();
   });
 
@@ -410,7 +419,8 @@ export function installSwarm() {
 
   $("swarm-mkdir").addEventListener("click", async () => {
     if (!isRunning()) return snack("Start the node first");
-    const name = await askDialog({ title: "New folder", value: "New folder", confirm: "Create" });
+    const raw = await askDialog({ title: "New folder", value: "New folder", confirm: "Create" });
+    const name = raw?.trim();
     if (!name) return;
     try {
       await invoke("swarm_mkdir", { dir: swarmDir, name });
@@ -456,33 +466,52 @@ function hideUpload() {
   $("swarm-upload").hidden = true;
 }
 
-function folderAddedText(a) {
-  const n = (k, w) => `${k} ${w}${k === 1 ? "" : "s"}`;
-  const skipped = a.skipped ? ` · ${n(a.skipped, "item")} skipped` : "";
-  return `Added ${n(a.files, "file")} in ${n(a.folders, "folder")}${skipped}`;
-}
-
 /** Sends files (and the folders of a drop) into `dir`, one upload at a time. */
-async function uploadInto(dir, files, dirs) {
+async function uploadInto(dir, files, dirs, { skipped = 0, skipReason = "" } = {}) {
   if (!isRunning()) return snack("Start the node first");
   if (uploading) return snack("Wait for the upload to finish");
   const plan = planUpload(dir, files, dirs);
-  if (!plan.files.length && !plan.folders.length) return snack("Nothing to add");
+  if (!plan.files.length && !plan.folders.length) {
+    return snack(uploadedText(0, [], false, skipped, skipReason), skipped ? 8000 : 4000);
+  }
   uploading = true;
   uploadCancelled = false;
+  let nodeChanged = false;
+  // Stop the batch if the node stops or restarts so retries never land on a new session.
+  const unsub = onNodeChange(() => { nodeChanged = true; });
   showUpload("Uploading…", 0);
   let last = 0;
-  const res = await sendUpload(invoke, plan, {
-    cancelled: () => uploadCancelled,
-    onProgress: (p) => {
-      showUpload(progressText(p), p.bytes ? p.sent / p.bytes : 1);
-      // A long upload: what is in shows up as it goes.
-      if (Date.now() - last > 5000 && p.index > 0) { last = Date.now(); loadSwarm(); }
-    },
-  });
-  uploading = false;
-  hideUpload();
-  snack(uploadedText(res.done, res.failed, res.cancelled), res.failed.length ? 8000 : 4000);
+  let res;
+  try {
+    res = await sendUpload(invoke, plan, {
+      // The backend refuses the batch's calls once its node restarted.
+      session: nodeSession(),
+      cancelled: () => uploadCancelled || nodeChanged || !isRunning(),
+      onProgress: (p) => {
+        showUpload(progressText(p), p.bytes ? p.sent / p.bytes : (p.waiting ? 0 : 1));
+        // A long upload: what is in shows up as it goes.
+        if (Date.now() - last > 5000 && p.index > 0) { last = Date.now(); loadSwarm(); }
+      },
+    });
+  } catch (err) {
+    snack(`Upload failed: ${err}`);
+    return;
+  } finally {
+    unsub();
+    uploading = false;
+    hideUpload();
+  }
+  const restarted = !uploadCancelled && (nodeChanged || !isRunning() || res.restarted);
+  const totalSkipped = skipped + res.skipped;
+  const anyProblem = res.failed.length || res.failedFolders.length || totalSkipped || (res.cancelled && restarted);
+  snack(
+    uploadedText(res.done, res.failed, res.cancelled, totalSkipped, skipReason, {
+      folders: res.folders,
+      failedFolders: res.failedFolders,
+      cancelReason: restarted ? "Stopped: NomadFS restarted" : "",
+    }),
+    anyProblem ? 8000 : 4000,
+  );
   loadSwarm();
 }
 
@@ -516,8 +545,8 @@ function installSwarmDrop() {
     hide();
     const dir = swarmDir;
     // Read the drop now: its items are gone once this handler returns a turn.
-    const { files, dirs } = await readDrop(e.dataTransfer);
-    uploadInto(dir, files, dirs);
+    const { files, dirs, skipped, skipReason } = await readDrop(e.dataTransfer);
+    uploadInto(dir, files, dirs, { skipped, skipReason });
   });
 }
 

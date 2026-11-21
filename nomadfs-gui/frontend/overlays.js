@@ -2,6 +2,7 @@
 // small ask dialog. Screens import these; overlays import nothing from screens.
 import { $, svg, ICONS } from "./core.js";
 import { syncBack, registerUp } from "./back.js";
+import { longPress } from "./selection.js";
 
 /** A Material list row: leading icon, headline + meta, optional trailing button. */
 export function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = false, onClick, action, actions, cols, menu, onLongPress }) {
@@ -62,11 +63,11 @@ export function row({ icon, iconClass = "", headline, meta, meta2, monoMeta = fa
     }
     li.appendChild(box);
   }
+  const press = (menu?.length || onLongPress) ? attachMenu(li, menu || [], onLongPress) : null;
   if (onClick) {
     li.classList.add("clickable");
-    li.addEventListener("click", (e) => { if (!li.dataset.menuOpened) onClick(e); delete li.dataset.menuOpened; });
+    li.addEventListener("click", (e) => { if (!press?.wasLongPress()) onClick(e); });
   }
-  if (menu?.length || onLongPress) attachMenu(li, menu || [], onLongPress);
   return li;
 }
 
@@ -78,33 +79,27 @@ let menuEl = null;
  *  `onLongPress`, a long press on a touch screen runs it instead of opening
  *  the menu (selecting, as Android's Photos does); right-click still opens it. */
 export function attachMenu(li, items, onLongPress = null) {
-  li.addEventListener("contextmenu", (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    // A touch's long press also fires contextmenu: the timer below owns it.
-    if (onLongPress && e.pointerType === "touch") return;
-    if (items.length) showMenu(e.clientX, e.clientY, items);
-  });
-  // Touch: a long press opens it, and the click that ends it doesn't open the row.
-  let timer = 0;
-  let start = null;
-  li.addEventListener("pointerdown", (e) => {
-    if (e.pointerType !== "touch") return;
-    start = { x: e.clientX, y: e.clientY };
-    timer = setTimeout(() => {
-      li.dataset.menuOpened = "1";
+  const press = longPress(
+    li,
+    (e) => (onLongPress || items.length ? { x: e.clientX, y: e.clientY } : null),
+    (pt) => {
       if (onLongPress) {
         navigator.vibrate?.(20);
         onLongPress();
-      } else showMenu(start.x, start.y, items);
-    }, 550);
+      } else if (items.length) {
+        showMenu(pt.x, pt.y, items);
+      }
+    },
+    { ms: 550 },
+  );
+  li.addEventListener("contextmenu", (e) => {
+    e.stopPropagation();
+    // Touch long-press (timer or pointercancel -> contextmenu) was handled above.
+    if (e.defaultPrevented) return;
+    e.preventDefault();
+    if (items.length) showMenu(e.clientX, e.clientY, items);
   });
-  const cancel = () => clearTimeout(timer);
-  li.addEventListener("pointerup", cancel);
-  li.addEventListener("pointercancel", cancel);
-  li.addEventListener("pointermove", (e) => {
-    if (start && Math.hypot(e.clientX - start.x, e.clientY - start.y) > 10) cancel();
-  });
+  return press;
 }
 
 export function showMenu(x, y, items) {

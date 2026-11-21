@@ -41,6 +41,24 @@ pub const ShareIndex = struct {
     /// Sorted by name. Guarded by `mutex`.
     shares: std.ArrayList(Share) = .empty,
     mutex: sync.Mutex = .{},
+    /// Bumped when a share is added, removed or moved to another path:
+    /// a collection that snapshotted the old set skips. A rescan that
+    /// publishes a new root leaves it alone (a share that keeps changing
+    /// would make every collection skip); collectionCutoff spares that
+    /// scan's blocks by time instead. Guarded by `mutex`.
+    generation: u64 = 0,
+    /// The running scan's wall-clock start. Guarded by `mutex`. One value
+    /// is enough: scan_mutex runs scans one at a time.
+    scan_started_s: ?i64 = null,
+    /// Bumped by each collection snapshot. One number, not a list per
+    /// snapshot: only one collection runs at a time (the cache thread),
+    /// and an overlapping one makes the older one skip, which is safe.
+    collect_epoch: u64 = 0,
+    /// The earliest start of a scan that published a new root since the
+    /// last collection snapshot: those roots are not in the snapshot, and
+    /// their first blocks may be older than the collection cutoff. Guarded
+    /// by `mutex`.
+    published_since_snapshot_s: ?i64 = null,
     /// Serializes scans (the scanner's file cache is not shared).
     scan_mutex: sync.Mutex = .{},
     rescan_interval_ns: u64 = 30 * std.time.ns_per_s,
@@ -134,13 +152,15 @@ pub const ShareIndex = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             const at = self.indexOf(name);
+            const gen = self.generation +% 1;
+            const share: Share = .{ .name = owned_name, .path = owned_path, .generation = gen };
             if (at.found) {
-                const gen = self.shares.items[at.index].generation +% 1;
                 freeShare(self.allocator, self.shares.items[at.index]);
-                self.shares.items[at.index] = .{ .name = owned_name, .path = owned_path, .generation = gen };
+                self.shares.items[at.index] = share;
             } else {
-                try self.shares.insert(self.allocator, at.index, .{ .name = owned_name, .path = owned_path, .generation = 0 });
+                try self.shares.insert(self.allocator, at.index, share);
             }
+            self.generation = gen;
         }
     }
 
@@ -153,6 +173,7 @@ pub const ShareIndex = struct {
             const at = self.indexOf(name);
             if (!at.found) return false;
             freeShare(self.allocator, self.shares.orderedRemove(at.index));
+            self.generation +%= 1;
         }
         self.files.remove(name);
         return true;
@@ -196,20 +217,26 @@ pub const ShareIndex = struct {
     fn rescanOne(self: *ShareIndex, name: []const u8) void {
         self.scan_mutex.lock();
         defer self.scan_mutex.unlock();
-
         const snap = blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
             const at = self.indexOf(name);
             if (!at.found) return;
             const s = self.shares.items[at.index];
+            const path = self.allocator.dupe(u8, s.path) catch return;
+            self.scan_started_s = sync.timestamp();
             break :blk .{
-                .path = self.allocator.dupe(u8, s.path) catch return,
+                .path = path,
                 .first = s.root == null,
                 .generation = s.generation,
             };
         };
         defer self.allocator.free(snap.path);
+        defer {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.scan_started_s = null;
+        }
 
         // Segments left by an earlier share of this name.
         if (snap.first) self.files.remove(name);
@@ -232,7 +259,8 @@ pub const ShareIndex = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             const at = self.indexOf(name);
-            if (at.found) self.shares.items[at.index].scan_error = err;
+            if (at.found and self.shares.items[at.index].generation == snap.generation)
+                self.shares.items[at.index].scan_error = err;
             return;
         };
 
@@ -249,12 +277,24 @@ pub const ShareIndex = struct {
             const ms = @divFloor(started.durationTo(std.Io.Timestamp.now(self.io, .awake)).nanoseconds, std.time.ns_per_ms);
             std.debug.print("share '{s}': indexed {d} files ({d} MiB) in {d} ms\n", .{ name, result.files, result.size >> 20, ms });
         }
-        share.root = result.root;
+        self.publishRootLocked(share, result.root);
         share.size = result.size;
         share.files = result.files;
         share.indexing = false;
         share.scan_error = null;
         share.scanned_at = nowSeconds(self.io);
+    }
+
+    fn publishRootLocked(self: *ShareIndex, share: *Share, root: codec.Cid) void {
+        if (share.root) |previous| {
+            if (std.mem.eql(u8, &previous, &root)) return;
+        }
+        share.root = root;
+        // Called during the scan, so scan_started_s is the publisher's start.
+        if (self.scan_started_s) |started| {
+            const earliest = self.published_since_snapshot_s orelse started;
+            self.published_since_snapshot_s = @min(earliest, started);
+        }
     }
 
     /// The CID of an empty dir block (put is a no-op once it is stored).
@@ -295,7 +335,7 @@ pub const ShareIndex = struct {
             try index.files.append(self.name, index.scanner.table.?);
             index.scanner.table = next;
             const share = &index.shares.items[at.index];
-            share.root = partial.root;
+            index.publishRootLocked(share, partial.root);
             share.size = partial.size;
             share.files = partial.files;
             share.indexing = true;
@@ -308,6 +348,26 @@ pub const ShareIndex = struct {
     pub fn snapshot(self: *ShareIndex, allocator: std.mem.Allocator) ![]Share {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.copySharesLocked(allocator);
+    }
+
+    pub const Snapshot = struct { shares: []Share, generation: u64, epoch: u64 };
+
+    /// Captures the shares for a collection, under one lock with the
+    /// tokens collectionCutoff checks. Starts a new epoch: the scans that
+    /// publish from now on are remembered until the collection claims its
+    /// sweep. Free `shares` with freeSnapshot.
+    pub fn collectionSnapshot(self: *ShareIndex, allocator: std.mem.Allocator) !Snapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const out = try self.copySharesLocked(allocator);
+        self.collect_epoch +%= 1;
+        self.published_since_snapshot_s = null;
+        return .{ .shares = out, .generation = self.generation, .epoch = self.collect_epoch };
+    }
+
+    /// Caller holds `mutex`.
+    fn copySharesLocked(self: *ShareIndex, allocator: std.mem.Allocator) ![]Share {
         const out = try allocator.alloc(Share, self.shares.items.len);
         var filled: usize = 0;
         errdefer {
@@ -325,6 +385,26 @@ pub const ShareIndex = struct {
             filled += 1;
         }
         return out;
+    }
+
+    /// Block mtimes come from the store filesystem's clock, which can lag
+    /// this node's clock on network or FUSE stores and rounds to 2 s on
+    /// FAT: a block a scan wrote right after it started can look older.
+    pub const cutoff_slack_s: i64 = 60;
+
+    /// After claiming a sweep: null when the share set changed since
+    /// `snap` (the collection skips). Otherwise the sweep cutoff, moved
+    /// back to the start of the running scan and of any scan that
+    /// published a root since the snapshot (its blocks are reachable from
+    /// no snapshot root), less `cutoff_slack_s`.
+    pub fn collectionCutoff(self: *ShareIndex, snap: Snapshot, cutoff_s: i64) ?i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.generation != snap.generation or self.collect_epoch != snap.epoch) return null;
+        var cutoff = cutoff_s;
+        if (self.scan_started_s) |s| cutoff = @min(cutoff, s);
+        if (self.published_since_snapshot_s) |s| cutoff = @min(cutoff, s);
+        return cutoff - cutoff_slack_s;
     }
 
     pub fn freeSnapshot(allocator: std.mem.Allocator, shares: []Share) void {
@@ -427,7 +507,12 @@ test "shares: listing follows add, rescan and remove" {
     defer index.destroy();
 
     try testing.expectError(error.InvalidShareName, index.add("../x", docs));
+    const initial_generation = index.generation;
     try index.add("docs", docs);
+    const added_generation = index.generation;
+    try testing.expect(added_generation != initial_generation);
+    index.rescanAll();
+    try testing.expectEqual(added_generation, index.generation);
 
     const bytes = try index.listing(allocator);
     defer allocator.free(bytes);
@@ -443,18 +528,108 @@ test "shares: listing follows add, rescan and remove" {
     try testing.expectEqualStrings("alpha", buf[0..try tree.readAt(allocator, loader, file.cid, 0, &buf)]);
 
     try tmp.dir.writeFile(io, .{ .sub_path = "docs/b.txt", .data = "beta!" });
+    const Probe = struct {
+        index: *ShareIndex,
+        called: bool = false,
+        collection_started: bool = false,
+        scan_started_s: ?i64 = null,
+
+        fn report(ctx: *anyopaque, _: scan.Result) !void {
+            const probe: *@This() = @ptrCast(@alignCast(ctx));
+            probe.called = true;
+            probe.index.mutex.lock();
+            probe.scan_started_s = probe.index.scan_started_s;
+            probe.index.mutex.unlock();
+            if (probe.index.store.tryBeginCollect()) {
+                probe.collection_started = true;
+                probe.index.store.endCollect();
+            }
+        }
+    };
+    var probe: Probe = .{ .index = index };
+    index.scanner.progress = .{ .ctx = &probe, .reportFn = Probe.report, .first_ns = 0, .interval_ns = 0 };
+    const before_scan_s = sync.timestamp();
     index.rescanAll();
+    try testing.expect(probe.called and probe.collection_started);
+    try testing.expect(probe.scan_started_s.? >= before_scan_s);
+    try testing.expect(probe.scan_started_s.? <= sync.timestamp());
+    try testing.expectEqual(null, index.scan_started_s);
+    // A new root alone leaves the share set's generation.
+    try testing.expectEqual(added_generation, index.generation);
+    try testing.expect(store.tryBeginCollect());
+    store.endCollect();
     const snap = try index.snapshot(allocator);
     defer ShareIndex.freeSnapshot(allocator, snap);
     try testing.expectEqual(@as(u64, 2), snap[0].files);
     try testing.expect(!std.mem.eql(u8, &snap[0].root.?, &listed.entries[0].cid));
 
     try testing.expect(index.remove("docs"));
+    try testing.expect(index.generation != added_generation);
     const empty = try index.listing(allocator);
     defer allocator.free(empty);
     const none = try tree.decodeListing(allocator, empty);
     defer none.deinit();
     try testing.expectEqual(@as(usize, 0), none.entries.len);
+}
+
+test "shares: collectionCutoff spares rescans that publish after the snapshot" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "docs");
+    try tmp.dir.createDirPath(io, "blocks");
+    try tmp.dir.writeFile(io, .{ .sub_path = "docs/a.txt", .data = "alpha" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const blocks = try std.fs.path.join(allocator, &.{ base, "blocks" });
+    defer allocator.free(blocks);
+    const docs = try std.fs.path.join(allocator, &.{ base, "docs" });
+    defer allocator.free(docs);
+
+    var store = try storage.engine.StorageEngine.init(allocator, blocks);
+    defer store.deinit();
+    const index = try ShareIndex.create(allocator, io, &store);
+    defer index.destroy();
+    try index.add("docs", docs);
+
+    const now_s: i64 = 100_000;
+    const first = try index.collectionSnapshot(allocator);
+    defer ShareIndex.freeSnapshot(allocator, first.shares);
+    // Nothing scanning or published: only the slack.
+    try testing.expectEqual(@as(?i64, now_s - ShareIndex.cutoff_slack_s), index.collectionCutoff(first, now_s));
+
+    // A long rescan (it started at 1000) publishes a new root after the snapshot.
+    const LongScan = struct {
+        fn report(ctx: *anyopaque, _: scan.Result) !void {
+            const idx: *ShareIndex = @ptrCast(@alignCast(ctx));
+            idx.mutex.lock();
+            defer idx.mutex.unlock();
+            idx.scan_started_s = 1000;
+        }
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "docs/b.txt", .data = "beta!" });
+    index.scanner.progress = .{ .ctx = index, .reportFn = LongScan.report, .first_ns = 0, .interval_ns = 0 };
+    index.rescanAll();
+    try testing.expectEqual(null, index.scan_started_s);
+    // Not skipped: pinned to the scan's start.
+    try testing.expectEqual(@as(?i64, 1000 - ShareIndex.cutoff_slack_s), index.collectionCutoff(first, now_s));
+
+    // A later snapshot has that root: only the slack again; the older snapshot is spent.
+    const second = try index.collectionSnapshot(allocator);
+    defer ShareIndex.freeSnapshot(allocator, second.shares);
+    try testing.expectEqual(@as(?i64, now_s - ShareIndex.cutoff_slack_s), index.collectionCutoff(second, now_s));
+    try testing.expectEqual(null, index.collectionCutoff(first, now_s));
+
+    // A share added, moved or removed still skips.
+    try index.register("docs", blocks);
+    try testing.expectEqual(null, index.collectionCutoff(second, now_s));
+    const third = try index.collectionSnapshot(allocator);
+    defer ShareIndex.freeSnapshot(allocator, third.shares);
+    try testing.expect(index.remove("docs"));
+    try testing.expectEqual(null, index.collectionCutoff(third, now_s));
 }
 
 test "shares: a first scan lists its progress, and every file reads back" {

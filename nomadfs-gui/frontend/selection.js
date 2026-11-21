@@ -193,10 +193,13 @@ export function longPress(root, pick, fire, { ms = 500, onRelease = null } = {})
   let start = null;
   let fired = false;
   let started = null; // what this press picked, at pointerdown
+  let cancelled = null;
   const cancel = () => { clearTimeout(timer); timer = 0; start = null; };
   root.addEventListener("pointerdown", (e) => {
     cancel();
     fired = false;
+    cancelled = null;
+    started = null;
     if (e.pointerType !== "touch") return;
     const picked = pick(e);
     if (picked === null || picked === undefined) return;
@@ -216,15 +219,14 @@ export function longPress(root, pick, fire, { ms = 500, onRelease = null } = {})
   // The WebView cancels the pointer when its own long press starts (an
   // image's drag or menu), before our timer: its contextmenu, which comes
   // right after, is the long press then.
-  let cancelled = null;
   root.addEventListener("pointercancel", (e) => {
-    cancelled = e.pointerType === "touch" && start ? pick(e) : null;
+    cancelled = e.pointerType === "touch" && start ? started : null;
     cancel();
   });
   root.addEventListener("contextmenu", (e) => {
-    if (e.pointerType !== "touch" && !cancelled) return;
-    // The press's own pick, from pointerdown, when the timer is still due.
-    const pending = timer ? started : null;
+    if (e.pointerType !== "touch" && !cancelled && !start) return;
+    // The press's own pick, from pointerdown, when the timer is still due or already fired.
+    const pending = timer || fired ? started : null;
     const picked = cancelled ?? pending ?? pick(e);
     cancelled = null;
     clearTimeout(timer);

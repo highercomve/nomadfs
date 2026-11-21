@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Selection, rangeBetween, chunk, deleteCopy, deleteMany, deletedText } from "../frontend/selection.js";
+import { Selection, rangeBetween, chunk, deleteCopy, deleteMany, deletedText, longPress } from "../frontend/selection.js";
 
 test("Selection: toggle starts select mode, leave forgets everything", () => {
   let changes = 0;
@@ -111,4 +111,87 @@ test("deleteMany: stops at the batch that fails and says how far it got", async 
   assert.deepEqual(res, { deleted: 2, error: "NodeStopped" });
   assert.equal(deletedText(res), "Deleted 2, then it failed: NodeStopped");
   assert.equal(deletedText({ deleted: 0, error: "NodeStopped" }), "Delete failed: NodeStopped");
+});
+
+function fakeRoot() {
+  const listeners = new Map();
+  return {
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    },
+    emit(type, ev = {}) {
+      let prevented = false;
+      const e = { pointerType: "touch", clientX: 0, clientY: 0, preventDefault() { prevented = true; }, ...ev };
+      for (const fn of listeners.get(type) || []) fn(e);
+      return { prevented };
+    },
+  };
+}
+
+test("longPress: stale cancelled pick is cleared on next pointerdown", () => {
+  const root = fakeRoot();
+  const fired = [];
+  longPress(root, (e) => e.item ?? null, (picked) => fired.push(picked), { ms: 5000 });
+
+  // Touch on tile A gets cancelled by scroll (no contextmenu follows).
+  root.emit("pointerdown", { pointerType: "touch", item: "A" });
+  root.emit("pointercancel", { pointerType: "touch", item: "A" });
+
+  // Later mouse right-click: pointerdown clears stale cancelled, so contextmenu must not fire A.
+  root.emit("pointerdown", { pointerType: "mouse", item: "B" });
+  const r1 = root.emit("contextmenu", { pointerType: "mouse", item: "B" });
+  assert.equal(r1.prevented, false);
+  assert.deepEqual(fired, []);
+
+  // Touch on tile A cancelled again, then a new touch on empty area (pick -> null) + contextmenu.
+  root.emit("pointerdown", { pointerType: "touch", item: "A" });
+  root.emit("pointercancel", { pointerType: "touch", item: "A" });
+  root.emit("pointerdown", { pointerType: "touch", item: null });
+  const r2 = root.emit("contextmenu", { pointerType: "touch", item: null });
+  assert.equal(r2.prevented, false);
+  assert.deepEqual(fired, []);
+});
+
+test("longPress: pointercancel keeps the press's own pick, not pick(e) at cancel time", () => {
+  const root = fakeRoot();
+  const fired = [];
+  const lp = longPress(root, (e) => e.item ?? null, (picked) => fired.push(picked), { ms: 5000 });
+
+  // Touch starts on tile A, but by pointercancel the recycled tile reports B.
+  root.emit("pointerdown", { pointerType: "touch", item: "A" });
+  root.emit("pointercancel", { pointerType: "touch", item: "B" });
+  const r = root.emit("contextmenu", { pointerType: "touch", item: "B" });
+  assert.equal(r.prevented, true);
+  assert.deepEqual(fired, ["A"]);
+  assert.equal(lp.wasLongPress(), true);
+  assert.equal(lp.wasLongPress(), false);
+});
+
+test("longPress: MouseEvent contextmenu (undefined pointerType) during active touch press is owned and prevented", async () => {
+  const root = fakeRoot();
+  const fired = [];
+  let selectActive = false;
+  longPress(root, (e) => (selectActive ? null : e.item ?? null), (picked) => {
+    fired.push(picked);
+    selectActive = true;
+  }, { ms: 10 });
+
+  // Before timer: WebView dispatches MouseEvent contextmenu without pointercancel.
+  root.emit("pointerdown", { pointerType: "touch", item: "A" });
+  const r1 = root.emit("contextmenu", { pointerType: undefined, item: "A" });
+  assert.equal(r1.prevented, true);
+  assert.deepEqual(fired, ["A"]);
+
+  // After timer already fired (selectActive is now true so pick() returns null):
+  // contextmenu arriving while finger is still down must still preventDefault without double-firing.
+  selectActive = false;
+  fired.length = 0;
+  root.emit("pointerdown", { pointerType: "touch", item: "B" });
+  await new Promise((r) => setTimeout(r, 25));
+  assert.deepEqual(fired, ["B"]);
+  const r2 = root.emit("contextmenu", { pointerType: undefined, item: "B" });
+  assert.equal(r2.prevented, true);
+  assert.deepEqual(fired, ["B"]);
+  root.emit("pointerup", { pointerType: "touch" });
 });

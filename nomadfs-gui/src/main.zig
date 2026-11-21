@@ -158,14 +158,14 @@ pub const Commands = struct {
     /// `invoke("swarm_add_folder", { dir })`: pick a folder and add it with
     /// everything in it. Null when the picker was cancelled. Desktops only:
     /// Android's picker answers a tree URI, not a folder to read.
-    pub fn swarm_add_folder(gpa: std.mem.Allocator, args: commands.SwarmDirArgs) !?nomadfs.fs.SwarmFolder.TreeAdded {
+    pub fn swarm_add_folder(gpa: std.mem.Allocator, args: commands.SwarmDirArgs) !?commands.FolderAdded {
         if (builtin.abi.isAndroid()) return error.Unsupported;
         const folder = try oriel.dialog.openFolder(gpa, .{ .title = "Add a folder to the swarm folder" }) orelse return null;
         defer folder.deinit(gpa);
         return try commands.swarmAddFolder(args.dir, folder.id);
     }
 
-    /// `invoke("swarm_upload_begin", { dir, name, size, mtime_ms })`: an id
+    /// `invoke("swarm_upload_begin", { dir, name, size, mtime_ms, session? })`: an id
     /// for a file the page sends in pieces (picked or dropped).
     pub fn swarm_upload_begin(args: commands.UploadBeginArgs) !u64 {
         return commands.swarmUploadBegin(args);
@@ -186,8 +186,8 @@ pub const Commands = struct {
         commands.swarmUploadCancel(args);
     }
 
-    /// `invoke("swarm_mkdir", { dir, name })`.
-    pub fn swarm_mkdir(args: commands.SwarmNameArgs) !void {
+    /// `invoke("swarm_mkdir", { dir, name, session? })`.
+    pub fn swarm_mkdir(args: commands.SwarmMkdirArgs) !void {
         return commands.swarmMkdir(args);
     }
 
@@ -620,10 +620,17 @@ fn nvidiaRenderer() void {
     if (nvidia) _ = c.setenv("GSK_RENDERER", "cairo", 0);
 }
 
+/// Before the node closes: downloads and folder adds read through it for
+/// long, and closing waits for them.
+fn stopLongWork() void {
+    downloads.cancelAll();
+    commands.stopAdds();
+}
+
 pub fn main(init: std.process.Init) !u8 {
     nvidiaRenderer();
     initDataDirs();
-    commands.before_node_close = downloads.cancelAll;
+    commands.before_node_close = stopLongWork;
     commands.after_node_open = notes_events.subscribe;
     commands.open_folder = openFolder;
     return oriel.main(init, .{ .commands = Commands, .events = Events }, .{

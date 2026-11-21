@@ -126,23 +126,33 @@ pub fn addStoredReachable(allocator: std.mem.Allocator, store: *StorageEngine, r
 
 /// Like addStoredReachable, but a leaf's data is never read (only its first
 /// byte, to tell it from a parent): for collecting what the store keeps,
-/// which walks every file the device holds.
-pub fn addStoredLinks(allocator: std.mem.Allocator, store: *StorageEngine, root: *const Cid, set: *CidSet) !void {
+/// which walks every file the device holds. Discard the mark set on error.
+pub fn addStoredLinks(allocator: std.mem.Allocator, store: *StorageEngine, root: *const Cid, set: *CidSet, running: *const std.atomic.Value(bool)) !void {
     var stack: std.ArrayList(Cid) = .empty;
     defer stack.deinit(allocator);
     try stack.append(allocator, root.*);
     while (stack.pop()) |cid| {
+        if (!running.load(.acquire)) return error.Stopped;
         if ((try set.getOrPut(allocator, cid)).found_existing) continue;
-        const bytes = switch (try store.getLocalNode(&cid, allocator)) {
+        const bytes = switch (store.getLocalNode(&cid, allocator) catch |err| {
+            if (err == error.CorruptBlock) return corruptBlock(cid);
+            return err;
+        }) {
             .missing, .leaf => continue,
             .node => |b| b,
         };
         defer allocator.free(bytes);
-        switch (codec.decode(bytes) catch continue) {
+        if (!std.mem.eql(u8, &Block.new(bytes).cid, &cid)) return corruptBlock(cid);
+        switch (codec.decode(bytes) catch return corruptBlock(cid)) {
             .leaf => {},
             inline .parent, .dir => |links| try pushChildren(allocator, &stack, links),
         }
     }
+}
+
+fn corruptBlock(cid: Cid) error{CorruptBlock} {
+    std.debug.print("store: collection stopped at corrupt block {s}\n", .{&std.fmt.bytesToHex(cid, .lower)});
+    return error.CorruptBlock;
 }
 
 /// Bounds and payload policy for a local DAG enumeration.
@@ -209,4 +219,84 @@ test "readFile bounds repeated subtree expansion including empty leaves" {
     // Repeated links still reproduce valid file content under the budget.
     try std.testing.expectEqual(@as(u64, 0), try readFile(allocator, &store, &root.cid, Writer{}, .{}));
     try std.testing.expectEqual(@as(u64, default_max_blocks), blockBudget(std.math.maxInt(u64)));
+}
+
+test "addStoredLinks marks every block of a multi-level file DAG" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(std.testing.io, &path_buf)];
+    var store = try StorageEngine.init(allocator, path);
+    defer store.deinit();
+
+    const builder_mod = @import("builder.zig");
+    const data = try allocator.alloc(u8, 4 * builder_mod.chunk_params.max_size + 1);
+    defer allocator.free(data);
+    var prng = std.Random.DefaultPrng.init(0);
+    prng.random().bytes(data);
+    var reader = chunker.SliceReader{ .buffer = data };
+    var builder: builder_mod.DagBuilder = .{ .allocator = allocator, .store = &store, .layout = .Linear };
+    const root_bytes = try builder.build(&reader);
+    defer allocator.free(root_bytes);
+    const root = try cidFromSlice(root_bytes);
+
+    const running: std.atomic.Value(bool) = .init(true);
+    var marked: CidSet = .empty;
+    defer marked.deinit(allocator);
+    try addStoredLinks(allocator, &store, &root, &marked, &running);
+
+    var files = store.root_dir.iterate();
+    var leaves: usize = 0;
+    var parents: usize = 0;
+    while (try files.next(std.testing.io)) |entry| {
+        if (entry.kind != .file) continue;
+        var cid: Cid = undefined;
+        _ = try std.fmt.hexToBytes(&cid, entry.name);
+        try std.testing.expect(marked.contains(cid));
+        switch (try store.getLocalNode(&cid, allocator)) {
+            .missing => return error.TestUnexpectedResult,
+            .leaf => leaves += 1,
+            .node => |bytes| {
+                defer allocator.free(bytes);
+                parents += 1;
+            },
+        }
+    }
+    try std.testing.expect(leaves > 3 and parents > 1);
+    try std.testing.expectEqual(leaves + parents, marked.count());
+}
+
+test "addStoredLinks aborts on a corrupt parent or shutdown" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(std.testing.io, &path_buf)];
+    var store = try StorageEngine.init(allocator, path);
+    defer store.deinit();
+    const corrupt = Block.new(&.{ @intFromEnum(codec.Tag.parent), 0, 1 });
+    try store.put(corrupt);
+
+    var running: std.atomic.Value(bool) = .init(true);
+    var marked: CidSet = .empty;
+    defer marked.deinit(allocator);
+    try std.testing.expectError(error.CorruptBlock, addStoredLinks(allocator, &store, &corrupt.cid, &marked, &running));
+    marked.clearRetainingCapacity();
+    const empty = Block.new("");
+    try store.root_dir.writeFile(std.testing.io, .{ .sub_path = &std.fmt.bytesToHex(empty.cid, .lower), .data = "" });
+    try std.testing.expectError(error.CorruptBlock, addStoredLinks(allocator, &store, &empty.cid, &marked, &running));
+    marked.clearRetainingCapacity();
+
+    const dir = try codec.encodeDir(allocator, &.{});
+    defer allocator.free(dir);
+    try std.testing.expect((try codec.decode(dir)) == .dir);
+    const wrong_cid = Block.new("different content").cid;
+    try store.root_dir.writeFile(std.testing.io, .{ .sub_path = &std.fmt.bytesToHex(wrong_cid, .lower), .data = dir });
+    try std.testing.expectError(error.CorruptBlock, addStoredLinks(allocator, &store, &wrong_cid, &marked, &running));
+    marked.clearRetainingCapacity();
+
+    running.store(false, .release);
+    try std.testing.expectError(error.Stopped, addStoredLinks(allocator, &store, &corrupt.cid, &marked, &running));
+    try std.testing.expectEqual(@as(usize, 0), marked.count());
 }

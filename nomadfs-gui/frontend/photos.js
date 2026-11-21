@@ -10,7 +10,7 @@ import { startDownload } from "./downloads.js";
 import { openPreview } from "./preview.js";
 import { groupByDay, layout, rowAt, yearMarks } from "./photos-model.js";
 import { createThumbLoader, loadImage } from "./thumb-loader.js";
-import { isRunning, isStarting } from "./state.js";
+import { isRunning, isStarting, onNodeChange } from "./state.js";
 
 // Thumbnails load in the background, a few at a time: the app sends at
 // most 6 thumbnail asks to other devices at once (cluster/block_manager).
@@ -354,13 +354,13 @@ function toggleDay(sectionIndex) {
 
 async function deleteSelected() {
   if (selBusy || !sel.size) return;
+  const paths = sel.keys();
   const ok = await askDialog({
-    ...deleteCopy(sel.size, { noun: ["photo or video", "photos and videos"] }),
+    ...deleteCopy(paths.length, { noun: ["photo or video", "photos and videos"] }),
     confirm: "Delete",
     danger: true,
   });
-  if (!ok || !sel.size) return;
-  const paths = sel.keys();
+  if (!ok || selBusy) return;
   selBusy = "Deleting…";
   drawSelectionBar();
   const res = await deleteMany(invoke, paths, {
@@ -656,7 +656,29 @@ function setupScrubberEvents() {
   scrubberEl.addEventListener("pointercancel", stop);
 }
 
+let loadSeq = 0;
+
+function clearPhotos() {
+  sel.leave();
+  currentIndex = null;
+  currentGeneration = -1;
+  thumbBase = "";
+  pageCache.clear();
+  rows = [];
+  sections = [];
+  unmountAllRows();
+  const spacerEl = $("photos-spacer");
+  const stickyEl = $("photos-sticky");
+  const scrubberEl = $("photos-scrubber");
+  const chipsEl = $("photos-chips");
+  if (spacerEl) spacerEl.style.height = "0px";
+  if (stickyEl) stickyEl.hidden = true;
+  if (scrubberEl) scrubberEl.hidden = true;
+  if (chipsEl) chipsEl.replaceChildren();
+}
+
 export async function loadPhotos(opts = {}) {
+  const seq = ++loadSeq;
   const { folder = currentFolder, keepScroll = false } = opts;
   currentFolder = folder;
 
@@ -678,6 +700,7 @@ export async function loadPhotos(opts = {}) {
   // the node still starting); a refresh keeps the photos shown meanwhile.
   const showSkeleton = (on) => { if (skeletonEl) skeletonEl.hidden = !on; };
   if (!isRunning()) {
+    clearPhotos();
     showSkeleton(isStarting());
     if (loadingEl) loadingEl.hidden = !isStarting();
     if (!isStarting() && emptyEl) {
@@ -698,6 +721,7 @@ export async function loadPhotos(opts = {}) {
     try {
       index = await invoke("photos_index", { folder, kinds: "all" });
     } catch (invokeErr) {
+      if (seq !== loadSeq || !isRunning()) return;
       if (loadingEl) loadingEl.hidden = true;
       showSkeleton(false);
       if (errorEl) {
@@ -707,6 +731,7 @@ export async function loadPhotos(opts = {}) {
       return;
     }
 
+    if (seq !== loadSeq || !isRunning()) return;
     if (loadingEl) loadingEl.hidden = true;
     showSkeleton(false);
     currentIndex = index;
@@ -741,6 +766,7 @@ export async function loadPhotos(opts = {}) {
     }
     onScroll();
   } catch (err) {
+    if (seq !== loadSeq || !isRunning()) return;
     if (loadingEl) loadingEl.hidden = true;
     showSkeleton(false);
     if (errorEl) {
@@ -766,6 +792,13 @@ export function installPhotos() {
 
   setupScrubberEvents();
   installSelection();
+
+  onNodeChange(() => {
+    if (!isRunning()) {
+      loadSeq++;
+      clearPhotos();
+    }
+  });
 
   window.oriel?.listen?.("photos://changed", () => {
     if (document.body.dataset.view === "photos") {

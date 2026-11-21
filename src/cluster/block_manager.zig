@@ -69,6 +69,10 @@ pub const BlockManager = struct {
     /// and announces this node as its provider. Returns the root CID
     /// (caller-owned). On error.QuorumNotReached the blocks are still stored
     /// locally; calling put again is idempotent and retries the announcement.
+    /// A writer of kept blocks must hold `beginWrite` until its root is
+    /// reachable from a collected root set, or its blocks may go. This
+    /// CID-only put (`put_text` and `nomadfs_put_file`) guards the build;
+    /// the resulting blocks are eligible for collection.
     pub fn put(self: *BlockManager, reader: anytype) ![]const u8 {
         const store = self.store orelse return error.StorageDisabled;
 
@@ -77,7 +81,11 @@ pub const BlockManager = struct {
             .store = store,
             .layout = self.layout,
         };
-        const root = try builder.build(reader);
+        const root = blk: {
+            store.beginWrite();
+            defer store.endWrite();
+            break :blk try builder.build(reader);
+        };
         errdefer self.allocator.free(root);
 
         try self.announce(root);
