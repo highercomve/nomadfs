@@ -3,6 +3,43 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## 0.8.0 - 2026-11-21
+
+Devices on 0.4.0 and later work together. Deleted files now free their space: update every device,
+since each one frees the blocks it keeps only once it runs 0.8.0.
+
+### Added
+
+- Delete many at once: select files and folders in the swarm folder, or photos and whole days in
+  Photos, and delete them in one go. A long press selects on phones, and right-click on desktops.
+- Deleted files free their space: a few minutes after a delete (time enough to undo it), every
+  device deletes the blocks no live file needs.
+- Add files takes several at once, Add folder (desktops) adds a folder with everything in it, and
+  files and folders dropped on the swarm folder are added where it is open, with progress and
+  Cancel. Each file keeps its own date.
+- Settings has an Offsite backup card: add a Cloudflare R2, AWS S3, Glacier Deep Archive or other
+  S3-compatible bucket, back up now, check the backup and confirm the recovery words. The command
+  line has `nomadfs backup add` and `nomadfs backup remove`.
+- While the node starts, Photos and the swarm folder show placeholders instead of "NomadFS isn't
+  running".
+
+### Fixed
+
+- Freeing space never deletes a file still being written, a file in a shared folder being
+  rescanned, or the rest of a file whose tree has a damaged block (the collection stops and logs
+  it). A device that lost its swarm folder list frees space again only after a sync brings its
+  files back.
+- New folder refuses a name a file already has.
+- Uploads wait while the swarm folder syncs, and stop once, saying so, if the node restarts in the
+  middle.
+- Android: no system backup. It failed on the store's size, then killed the app, and would have
+  copied the device key off the phone.
+- Android: a RAW photo's preview no longer overflows the WebView's thread.
+- Photos: a long press selects the photo pressed, on WebViews that cancel the touch or open their
+  menu first.
+- The offsite backup card no longer shows on every screen.
+- The uploader no longer prints new recovery words to the node's log.
+
 ## 0.7.1 - 2026-11-17
 
 Devices on 0.4.0 and later work together. Update every Windows computer: the app failed there from
