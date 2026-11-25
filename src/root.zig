@@ -17,6 +17,7 @@ pub const fs = @import("fs/mod.zig");
 /// Pictures to thumbnails (std and the vendored stb; knows no folders).
 pub const codec = @import("codec/mod.zig");
 /// The mount where there is no FUSE: WebDAV on 127.0.0.1, and mounting it.
+pub const webdav_login = @import("webdav/login.zig");
 pub const webdav = @import("webdav.zig");
 pub const webdav_mount = @import("webdav_mount.zig");
 /// The local swarm API the running node serves (`nomadfs swarm`, Locket).

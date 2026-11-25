@@ -1,7 +1,7 @@
 // ---- Mount (desktop Linux) ----
 
 import { $, snack } from "./core.js";
-import { isRunning } from "./state.js";
+import { isRunning, ensureConfig, onNodeChange } from "./state.js";
 
 const { invoke } = window.oriel;
 
@@ -25,11 +25,12 @@ function renderMount(status) {
 async function loadMount() {
   let status;
   try { status = await invoke("mount_status", null); } catch { return; }
-  $("nav-mount").hidden = !status.supported;
+  $("nav-mount").hidden = false;
+  $("mount-section").hidden = !status.supported;
   const os = window.oriel.platform?.os;
   if (os === "windows") $("mount-hint").innerHTML = "Uses Windows's WebDAV client (the WebClient service). Also from a terminal: <code>nomadfs --mount Z:</code>";
   else if (os === "macos") $("mount-hint").innerHTML = "Mounted over WebDAV, which macOS reads natively. Also from a terminal: <code>nomadfs --mount ~/NomadFS</code>";
-  if (!status.supported && document.body.dataset.view === "mount") ctx.setView("browse");
+  await loadWebDav();
   renderMount(status);
 }
 
@@ -41,6 +42,12 @@ let ctx = null; // injected deps from the root
 
 export function installMount({ setView, nodeState }) {
   ctx = { setView, nodeState };
+  onNodeChange(loadMount);
+  $("webdav-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    saveWebDav(false);
+  });
+  $("webdav-clear").addEventListener("click", () => saveWebDav(true));
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") loadMount(); });
 
   $("mount-toggle").addEventListener("click", async () => {
@@ -80,3 +87,42 @@ export function installMount({ setView, nodeState }) {
 
 
 export { loadMount };
+
+async function loadWebDav() {
+  try {
+    const status = await invoke("webdav_info", { config_path: await ensureConfig() });
+    // Do not overwrite an edit when node state or window visibility changes.
+    if (!$("webdav-form").contains(document.activeElement)) {
+      $("webdav-enabled").checked = status.port > 0;
+      $("webdav-port").value = status.port || 8080;
+      $("webdav-user").value = status.user;
+    }
+    $("webdav-state").textContent = `${status.running ? "Serving" : status.port ? "Starts with the node" : "Off"}. ${status.password_set ? "Password set." : "No login: the address uses a random token."}`;
+    $("webdav-address").textContent = status.address;
+    $("webdav-clear").disabled = !status.password_set;
+  } catch (err) { snack(`Couldn't read WebDAV settings: ${err}`); }
+}
+
+async function saveWebDav(clear) {
+  const form = $("webdav-form");
+  const password = $("webdav-password");
+  const buttons = form.querySelectorAll("button");
+  buttons.forEach((b) => { b.disabled = true; });
+  try {
+    await invoke("webdav_set", {
+      config_path: await ensureConfig(),
+      port: $("webdav-enabled").checked ? Number($("webdav-port").value) : 0,
+      user: $("webdav-user").value,
+      password: password.value,
+      clear_password: clear,
+    });
+    password.value = "";
+    if (clear) $("webdav-user").value = "";
+    snack("WebDAV settings saved");
+  } catch (err) { snack(`Couldn't save WebDAV settings: ${err}`); }
+  finally {
+    password.value = "";
+    buttons.forEach((b) => { b.disabled = false; });
+    await loadWebDav();
+  }
+}

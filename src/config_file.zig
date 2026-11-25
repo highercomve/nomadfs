@@ -1,6 +1,6 @@
 //! Changing `nomadfs.conf` in place: the one editor the app and the command
 //! line use. Legacy settings are flat `key = value` lines; [backup.<name>]
-//! is scoped and preserved. An edit drops the lines it replaces and appends the
+//! and [webdav] are scoped and preserved. An edit drops the lines it replaces and appends the
 //! new ones, keeping comments and every other setting as they are. Writes
 //! are atomic (temp file, fsync, rename) and owner-only: the file holds the
 //! swarm key.
@@ -39,17 +39,19 @@ pub fn edit(allocator: std.mem.Allocator, path: []const u8, change: Edit) !void 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     var backup_section = false;
+    var webdav_section = false;
     var lines = std.mem.splitScalar(u8, old, '\n');
     while (lines.next()) |line| {
         if (lines.index == null and line.len == 0) break; // trailing newline
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (std.mem.startsWith(u8, trimmed, "[")) backup_section = @import("backup/config.zig").sectionName(trimmed) != null;
-        if (!backup_section and dropped(line, change)) continue;
+        if (std.mem.startsWith(u8, trimmed, "[")) webdav_section = std.mem.eql(u8, trimmed, "[webdav]");
+        if (!backup_section and !webdav_section and dropped(line, change)) continue;
         try out.appendSlice(allocator, line);
         try out.append(allocator, '\n');
     }
     // The legacy editor appends node settings; leave the scoped backup section.
-    if (backup_section and change.append.len > 0) try out.appendSlice(allocator, "[node]\n");
+    if ((backup_section or webdav_section) and change.append.len > 0) try out.appendSlice(allocator, "[node]\n");
     for (change.append) |line| {
         try out.appendSlice(allocator, line);
         try out.append(allocator, '\n');
@@ -372,4 +374,58 @@ test "config: S3 sections are added, changed and removed, and the rest stays" {
     try std.testing.expect(std.mem.startsWith(u8, text, "# mine\n"));
     try std.testing.expect(std.mem.indexOf(u8, text, "one.test") == null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "[backup."));
+}
+
+/// Replaces only the scoped WebDAV section, preserving all other settings.
+pub fn setWebDav(a: std.mem.Allocator, path: []const u8, value: config_mod.Config.WebDavConfig) !void {
+    try @import("webdav/login.zig").validate(value);
+    mutex.lock();
+    defer mutex.unlock();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const old = try readWhole(a, io, path);
+    defer a.free(old);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    var inside = false;
+    var lines = std.mem.splitScalar(u8, old, '\n');
+    while (lines.next()) |line| {
+        if (lines.index == null and line.len == 0) break;
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "[")) inside = std.mem.eql(u8, trimmed, "[webdav]");
+        if (inside) continue;
+        try out.appendSlice(a, line);
+        try out.append(a, '\n');
+    }
+    try out.print(a, "[webdav]\nport = {d}\nuser = \"{s}\"\npassword_hash = \"{s}\"\n", .{ value.port, value.user, value.password_hash });
+    try writeAtomic(a, io, path, out.items);
+}
+
+test "config: WebDAV scoped round trip preserves peer port and credentials during edits" {
+    const a = testing.allocator;
+    const io = std.testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config", .data = "nickname = alpha\nswarm_key = " ++ "ab" ** 32 ++ "\nstorage_path = /tmp/a\nport = 14700\n" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    const path = try std.fs.path.join(a, &.{ dir, "config" });
+    defer a.free(path);
+    var hash_buf: [106]u8 = undefined;
+    const hash = try @import("webdav/login.zig").hash(a, "password", &hash_buf);
+    try setWebDav(a, path, .{ .port = 8080, .user = "reader", .password_hash = hash });
+    try setInt(a, path, "port", 14701);
+    try setNickname(a, path, "beta");
+    var cfg = try config_mod.parseConfig(a, path);
+    defer cfg.deinit(a);
+    try testing.expectEqual(@as(u16, 14701), cfg.network.port);
+    try testing.expectEqual(@as(u16, 8080), cfg.webdav.port);
+    try testing.expectEqualStrings("reader", cfg.webdav.user);
+    try testing.expectEqualStrings(hash, cfg.webdav.password_hash);
+    try setWebDav(a, path, .{});
+    var cleared = try config_mod.parseConfig(a, path);
+    defer cleared.deinit(a);
+    try testing.expect(!cleared.webdav.hasLogin());
+    try testing.expectEqual(@as(u16, 0), cleared.webdav.port);
+    try testing.expectEqual(@as(u16, 14701), cleared.network.port);
+    try testing.expectError(error.InvalidWebDavHash, setWebDav(a, path, .{ .user = "reader", .password_hash = "plaintext" }));
 }

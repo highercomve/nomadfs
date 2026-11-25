@@ -2097,6 +2097,29 @@ test "commands: node put/get text round trip" {
     const fetched = try getText(alloc, .{ .cid = cid });
     defer alloc.free(fetched);
     try testing.expectEqualStrings(text, fetched);
+
+    // The WebDAV card changes a running node without touching its mount.
+    var probe = try nomadfs.net.compat.listenLoopback(0);
+    const webdav_port = probe.inner.socket.address.getPort();
+    probe.deinit();
+    try webDavSet(alloc, .{ .config_path = conf_path, .port = webdav_port, .user = "reader", .password = "secret" });
+    {
+        const info = try webDavInfo(alloc, .{ .config_path = conf_path });
+        defer alloc.free(info.user);
+        defer alloc.free(info.address);
+        try testing.expect(info.running and info.password_set);
+        try testing.expectEqual(webdav_port, info.port);
+        try testing.expect(std.mem.endsWith(u8, info.address, "/Swarm/"));
+        try testing.expect(std.mem.indexOf(u8, info.address, "secret") == null);
+    }
+    // Blank leaves the saved hash alone, invalid settings leave it running.
+    try webDavSet(alloc, .{ .config_path = conf_path, .port = webdav_port, .user = "reader" });
+    try testing.expectError(error.InvalidWebDavUser, webDavSet(alloc, .{ .config_path = conf_path, .port = webdav_port, .user = "bad:user" }));
+    try testing.expect(g_node.?.node.webdav_service != null);
+    try webDavSet(alloc, .{ .config_path = conf_path, .port = webdav_port, .user = "", .clear_password = true });
+    try testing.expect(!g_node.?.node.webdav_service.?.server.login.hasLogin());
+    try webDavSet(alloc, .{ .config_path = conf_path, .port = 0, .user = "" });
+    try testing.expect(g_node.?.node.webdav_service == null);
 }
 
 test "commands: ensureConfig sets private permissions on dir and file" {
@@ -2342,4 +2365,65 @@ test "commands: backup acceptance follows this device identity" {
     _ = try policy.apply(record, &trust, self_id, 1);
     try std.testing.expect(!acceptsCopiesForIdentity(policy, identity));
     try std.testing.expect(acceptsCopiesForIdentity(policy, other));
+}
+
+pub const WebDavInfo = struct {
+    port: u16,
+    user: []const u8,
+    password_set: bool,
+    running: bool,
+    address: []const u8,
+};
+pub const WebDavArgs = struct {
+    config_path: []const u8,
+    port: u16,
+    user: []const u8,
+    password: []const u8 = "",
+    clear_password: bool = false,
+};
+
+pub fn webDavInfo(gpa: std.mem.Allocator, args: ListArgs) !WebDavInfo {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    var cfg = try config_mod.parseConfig(gpa, args.config_path);
+    defer cfg.deinit(gpa);
+    const service = if (runningNode()) |n| n.webdav_service else null;
+    const user = try gpa.dupe(u8, cfg.webdav.user);
+    errdefer gpa.free(user);
+    return .{
+        .port = cfg.webdav.port,
+        .user = user,
+        .password_set = cfg.webdav.hasLogin(),
+        .running = service != null,
+        .address = if (service) |m| try std.fmt.allocPrint(gpa, "{s}Swarm/", .{m.url()}) else try gpa.dupe(u8, ""),
+    };
+}
+
+pub fn webDavSet(gpa: std.mem.Allocator, args: WebDavArgs) !void {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    var cfg = try config_mod.parseConfig(gpa, args.config_path);
+    defer cfg.deinit(gpa);
+    var value = cfg.webdav;
+    value.port = args.port;
+    var hash_buf: [106]u8 = undefined;
+    if (args.clear_password) {
+        value.user = "";
+        value.password_hash = "";
+    } else {
+        value.user = args.user;
+        if (args.password.len > 0) value.password_hash = try nomadfs.webdav_login.hash(gpa, args.password, &hash_buf);
+    }
+    try nomadfs.webdav_login.validate(value);
+    // Apply first: a port already in use must not be saved as working.
+    if (runningNode()) |n| {
+        n.configureWebDav(value) catch |err| {
+            n.configureWebDav(cfg.webdav) catch {};
+            return err;
+        };
+    }
+    config_file.setWebDav(gpa, args.config_path, value) catch |err| {
+        if (runningNode()) |n| n.configureWebDav(cfg.webdav) catch {};
+        return err;
+    };
 }

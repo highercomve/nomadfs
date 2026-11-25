@@ -400,6 +400,25 @@
         <p class="hint" id="mount-hint">Also from a terminal: <code>nomadfs --mount ~/NomadFS</code></p>
       </section>
 
+      <section class="card" data-view="mount">
+        <div class="card-head"><div>
+          <h2>WebDAV</h2>
+          <p class="supporting">Let apps on this computer use the swarm folder without mounting it. Set a login for an address that stays the same after restarting.</p>
+        </div></div>
+        <form id="webdav-form" class="stack">
+          <label><input id="webdav-enabled" type="checkbox"> Serve WebDAV while NomadFS runs</label>
+          <label class="field"><input id="webdav-port" type="number" min="1" max="65535" value="8080" required placeholder=" "><span class="field-label">Port</span></label>
+          <label class="field"><input id="webdav-user" autocomplete="username" maxlength="128" placeholder=" "><span class="field-label">User</span></label>
+          <label class="field"><input id="webdav-password" type="password" autocomplete="new-password" maxlength="1024" placeholder=" "><span class="field-label">New password (leave blank to keep)</span></label>
+          <p class="hint" id="webdav-state" role="status"></p>
+          <p class="hint"><code id="webdav-address"></code></p>
+          <div class="actions">
+            <button type="submit" class="btn outlined">Save WebDAV settings</button>
+            <button type="button" id="webdav-clear" class="btn text">Clear login</button>
+          </div>
+        </form>
+      </section>
+
       <!-- Join -->
       <section class="card" id="join-section" data-view="connect">
         <div class="card-head">

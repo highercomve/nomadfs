@@ -45,6 +45,11 @@ pub fn main(init: std.process.Init) !void {
     const allocator = if (@import("builtin").mode == .Debug) init.gpa else std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "webdav-login")) {
+        try @import("webdav_login_cli.zig").run(init.io, allocator, args[2..]);
+        return;
+    }
+
     if (args.len >= 2 and std.mem.eql(u8, args[1], "backup")) {
         std.process.exit(try @import("backup_cli.zig").run(init.io, allocator, args[2..]));
     }
@@ -439,7 +444,9 @@ extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (u32) callconv(.w
 /// macOS, a drive letter like Z: on Windows), until Ctrl-C.
 fn webdavCommand(allocator: std.mem.Allocator, config: config_mod.Config, port: u16, mountpoint: ?[]const u8) !void {
     var live: LiveNode = undefined;
-    try live.start(allocator, config, "--mount and --webdav");
+    var live_config = config;
+    live_config.webdav.port = 0;
+    try live.start(allocator, live_config, "--mount and --webdav");
     defer live.stop();
     if (builtin.os.tag == .windows) {
         _ = SetConsoleCtrlHandler(onWebDavConsole, 1);
@@ -448,7 +455,7 @@ fn webdavCommand(allocator: std.mem.Allocator, config: config_mod.Config, port: 
         std.posix.sigaction(.INT, &action, null);
         std.posix.sigaction(.TERM, &action, null);
     }
-    const mount = live.node.startWebDav(allocator, port, mountpoint) catch |err| {
+    const mount = live.node.startWebDavLogin(allocator, port, mountpoint, if (mountpoint == null) config.webdav else .{}) catch |err| {
         std.debug.print("Error: couldn't start the mount: {s}\n", .{@errorName(err)});
         if (builtin.os.tag == .windows and mountpoint != null) std.debug.print("Windows mounts WebDAV with its WebClient service: start it (services.msc), or use --webdav <port> and connect from Explorer.\n", .{});
         return err;

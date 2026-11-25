@@ -3,6 +3,14 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
+## Unreleased
+
+### Added
+
+- Optional fixed WebDAV login with salted Argon2id password storage, stable paths,
+  and `webdav-login set` / `clear` commands. A configured port starts the server
+  with the node. The Mount page can configure it and show the active address.
+
 ## 0.8.1 - 2026-11-24
 
 Devices on 0.4.0 and later work together. Nodes that share big folders use much less memory.

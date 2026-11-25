@@ -43,6 +43,7 @@ fn validateSwarmKey(val: []const u8, allocator: std.mem.Allocator) ![]const u8 {
 pub const Config = struct {
     /// Offsite targets, one per `[backup.<name>]` section, in file order.
     backup_targets: []BackupTarget = &.{},
+    webdav: WebDavConfig = .{},
     node: NodeConfig,
     storage: StorageConfig,
     network: NetworkConfig,
@@ -52,6 +53,16 @@ pub const Config = struct {
     /// Shares marked for backup (`backup = "Camera"`, repeatable): swarm
     /// backup devices keep a copy of them (fs/backup.zig).
     backup_shares: [][]const u8 = &.{},
+
+    pub const WebDavConfig = struct {
+        port: u16 = 0,
+        user: []const u8 = "",
+        password_hash: []const u8 = "",
+
+        pub fn hasLogin(self: WebDavConfig) bool {
+            return self.user.len > 0 and self.password_hash.len > 0;
+        }
+    };
 
     pub const Share = struct {
         name: []const u8,
@@ -161,6 +172,8 @@ pub const Config = struct {
     }
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
+        if (self.webdav.user.len > 0) allocator.free(self.webdav.user);
+        if (self.webdav.password_hash.len > 0) allocator.free(self.webdav.password_hash);
         for (self.backup_targets) |*target| target.deinit(allocator);
         if (self.backup_targets.len > 0) allocator.free(self.backup_targets);
         self.backup_targets = &.{};
@@ -264,6 +277,7 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
     }
 
     var backup_section: ?usize = null;
+    var webdav_section = false;
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -271,6 +285,7 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
 
         if (trimmed[0] == '[') {
             backup_section = null;
+            webdav_section = std.mem.eql(u8, trimmed, "[webdav]");
             if (@import("backup/config.zig").sectionName(trimmed)) |name| {
                 backup_section = try config.backupSection(allocator, name);
             } else if (std.mem.startsWith(u8, trimmed, "[backup.")) return error.InvalidBackupTarget;
@@ -288,7 +303,15 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
         else
             val_raw;
 
-        if (backup_section) |index| {
+        if (webdav_section) {
+            if (std.mem.eql(u8, key, "port")) {
+                config.webdav.port = try std.fmt.parseInt(u16, val, 10);
+            } else if (std.mem.eql(u8, key, "user")) {
+                replaceString(allocator, &config.webdav.user, try allocator.dupe(u8, val));
+            } else if (std.mem.eql(u8, key, "password_hash")) {
+                replaceString(allocator, &config.webdav.password_hash, try allocator.dupe(u8, val));
+            } else if (std.mem.eql(u8, key, "password")) return error.PlaintextWebDavPassword;
+        } else if (backup_section) |index| {
             try config.backup_targets[index].apply(allocator, key, val);
         } else try applyConfigEntry(allocator, &config, &bootstrap_list, key, val);
     }
@@ -304,6 +327,7 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
     if (config.storage.storage_path.len == 0) return error.MissingRequiredField;
     if (config.network.port == 0) return error.MissingRequiredField;
 
+    try @import("webdav/login.zig").validate(config.webdav);
     return config;
 }
 

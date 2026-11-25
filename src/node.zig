@@ -31,6 +31,7 @@ const DiscoveryNode = net.discovery.Node;
 const HashRing = cluster.ring.HashRing;
 
 pub const Node = struct {
+    webdav_service: ?*webdav_mount.Mount = null,
     offsite: ?*offsite_worker.Worker = null,
     /// Held to use or replace `offsite`: the targets change while the node
     /// runs (`setBackupTargets`), from a command or the local API's thread.
@@ -472,6 +473,7 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        self.stopWebDavService();
         // The local API's backup requests work on the uploader: none is
         // left when this returns.
         if (self.swarm_api) |api| {
@@ -706,17 +708,39 @@ pub const Node = struct {
     /// mounted at `target` when given (a folder on macOS, a drive letter on
     /// Windows). Stop it with `Mount.stop`, before the node goes.
     pub fn startWebDav(self: *Node, allocator: std.mem.Allocator, port: u16, target: ?[]const u8) !*webdav_mount.Mount {
+        return self.startWebDavLogin(allocator, port, target, .{});
+    }
+
+    pub fn startWebDavLogin(self: *Node, allocator: std.mem.Allocator, port: u16, target: ?[]const u8, login: config.Config.WebDavConfig) !*webdav_mount.Mount {
         if (self.store == null) return error.StorageDisabled;
         const server = try allocator.create(webdav.Server);
         server.* = webdav.Server.init(allocator, self.block_manager);
         server.swarm = self.swarm;
         server.read_ahead = self.read_ahead;
+        server.setLogin(login) catch |err| {
+            server.deinit();
+            allocator.destroy(server);
+            return err;
+        };
         server.start(port) catch |err| {
             server.deinit();
             allocator.destroy(server);
             return err;
         };
         return webdav_mount.start(allocator, server, target);
+    }
+
+    pub fn stopWebDavService(self: *Node) void {
+        if (self.webdav_service) |service| service.stop();
+        self.webdav_service = null;
+    }
+
+    /// Caller serializes changes with the host's node lock.
+    pub fn configureWebDav(self: *Node, cfg: config.Config.WebDavConfig) !void {
+        try @import("webdav/login.zig").validate(cfg);
+        self.stopWebDavService();
+        if (cfg.port == 0) return;
+        self.webdav_service = try self.startWebDavLogin(self.allocator, cfg.port, null, cfg);
     }
 
     pub fn inspectFile(self: *Node, allocator: std.mem.Allocator, source: FileSource) !fs.inspect.Inspection {
@@ -999,6 +1023,8 @@ pub const Node = struct {
     /// maintenance threads run on their own. `running` must stay alive until
     /// stopListener() returns: the accept loop polls it.
     pub fn listen(self: *Node, running: *std.atomic.Value(bool), cfg: config.Config) !void {
+        try self.configureWebDav(cfg.webdav);
+        errdefer self.stopWebDavService();
         try self.connection_manager.start();
         try self.connection_manager.listen(cfg, running);
         if (self.keeper) |k| k.start() catch |err| std.debug.print("keeper: thread not started: {any}\n", .{err});
@@ -1224,6 +1250,7 @@ pub const Node = struct {
     /// them. Stopping is not undone here: a later listen() fails with
     /// ManagerStopping until the connection manager can restart.
     pub fn stopListener(self: *Node) void {
+        self.stopWebDavService();
         self.offsite_mutex.lock();
         self.offsite_hosted = false;
         if (self.offsite) |worker| worker.stop();

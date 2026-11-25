@@ -66,6 +66,34 @@ irm https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/install.p
 - **Private to you**: A random token in the address, new each start; requests naming another host are refused; on macOS and Linux only your own user's programs are served.
 - **CLI**: `nomadfs --mount ~/NomadFS` (macOS), `nomadfs --mount Z:` (Windows), or `nomadfs --webdav <port>` to serve without mounting.
 
+### Fixed WebDAV address and login
+
+The Mount page's WebDAV card can serve files without a mounted volume. Enable it,
+choose a port and user, and enter a password. Changes apply to the running GUI node;
+the password field is write-only. Clear login returns to a random token address.
+The card shows the active address and whether a password is set.
+
+For a CLI node, add this section to its configuration:
+
+```toml
+[webdav]
+port = 8080
+```
+
+Set the login with `nomadfs webdav-login set reader --config /path/to/nomadfs.conf`,
+supplying the password on standard input (one line, then EOF). Only a randomly salted
+Argon2id hash is saved, with owner-only file permissions. Never put a plain password
+in the configuration. `nomadfs webdav-login clear --config /path/to/nomadfs.conf`
+removes the login; restart a CLI node after changing its settings.
+
+With a login, connect to `http://127.0.0.1:8080/Swarm/` using HTTP Basic authentication.
+The root and device shares also use fixed paths (`/<device>/<share>/`). The server
+stays on loopback and rejects non-local Host headers. Without a login, it keeps the
+random token path and existing same-user protection; use the address shown by the app
+or `nomadfs --webdav 8080`. Port 0 or an absent section disables automatic serving.
+`--webdav <port>` also accepts the configured login. System mounts keep their private
+token URLs and need no credentials.
+
 ### One-Time Invites & Mutual Trust
 - **Zero-leak pairing**: Join devices to a swarm without exposing or copy-pasting the master swarm key.
 - **Time-limited single-use tokens**: Invites generate a URI (`nomadfs://invite?addr=..&token=..`) with a 128-bit random token expiring after 10 minutes.

@@ -99,6 +99,17 @@ test "webdav: the swarm folder is read-write over HTTP, the rest read-only" {
     const wrong = try std.fmt.allocPrint(a, "/{s}/Swarm/", .{"0" ** 32});
     try std.testing.expectEqual(@as(u16, 404), (try requestAt(a, port, "PROPFIND", wrong, "Depth: 0\r\n", "")).status);
 
+    // A separately served login exposes the same swarm without a token.
+    var login_server = nomadfs.webdav.Server.init(allocator, bm);
+    defer login_server.deinit();
+    login_server.swarm = folder;
+    var hash_buf: [106]u8 = undefined;
+    try login_server.setLogin(.{ .user = "user", .password_hash = try nomadfs.webdav_login.hash(allocator, "pass", &hash_buf) });
+    try login_server.start(0);
+    const login_listing = try requestAt(a, login_server.port, "PROPFIND", "/Swarm/", "Authorization: Basic dXNlcjpwYXNz\r\nDepth: 1\r\n", "");
+    try std.testing.expectEqual(@as(u16, 207), login_listing.status);
+    try std.testing.expect(std.mem.indexOf(u8, login_listing.body, "<D:href>/Swarm/</D:href>") != null);
+
     // Discovery: it's a class 2 WebDAV server (lockable, so writable).
     const options = try request(a, port, "OPTIONS", "/", "", "");
     try std.testing.expectEqual(@as(u16, 200), options.status);
@@ -205,4 +216,28 @@ test "webdav: the swarm folder is read-write over HTTP, the rest read-only" {
     defer stream.close();
     try stream.writeAll(try std.fmt.allocPrint(a, "GET {s}/Swarm/copy.txt HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n", .{root}));
     try std.testing.expectEqual(@as(u16, 403), (try readResponse(a, stream)).status);
+}
+
+test "webdav: fixed Basic login protects stable routes and token mode stays private" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var server = nomadfs.webdav.Server.init(a, null);
+    defer server.deinit();
+    var hash_buf: [106]u8 = undefined;
+    try server.setLogin(.{ .user = "user", .password_hash = try nomadfs.webdav_login.hash(a, "pass", &hash_buf) });
+    try server.start(0);
+    const missing = try requestAt(arena.allocator(), server.port, "PROPFIND", "/", "Depth: 0\r\n", "");
+    try std.testing.expectEqual(@as(u16, 401), missing.status);
+    try std.testing.expectEqualStrings("Basic realm=\"NomadFS\"", missing.header("WWW-Authenticate").?);
+    try std.testing.expectEqual(@as(u16, 401), (try requestAt(arena.allocator(), server.port, "PROPFIND", "/", "Authorization: Basic dXNlcjp3cm9uZw==\r\n", "")).status);
+    const good = try requestAt(arena.allocator(), server.port, "PROPFIND", "/", "Authorization: Basic dXNlcjpwYXNz\r\nDepth: 1\r\n", "");
+    try std.testing.expectEqual(@as(u16, 207), good.status);
+    try std.testing.expect(std.mem.indexOf(u8, good.body, "<D:href>/</D:href>") != null);
+    server.stop();
+    try server.setLogin(.{});
+    try server.start(0);
+    try std.testing.expectEqual(@as(u16, 404), (try requestAt(arena.allocator(), server.port, "PROPFIND", "/Swarm/", "Depth: 0\r\n", "")).status);
+    const token_root = try std.fmt.allocPrint(arena.allocator(), "/{s}/", .{server.token});
+    try std.testing.expectEqual(@as(u16, 207), (try requestAt(arena.allocator(), server.port, "PROPFIND", token_root, "Depth: 0\r\n", "")).status);
 }

@@ -5,6 +5,10 @@
 //!   /<token>/Swarm/<path...>             the swarm folder: read and write
 //!   /<token>/<device>/<share>/<path...>  every reachable device's shares: read only
 //!
+//! An optional fixed login replaces the token with HTTP Basic authentication
+//! and serves /Swarm/ and /<device>/<share>/ at stable paths. System mounts
+//! keep their token URLs.
+//!
 //! The token is random for each start and is in the URL the mount uses.
 //! Other accounts on the machine can reach 127.0.0.1 too, and on macOS
 //! they can read the URL (the mount table shows it): where the system can
@@ -54,6 +58,8 @@ const chunk_len = 256 * 1024;
 const idle_timeout_ms = 60_000;
 
 pub const Server = struct {
+    login: @import("config.zig").Config.WebDavConfig = .{},
+    auth_mutex: sync.Mutex = .{},
     allocator: std.mem.Allocator,
     io: std.Io,
     block_manager: ?*cluster.BlockManager,
@@ -98,8 +104,32 @@ pub const Server = struct {
         };
     }
 
+    pub fn setLogin(self: *Server, cfg: @import("config.zig").Config.WebDavConfig) !void {
+        std.debug.assert(self.listener == null);
+        try @import("webdav/login.zig").validate(cfg);
+        const user = try self.allocator.dupe(u8, cfg.user);
+        errdefer self.allocator.free(user);
+        const password_hash = try self.allocator.dupe(u8, cfg.password_hash);
+        if (self.login.user.len > 0) self.allocator.free(self.login.user);
+        if (self.login.password_hash.len > 0) self.allocator.free(self.login.password_hash);
+        self.login = .{ .user = user, .password_hash = password_hash };
+    }
+
+    fn hrefRoot(self: *const Server) []const u8 {
+        return if (self.login.hasLogin()) "" else &self.root;
+    }
+
+    fn authenticated(self: *Server, header: ?[]const u8) bool {
+        // Bound Argon2 memory use even with many simultaneous connections.
+        self.auth_mutex.lock();
+        defer self.auth_mutex.unlock();
+        return @import("webdav/login.zig").verify(self.allocator, self.login, header);
+    }
+
     pub fn deinit(self: *Server) void {
         self.stop();
+        if (self.login.user.len > 0) self.allocator.free(self.login.user);
+        if (self.login.password_hash.len > 0) self.allocator.free(self.login.password_hash);
         self.directory.deinit();
         var it = self.scratch.files.iterator();
         while (it.next()) |e| {
@@ -153,7 +183,7 @@ pub const Server = struct {
 
     /// `http://127.0.0.1:<port>/<token>/`, into `buf`.
     pub fn url(self: *const Server, buf: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}/{s}/", .{ self.port, &self.token });
+        return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}{s}/", .{ self.port, self.hrefRoot() });
     }
 
     fn acceptLoop(self: *Server) void {
@@ -232,6 +262,10 @@ pub const Server = struct {
             try conn.respond(403, "Forbidden", &.{}, "");
             return false;
         }
+        if (self.login.hasLogin() and !self.authenticated(req.header("authorization"))) {
+            try conn.respond(401, "Unauthorized", &.{ .{ "WWW-Authenticate", "Basic realm=\"NomadFS\"" }, .{ "Connection", "close" } }, "");
+            return false;
+        }
         const keep = !std.ascii.eqlIgnoreCase(req.header("connection") orelse "", "close");
         // Without the token only OPTIONS is answered: it says nothing of
         // what is served.
@@ -289,6 +323,7 @@ pub const Server = struct {
 
     /// `segments` without the token in front, or null when it isn't there.
     fn underRoot(self: *const Server, segments: []const []const u8) ?[]const []const u8 {
+        if (self.login.hasLogin()) return segments;
         if (segments.len == 0 or segments[0].len != self.token.len) return null;
         if (!std.crypto.timing_safe.eql([32]u8, segments[0][0..32].*, self.token)) return null;
         return segments[1..];
@@ -421,9 +456,9 @@ pub const Server = struct {
         const w = &body.writer;
         try w.writeAll("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n");
         const name = if (req.segments.len > 0) req.segments[req.segments.len - 1] else "NomadFS";
-        try writeResponse(w, &self.root, req.segments, null, name, node);
+        try writeResponse(w, self.hrefRoot(), req.segments, null, name, node);
         if (!eql(depth, "0") and node.isDir()) {
-            for (try self.children(arena, node)) |c| try writeResponse(w, &self.root, req.segments, c.name, c.name, c.node);
+            for (try self.children(arena, node)) |c| try writeResponse(w, self.hrefRoot(), req.segments, c.name, c.name, c.node);
         }
         try w.writeAll("</D:multistatus>\n");
         try conn.respond(207, "Multi-Status", &.{.{ "Content-Type", "application/xml; charset=utf-8" }}, body.written());
@@ -639,7 +674,7 @@ pub const Server = struct {
             "<D:timeout>Second-3600</D:timeout><D:locktoken><D:href>");
         try w.writeAll(token);
         try w.writeAll("</D:href></D:locktoken><D:lockroot><D:href>");
-        try xml.writeHref(w, &self.root, req.segments, null);
+        try xml.writeHref(w, self.hrefRoot(), req.segments, null);
         try w.writeAll("</D:href></D:lockroot></D:activelock></D:lockdiscovery></D:prop>\n");
         const header = try std.fmt.allocPrint(arena, "<{s}>", .{token});
         try conn.respond(200, "OK", &.{ .{ "Content-Type", "application/xml; charset=utf-8" }, .{ "Lock-Token", header } }, body.written());
@@ -652,7 +687,7 @@ pub const Server = struct {
         var body: std.Io.Writer.Allocating = .init(arena);
         const w = &body.writer;
         try w.writeAll("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>");
-        try xml.writeHref(w, &self.root, req.segments, null);
+        try xml.writeHref(w, self.hrefRoot(), req.segments, null);
         try w.writeAll("</D:href><D:propstat><D:prop>");
         // Echo each property element named inside <prop> as an empty one.
         var it = std.mem.splitSequence(u8, body_in, "<");
