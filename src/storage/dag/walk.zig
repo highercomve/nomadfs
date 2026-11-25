@@ -128,11 +128,31 @@ pub fn addStoredReachable(allocator: std.mem.Allocator, store: *StorageEngine, r
 /// byte, to tell it from a parent): for collecting what the store keeps,
 /// which walks every file the device holds. Discard the mark set on error.
 pub fn addStoredLinks(allocator: std.mem.Allocator, store: *StorageEngine, root: *const Cid, set: *CidSet, running: *const std.atomic.Value(bool)) !void {
+    return walkStoredLinks(allocator, store, root, set, running, .probe);
+}
+
+/// Marks everything collection must keep: every stored block reachable from
+/// `swarm_roots`, then the stored blocks of `share_roots` (their parents and
+/// dirs). Leaves the filestore serves from the shared files are skipped on
+/// the share walk without touching the store (millions on a big share, none
+/// stored); a stored copy only a share links is redundant and is collected.
+/// The order is the point: a block already in `set` is not descended into,
+/// so share-first would hide the leaves under a parent both link, and their
+/// stored swarm copies would be collected. Discard `set` on error.
+pub fn markLive(allocator: std.mem.Allocator, store: *StorageEngine, swarm_roots: []const Cid, share_roots: []const Cid, set: *CidSet, running: *const std.atomic.Value(bool)) !void {
+    for (swarm_roots) |*r| try walkStoredLinks(allocator, store, r, set, running, .probe);
+    for (share_roots) |*r| try walkStoredLinks(allocator, store, r, set, running, .skip_external);
+}
+
+const ExternalLeaves = enum { probe, skip_external };
+
+fn walkStoredLinks(allocator: std.mem.Allocator, store: *StorageEngine, root: *const Cid, set: *CidSet, running: *const std.atomic.Value(bool), external: ExternalLeaves) !void {
     var stack: std.ArrayList(Cid) = .empty;
     defer stack.deinit(allocator);
     try stack.append(allocator, root.*);
     while (stack.pop()) |cid| {
         if (!running.load(.acquire)) return error.Stopped;
+        if (external == .skip_external and store.servesExternally(&cid)) continue;
         if ((try set.getOrPut(allocator, cid)).found_existing) continue;
         const bytes = switch (store.getLocalNode(&cid, allocator) catch |err| {
             if (err == error.CorruptBlock) return corruptBlock(cid);
@@ -299,4 +319,77 @@ test "addStoredLinks aborts on a corrupt parent or shutdown" {
     running.store(false, .release);
     try std.testing.expectError(error.Stopped, addStoredLinks(allocator, &store, &corrupt.cid, &marked, &running));
     try std.testing.expectEqual(@as(usize, 0), marked.count());
+}
+
+test "markLive skips leaves the filestore serves, but keeps a swarm file's stored copies" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(std.testing.io, &path_buf)];
+    var store = try StorageEngine.init(allocator, path);
+    defer store.deinit();
+
+    const builder_mod = @import("builder.zig");
+    const data = try allocator.alloc(u8, 3 * builder_mod.chunk_params.max_size + 1);
+    defer allocator.free(data);
+    var prng = std.Random.DefaultPrng.init(1);
+    prng.random().bytes(data);
+    var reader = chunker.SliceReader{ .buffer = data };
+    var builder: builder_mod.DagBuilder = .{ .allocator = allocator, .store = &store, .layout = .Linear };
+    const root_bytes = try builder.build(&reader);
+    defer allocator.free(root_bytes);
+    const root = try cidFromSlice(root_bytes);
+
+    // Every leaf of the file is "served from a shared file".
+    var leaves: CidSet = .empty;
+    defer leaves.deinit(allocator);
+    var files = store.root_dir.iterate();
+    while (try files.next(std.testing.io)) |entry| {
+        if (entry.kind != .file) continue;
+        var cid: Cid = undefined;
+        _ = try std.fmt.hexToBytes(&cid, entry.name);
+        switch (try store.getLocalNode(&cid, allocator)) {
+            .leaf => try leaves.put(allocator, cid, {}),
+            .node => |bytes| allocator.free(bytes),
+            .missing => {},
+        }
+    }
+    try std.testing.expect(leaves.count() > 1);
+    const Source = struct {
+        leaves: *const CidSet,
+        fn getFn(_: *anyopaque, _: *const [32]u8, _: std.mem.Allocator) anyerror!?[]u8 {
+            return null;
+        }
+        fn hasFn(ctx: *anyopaque, cid: *const [32]u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.leaves.contains(cid.*);
+        }
+    };
+    var source = Source{ .leaves = &leaves };
+    store.external = .{ .ctx = &source, .getFn = Source.getFn, .hasFn = Source.hasFn };
+
+    const running: std.atomic.Value(bool) = .init(true);
+    var marked: CidSet = .empty;
+    defer marked.deinit(allocator);
+    try markLive(allocator, &store, &.{}, &.{root}, &marked, &running);
+    try std.testing.expect(marked.contains(root));
+    var it = leaves.keyIterator();
+    while (it.next()) |leaf| try std.testing.expect(!marked.contains(leaf.*));
+
+    // The same DAG as a swarm file keeps every stored copy.
+    var both: CidSet = .empty;
+    defer both.deinit(allocator);
+    try markLive(allocator, &store, &.{root}, &.{root}, &both, &running);
+    it = leaves.keyIterator();
+    while (it.next()) |leaf| try std.testing.expect(both.contains(leaf.*));
+
+    // The hazard markLive's order prevents: a share walk first marks the
+    // shared parents, so a swarm walk after it never reaches their leaves.
+    var share_first: CidSet = .empty;
+    defer share_first.deinit(allocator);
+    try walkStoredLinks(allocator, &store, &root, &share_first, &running, .skip_external);
+    try walkStoredLinks(allocator, &store, &root, &share_first, &running, .probe);
+    it = leaves.keyIterator();
+    while (it.next()) |leaf| try std.testing.expect(!share_first.contains(leaf.*));
 }

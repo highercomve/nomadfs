@@ -535,6 +535,14 @@ pub const StorageEngine = struct {
         return (try sumDir(self.root_dir)).bytes;
     }
 
+    /// Whether `external` (a shared folder's files) serves this block. A
+    /// memory lookup in the filestore: no file in the store is touched.
+    pub fn servesExternally(self: *StorageEngine, cid: *const [32]u8) bool {
+        // Outside the lock: the external source may take locks of its own.
+        const ext = self.external orelse return false;
+        return ext.hasFn(ext.ctx, cid);
+    }
+
     /// The bytes of a block stored here (not `external`), unverified, or
     /// null. For walking this device's own parent blocks cheaply: a shared
     /// file's leaves are never read.

@@ -1143,12 +1143,7 @@ pub const Node = struct {
 
         var keep: storage.dag.walk.CidSet = .empty;
         defer keep.deinit(self.allocator);
-        for (live.share_roots) |*r| {
-            try storage.dag.walk.addStoredLinks(self.allocator, store, r, &keep, &self.cache_running);
-        }
-        for (live.swarm_roots) |*r| {
-            try storage.dag.walk.addStoredLinks(self.allocator, store, r, &keep, &self.cache_running);
-        }
+        try storage.dag.walk.markLive(self.allocator, store, live.swarm_roots, live.share_roots, &keep, &self.cache_running);
         var candidates = try store.collectCandidates(&keep, &self.cache_running);
         defer candidates.deinit(store.allocator);
         if (beforeClaim) |hook| try hook(self);
