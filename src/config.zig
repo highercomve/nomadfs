@@ -56,6 +56,7 @@ pub const Config = struct {
 
     pub const WebDavConfig = struct {
         port: u16 = 0,
+        allow_other_users: bool = false,
         user: []const u8 = "",
         password_hash: []const u8 = "",
 
@@ -306,6 +307,8 @@ pub fn parseConfigText(allocator: std.mem.Allocator, content: []const u8) !Confi
         if (webdav_section) {
             if (std.mem.eql(u8, key, "port")) {
                 config.webdav.port = try std.fmt.parseInt(u16, val, 10);
+            } else if (std.mem.eql(u8, key, "allow_other_users")) {
+                config.webdav.allow_other_users = std.mem.eql(u8, val, "true");
             } else if (std.mem.eql(u8, key, "user")) {
                 replaceString(allocator, &config.webdav.user, try allocator.dupe(u8, val));
             } else if (std.mem.eql(u8, key, "password_hash")) {

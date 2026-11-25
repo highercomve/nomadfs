@@ -82,6 +82,7 @@ For a CLI node, add this section to its configuration:
 ```toml
 [webdav]
 port = 8080
+allow_other_users = false
 ```
 
 Set the login with `nomadfs webdav-login set reader --config /path/to/nomadfs.conf`,
@@ -89,6 +90,15 @@ supplying the password on standard input (one line, then EOF). Only a randomly s
 Argon2id hash is saved, with owner-only file permissions. Never put a plain password
 in the configuration. `nomadfs webdav-login clear --config /path/to/nomadfs.conf`
 removes the login; restart a CLI node after changing its settings.
+
+By default, connections from other Unix users are refused. To let other local
+programs (including host-network containers running as another uid) connect,
+set `allow_other_users = true` in `[webdav]`, or select “Let other programs on this
+computer connect (needs the login)” in the WebDAV card. This takes effect only
+with a configured login: every request must supply it. Without a login the option
+has no effect and same-user protection stays enforced. The checkbox is disabled
+until a password is saved. GUI changes apply live; restart a CLI node after edits.
+The server stays on loopback and the Host / DNS-rebinding check stays in force.
 
 With a login, connect to `http://127.0.0.1:8080/Swarm/` using HTTP Basic authentication.
 The root and device shares also use fixed paths (`/<device>/<share>/`). The server

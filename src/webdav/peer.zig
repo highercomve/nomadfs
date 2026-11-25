@@ -2,7 +2,8 @@
 //! listens on 127.0.0.1, which every account on the machine can reach, and
 //! its URL (token included) is public on macOS: the mount table and the
 //! webdavfs_agent command line show it to every account. So a connection
-//! is served only when it comes from a process of this user.
+//! is served only when it comes from a process of this user, unless the
+//! owner explicitly allows other users with a configured login.
 //!
 //! Linux reads the socket's owner from /proc/net/tcp. macOS has no such
 //! table, but lets a process read only its own user's file descriptors:
@@ -16,6 +17,23 @@ const builtin = @import("builtin");
 
 /// Where a connection's owner can be told.
 pub const supported = (builtin.os.tag == .linux and !builtin.abi.isAndroid()) or builtin.os.tag == .macos;
+
+/// Peer policy, separate from platform-specific owner discovery. Unknown
+/// owners count as other users; opting in requires authentication on every request.
+pub fn allowed(same_user: bool, cfg: @import("../config.zig").Config.WebDavConfig) bool {
+    return same_user or (cfg.allow_other_users and cfg.hasLogin());
+}
+
+test "other users need explicit permission and a login" {
+    const own_uid: u32 = 1000;
+    const peer_uid: u32 = 10102;
+    const other = peer_uid == own_uid;
+    try std.testing.expect(!allowed(other, .{}));
+    try std.testing.expect(!allowed(other, .{ .allow_other_users = true }));
+    try std.testing.expect(!allowed(other, .{ .user = "reader", .password_hash = "hash" }));
+    try std.testing.expect(allowed(other, .{ .allow_other_users = true, .user = "reader", .password_hash = "hash" }));
+    try std.testing.expect(allowed(true, .{}));
+}
 
 /// The connection from 127.0.0.1:`client_port` to 127.0.0.1:`server_port`
 /// belongs to a process of this user. False when it can't be told.

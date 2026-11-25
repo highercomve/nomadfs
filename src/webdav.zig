@@ -13,7 +13,8 @@
 //! Other accounts on the machine can reach 127.0.0.1 too, and on macOS
 //! they can read the URL (the mount table shows it): where the system can
 //! tell (Linux, macOS), a connection from another user's process is closed
-//! unanswered (webdav/peer.zig).
+//! unanswered (webdav/peer.zig), unless allow_other_users is enabled with
+//! a configured login. Every request still needs that login.
 //!
 //! Devices come from devices.Directory, the same list and names as the FUSE
 //! mount. Writes go through the swarm folder's own edits (addFileAt,
@@ -112,7 +113,9 @@ pub const Server = struct {
         const password_hash = try self.allocator.dupe(u8, cfg.password_hash);
         if (self.login.user.len > 0) self.allocator.free(self.login.user);
         if (self.login.password_hash.len > 0) self.allocator.free(self.login.password_hash);
-        self.login = .{ .user = user, .password_hash = password_hash };
+        self.login = cfg;
+        self.login.user = user;
+        self.login.password_hash = password_hash;
     }
 
     fn hrefRoot(self: *const Server) []const u8 {
@@ -235,8 +238,8 @@ pub const Server = struct {
             self.forget(stream);
             stream.close();
         }
-        // Another account's process: closed unanswered (see peer.zig).
-        if (peer.supported and !peer.sameUser(self.allocator, self.port, client_port)) {
+        // Other users need both explicit permission and a configured login.
+        if (!peer.allowed(false, self.login) and peer.supported and !peer.sameUser(self.allocator, self.port, client_port)) {
             if (self.log_requests) std.debug.print("webdav: refused a connection from another user (port {d})\n", .{client_port});
             return;
         }

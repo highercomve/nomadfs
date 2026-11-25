@@ -106,6 +106,10 @@ function renderWebDav() {
   if (!status) return;
   $("webdav-state").textContent = webDavError ? `Error: ${webDavError}` : status.running ? `Serving at ${status.address}` : "Stopped";
   $("webdav-login").textContent = status.password_set ? "Password set." : "No login: the address uses a random token.";
+  $("webdav-other-users").disabled = webDavBusy || !status.password_set;
+  $("webdav-other-users-hint").textContent = status.password_set
+    ? "Other local users must supply the login on every request."
+    : "Set and save a password first. Without a login, only programs running as your user can connect; this option has no effect.";
   $("webdav-address").textContent = status.address;
   $("webdav-clear").disabled = webDavBusy || !status.password_set;
   $("webdav-start").disabled = webDavBusy || status.running || !status.port || !isRunning();
@@ -126,6 +130,7 @@ async function loadWebDav(refreshFields = true) {
     if (refreshFields && !webDavDirty && !webDavBusy && !$("webdav-form").contains(document.activeElement)) {
       $("webdav-port").value = status.port || 8080;
       $("webdav-user").value = status.user;
+      $("webdav-other-users").checked = status.allow_other_users;
     }
     webDavStatus = status;
     renderWebDav();
@@ -144,6 +149,7 @@ async function saveWebDav(clear) {
     user: $("webdav-user").value,
     password: password.value,
     clear_password: clear,
+    allow_other_users: $("webdav-other-users").checked,
   };
   webDavBusy = true;
   webDavDirty = true;

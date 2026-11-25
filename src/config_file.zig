@@ -396,7 +396,7 @@ pub fn setWebDav(a: std.mem.Allocator, path: []const u8, value: config_mod.Confi
         try out.appendSlice(a, line);
         try out.append(a, '\n');
     }
-    try out.print(a, "[webdav]\nport = {d}\nuser = \"{s}\"\npassword_hash = \"{s}\"\n", .{ value.port, value.user, value.password_hash });
+    try out.print(a, "[webdav]\nport = {d}\nallow_other_users = {}\nuser = \"{s}\"\npassword_hash = \"{s}\"\n", .{ value.port, value.allow_other_users, value.user, value.password_hash });
     try writeAtomic(a, io, path, out.items);
 }
 
@@ -412,19 +412,21 @@ test "config: WebDAV scoped round trip preserves peer port and credentials durin
     defer a.free(path);
     var hash_buf: [106]u8 = undefined;
     const hash = try @import("webdav/login.zig").hash(a, "password", &hash_buf);
-    try setWebDav(a, path, .{ .port = 8080, .user = "reader", .password_hash = hash });
+    try setWebDav(a, path, .{ .port = 8080, .allow_other_users = true, .user = "reader", .password_hash = hash });
     try setInt(a, path, "port", 14701);
     try setNickname(a, path, "beta");
     var cfg = try config_mod.parseConfig(a, path);
     defer cfg.deinit(a);
     try testing.expectEqual(@as(u16, 14701), cfg.network.port);
     try testing.expectEqual(@as(u16, 8080), cfg.webdav.port);
+    try testing.expect(cfg.webdav.allow_other_users);
     try testing.expectEqualStrings("reader", cfg.webdav.user);
     try testing.expectEqualStrings(hash, cfg.webdav.password_hash);
     try setWebDav(a, path, .{});
     var cleared = try config_mod.parseConfig(a, path);
     defer cleared.deinit(a);
     try testing.expect(!cleared.webdav.hasLogin());
+    try testing.expect(!cleared.webdav.allow_other_users);
     try testing.expectEqual(@as(u16, 0), cleared.webdav.port);
     try testing.expectEqual(@as(u16, 14701), cleared.network.port);
     try testing.expectError(error.InvalidWebDavHash, setWebDav(a, path, .{ .user = "reader", .password_hash = "plaintext" }));

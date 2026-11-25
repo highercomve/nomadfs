@@ -2112,6 +2112,16 @@ test "commands: node put/get text round trip" {
         try testing.expect(std.mem.endsWith(u8, info.address, "/Swarm/"));
         try testing.expect(std.mem.indexOf(u8, info.address, "secret") == null);
     }
+    // The opt-in is saved and applied to the running server immediately.
+    try testing.expect(!g_node.?.node.webdav_service.?.server.login.allow_other_users);
+    try webDavSet(alloc, .{ .config_path = conf_path, .port = webdav_port, .user = "reader", .allow_other_users = true });
+    try testing.expect(g_node.?.node.webdav_service.?.server.login.allow_other_users);
+    {
+        const info = try webDavInfo(alloc, .{ .config_path = conf_path });
+        defer alloc.free(info.user);
+        defer alloc.free(info.address);
+        try testing.expect(info.allow_other_users and info.password_set);
+    }
     // Runtime controls preserve the saved port and credentials.
     webDavStop();
     try testing.expect(g_node.?.node.webdav_service == null);
@@ -2138,6 +2148,7 @@ test "commands: node put/get text round trip" {
         defer saved.deinit(alloc);
         try testing.expectEqual(webdav_port, saved.webdav.port);
         try testing.expect(saved.webdav.hasLogin());
+        try testing.expect(saved.webdav.allow_other_users);
     }
     webDavStop();
     // A failed Save while stopped must not restart the previous server.
@@ -2409,6 +2420,7 @@ pub const WebDavInfo = struct {
     port: u16,
     user: []const u8,
     password_set: bool,
+    allow_other_users: bool,
     running: bool,
     address: []const u8,
 };
@@ -2418,6 +2430,7 @@ pub const WebDavArgs = struct {
     user: []const u8,
     password: []const u8 = "",
     clear_password: bool = false,
+    allow_other_users: bool = false,
 };
 
 pub fn webDavInfo(gpa: std.mem.Allocator, args: ListArgs) !WebDavInfo {
@@ -2432,6 +2445,7 @@ pub fn webDavInfo(gpa: std.mem.Allocator, args: ListArgs) !WebDavInfo {
         .port = cfg.webdav.port,
         .user = user,
         .password_set = cfg.webdav.hasLogin(),
+        .allow_other_users = cfg.webdav.allow_other_users,
         .running = service != null,
         .address = if (service) |m| try std.fmt.allocPrint(gpa, "{s}Swarm/", .{m.url()}) else try gpa.dupe(u8, ""),
     };
@@ -2444,6 +2458,7 @@ pub fn webDavSet(gpa: std.mem.Allocator, args: WebDavArgs) !void {
     defer cfg.deinit(gpa);
     var value = cfg.webdav;
     value.port = args.port;
+    value.allow_other_users = args.allow_other_users;
     var hash_buf: [106]u8 = undefined;
     if (args.clear_password) {
         value.user = "";

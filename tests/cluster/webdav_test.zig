@@ -225,7 +225,8 @@ test "webdav: fixed Basic login protects stable routes and token mode stays priv
     var server = nomadfs.webdav.Server.init(a, null);
     defer server.deinit();
     var hash_buf: [106]u8 = undefined;
-    try server.setLogin(.{ .user = "user", .password_hash = try nomadfs.webdav_login.hash(a, "pass", &hash_buf) });
+    try server.setLogin(.{ .allow_other_users = true, .user = "user", .password_hash = try nomadfs.webdav_login.hash(a, "pass", &hash_buf) });
+    try std.testing.expect(server.login.allow_other_users);
     try server.start(0);
     const missing = try requestAt(arena.allocator(), server.port, "PROPFIND", "/", "Depth: 0\r\n", "");
     try std.testing.expectEqual(@as(u16, 401), missing.status);

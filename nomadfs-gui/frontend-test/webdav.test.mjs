@@ -13,7 +13,7 @@ function el(id) {
   return elements.get(id);
 }
 globalThis.document = { getElementById: el, activeElement: null, addEventListener() {} };
-let saved = { port: 0, user: '', password_set: false, running: false, address: '' };
+let saved = { port: 0, user: '', password_set: false, allow_other_users: false, running: false, address: '' };
 let failure = null;
 let infoGate = null;
 const calls = [];
@@ -29,7 +29,7 @@ globalThis.window = { oriel: { invoke: async (cmd, args) => {
   }
   if (failure) throw failure;
   if (cmd === 'webdav_set' && args.password && !args.user) throw new Error('InvalidWebDavUser');
-  if (cmd === 'webdav_set') saved = { ...saved, ...args, running: true, password_set: true, address: `http://127.0.0.1:${args.port}/Swarm/` };
+  if (cmd === 'webdav_set') saved = { ...saved, ...args, running: true, password_set: !args.clear_password && (!!args.password || saved.password_set), address: `http://127.0.0.1:${args.port}/Swarm/` };
   if (cmd === 'webdav_stop') saved.running = false;
   if (cmd === 'webdav_start' || cmd === 'webdav_restart') saved.running = true;
 } } };
@@ -39,6 +39,13 @@ const { installMount, loadMount } = await import('../frontend/mount.js');
 installMount({ setView() {}, nodeState() {} });
 const click = id => el(id).listeners.click();
 const submit = () => el('webdav-form').listeners.submit({ preventDefault() {} });
+
+test('other-user checkbox explains why it is disabled without a saved login', async () => {
+  await loadMount();
+  assert.equal(el('webdav-other-users').disabled, true);
+  assert.equal(el('webdav-other-users').checked, false);
+  assert.match(el('webdav-other-users-hint').textContent, /Without a login.*option has no effect/);
+});
 
 test('Save snapshots port and login before an in-flight status refresh can overwrite them', async () => {
   await loadMount();
@@ -104,4 +111,18 @@ test('the rendered card has explicit controls and explains session-only Stop', (
   for (const id of ['webdav-start', 'webdav-stop', 'webdav-restart', 'webdav-error']) assert.ok(html.includes(`id="${id}"`));
   assert.ok(!html.includes('id="webdav-enabled"'));
   assert.match(html, /Stop lasts until Start or the next node restart/);
+});
+
+test('other-user permission saves, reloads and disables again after clearing the login', async () => {
+  await submit(); // retry the failed edit
+  assert.equal(el('webdav-other-users').disabled, false);
+  el('webdav-other-users').checked = true;
+  await submit();
+  assert.equal(calls.filter(c => c.cmd === 'webdav_set').at(-1).args.allow_other_users, true);
+  assert.equal(el('webdav-other-users').checked, true);
+  await loadMount();
+  assert.equal(el('webdav-other-users').checked, true);
+  await click('webdav-clear');
+  assert.equal(el('webdav-other-users').disabled, true);
+  assert.match(el('webdav-other-users-hint').textContent, /only programs running as your user/);
 });

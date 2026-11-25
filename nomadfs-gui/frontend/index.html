@@ -410,6 +410,8 @@
           <label class="field"><input id="webdav-port" type="number" min="1" max="65535" value="8080" required placeholder=" "><span class="field-label">Port</span></label>
           <label class="field"><input id="webdav-user" autocomplete="username" maxlength="128" placeholder=" "><span class="field-label">User</span></label>
           <label class="field"><input id="webdav-password" type="password" autocomplete="new-password" maxlength="1024" placeholder=" "><span class="field-label">New password (leave blank to keep)</span></label>
+          <label><input id="webdav-other-users" type="checkbox" aria-describedby="webdav-other-users-hint"> Let other programs on this computer connect (needs the login)</label>
+          <p class="hint" id="webdav-other-users-hint"></p>
           <p class="hint" id="webdav-state" role="status"></p>
           <p class="hint" id="webdav-login"></p>
           <p class="hint" id="webdav-error" role="alert" hidden></p>
