@@ -68,10 +68,14 @@ irm https://raw.githubusercontent.com/highercomve/nomadfs/main/scripts/install.p
 
 ### Fixed WebDAV address and login
 
-The Mount page's WebDAV card can serve files without a mounted volume. Enable it,
-choose a port and user, and enter a password. Changes apply to the running GUI node;
+The Mount page's WebDAV card can serve files without a mounted volume.
+Choose a port and user, and enter a password. Changes apply to the running GUI node;
 the password field is write-only. Clear login returns to a random token address.
-The card shows the active address and whether a password is set.
+The card shows the active address and whether a password is set. Save starts the
+server; Start and Restart use the saved settings. Stop leaves those settings on
+disk and lasts for this node run only: a saved nonzero port means serve when the
+node starts, including after a GUI restart. A busy port leaves settings unsaved
+and shows a persistent error in the card.
 
 For a CLI node, add this section to its configuration:
 

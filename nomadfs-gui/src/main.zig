@@ -51,7 +51,7 @@ pub const Commands = struct {
     /// worker thread: they share one lock, and a command waiting on it on
     /// the UI thread would freeze the window (node_open behind a share scan
     /// did, for 20 s on a phone). Only quick config-file reads stay inline.
-    pub const async_commands = .{ "webdav_info", "webdav_set", "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_add_folder", "swarm_upload_begin", "swarm_upload_chunk", "swarm_upload_finish", "swarm_upload_cancel", "swarm_mkdir", "swarm_delete", "swarm_delete_many", "swarm_rename", "swarm_move", "swarm_read_range", "swarm_download", "downloads_list", "download_cancel", "download_remove", "downloads_clear", "downloads_dir", "download_open", "downloads_open_folder", "download_read_range", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "offsite_status", "offsite_add", "offsite_remove", "offsite_run", "offsite_check", "offsite_words", "offsite_words_confirm", "swarm_backup_set", "swarm_copies_set", "accept_copies_set", "media_url", "about_info", "update_info", "notes_list", "note_read", "note_create", "note_from_share", "note_keep_both", "note_resolve_copy", "note_save", "note_rename", "note_move", "note_delete", "note_restore", "note_pin", "notes_search", "note_export", "cache_info", "cache_clear", "cache_set_limit", "share_backup_set", "backup_status", "file_details", "device_info", "photos_index", "photos_page" } ++ updates.Updater.async_commands;
+    pub const async_commands = .{ "webdav_info", "webdav_set", "webdav_start", "webdav_stop", "webdav_restart", "invite_create", "invite_status", "invite_cancel", "invite_accept", "read_range", "mount_status", "mount_start", "mount_stop", "open_path", "pick_folder", "app_info", "node_open", "node_close", "node_state", "put_text", "get_text", "pair_ticket", "devices_list", "trust_device", "revoke_device", "shares_local", "share_add", "share_remove", "remote_devices", "browse", "download", "swarm_list", "swarm_sync", "swarm_add_file", "swarm_add_folder", "swarm_upload_begin", "swarm_upload_chunk", "swarm_upload_finish", "swarm_upload_cancel", "swarm_mkdir", "swarm_delete", "swarm_delete_many", "swarm_rename", "swarm_move", "swarm_read_range", "swarm_download", "downloads_list", "download_cancel", "download_remove", "downloads_clear", "downloads_dir", "download_open", "downloads_open_folder", "download_read_range", "swarm_rotate_key", "keep_running_status", "keep_running_set", "open_app_settings", "swarm_backup_status", "offsite_status", "offsite_add", "offsite_remove", "offsite_run", "offsite_check", "offsite_words", "offsite_words_confirm", "swarm_backup_set", "swarm_copies_set", "accept_copies_set", "media_url", "about_info", "update_info", "notes_list", "note_read", "note_create", "note_from_share", "note_keep_both", "note_resolve_copy", "note_save", "note_rename", "note_move", "note_delete", "note_restore", "note_pin", "notes_search", "note_export", "cache_info", "cache_clear", "cache_set_limit", "share_backup_set", "backup_status", "file_details", "device_info", "photos_index", "photos_page" } ++ updates.Updater.async_commands;
 
     pub fn webdav_info(gpa: std.mem.Allocator, args: commands.ListArgs) !commands.WebDavInfo {
         return commands.webDavInfo(gpa, args);
@@ -59,6 +59,18 @@ pub const Commands = struct {
 
     pub fn webdav_set(gpa: std.mem.Allocator, args: commands.WebDavArgs) !void {
         return commands.webDavSet(gpa, args);
+    }
+
+    pub fn webdav_start(gpa: std.mem.Allocator, args: commands.ListArgs) !void {
+        return commands.webDavStart(gpa, args);
+    }
+
+    pub fn webdav_stop() void {
+        commands.webDavStop();
+    }
+
+    pub fn webdav_restart(gpa: std.mem.Allocator, args: commands.ListArgs) !void {
+        return commands.webDavRestart(gpa, args);
     }
 
     /// The Photos page (fs/photos.zig through photos_commands.zig).

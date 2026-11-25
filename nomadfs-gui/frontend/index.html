@@ -406,14 +406,19 @@
           <p class="supporting">Let apps on this computer use the swarm folder without mounting it. Set a login for an address that stays the same after restarting.</p>
         </div></div>
         <form id="webdav-form" class="stack">
-          <label><input id="webdav-enabled" type="checkbox"> Serve WebDAV while NomadFS runs</label>
+          <p class="hint">Save starts WebDAV and serves it whenever the node starts. Stop lasts until Start or the next node restart.</p>
           <label class="field"><input id="webdav-port" type="number" min="1" max="65535" value="8080" required placeholder=" "><span class="field-label">Port</span></label>
           <label class="field"><input id="webdav-user" autocomplete="username" maxlength="128" placeholder=" "><span class="field-label">User</span></label>
           <label class="field"><input id="webdav-password" type="password" autocomplete="new-password" maxlength="1024" placeholder=" "><span class="field-label">New password (leave blank to keep)</span></label>
           <p class="hint" id="webdav-state" role="status"></p>
+          <p class="hint" id="webdav-login"></p>
+          <p class="hint" id="webdav-error" role="alert" hidden></p>
           <p class="hint"><code id="webdav-address"></code></p>
           <div class="actions">
             <button type="submit" class="btn outlined">Save WebDAV settings</button>
+            <button type="button" id="webdav-start" class="btn outlined">Start</button>
+            <button type="button" id="webdav-stop" class="btn outlined">Stop</button>
+            <button type="button" id="webdav-restart" class="btn outlined">Restart</button>
             <button type="button" id="webdav-clear" class="btn text">Clear login</button>
           </div>
         </form>

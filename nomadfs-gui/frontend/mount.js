@@ -43,11 +43,15 @@ let ctx = null; // injected deps from the root
 export function installMount({ setView, nodeState }) {
   ctx = { setView, nodeState };
   onNodeChange(loadMount);
+  $("webdav-form").addEventListener("input", () => { webDavDirty = true; });
   $("webdav-form").addEventListener("submit", (event) => {
     event.preventDefault();
-    saveWebDav(false);
+    return saveWebDav(false);
   });
   $("webdav-clear").addEventListener("click", () => saveWebDav(true));
+  for (const action of ["start", "stop", "restart"]) {
+    $(`webdav-${action}`).addEventListener("click", () => controlWebDav(action));
+  }
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") loadMount(); });
 
   $("mount-toggle").addEventListener("click", async () => {
@@ -88,41 +92,86 @@ export function installMount({ setView, nodeState }) {
 
 export { loadMount };
 
-async function loadWebDav() {
+let webDavError = "";
+let webDavBusy = false;
+let webDavDirty = false;
+let webDavStatus = null;
+
+function renderWebDav() {
+  const status = webDavStatus;
+  $("webdav-error").textContent = webDavError ? `Error: ${webDavError}` : "";
+  $("webdav-state").hidden = !!webDavError;
+  $("webdav-error").hidden = !webDavError;
+  $("webdav-form").querySelectorAll("button").forEach((b) => { b.disabled = webDavBusy; });
+  if (!status) return;
+  $("webdav-state").textContent = webDavError ? `Error: ${webDavError}` : status.running ? `Serving at ${status.address}` : "Stopped";
+  $("webdav-login").textContent = status.password_set ? "Password set." : "No login: the address uses a random token.";
+  $("webdav-address").textContent = status.address;
+  $("webdav-clear").disabled = webDavBusy || !status.password_set;
+  $("webdav-start").disabled = webDavBusy || status.running || !status.port || !isRunning();
+  $("webdav-stop").disabled = webDavBusy || !status.running;
+  $("webdav-restart").disabled = webDavBusy || !status.port || !isRunning();
+}
+
+function webDavFailure(err, port) {
+  return String(err).includes("AddressInUse")
+    ? `Port ${port} is already in use by another program. Choose another port.`
+    : String(err);
+}
+
+async function loadWebDav(refreshFields = true) {
   try {
     const status = await invoke("webdav_info", { config_path: await ensureConfig() });
     // Do not overwrite an edit when node state or window visibility changes.
-    if (!$("webdav-form").contains(document.activeElement)) {
-      $("webdav-enabled").checked = status.port > 0;
+    if (refreshFields && !webDavDirty && !webDavBusy && !$("webdav-form").contains(document.activeElement)) {
       $("webdav-port").value = status.port || 8080;
       $("webdav-user").value = status.user;
     }
-    $("webdav-state").textContent = `${status.running ? "Serving" : status.port ? "Starts with the node" : "Off"}. ${status.password_set ? "Password set." : "No login: the address uses a random token."}`;
-    $("webdav-address").textContent = status.address;
-    $("webdav-clear").disabled = !status.password_set;
-  } catch (err) { snack(`Couldn't read WebDAV settings: ${err}`); }
+    webDavStatus = status;
+    renderWebDav();
+  } catch (err) {
+    webDavError = `Couldn't read WebDAV settings: ${err}`;
+    renderWebDav();
+  }
 }
 
 async function saveWebDav(clear) {
-  const form = $("webdav-form");
+  if (webDavBusy) return;
   const password = $("webdav-password");
-  const buttons = form.querySelectorAll("button");
-  buttons.forEach((b) => { b.disabled = true; });
+  // Snapshot before awaiting the config path or any background refresh.
+  const values = {
+    port: Number($("webdav-port").value),
+    user: $("webdav-user").value,
+    password: password.value,
+    clear_password: clear,
+  };
+  webDavBusy = true;
+  webDavDirty = true;
+  webDavError = "";
+  renderWebDav();
   try {
-    await invoke("webdav_set", {
-      config_path: await ensureConfig(),
-      port: $("webdav-enabled").checked ? Number($("webdav-port").value) : 0,
-      user: $("webdav-user").value,
-      password: password.value,
-      clear_password: clear,
-    });
+    await invoke("webdav_set", { config_path: await ensureConfig(), ...values });
+    webDavDirty = false;
     password.value = "";
     if (clear) $("webdav-user").value = "";
     snack("WebDAV settings saved");
-  } catch (err) { snack(`Couldn't save WebDAV settings: ${err}`); }
+  } catch (err) { webDavError = webDavFailure(err, values.port); }
   finally {
-    password.value = "";
-    buttons.forEach((b) => { b.disabled = false; });
+    webDavBusy = false;
+    await loadWebDav(!webDavError);
+  }
+}
+
+async function controlWebDav(action) {
+  if (webDavBusy) return;
+  webDavBusy = true;
+  webDavError = "";
+  renderWebDav();
+  try {
+    await invoke(`webdav_${action}`, { config_path: await ensureConfig() });
+  } catch (err) { webDavError = webDavFailure(err, webDavStatus?.port); }
+  finally {
+    webDavBusy = false;
     await loadWebDav();
   }
 }

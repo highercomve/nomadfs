@@ -149,7 +149,7 @@ pub const Server = struct {
         self.token = std.fmt.bytesToHex(secret, .lower);
         self.root[0] = '/';
         @memcpy(self.root[1..], &self.token);
-        var listener = try compat.listenLoopback(port);
+        var listener = try compat.listenLoopbackExclusive(port);
         errdefer listener.deinit();
         self.port = listener.inner.socket.address.getPort();
         self.listener = listener;

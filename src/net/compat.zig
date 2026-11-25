@@ -320,6 +320,39 @@ pub fn listenLoopback(port: u16) !Server {
     return listenOn("127.0.0.1", port);
 }
 
+/// A single owner for a WebDAV port. Zig's reuse_address also enables
+/// SO_REUSEPORT on POSIX, which would share traffic with another listener.
+/// Keep only SO_REUSEADDR so a stopped server can rebind after requests.
+pub fn listenLoopbackExclusive(port: u16) !Server {
+    initNetwork();
+    const address = Address.initIp4(.{ 127, 0, 0, 1 }, port);
+    if (builtin.os.tag == .windows) {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        return .{ .inner = try address.ip.listen(io, .{}) };
+    }
+    const flags = std.posix.SOCK.STREAM | if (@hasDecl(std.posix.SOCK, "CLOEXEC")) std.posix.SOCK.CLOEXEC else 0;
+    const fd = std.c.socket(std.posix.AF.INET, flags, std.posix.IPPROTO.TCP);
+    if (fd < 0) return error.SystemResources;
+    errdefer _ = std.c.close(fd);
+    if (!@hasDecl(std.posix.SOCK, "CLOEXEC")) {
+        if (std.c.fcntl(fd, std.posix.F.SETFD, @as(c_int, std.posix.FD_CLOEXEC)) < 0) return error.SystemResources;
+    }
+    const one: c_int = 1;
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one));
+    var addr = address.toPosix();
+    if (std.c.bind(fd, @ptrCast(&addr.ip4), @sizeOf(std.posix.sockaddr.in)) != 0) {
+        return switch (std.posix.errno(-1)) {
+            .ADDRINUSE => error.AddressInUse,
+            .ADDRNOTAVAIL => error.AddressUnavailable,
+            else => |err| std.posix.unexpectedErrno(err),
+        };
+    }
+    if (std.c.listen(fd, 128) != 0) return error.SystemResources;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.c.getsockname(fd, @ptrCast(&addr.ip4), &len) != 0) return error.SystemResources;
+    return .{ .inner = .{ .socket = .{ .handle = fd, .address = Address.fromPosix(addr.ip4).ip }, .options = {} } };
+}
+
 fn listenOn(ip: []const u8, port: u16) !Server {
     initNetwork();
     const io = std.Io.Threaded.global_single_threaded.io();

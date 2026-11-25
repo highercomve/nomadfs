@@ -2112,10 +2112,48 @@ test "commands: node put/get text round trip" {
         try testing.expect(std.mem.endsWith(u8, info.address, "/Swarm/"));
         try testing.expect(std.mem.indexOf(u8, info.address, "secret") == null);
     }
+    // Runtime controls preserve the saved port and credentials.
+    webDavStop();
+    try testing.expect(g_node.?.node.webdav_service == null);
+    {
+        const info = try webDavInfo(alloc, .{ .config_path = conf_path });
+        defer alloc.free(info.user);
+        defer alloc.free(info.address);
+        try testing.expect(!info.running and info.password_set);
+        try testing.expectEqual(webdav_port, info.port);
+    }
+    try webDavStart(alloc, .{ .config_path = conf_path });
+    try testing.expect(g_node.?.node.webdav_service != null);
+    // Start is idempotent, Restart binds the saved port again.
+    try webDavStart(alloc, .{ .config_path = conf_path });
+    try webDavRestart(alloc, .{ .config_path = conf_path });
+    try testing.expectEqual(webdav_port, g_node.?.node.webdav_service.?.server.port);
+    var busy = try nomadfs.net.compat.listenLoopback(0);
+    defer busy.deinit();
+    const busy_port = busy.inner.socket.address.getPort();
+    try testing.expectError(error.AddressInUse, webDavSet(alloc, .{ .config_path = conf_path, .port = busy_port, .user = "reader" }));
+    try testing.expectEqual(webdav_port, g_node.?.node.webdav_service.?.server.port);
+    {
+        var saved = try config_mod.parseConfig(alloc, conf_path);
+        defer saved.deinit(alloc);
+        try testing.expectEqual(webdav_port, saved.webdav.port);
+        try testing.expect(saved.webdav.hasLogin());
+    }
+    webDavStop();
+    // A failed Save while stopped must not restart the previous server.
+    try testing.expectError(error.AddressInUse, webDavSet(alloc, .{ .config_path = conf_path, .port = busy_port, .user = "reader" }));
+    try testing.expect(g_node.?.node.webdav_service == null);
+    try webDavStart(alloc, .{ .config_path = conf_path });
     // Blank leaves the saved hash alone, invalid settings leave it running.
     try webDavSet(alloc, .{ .config_path = conf_path, .port = webdav_port, .user = "reader" });
     try testing.expectError(error.InvalidWebDavUser, webDavSet(alloc, .{ .config_path = conf_path, .port = webdav_port, .user = "bad:user" }));
     try testing.expect(g_node.?.node.webdav_service != null);
+    // Stop is for this run: reopening the node serves the saved port again.
+    webDavStop();
+    nodeClose();
+    try nodeOpen(alloc, .{ .config_path = conf_path });
+    nomadfs.sync.sleep(200 * std.time.ns_per_ms);
+    try testing.expectEqual(webdav_port, g_node.?.node.webdav_service.?.server.port);
     try webDavSet(alloc, .{ .config_path = conf_path, .port = webdav_port, .user = "", .clear_password = true });
     try testing.expect(!g_node.?.node.webdav_service.?.server.login.hasLogin());
     try webDavSet(alloc, .{ .config_path = conf_path, .port = 0, .user = "" });
@@ -2415,15 +2453,75 @@ pub fn webDavSet(gpa: std.mem.Allocator, args: WebDavArgs) !void {
         if (args.password.len > 0) value.password_hash = try nomadfs.webdav_login.hash(gpa, args.password, &hash_buf);
     }
     try nomadfs.webdav_login.validate(value);
+    const was_running = if (runningNode()) |n| n.webdav_service != null else false;
     // Apply first: a port already in use must not be saved as working.
     if (runningNode()) |n| {
         n.configureWebDav(value) catch |err| {
-            n.configureWebDav(cfg.webdav) catch {};
+            if (was_running) n.configureWebDav(cfg.webdav) catch {};
             return err;
         };
+    } else if (value.port != 0) {
+        // Saving while the node is stopped still checks the requested port.
+        var listener = try nomadfs.net.compat.listenLoopbackExclusive(value.port);
+        listener.deinit();
     }
     config_file.setWebDav(gpa, args.config_path, value) catch |err| {
-        if (runningNode()) |n| n.configureWebDav(cfg.webdav) catch {};
+        if (runningNode()) |n| {
+            n.stopWebDavService();
+            if (was_running) n.configureWebDav(cfg.webdav) catch {};
+        }
         return err;
     };
+}
+
+/// Stop is session-only; the saved port still means serve at node startup.
+pub fn webDavStop() void {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    if (runningNode()) |n| n.stopWebDavService();
+}
+
+pub fn webDavStart(gpa: std.mem.Allocator, args: ListArgs) !void {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const n = runningNode() orelse return error.NodeNotRunning;
+    if (n.webdav_service != null) return;
+    try startSavedWebDav(gpa, args.config_path, n);
+}
+
+pub fn webDavRestart(gpa: std.mem.Allocator, args: ListArgs) !void {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+    const n = runningNode() orelse return error.NodeNotRunning;
+    try startSavedWebDav(gpa, args.config_path, n);
+}
+
+fn startSavedWebDav(gpa: std.mem.Allocator, path: []const u8, n: *nomadfs.Node) !void {
+    var cfg = try config_mod.parseConfig(gpa, path);
+    defer cfg.deinit(gpa);
+    if (cfg.webdav.port == 0) return error.WebDavPortNotConfigured;
+    try n.configureWebDav(cfg.webdav);
+}
+
+test "commands: saving WebDAV while node is stopped refuses a busy port without writing" {
+    const a = testing.allocator;
+    const io = std.testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const original = "nickname = test\nswarm_key = " ++ "ab" ** 32 ++ "\nstorage_path = /tmp/unused-webdav-test\nport = 14701\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "config", .data = original });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    const path = try std.fs.path.join(a, &.{ dir, "config" });
+    defer a.free(path);
+    var busy = try nomadfs.net.compat.listenLoopback(0);
+    defer busy.deinit();
+    const port = busy.inner.socket.address.getPort();
+    // The old frontend refresh race sent an empty user with a password;
+    // validation rejects it before a [webdav] section can be written.
+    try testing.expectError(error.InvalidWebDavUser, webDavSet(a, .{ .config_path = path, .port = port, .user = "", .password = "secret" }));
+    try testing.expectError(error.AddressInUse, webDavSet(a, .{ .config_path = path, .port = port, .user = "" }));
+    const after = try tmp.dir.readFileAlloc(io, "config", a, .limited(4096));
+    defer a.free(after);
+    try testing.expectEqualStrings(original, after);
 }
