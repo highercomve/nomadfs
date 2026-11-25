@@ -7,6 +7,19 @@
 .custom = { "label": "changelog" },
 ---
 
+# 0.8.1 - 2026-11-24
+
+Devices on 0.4.0 and later work together. Nodes that share big folders use much less memory.
+
+## Fixed
+
+- A device sharing big folders no longer spikes its memory every 30 seconds. Rescanning a shared
+  folder used to rebuild the index of every chunk in it; now it updates only the files that
+  changed, and keeps each chunk's location once. On a node sharing 1.3 TB, memory went from about
+  780 MB, peaking at 1.3 GB every 30 seconds, to a steady 500 MB.
+- Freeing deleted space no longer walks every chunk of shared folders, which held 270 MB on a node
+  sharing 1.3 TB and looked each chunk up twice on disk.
+
 # 0.8.0 - 2026-11-21
 
 Devices on 0.4.0 and later work together. Deleted files now free their space: update every device,
