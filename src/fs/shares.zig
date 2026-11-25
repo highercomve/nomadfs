@@ -148,6 +148,8 @@ pub const ShareIndex = struct {
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned_path);
 
+        var detached: ?filestore.Filestore.Detached = null;
+        defer if (detached) |*table| table.deinit(self.allocator);
         {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -155,6 +157,7 @@ pub const ShareIndex = struct {
             const gen = self.generation +% 1;
             const share: Share = .{ .name = owned_name, .path = owned_path, .generation = gen };
             if (at.found) {
+                detached = self.files.detach(name);
                 freeShare(self.allocator, self.shares.items[at.index]);
                 self.shares.items[at.index] = share;
             } else {
@@ -167,15 +170,15 @@ pub const ShareIndex = struct {
     /// Stops sharing `name`: its files are no longer served. Dir and
     /// parent blocks stay in the store.
     pub fn remove(self: *ShareIndex, name: []const u8) bool {
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            const at = self.indexOf(name);
-            if (!at.found) return false;
-            freeShare(self.allocator, self.shares.orderedRemove(at.index));
-            self.generation +%= 1;
-        }
-        self.files.remove(name);
+        var detached: ?filestore.Filestore.Detached = null;
+        defer if (detached) |*table| table.deinit(self.allocator);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const at = self.indexOf(name);
+        if (!at.found) return false;
+        detached = self.files.detach(name);
+        freeShare(self.allocator, self.shares.orderedRemove(at.index));
+        self.generation +%= 1;
         return true;
     }
 
@@ -224,11 +227,16 @@ pub const ShareIndex = struct {
             if (!at.found) return;
             const s = self.shares.items[at.index];
             const path = self.allocator.dupe(u8, s.path) catch return;
+            const target = self.files.prepare(name, s.generation) catch {
+                self.allocator.free(path);
+                return;
+            };
             self.scan_started_s = sync.timestamp();
             break :blk .{
                 .path = path,
-                .first = s.root == null,
+                .first = s.root == null or s.indexing,
                 .generation = s.generation,
+                .target = target,
             };
         };
         defer self.allocator.free(snap.path);
@@ -238,14 +246,8 @@ pub const ShareIndex = struct {
             self.scan_started_s = null;
         }
 
-        // Segments left by an earlier share of this name.
-        if (snap.first) self.files.remove(name);
-        self.scanner.table = newTable(self.allocator) catch return;
-        defer if (self.scanner.table) |t| {
-            t.deinit();
-            self.allocator.destroy(t);
-            self.scanner.table = null;
-        };
+        self.scanner.target = snap.target;
+        defer self.scanner.target = null;
         var progress: ProgressCtx = .{ .index = self, .name = name, .generation = snap.generation };
         if (snap.first) self.scanner.progress = .{
             .ctx = &progress,
@@ -270,12 +272,13 @@ pub const ShareIndex = struct {
         if (!at.found) return; // removed while scanning
         const share = &self.shares.items[at.index];
         if (share.generation != snap.generation or !std.mem.eql(u8, share.path, snap.path)) return; // changed or re-added while scanning
-        const table = self.scanner.table.?;
-        (if (snap.first) self.files.append(name, table) else self.files.replace(name, table)) catch return;
-        self.scanner.table = null;
         if (snap.first) {
             const ms = @divFloor(started.durationTo(std.Io.Timestamp.now(self.io, .awake)).nanoseconds, std.time.ns_per_ms);
             std.debug.print("share '{s}': indexed {d} files ({d} MiB) in {d} ms\n", .{ name, result.files, result.size >> 20, ms });
+            if (self.files.stats(name)) |st| std.debug.print(
+                "share '{s}': {d} chunks ({d} slots), {d} in several files ({d} slots)\n",
+                .{ name, st.chunks, st.chunk_slots, st.duplicates, st.duplicate_slots },
+            );
         }
         self.publishRootLocked(share, result.root);
         share.size = result.size;
@@ -306,12 +309,6 @@ pub const ShareIndex = struct {
         return block.cid;
     }
 
-    fn newTable(allocator: std.mem.Allocator) !*filestore.Table {
-        const table = try allocator.create(filestore.Table);
-        table.* = filestore.Table.init(allocator);
-        return table;
-    }
-
     /// A first scan's progress: the share lists what is done so far.
     const ProgressCtx = struct {
         index: *ShareIndex,
@@ -321,19 +318,11 @@ pub const ShareIndex = struct {
         fn report(ctx: *anyopaque, partial: scan.Result) anyerror!void {
             const self: *ProgressCtx = @ptrCast(@alignCast(ctx));
             const index = self.index;
-            const next = try newTable(index.allocator);
-            errdefer {
-                next.deinit();
-                index.allocator.destroy(next);
-            }
             index.mutex.lock();
             defer index.mutex.unlock();
             const at = index.indexOf(self.name);
             if (!at.found) return error.ScanCancelled; // removed meanwhile
             if (index.shares.items[at.index].generation != self.generation) return error.ScanCancelled;
-            // Hand over the files scanned since the last report.
-            try index.files.append(self.name, index.scanner.table.?);
-            index.scanner.table = next;
             const share = &index.shares.items[at.index];
             index.publishRootLocked(share, partial.root);
             share.size = partial.size;
@@ -572,6 +561,87 @@ test "shares: listing follows add, rescan and remove" {
     try testing.expectEqual(@as(usize, 0), none.entries.len);
 }
 
+test "shares: incremental rescans reuse, replace and retire leaves" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "media");
+    try tmp.dir.createDirPath(io, "blocks");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const blocks = try std.fs.path.join(allocator, &.{ base, "blocks" });
+    defer allocator.free(blocks);
+    const media = try std.fs.path.join(allocator, &.{ base, "media" });
+    defer allocator.free(media);
+
+    const params = storage.dag.builder.chunk_params;
+    const sample = try allocator.alloc(u8, 1 + params.max_size + 5);
+    defer allocator.free(sample);
+    sample[0] = @intFromEnum(codec.Tag.leaf);
+    var prng = std.Random.DefaultPrng.init(17);
+    prng.random().bytes(sample[1..]);
+    const cut = storage.chunker.cut(params, sample[1..]);
+    const shared = storage.block.Block.new(sample[0 .. 1 + cut]).cid;
+    const tail = sample[1 + cut ..][0..5];
+    @memcpy(tail, "alpha");
+    try tmp.dir.writeFile(io, .{ .sub_path = "media/a.bin", .data = sample[1 .. 1 + cut + tail.len] });
+    @memcpy(tail, "beta!");
+    try tmp.dir.writeFile(io, .{ .sub_path = "media/b.bin", .data = sample[1 .. 1 + cut + tail.len] });
+    const alpha = storage.block.Block.new("\x00alpha").cid;
+    const beta = storage.block.Block.new("\x00beta!").cid;
+    const changed = storage.block.Block.new("\x00changed").cid;
+
+    var store = try storage.engine.StorageEngine.init(allocator, blocks);
+    defer store.deinit();
+    const index = try ShareIndex.create(allocator, io, &store);
+    defer index.destroy();
+    try index.add("media", media);
+
+    try expectSharedLeaf(&index.files, &alpha, "alpha");
+    try expectSharedLeaf(&index.files, &beta, "beta!");
+    try expectSharedLeaf(&index.files, &shared, sample[1 .. 1 + cut]);
+    const mutations = index.files.tables.get("media").?.mutations;
+    try testing.expectEqual(@as(u64, 4), mutations);
+    index.rescanAll();
+    try testing.expectEqual(mutations, index.files.tables.get("media").?.mutations);
+    try testing.expectEqual(@as(u64, 2), index.scanner.files_hashed);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "media/a.bin", .data = "changed" });
+    try expectSharedLeaf(&index.files, &shared, sample[1 .. 1 + cut]);
+    index.rescanAll();
+    try expectSharedLeaf(&index.files, &changed, "changed");
+    try testing.expect(!index.files.has(&alpha));
+    try expectSharedLeaf(&index.files, &shared, sample[1 .. 1 + cut]);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "media/c.bin", .data = sample[1 .. 1 + cut] });
+    index.rescanAll();
+    try tmp.dir.deleteFile(io, "media/b.bin");
+    try expectSharedLeaf(&index.files, &shared, sample[1 .. 1 + cut]);
+    index.rescanAll();
+    try testing.expect(!index.files.has(&beta));
+    try expectSharedLeaf(&index.files, &shared, sample[1 .. 1 + cut]);
+    // Check read visibility above before forcing physical reclamation.
+    (try index.files.prepare("media", index.shares.items[0].generation)).forceSweep();
+    try testing.expectEqual(@as(u32, 2), index.files.tables.get("media").?.refs.count());
+    try testing.expectEqual(@as(u32, 0), index.files.tables.get("media").?.copies.count());
+
+    try testing.expect(index.remove("media"));
+    try testing.expectEqual(@as(u32, 0), index.files.tables.count());
+    try testing.expect(!index.files.has(&shared));
+    try testing.expect(!index.files.has(&changed));
+}
+
+fn expectSharedLeaf(files: *filestore.Filestore, cid: *const codec.Cid, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const block = (try files.get(cid, allocator)) orelse return error.MissingSharedLeaf;
+    defer allocator.free(block);
+    try std.testing.expectEqual(@intFromEnum(codec.Tag.leaf), block[0]);
+    try std.testing.expectEqualSlices(u8, expected, block[1..]);
+}
+
 test "shares: collectionCutoff spares rescans that publish after the snapshot" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -666,12 +736,8 @@ test "shares: a first scan lists its progress, and every file reads back" {
     index.progress_interval_ns = 0;
     try index.add("media", media);
 
-    // Each report handed its files over as a segment of their own.
-    {
-        index.files.mutex.lock();
-        defer index.files.mutex.unlock();
-        try testing.expect(index.files.tables.get("media").?.items.len >= 3);
-    }
+    // Reports and the final root all use the same table.
+    try testing.expectEqual(@as(u32, 1), index.files.tables.count());
     const snap = try index.snapshot(allocator);
     defer ShareIndex.freeSnapshot(allocator, snap);
     try testing.expectEqual(@as(u64, 3), snap[0].files);
@@ -817,12 +883,37 @@ test "shares: re-add mid-scan does not install stale result" {
     const index = try ShareIndex.create(allocator, io, &store);
     defer index.destroy();
 
-    try index.register("test_share", old_path);
+    try index.add("test_share", old_path);
     const gen0 = index.shares.items[0].generation;
+    const old = storage.block.Block.new("\x00old").cid;
+    const new = storage.block.Block.new("\x00new").cid;
+    try expectSharedLeaf(&index.files, &old, "old");
 
-    // Re-registering with new path increments generation
-    try index.register("test_share", new_path);
+    const Move = struct {
+        index: *ShareIndex,
+        path: []const u8,
+        done: bool = false,
+
+        fn report(ctx: *anyopaque, _: scan.Result) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.done) return;
+            try self.index.register("test_share", self.path);
+            self.done = true;
+        }
+    };
+    var move: Move = .{ .index = index, .path = new_path };
+    index.scanner.progress = .{ .ctx = &move, .reportFn = Move.report, .first_ns = 0, .interval_ns = 0 };
+    index.rescanAll();
+    try testing.expect(move.done);
+
     const gen1 = index.shares.items[0].generation;
     try testing.expect(gen1 != gen0);
     try testing.expectEqualStrings(new_path, index.shares.items[0].path);
+    try testing.expectEqual(null, index.shares.items[0].root);
+    try testing.expectEqual(@as(u32, 0), index.files.tables.count());
+    try testing.expect(!index.files.has(&old));
+
+    index.rescanAll();
+    try expectSharedLeaf(&index.files, &new, "new");
+    try testing.expect(!index.files.has(&old));
 }

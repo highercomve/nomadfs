@@ -3,12 +3,12 @@
 //! listing its children by name. The folder's root CID changes whenever
 //! anything under it changes, and unchanged files reuse their blocks.
 //!
-//! With a filestore table set, file bytes are not copied: leaves are
+//! With a filestore target set, file bytes are not copied: leaves are
 //! recorded as (file, offset, length) and served from the files themselves
 //! (filestore.zig); only dir and parent blocks enter the store.
 //!
 //! Files whose size and mtime match the previous scan are not re-read: the
-//! scanner remembers their CIDs (and leaf locations), across restarts too
+//! scanner remembers their CIDs, across restarts too
 //! with a scan cache (scan_cache.zig). Symlinks, devices, sockets, names a peer
 //! could not map onto its own filesystem, and entries that cannot be read
 //! are skipped rather than failing the whole share.
@@ -42,9 +42,6 @@ const Remembered = struct {
     ctime_ns: i96,
     inode: u64,
     cid: Cid,
-    /// Where the file's leaves sit (filestore scans only; owned). Empty
-    /// for an entry loaded from the scan cache until a scan needs them.
-    leaves: []filestore.Leaf = &.{},
     /// The scan that last saw the file (pruning).
     generation: u32 = 0,
 };
@@ -65,10 +62,9 @@ pub const Scanner = struct {
     store: *StorageEngine,
     /// Absolute file path -> what the last scan built from it.
     remembered: std.StringHashMapUnmanaged(Remembered) = .empty,
-    /// When set, file bytes stay in the files: leaves are recorded here
-    /// instead of copied into `store` (see filestore.zig). Dir and parent
-    /// blocks are stored either way.
-    table: ?*filestore.Table = null,
+    /// When set, leaves are indexed in the share instead of stored as
+    /// blocks. Dir and parent blocks are stored either way.
+    target: ?filestore.Filestore.Target = null,
     /// The chunking buffers, reused for every file (allocated on first use).
     scratch: ?storage.dag.DagBuilder.Scratch = null,
     /// What `remembered` is saved to (loadCache).
@@ -111,9 +107,7 @@ pub const Scanner = struct {
     /// ScanCache.open visitor: an entry from disk.
     pub fn put(self: *Scanner, path: []const u8, e: @import("scan_cache.zig").Entry) !void {
         const gop = try self.remembered.getOrPut(self.allocator, path);
-        if (gop.found_existing) {
-            self.allocator.free(gop.value_ptr.leaves);
-        } else {
+        if (!gop.found_existing) {
             gop.key_ptr.* = self.allocator.dupe(u8, path) catch |err| {
                 self.remembered.removeByPtr(gop.key_ptr);
                 return err;
@@ -126,7 +120,6 @@ pub const Scanner = struct {
     pub fn drop(self: *Scanner, path: []const u8) !void {
         const kv = self.remembered.fetchRemove(path) orelse return;
         self.allocator.free(kv.key);
-        self.allocator.free(kv.value.leaves);
     }
 
     pub fn deinit(self: *Scanner) void {
@@ -136,7 +129,6 @@ pub const Scanner = struct {
         var it = self.remembered.iterator();
         while (it.next()) |e| {
             self.allocator.free(e.key_ptr.*);
-            self.allocator.free(e.value_ptr.leaves);
         }
         self.remembered.deinit(self.allocator);
     }
@@ -145,6 +137,7 @@ pub const Scanner = struct {
     pub fn scan(self: *Scanner, path: []const u8) !Result {
         defer self.progress = null;
         defer self.frames.clearRetainingCapacity();
+        defer if (self.target) |target| target.sweep();
         self.generation +%= 1;
         self.files_seen = 0;
         if (self.progress) |p| self.next_report_ns = now(self.io) + p.first_ns;
@@ -153,6 +146,7 @@ pub const Scanner = struct {
         defer dir.close(self.io);
         var files: u64 = 0;
         const node = try self.scanDir(dir, "", path, 0, &files);
+        if (self.target) |target| try target.forgetUnseen(self.generation);
         self.forgetUnseen(path);
         self.saveCache();
         return .{ .root = node.cid, .size = node.size, .files = files };
@@ -163,11 +157,13 @@ pub const Scanner = struct {
     fn forgetUnseen(self: *Scanner, root: []const u8) void {
         var it = self.remembered.iterator();
         while (it.next()) |e| {
-            if (!std.mem.startsWith(u8, e.key_ptr.*, root)) continue;
+            const path = e.key_ptr.*;
+            if (!std.mem.startsWith(u8, path, root)) continue;
+            if (root.len > 0 and !std.fs.path.isSep(root[root.len - 1]) and
+                (path.len == root.len or !std.fs.path.isSep(path[root.len]))) continue;
             if (e.value_ptr.generation == self.generation) continue;
             if (self.cache) |*c| c.drop(e.key_ptr.*) catch {};
             self.allocator.free(e.key_ptr.*);
-            self.allocator.free(e.value_ptr.leaves);
             self.remembered.removeByPtr(e.key_ptr);
         }
     }
@@ -272,6 +268,7 @@ pub const Scanner = struct {
         for (file_names.items) |file_name| {
             const child_path = try std.fs.path.join(arena, &.{ path, file_name });
             const built = self.scanFile(dir, file_name, child_path) catch |err| {
+                if (err == error.ScanCancelled) return err;
                 std.debug.print("share: skipping {s}: {any}\n", .{ child_path, err });
                 continue;
             };
@@ -330,27 +327,35 @@ pub const Scanner = struct {
     const Built = struct { cid: Cid, size: u64, mtime: u64 };
 
     fn scanFile(self: *Scanner, dir: std.Io.Dir, name: []const u8, full_path: []const u8) !Built {
-        var file = try filestore.openRegular(self.io, dir, name);
-        defer file.close(self.io);
-        const stat = try file.stat(self.io);
-        const mtime_ns = stat.mtime.nanoseconds;
-        const ctime_ns = stat.ctime.nanoseconds;
-        const inode: u64 = @intCast(stat.inode);
-
-        if (self.remembered.getPtr(full_path)) |seen| reuse: {
-            if (seen.size != stat.size or seen.mtime_ns != mtime_ns or seen.ctime_ns != ctime_ns or seen.inode != inode) break :reuse;
-            if (self.table) |table| {
-                // From the scan cache: the leaves are listed by the file's
-                // parent blocks, already in the store.
-                if (seen.leaves.len == 0 and seen.size > 0) {
-                    seen.leaves = (self.leavesFromStore(seen.cid, seen.size) catch null) orelse break :reuse;
+        const stat = try dir.statFile(self.io, name, .{ .follow_symlinks = false });
+        if (stat.kind != .file) return error.NotRegularFile;
+        if (self.remembered.getPtr(full_path)) |seen| {
+            if (seen.size == stat.size and seen.mtime_ns == stat.mtime.nanoseconds and
+                seen.ctime_ns == stat.ctime.nanoseconds and seen.inode == stat.inode)
+            {
+                if (try self.reuseFile(full_path, seen.*)) {
+                    seen.generation = self.generation;
+                    return .{ .cid = seen.cid, .size = seen.size, .mtime = mtimeSeconds(stat) };
                 }
-                try table.addFile(full_path, seen.leaves);
             }
-            seen.generation = self.generation;
-            return .{ .cid = seen.cid, .size = seen.size, .mtime = mtimeSeconds(stat) };
         }
 
+        var file = try filestore.openRegular(self.io, dir, name);
+        defer file.close(self.io);
+        return self.hashFile(file, try file.stat(self.io), full_path);
+    }
+
+    fn reuseFile(self: *Scanner, path: []const u8, seen: Remembered) !bool {
+        const target = self.target orelse return true;
+        if (try target.reuseFile(path, seen.cid, self.generation)) return true;
+        // A new table can reuse the parent blocks kept on disk.
+        const leaves = if (seen.size == 0) &.{} else (self.leavesFromStore(seen.cid, seen.size) catch null) orelse return false;
+        defer self.allocator.free(leaves);
+        try target.setFile(path, seen.cid, self.generation, leaves);
+        return true;
+    }
+
+    fn hashFile(self: *Scanner, file: std.Io.File, stat: std.Io.File.Stat, full_path: []const u8) !Built {
         var leaves: std.ArrayList(filestore.Leaf) = .empty;
         defer leaves.deinit(self.allocator);
         var collector = LeafCollector{ .allocator = self.allocator, .leaves = &leaves };
@@ -360,7 +365,7 @@ pub const Scanner = struct {
             .allocator = self.allocator,
             .store = self.store,
             .layout = .Balanced,
-            .leaf_sink = if (self.table != null) collector.sink() else null,
+            .leaf_sink = if (self.target != null) collector.sink() else null,
             .scratch = &self.scratch.?,
         };
         var reader = FileReader{ .io = self.io, .file = file };
@@ -369,20 +374,26 @@ pub const Scanner = struct {
         defer self.allocator.free(root);
         const cid: Cid = root[0..codec.cid_len].*;
 
-        if (self.table) |table| try table.addFile(full_path, leaves.items);
-        const owned_leaves = try leaves.toOwnedSlice(self.allocator);
-        errdefer self.allocator.free(owned_leaves);
-
         const gop = try self.remembered.getOrPut(self.allocator, full_path);
-        if (gop.found_existing) {
-            self.allocator.free(gop.value_ptr.leaves);
-        } else {
+        if (!gop.found_existing) {
             gop.key_ptr.* = self.allocator.dupe(u8, full_path) catch |err| {
                 self.remembered.removeByPtr(gop.key_ptr);
                 return err;
             };
         }
-        gop.value_ptr.* = .{ .size = reader.offset, .mtime_ns = mtime_ns, .ctime_ns = ctime_ns, .inode = inode, .cid = cid, .leaves = owned_leaves, .generation = self.generation };
+        errdefer if (!gop.found_existing) {
+            self.allocator.free(gop.key_ptr.*);
+            self.remembered.removeByPtr(gop.key_ptr);
+        };
+        if (self.target) |target| try target.setFile(full_path, cid, self.generation, leaves.items);
+        gop.value_ptr.* = .{
+            .size = reader.offset,
+            .mtime_ns = stat.mtime.nanoseconds,
+            .ctime_ns = stat.ctime.nanoseconds,
+            .inode = @intCast(stat.inode),
+            .cid = cid,
+            .generation = self.generation,
+        };
         if (self.cache) |*c| c.put(full_path, cacheEntry(gop.value_ptr.*)) catch {};
         return .{ .cid = cid, .size = reader.offset, .mtime = mtimeSeconds(stat) };
     }
@@ -392,12 +403,15 @@ pub const Scanner = struct {
     /// null when a block is missing. Owned by the caller.
     fn leavesFromStore(self: *Scanner, root: Cid, size: u64) !?[]filestore.Leaf {
         var leaves: std.ArrayList(filestore.Leaf) = .empty;
-        errdefer leaves.deinit(self.allocator);
-        const bytes = try self.store.getLocal(&root, self.allocator) orelse {
-            // Not stored: the file is a single leaf.
-            if (size > storage.dag.builder.chunk_params.max_size) return null;
-            try leaves.append(self.allocator, .{ .cid = root, .offset = 0, .len = @intCast(size) });
-            return try leaves.toOwnedSlice(self.allocator);
+        defer leaves.deinit(self.allocator);
+        const bytes = switch (try self.store.getLocalNode(&root, self.allocator)) {
+            .missing, .leaf => {
+                // A single leaf, either shared directly or also stored locally.
+                if (size > storage.dag.builder.chunk_params.max_size) return null;
+                try leaves.append(self.allocator, .{ .cid = root, .offset = 0, .len = @intCast(size) });
+                return try leaves.toOwnedSlice(self.allocator);
+            },
+            .node => |bytes| bytes,
         };
         defer self.allocator.free(bytes);
 
@@ -417,16 +431,17 @@ pub const Scanner = struct {
         var it = links;
         var probe = links;
         const first = probe.next() orelse return true;
-        const first_bytes = try self.store.getLocal(first.cid, self.allocator);
-        if (first_bytes == null) {
-            while (it.next()) |link| {
-                if (link.size > storage.dag.builder.chunk_params.max_size) return false;
-                try out.append(self.allocator, .{ .cid = link.cid.*, .offset = offset.*, .len = @intCast(link.size) });
-                offset.* += link.size;
-            }
-            return true;
+        switch (try self.store.getLocalNode(first.cid, self.allocator)) {
+            .missing, .leaf => {
+                while (it.next()) |link| {
+                    if (link.size > storage.dag.builder.chunk_params.max_size) return false;
+                    try out.append(self.allocator, .{ .cid = link.cid.*, .offset = offset.*, .len = @intCast(link.size) });
+                    offset.* += link.size;
+                }
+                return true;
+            },
+            .node => |first_bytes| self.allocator.free(first_bytes),
         }
-        self.allocator.free(first_bytes.?);
         while (it.next()) |link| {
             const bytes = try self.store.getLocal(link.cid, self.allocator) orelse return false;
             defer self.allocator.free(bytes);
@@ -516,20 +531,34 @@ test "scan: progress lists folders not reached yet, and the files done" {
 
     var store = try StorageEngine.init(allocator, blocks);
     defer store.deinit();
+    var files = filestore.Filestore.init(allocator, io);
+    defer files.deinit();
+    store.external = files.external();
     var scanner = Scanner.init(allocator, io, &store);
     defer scanner.deinit();
+    scanner.target = try files.prepare("share", 1);
 
     // The first report: after the share's own file, before any subfolder.
     const First = struct {
+        store: *StorageEngine,
         root: ?Cid = null,
+        read_partial: bool = false,
+
         fn report(ctx: *anyopaque, partial: Result) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (self.root == null) self.root = partial.root;
+            if (self.root != null) return;
+            self.root = partial.root;
+            const loader = tree.Loader.local(self.store);
+            const top = try tree.resolve(allocator, loader, partial.root, "top.txt");
+            var buf: [3]u8 = undefined;
+            const n = try tree.readAt(allocator, loader, top.cid, 0, &buf);
+            self.read_partial = std.mem.eql(u8, "top", buf[0..n]);
         }
     };
-    var first: First = .{};
+    var first: First = .{ .store = &store };
     scanner.progress = .{ .ctx = &first, .reportFn = First.report, .first_ns = 0, .interval_ns = 0 };
     const done = try scanner.scan(share);
+    try testing.expect(first.read_partial);
 
     const loader = tree.Loader.local(&store);
     const partial = try tree.listDir(allocator, loader, &first.root.?);
