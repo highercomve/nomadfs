@@ -3,13 +3,23 @@
 All notable changes to NomadFS. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may break compatibility.
 
-## Unreleased
+## 0.8.2 - 2026-11-25
+
+Devices on 0.4.0 and later work together. Other programs on your computer can now reach your files
+over WebDAV at a stable address, behind a login.
 
 ### Added
 
-- Optional fixed WebDAV login with salted Argon2id password storage, stable paths,
-  and `webdav-login set` / `clear` commands. A configured port starts the server
-  with the node. The Mount page can configure it and show the active address.
+- An optional fixed WebDAV login. Set it on the Mount page or with `nomadfs webdav-login set <user>`
+  (the password is read from stdin) and remove it with `nomadfs webdav-login clear`. The password
+  is stored as a salted Argon2id hash, never as plain text. With a login, the address stays the
+  same across restarts (`http://127.0.0.1:<port>/Swarm/`) instead of using a random token, and a
+  configured `[webdav] port` starts the server with the node.
+- The Mount page starts, stops and restarts the WebDAV server. When it can't start, for example
+  because the port is already in use, the page says why and keeps the message until the next try.
+- Programs running as another user on the same computer, such as a container or a service, can
+  connect once you tick "Let other programs on this computer connect" (`allow_other_users = true`
+  in `[webdav]`). It works only with a login set; otherwise only your own user gets in, as before.
 
 ## 0.8.1 - 2026-11-24
 
